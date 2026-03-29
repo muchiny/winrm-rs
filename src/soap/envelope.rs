@@ -1,16 +1,25 @@
 //! SOAP envelope builders for WS-Management shell lifecycle operations.
 
+use std::fmt::Write;
+
 use uuid::Uuid;
 
 use super::namespaces::*;
 
 /// Escape special XML characters to prevent injection in SOAP envelopes.
 fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// XML namespace declarations used in envelopes that include the shell namespace.
@@ -116,11 +125,13 @@ pub(crate) fn execute_command_request(
         timeout_secs,
         max_envelope_size,
     );
-    let args_xml: String = args
-        .iter()
-        .map(|a| format!("      <rsp:Arguments>{}</rsp:Arguments>", xml_escape(a)))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let mut args_xml = String::new();
+    for (i, a) in args.iter().enumerate() {
+        if i > 0 {
+            args_xml.push('\n');
+        }
+        let _ = write!(args_xml, "      <rsp:Arguments>{}</rsp:Arguments>", xml_escape(a));
+    }
     let escaped_command = xml_escape(command);
     format!(
         r#"<s:Envelope {NS_DECL_WITH_RSP}>

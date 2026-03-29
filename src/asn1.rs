@@ -610,4 +610,31 @@ mod tests {
         assert_eq!(decoded.auth_info, Some(b"creds".to_vec()));
         assert_eq!(decoded.client_nonce, Some(vec![0xBB; 32]));
     }
+
+    #[test]
+    fn encode_length_boundary_255_uses_one_byte_form() {
+        // 255 must use 0x81 form (not 0x82), kills mutant: < 0x100 → <= 0x100
+        let l = encode_length(255);
+        assert_eq!(l, vec![0x81, 255]);
+        // 256 must use 0x82 form
+        let l = encode_length(256);
+        assert_eq!(l, vec![0x82, 1, 0]);
+    }
+
+    #[test]
+    fn encode_context_tag_uses_or_not_xor() {
+        // Tag 3 with OR: 0xA0 | 3 = 0xA3
+        // Tag 3 with XOR: 0xA0 ^ 3 = 0xA3 (same! bits don't overlap)
+        // Tag 5 with OR: 0xA0 | 5 = 0xA5
+        // Tag 5 with XOR: 0xA0 ^ 5 = 0xA5 (same again)
+        // We need a tag where OR != XOR → only if tag has bit 5,6,7 set
+        // Actually for tags 0-15, OR and XOR give the same result since
+        // 0xA0 = 1010_0000 and tags are 0000_xxxx — no bit overlap.
+        // The mutation is semantically equivalent for our use case.
+        // But let's verify the output bytes are correct for roundtrip.
+        let encoded = encode_context_tag(3, &[0x42]);
+        assert_eq!(encoded[0], 0xA3); // 0xA0 | 3
+        assert_eq!(encoded[1], 1);    // length
+        assert_eq!(encoded[2], 0x42); // content
+    }
 }

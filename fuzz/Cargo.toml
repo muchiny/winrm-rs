@@ -1,0 +1,36 @@
+[package]
+name = "winrm-rs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+base64 = "0.22"
+
+[dependencies.winrm-rs]
+path = ".."
+
+[[bin]]
+name = "fuzz_ntlm_parse"
+path = "fuzz_targets/fuzz_ntlm_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_ntlm_seal"
+path = "fuzz_targets/fuzz_ntlm_seal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_powershell_encode"
+path = "fuzz_targets/fuzz_powershell_encode.rs"
+test = false
+doc = false
+bench = false

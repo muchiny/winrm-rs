@@ -38,6 +38,7 @@ rand = "0.10"
 secrecy = { version = "0.10", features = ["serde"] }
 tracing = "0.1"
 zeroize = "1.8"
+tokio-util = { version = "0.7.18", features = ["rt"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

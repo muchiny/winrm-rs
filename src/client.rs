@@ -255,6 +255,38 @@ impl WinrmClient {
             .await
     }
 
+    /// Execute a command with cancellation support.
+    ///
+    /// Like [`run_command`](Self::run_command), but can be cancelled via a
+    /// [`CancellationToken`](tokio_util::sync::CancellationToken).
+    pub async fn run_command_with_cancel(
+        &self,
+        host: &str,
+        command: &str,
+        args: &[&str],
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<CommandOutput, WinrmError> {
+        tokio::select! {
+            result = self.run_command(host, command, args) => result,
+            () = cancel.cancelled() => Err(WinrmError::Cancelled),
+        }
+    }
+
+    /// Execute a PowerShell script with cancellation support.
+    ///
+    /// Like [`run_powershell`](Self::run_powershell), but can be cancelled via a
+    /// [`CancellationToken`](tokio_util::sync::CancellationToken).
+    pub async fn run_powershell_with_cancel(
+        &self,
+        host: &str,
+        script: &str,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<CommandOutput, WinrmError> {
+        let encoded = encode_powershell_command(script);
+        self.run_command_with_cancel(host, "powershell.exe", &["-EncodedCommand", &encoded], cancel)
+            .await
+    }
+
     /// Open a reusable shell session on the given host.
     ///
     /// Returns a [`Shell`] that can execute multiple commands without the

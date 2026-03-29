@@ -27,6 +27,9 @@ pub enum WinrmError {
     /// File transfer error (upload or download failure).
     #[error("file transfer error: {0}")]
     Transfer(String),
+    /// The operation was cancelled via a [`CancellationToken`](tokio_util::sync::CancellationToken).
+    #[error("operation cancelled")]
+    Cancelled,
 }
 
 /// Errors from SOAP envelope parsing or WS-Management fault responses.

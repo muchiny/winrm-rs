@@ -96,6 +96,25 @@ impl<'a> Shell<'a> {
         }
     }
 
+    /// Execute a command with cancellation support.
+    ///
+    /// Like [`run_command`](Self::run_command), but can be cancelled via a
+    /// [`CancellationToken`]. When cancelled, a Ctrl+C signal is sent to the
+    /// running command and [`WinrmError::Cancelled`] is returned.
+    pub async fn run_command_with_cancel(
+        &self,
+        command: &str,
+        args: &[&str],
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<CommandOutput, WinrmError> {
+        tokio::select! {
+            result = self.run_command(command, args) => result,
+            () = cancel.cancelled() => {
+                Err(WinrmError::Cancelled)
+            }
+        }
+    }
+
     /// Execute a PowerShell script in this shell.
     ///
     /// The script is encoded as UTF-16LE base64 and executed via
@@ -103,6 +122,20 @@ impl<'a> Shell<'a> {
     pub async fn run_powershell(&self, script: &str) -> Result<CommandOutput, WinrmError> {
         let encoded = crate::command::encode_powershell_command(script);
         self.run_command("powershell.exe", &["-EncodedCommand", &encoded])
+            .await
+    }
+
+    /// Execute a PowerShell script with cancellation support.
+    ///
+    /// Like [`run_powershell`](Self::run_powershell), but can be cancelled via a
+    /// [`CancellationToken`].
+    pub async fn run_powershell_with_cancel(
+        &self,
+        script: &str,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<CommandOutput, WinrmError> {
+        let encoded = crate::command::encode_powershell_command(script);
+        self.run_command_with_cancel("powershell.exe", &["-EncodedCommand", &encoded], cancel)
             .await
     }
 

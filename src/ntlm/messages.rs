@@ -59,24 +59,22 @@ pub fn parse_challenge(data: &[u8]) -> Result<ChallengeMessage, NtlmError> {
     if &data[0..8] != SIGNATURE {
         return Err(NtlmError::InvalidMessage("bad NTLMSSP signature".into()));
     }
-    // SAFETY: fixed-size slices from bounds-checked data (len >= 32 verified above)
-    let msg_type = u32::from_le_bytes(data[8..12].try_into().unwrap());
+    let msg_type = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
     if msg_type != 2 {
         return Err(NtlmError::InvalidMessage(format!(
             "expected type 2, got {msg_type}"
         )));
     }
 
-    let negotiate_flags = u32::from_le_bytes(data[20..24].try_into().unwrap());
+    let negotiate_flags = u32::from_le_bytes([data[20], data[21], data[22], data[23]]);
 
     let mut server_challenge = [0u8; 8];
     server_challenge.copy_from_slice(&data[24..32]);
 
     // Target info security buffer at offset 40
     let (target_info, target_domain, timestamp) = if data.len() >= 48 {
-        // SAFETY: fixed-size slices from bounds-checked data (len >= 48 verified above)
-        let ti_len = u16::from_le_bytes(data[40..42].try_into().unwrap()) as usize;
-        let ti_offset = u32::from_le_bytes(data[44..48].try_into().unwrap()) as usize;
+        let ti_len = u16::from_le_bytes([data[40], data[41]]) as usize;
+        let ti_offset = u32::from_le_bytes([data[44], data[45], data[46], data[47]]) as usize;
         if ti_offset + ti_len <= data.len() {
             let ti = data[ti_offset..ti_offset + ti_len].to_vec();
             let (domain, ts) = parse_av_pairs(&ti);

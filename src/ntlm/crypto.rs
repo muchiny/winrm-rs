@@ -80,8 +80,8 @@ pub(crate) fn parse_av_pairs(data: &[u8]) -> (String, Option<[u8; 8]>) {
     let mut offset = 0;
 
     while offset + 4 <= data.len() {
-        let av_id = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap());
-        let av_len = u16::from_le_bytes(data[offset + 2..offset + 4].try_into().unwrap()) as usize;
+        let av_id = u16::from_le_bytes([data[offset], data[offset + 1]]);
+        let av_len = u16::from_le_bytes([data[offset + 2], data[offset + 3]]) as usize;
         offset += 4;
 
         if av_id == AV_EOL {

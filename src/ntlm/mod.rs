@@ -147,15 +147,13 @@ impl NtlmSession {
         let ciphertext = &sealed[16..];
 
         // Verify signature version (unencrypted field)
-        // SAFETY: slice [0..4] is exactly 4 bytes, guaranteed by length check above
-        let version = u32::from_le_bytes(signature[0..4].try_into().unwrap());
+        let version = u32::from_le_bytes([signature[0], signature[1], signature[2], signature[3]]);
         if version != 1 {
             return Err(NtlmError::InvalidMessage("bad signature version".into()));
         }
 
         // Verify sequence number (unencrypted field)
-        // SAFETY: slice [12..16] is exactly 4 bytes, guaranteed by length check above
-        let sig_seq = u32::from_le_bytes(signature[12..16].try_into().unwrap());
+        let sig_seq = u32::from_le_bytes([signature[12], signature[13], signature[14], signature[15]]);
         if sig_seq != self.server_seq_num {
             return Err(NtlmError::InvalidMessage("sequence number mismatch".into()));
         }

@@ -42,7 +42,13 @@ impl HttpTransport {
             .danger_accept_invalid_certs(config.accept_invalid_certs)
             .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
             .timeout(Duration::from_secs(config.operation_timeout_secs + 10))
-            .pool_max_idle_per_host(1);
+            .pool_max_idle_per_host(1)
+            .user_agent(
+                config
+                    .user_agent
+                    .as_deref()
+                    .unwrap_or(concat!("winrm-rs/", env!("CARGO_PKG_VERSION"))),
+            );
 
         // Configure TLS client certificate for Certificate auth
         if matches!(config.auth_method, AuthMethod::Certificate) {

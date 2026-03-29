@@ -75,11 +75,7 @@ impl WinrmClient {
     #[tracing::instrument(level = "debug", skip(self))]
     pub async fn create_shell(&self, host: &str) -> Result<String, WinrmError> {
         let config = self.transport.config();
-        let envelope = soap::create_shell_request(
-            &self.transport.endpoint(host),
-            config.operation_timeout_secs,
-            config.max_envelope_size,
-        );
+        let envelope = soap::create_shell_request(&self.transport.endpoint(host), config);
         let response = self.transport.send_soap_with_retry(host, envelope).await?;
         soap::parse_shell_id(&response).map_err(WinrmError::Soap)
     }

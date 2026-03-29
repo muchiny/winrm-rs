@@ -44,6 +44,28 @@ pub struct WinrmConfig {
     ///
     /// When set, all WinRM HTTP(S) requests are routed through this proxy.
     pub proxy: Option<String>,
+    /// Console output code page (default: 65001 = UTF-8).
+    ///
+    /// Controls the `WINRS_CODEPAGE` option in the shell creation envelope.
+    /// Common values: 65001 (UTF-8), 437 (US), 850 (Western European).
+    pub codepage: u32,
+    /// Initial working directory for the remote shell (default: `None`).
+    ///
+    /// When set, the shell starts in this directory. Equivalent to running
+    /// `cd <path>` before any command.
+    pub working_directory: Option<String>,
+    /// Environment variables to set in the remote shell (default: empty).
+    ///
+    /// Each `(key, value)` pair is injected into the shell's environment
+    /// at creation time via `<rsp:Environment>`.
+    pub env_vars: Vec<(String, String)>,
+    /// Custom HTTP `User-Agent` header (default: `None` = `winrm-rs/<version>`).
+    pub user_agent: Option<String>,
+    /// Shell idle timeout in seconds (default: `None` = server default).
+    ///
+    /// When set, the shell will be automatically closed by the server
+    /// after this many seconds of inactivity.
+    pub idle_timeout_secs: Option<u64>,
 }
 
 impl Default for WinrmConfig {
@@ -60,6 +82,11 @@ impl Default for WinrmConfig {
             client_cert_pem: None,
             client_key_pem: None,
             proxy: None,
+            user_agent: None,
+            codepage: 65001,
+            working_directory: None,
+            env_vars: Vec::new(),
+            idle_timeout_secs: None,
         }
     }
 }

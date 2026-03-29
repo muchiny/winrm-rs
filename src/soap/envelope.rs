@@ -75,30 +75,64 @@ fn build_header(
 
 /// Build a WS-Management Create Shell SOAP envelope (MS-WSMV 3.1.4.1).
 ///
-/// The returned XML creates a `cmd` shell with UTF-8 codepage (65001) and
-/// stdout/stderr output streams. Each request gets a unique `MessageID` (UUID v4).
+/// The returned XML creates a `cmd` shell with configurable codepage, optional
+/// working directory, environment variables, and idle timeout. Each request gets
+/// a unique `MessageID` (UUID v4).
 ///
 /// # Arguments
 /// * `endpoint` -- full WinRM URL, e.g. `http://host:5985/wsman`
-/// * `timeout_secs` -- server-side operation timeout in seconds
-/// * `max_envelope_size` -- maximum SOAP envelope size in bytes
+/// * `config` -- WinRM configuration containing shell options
 pub(crate) fn create_shell_request(
     endpoint: &str,
-    timeout_secs: u64,
-    max_envelope_size: u32,
+    config: &crate::config::WinrmConfig,
 ) -> String {
-    let header = build_header(endpoint, ACTION_CREATE, None, timeout_secs, max_envelope_size);
+    let header = build_header(
+        endpoint,
+        ACTION_CREATE,
+        None,
+        config.operation_timeout_secs,
+        config.max_envelope_size,
+    );
+    let codepage = config.codepage;
+
+    let working_dir = config
+        .working_directory
+        .as_deref()
+        .map(|dir| format!("\n      <rsp:WorkingDirectory>{}</rsp:WorkingDirectory>", xml_escape(dir)))
+        .unwrap_or_default();
+
+    let env_block = if config.env_vars.is_empty() {
+        String::new()
+    } else {
+        let mut buf = String::from("\n      <rsp:Environment>");
+        for (key, val) in &config.env_vars {
+            let _ = write!(
+                buf,
+                "\n        <rsp:Variable Name=\"{}\">{}</rsp:Variable>",
+                xml_escape(key),
+                xml_escape(val),
+            );
+        }
+        buf.push_str("\n      </rsp:Environment>");
+        buf
+    };
+
+    let idle_timeout = config
+        .idle_timeout_secs
+        .map(|secs| format!("\n      <rsp:IdleTimeOut>PT{secs}S</rsp:IdleTimeOut>"))
+        .unwrap_or_default();
+
     format!(
         r#"<s:Envelope {NS_DECL_WITH_RSP}>
 {header}
     <wsman:OptionSet xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
       <wsman:Option Name="WINRS_NOPROFILE">TRUE</wsman:Option>
-      <wsman:Option Name="WINRS_CODEPAGE">65001</wsman:Option>
+      <wsman:Option Name="WINRS_CODEPAGE">{codepage}</wsman:Option>
     </wsman:OptionSet>
   <s:Body>
     <rsp:Shell>
       <rsp:InputStreams>stdin</rsp:InputStreams>
-      <rsp:OutputStreams>stdout stderr</rsp:OutputStreams>
+      <rsp:OutputStreams>stdout stderr</rsp:OutputStreams>{working_dir}{env_block}{idle_timeout}
     </rsp:Shell>
   </s:Body>
 </s:Envelope>"#
@@ -310,7 +344,7 @@ mod tests {
 
     #[test]
     fn create_shell_contains_required_elements() {
-        let xml = create_shell_request("http://host:5985/wsman", 60, 153600);
+        let xml = create_shell_request("http://host:5985/wsman", &crate::config::WinrmConfig::default());
         assert!(xml.contains("transfer/Create"));
         assert!(xml.contains("WINRS_CODEPAGE"));
         assert!(xml.contains("65001"));
@@ -360,7 +394,11 @@ mod tests {
 
     #[test]
     fn max_envelope_size_appears_in_create_shell() {
-        let xml = create_shell_request("http://host:5985/wsman", 60, 512000);
+        let config = crate::config::WinrmConfig {
+            max_envelope_size: 512000,
+            ..Default::default()
+        };
+        let xml = create_shell_request("http://host:5985/wsman", &config);
         assert!(xml.contains("512000"));
         assert!(!xml.contains("153600"));
     }
@@ -518,5 +556,69 @@ mod tests {
         );
         assert!(!xml.contains("CMD\"injected"));
         assert!(xml.contains("CMD&quot;injected"));
+    }
+
+    #[test]
+    fn create_shell_with_custom_codepage() {
+        let config = crate::config::WinrmConfig {
+            codepage: 437,
+            ..Default::default()
+        };
+        let xml = create_shell_request("http://host:5985/wsman", &config);
+        assert!(xml.contains("437"));
+        assert!(!xml.contains("65001"));
+    }
+
+    #[test]
+    fn create_shell_with_working_directory() {
+        let config = crate::config::WinrmConfig {
+            working_directory: Some("C:\\Users\\admin".into()),
+            ..Default::default()
+        };
+        let xml = create_shell_request("http://host:5985/wsman", &config);
+        assert!(xml.contains("<rsp:WorkingDirectory>C:\\Users\\admin</rsp:WorkingDirectory>"));
+    }
+
+    #[test]
+    fn create_shell_without_working_directory() {
+        let xml = create_shell_request("http://host:5985/wsman", &crate::config::WinrmConfig::default());
+        assert!(!xml.contains("WorkingDirectory"));
+    }
+
+    #[test]
+    fn create_shell_with_env_vars() {
+        let config = crate::config::WinrmConfig {
+            env_vars: vec![
+                ("PATH".into(), "C:\\bin".into()),
+                ("FOO".into(), "bar&baz".into()),
+            ],
+            ..Default::default()
+        };
+        let xml = create_shell_request("http://host:5985/wsman", &config);
+        assert!(xml.contains("<rsp:Environment>"));
+        assert!(xml.contains(r#"<rsp:Variable Name="PATH">C:\bin</rsp:Variable>"#));
+        assert!(xml.contains(r#"<rsp:Variable Name="FOO">bar&amp;baz</rsp:Variable>"#));
+    }
+
+    #[test]
+    fn create_shell_without_env_vars() {
+        let xml = create_shell_request("http://host:5985/wsman", &crate::config::WinrmConfig::default());
+        assert!(!xml.contains("Environment"));
+    }
+
+    #[test]
+    fn create_shell_with_idle_timeout() {
+        let config = crate::config::WinrmConfig {
+            idle_timeout_secs: Some(300),
+            ..Default::default()
+        };
+        let xml = create_shell_request("http://host:5985/wsman", &config);
+        assert!(xml.contains("<rsp:IdleTimeOut>PT300S</rsp:IdleTimeOut>"));
+    }
+
+    #[test]
+    fn create_shell_without_idle_timeout() {
+        let xml = create_shell_request("http://host:5985/wsman", &crate::config::WinrmConfig::default());
+        assert!(!xml.contains("IdleTimeOut"));
     }
 }

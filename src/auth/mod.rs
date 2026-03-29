@@ -5,6 +5,7 @@
 
 pub(crate) mod basic;
 pub(crate) mod certificate;
+pub(crate) mod credssp;
 pub(crate) mod kerberos;
 pub(crate) mod ntlm;
 

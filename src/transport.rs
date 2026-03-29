@@ -13,6 +13,7 @@ use zeroize::Zeroizing;
 use crate::auth::AuthTransport;
 use crate::auth::basic::BasicAuth;
 use crate::auth::certificate::CertificateAuth;
+use crate::auth::credssp::CredSspAuth;
 use crate::auth::kerberos::KerberosAuth;
 use crate::auth::ntlm::NtlmAuth;
 use crate::config::{AuthMethod, WinrmConfig, WinrmCredentials};
@@ -86,6 +87,12 @@ impl HttpTransport {
             tracing::warn!(
                 "Basic auth over HTTP transmits credentials in cleartext — use HTTPS in production"
             );
+        }
+
+        if matches!(config.auth_method, AuthMethod::CredSsp) && !config.use_tls {
+            return Err(WinrmError::AuthFailed(
+                "CredSSP requires HTTPS (set use_tls = true)".into(),
+            ));
         }
 
         // When using TLS, inject a CertCapturingVerifier to enable Channel Binding Tokens.
@@ -176,11 +183,13 @@ impl HttpTransport {
                 auth.send_authenticated(&self.http, &url, body).await?
             }
             AuthMethod::CredSsp => {
-                return Err(WinrmError::AuthFailed(
-                    "CredSSP authentication is not yet implemented. \
-                     See https://github.com/muchini/winrm-rs/issues for tracking."
-                        .into(),
-                ));
+                let auth = CredSspAuth {
+                    username: self.credentials.username.clone(),
+                    password: Zeroizing::new(self.credentials.password.expose_secret().to_string()),
+                    domain: self.credentials.domain.clone(),
+                    cert_handle: self.cert_handle.clone(),
+                };
+                auth.send_authenticated(&self.http, &url, body).await?
             }
         };
 

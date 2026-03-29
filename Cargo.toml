@@ -23,6 +23,7 @@ include = [
 [features]
 default = []
 kerberos = ["dep:cross-krb5"]
+credssp = []
 
 [dependencies]
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots"] }

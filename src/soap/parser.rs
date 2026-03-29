@@ -159,17 +159,10 @@ fn extract_streams(xml: &str) -> Vec<(String, String)> {
     let stream_tags = ["<rsp:Stream ", "<Stream "];
 
     while search_from < xml.len() {
-        let mut found = None;
-        for tag in &stream_tags {
-            if let Some(pos) = xml[search_from..].find(tag) {
-                let abs_pos = search_from + pos;
-                match found {
-                    None => found = Some((abs_pos, *tag)),
-                    Some((prev, _)) if abs_pos < prev => found = Some((abs_pos, *tag)),
-                    _ => {}
-                }
-            }
-        }
+        let found = stream_tags
+            .iter()
+            .filter_map(|tag| xml[search_from..].find(tag).map(|pos| (search_from + pos, *tag)))
+            .min_by_key(|(pos, _)| *pos);
 
         let Some((tag_start, _)) = found else {
             break;
@@ -190,16 +183,10 @@ fn extract_streams(xml: &str) -> Vec<(String, String)> {
         let content_start = tag_start + tag_end + 1;
 
         let close_tags = ["</rsp:Stream>", "</Stream>"];
-        let mut close_pos = None;
-        for close in &close_tags {
-            if let Some(pos) = xml[content_start..].find(close) {
-                match close_pos {
-                    None => close_pos = Some(pos),
-                    Some(prev) if pos < prev => close_pos = Some(pos),
-                    _ => {}
-                }
-            }
-        }
+        let close_pos = close_tags
+            .iter()
+            .filter_map(|close| xml[content_start..].find(close))
+            .min();
 
         if let Some(end_offset) = close_pos {
             let content = &xml[content_start..content_start + end_offset];

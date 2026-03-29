@@ -1,0 +1,65 @@
+name: Bug Report
+description: Report a bug in winrm-rs
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug! Please fill out the sections below.
+  - type: input
+    id: version
+    attributes:
+      label: winrm-rs version
+      placeholder: "0.5.0"
+    validations:
+      required: true
+  - type: input
+    id: rust-version
+    attributes:
+      label: Rust version
+      description: Output of `rustc --version`
+      placeholder: "rustc 1.94.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: auth-method
+    attributes:
+      label: Authentication method
+      options:
+        - NTLM
+        - Basic
+        - Kerberos
+        - Certificate
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What happened? What did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Minimal code or steps to reproduce the issue
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Error output / logs
+      description: Paste any relevant error messages or logs
+      render: text

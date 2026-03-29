@@ -55,7 +55,7 @@ impl AuthTransport for KerberosAuth {
             .and_then(|v| v.to_str().ok())
         {
             if let Some(token_b64) = www_auth.strip_prefix("Negotiate ") {
-                if let Ok(server_token) = B64.decode(token_b64.trim()) {
+                if let Ok(server_token) = B64.decode(token_b64.trim_ascii()) {
                     // Complete the Kerberos handshake
                     let _ = ctx.step(&server_token);
                 }

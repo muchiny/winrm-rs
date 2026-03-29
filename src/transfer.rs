@@ -116,7 +116,7 @@ impl WinrmClient {
 
         let b64 = String::from_utf8_lossy(&output.stdout);
         let data = B64
-            .decode(b64.trim())
+            .decode(b64.trim_ascii())
             .map_err(|e| WinrmError::Transfer(format!("base64 decode of downloaded file: {e}")))?;
 
         let total = data.len() as u64;

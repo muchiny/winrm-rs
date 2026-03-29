@@ -56,7 +56,7 @@ pub fn parse_receive_output(xml: &str) -> Result<ReceiveOutput, SoapError> {
     // Format: <rsp:Stream Name="stdout" CommandId="...">base64data</rsp:Stream>
     for (name, data) in extract_streams(xml) {
         let decoded = B64
-            .decode(data.trim())
+            .decode(data.trim_ascii())
             .map_err(|e| SoapError::ParseError(format!("base64 decode: {e}")))?;
         match name.as_str() {
             "stdout" => stdout.extend_from_slice(&decoded),
@@ -190,7 +190,7 @@ fn extract_streams(xml: &str) -> Vec<(String, String)> {
 
         if let Some(end_offset) = close_pos {
             let content = &xml[content_start..content_start + end_offset];
-            if !content.trim().is_empty() {
+            if !content.trim_ascii().is_empty() {
                 streams.push((name, content.to_string()));
             }
             search_from = content_start + end_offset + 1;

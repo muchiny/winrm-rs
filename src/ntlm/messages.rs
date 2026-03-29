@@ -241,7 +241,7 @@ pub fn decode_challenge_header(header: &str) -> Result<ChallengeMessage, NtlmErr
         .strip_prefix("Negotiate ")
         .ok_or_else(|| NtlmError::InvalidMessage("missing Negotiate prefix".into()))?;
     let bytes = B64
-        .decode(token.trim())
+        .decode(token.trim_ascii())
         .map_err(|e| NtlmError::InvalidMessage(format!("base64 decode: {e}")))?;
     parse_challenge(&bytes)
 }

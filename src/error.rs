@@ -30,6 +30,23 @@ pub enum WinrmError {
     /// The operation was cancelled via a [`CancellationToken`](tokio_util::sync::CancellationToken).
     #[error("operation cancelled")]
     Cancelled,
+    /// CredSSP protocol error.
+    #[error("CredSSP error: {0}")]
+    CredSsp(CredSspError),
+}
+
+/// Errors from the CredSSP authentication protocol (MS-CSSP).
+#[derive(Debug, thiserror::Error)]
+pub enum CredSspError {
+    /// ASN.1 DER encoding or decoding error.
+    #[error("ASN.1 decode error: {0}")]
+    Asn1Decode(String),
+    /// Server public key verification failed (possible MiTM).
+    #[error("server public key mismatch")]
+    PublicKeyMismatch,
+    /// Server returned an NTSTATUS error code.
+    #[error("server error: {0:#010x}")]
+    ServerError(u32),
 }
 
 /// Errors from SOAP envelope parsing or WS-Management fault responses.

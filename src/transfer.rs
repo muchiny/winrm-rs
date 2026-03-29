@@ -130,3 +130,39 @@ impl WinrmClient {
         Ok(total)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_remote_path_ok() {
+        assert!(validate_remote_path("C:\\Users\\admin\\file.txt").is_ok());
+    }
+
+    #[test]
+    fn validate_remote_path_too_long() {
+        let long_path = "C:\\".to_string() + &"a".repeat(260);
+        assert!(validate_remote_path(&long_path).is_err());
+    }
+
+    #[test]
+    fn validate_remote_path_control_chars() {
+        assert!(validate_remote_path("C:\\bad\x00path").is_err());
+        assert!(validate_remote_path("C:\\bad\x01path").is_err());
+    }
+
+    #[test]
+    fn validate_remote_path_tab_allowed() {
+        // Tab (\t) is explicitly allowed
+        assert!(validate_remote_path("C:\\path\twith\ttabs").is_ok());
+    }
+
+    #[test]
+    fn validate_remote_path_max_length_boundary() {
+        let exact = "a".repeat(260);
+        assert!(validate_remote_path(&exact).is_ok());
+        let over = "a".repeat(261);
+        assert!(validate_remote_path(&over).is_err());
+    }
+}

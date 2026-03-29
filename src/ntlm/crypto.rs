@@ -407,4 +407,26 @@ mod tests {
         Rc4State::new(b"key").process(&mut data);
         assert!(data.is_empty());
     }
+
+    #[test]
+    fn compute_channel_bindings_produces_16_bytes() {
+        let fake_cert = vec![0x30, 0x82, 0x01, 0x00]; // minimal DER
+        let result = compute_channel_bindings(&fake_cert);
+        assert_eq!(result.len(), 16);
+    }
+
+    #[test]
+    fn compute_channel_bindings_deterministic() {
+        let cert = b"test certificate DER bytes";
+        let a = compute_channel_bindings(cert);
+        let b = compute_channel_bindings(cert);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn compute_channel_bindings_different_certs_differ() {
+        let a = compute_channel_bindings(b"cert A");
+        let b = compute_channel_bindings(b"cert B");
+        assert_ne!(a, b);
+    }
 }

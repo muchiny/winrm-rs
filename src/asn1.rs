@@ -468,4 +468,146 @@ mod tests {
         let big = encode_integer_value(256);
         assert_eq!(big, vec![TAG_INTEGER, 2, 1, 0]);
     }
+
+    #[test]
+    fn encode_length_very_long() {
+        // > 65535 → 3-byte length
+        let l = encode_length(70000);
+        assert_eq!(l[0], 0x83);
+        assert_eq!(l.len(), 4);
+    }
+
+    #[test]
+    fn integer_encoding_high_bit() {
+        // 128 has high bit set → needs leading 0x00
+        let enc = encode_integer_value(128);
+        assert_eq!(enc, vec![TAG_INTEGER, 2, 0x00, 0x80]);
+    }
+
+    #[test]
+    fn decode_length_error_empty() {
+        assert!(decode_length(&[]).is_err());
+    }
+
+    #[test]
+    fn decode_length_error_truncated() {
+        // Claims 2-byte length but only 1 byte follows
+        assert!(decode_length(&[0x82, 0x01]).is_err());
+    }
+
+    #[test]
+    fn decode_length_error_zero_num_bytes() {
+        // 0x80 = indefinite form, not supported
+        assert!(decode_length(&[0x80]).is_err());
+    }
+
+    #[test]
+    fn read_tlv_error_empty() {
+        assert!(read_tlv(&[]).is_err());
+    }
+
+    #[test]
+    fn read_tlv_error_truncated_value() {
+        // TAG=0x30, LEN=10, but only 2 bytes of data
+        assert!(read_tlv(&[0x30, 10, 0x00, 0x00]).is_err());
+    }
+
+    #[test]
+    fn decode_octet_string_wrong_tag() {
+        // INTEGER instead of OCTET STRING
+        let data = encode_integer_value(42);
+        assert!(decode_octet_string(&data).is_err());
+    }
+
+    #[test]
+    fn decode_integer_wrong_tag() {
+        let data = encode_octet_string(b"nope");
+        assert!(decode_integer(&data).is_err());
+    }
+
+    #[test]
+    fn decode_ts_request_not_sequence() {
+        // OCTET STRING instead of SEQUENCE
+        let data = encode_octet_string(b"bad");
+        assert!(decode_ts_request(&data).is_err());
+    }
+
+    #[test]
+    fn decode_spnego_token_bad_tag() {
+        // Random tag that's neither 0x60 nor 0xA1
+        let data = encode_octet_string(b"not spnego");
+        assert!(decode_spnego_token(&data).is_err());
+    }
+
+    #[test]
+    fn extract_subject_public_key_from_self_signed_cert() {
+        // Minimal self-signed DER certificate structure:
+        // SEQUENCE { SEQUENCE { ... BIT STRING(public_key) ... }, ... }
+        // We'll build a minimal fake certificate with a BIT STRING in the right place.
+        let pub_key_bytes = vec![0x00, 0x30, 0x0d]; // BIT STRING: 0x00 unused bits prefix + key
+        let bit_string = encode_tlv(TAG_BIT_STRING, &pub_key_bytes);
+        let algo = encode_sequence(&[TAG_OID, 3, 0x2a, 0x86, 0x48]); // fake algo OID
+        let mut spki_contents = Vec::new();
+        spki_contents.extend_from_slice(&algo);
+        spki_contents.extend_from_slice(&bit_string);
+        let spki = encode_sequence(&spki_contents);
+
+        // Build TBS with enough fields before SPKI (need field_idx >= 5)
+        let version = encode_context_tag(0, &encode_integer_value(2));
+        let serial = encode_integer_value(1);
+        let sig_algo = encode_sequence(&[TAG_OID, 3, 0x2a, 0x86, 0x48]);
+        let issuer = encode_sequence(&[]);
+        let validity = encode_sequence(&[]);
+        let subject = encode_sequence(&[]);
+
+        let mut tbs = Vec::new();
+        tbs.extend_from_slice(&version);
+        tbs.extend_from_slice(&serial);
+        tbs.extend_from_slice(&sig_algo);
+        tbs.extend_from_slice(&issuer);
+        tbs.extend_from_slice(&validity);
+        tbs.extend_from_slice(&subject);
+        tbs.extend_from_slice(&spki);
+        let tbs_seq = encode_sequence(&tbs);
+
+        let sig_algo2 = encode_sequence(&[TAG_OID, 3, 0x2a, 0x86, 0x48]);
+        let sig_val = encode_tlv(TAG_BIT_STRING, &[0x00, 0xFF]);
+
+        let mut cert_contents = Vec::new();
+        cert_contents.extend_from_slice(&tbs_seq);
+        cert_contents.extend_from_slice(&sig_algo2);
+        cert_contents.extend_from_slice(&sig_val);
+        let cert = encode_sequence(&cert_contents);
+
+        let result = extract_subject_public_key(&cert).unwrap();
+        assert_eq!(result, vec![0x30, 0x0d]); // key bytes without unused-bits prefix
+    }
+
+    #[test]
+    fn extract_subject_public_key_bad_cert() {
+        assert!(extract_subject_public_key(&[0x30, 0x00]).is_err());
+    }
+
+    #[test]
+    fn find_context_tag_not_found() {
+        let data = encode_context_tag(0, &encode_integer_value(1));
+        assert!(find_context_tag(&data, 5).is_none());
+    }
+
+    #[test]
+    fn ts_request_all_fields() {
+        let encoded = encode_ts_request(
+            6,
+            Some(b"nego"),
+            Some(b"pubkey"),
+            Some(b"creds"),
+            Some(&[0xBB; 32]),
+        );
+        let decoded = decode_ts_request(&encoded).unwrap();
+        assert_eq!(decoded.version, 6);
+        assert_eq!(decoded.nego_token, Some(b"nego".to_vec()));
+        assert_eq!(decoded.pub_key_auth, Some(b"pubkey".to_vec()));
+        assert_eq!(decoded.auth_info, Some(b"creds".to_vec()));
+        assert_eq!(decoded.client_nonce, Some(vec![0xBB; 32]));
+    }
 }

@@ -599,4 +599,45 @@ mod tests {
         assert_ne!(key, [0u8; 16]);
         assert_ne!(key, [1u8; 16]);
     }
+
+    #[test]
+    fn create_authenticate_message_with_cbt_produces_valid_type3() {
+        let challenge = {
+            let mut msg = vec![0u8; 32];
+            msg[0..8].copy_from_slice(b"NTLMSSP\0");
+            msg[8..12].copy_from_slice(&2u32.to_le_bytes());
+            msg[20..24].copy_from_slice(&TYPE1_FLAGS.to_le_bytes());
+            msg[24..32].copy_from_slice(&[0xCC; 8]);
+            parse_challenge(&msg).unwrap()
+        };
+        let cbt = [0xAA; 16];
+        let msg = create_authenticate_message_with_cbt(
+            &challenge, "user", "pass", "DOMAIN", cbt,
+        );
+        // Should be a valid NTLM Type 3 message
+        assert_eq!(&msg[0..8], SIGNATURE);
+        let msg_type = u32::from_le_bytes([msg[8], msg[9], msg[10], msg[11]]);
+        assert_eq!(msg_type, 3);
+    }
+
+    #[test]
+    fn create_authenticate_message_with_cbt_differs_from_without() {
+        let challenge = {
+            let mut msg = vec![0u8; 32];
+            msg[0..8].copy_from_slice(b"NTLMSSP\0");
+            msg[8..12].copy_from_slice(&2u32.to_le_bytes());
+            msg[20..24].copy_from_slice(&TYPE1_FLAGS.to_le_bytes());
+            msg[24..32].copy_from_slice(&[0xCC; 8]);
+            parse_challenge(&msg).unwrap()
+        };
+        let without = create_authenticate_message(&challenge, "user", "pass", "DOMAIN");
+        let with_cbt = create_authenticate_message_with_cbt(
+            &challenge, "user", "pass", "DOMAIN", [0xBB; 16],
+        );
+        // Messages should differ because target_info is modified
+        assert_ne!(without, with_cbt);
+        // Both should be valid Type 3
+        assert_eq!(&without[0..8], SIGNATURE);
+        assert_eq!(&with_cbt[0..8], SIGNATURE);
+    }
 }

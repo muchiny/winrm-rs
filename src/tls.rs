@@ -216,4 +216,25 @@ mod tests {
 
         assert_eq!(handle1.get(), handle2.get());
     }
+
+    #[test]
+    fn no_verifier_accepts_any_cert() {
+        let verifier = NoVerifier;
+        let cert = CertificateDer::from(vec![0xFF; 100]);
+        let name = ServerName::try_from("any.host").unwrap();
+        assert!(verifier.verify_server_cert(&cert, &[], &name, &[], UnixTime::now()).is_ok());
+    }
+
+    #[test]
+    fn no_verifier_supported_schemes_not_empty() {
+        let verifier = NoVerifier;
+        assert!(!verifier.supported_verify_schemes().is_empty());
+    }
+
+    #[test]
+    fn capturing_verifier_delegates_supported_schemes() {
+        let inner = Arc::new(AcceptAllVerifier);
+        let verifier = CertCapturingVerifier::new(inner);
+        assert_eq!(verifier.supported_verify_schemes(), vec![SignatureScheme::RSA_PKCS1_SHA256]);
+    }
 }

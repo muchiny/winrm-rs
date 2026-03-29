@@ -6,7 +6,7 @@
 
 pub(crate) mod envelope;
 pub(crate) mod namespaces;
-pub(crate) mod parser;
+pub mod parser;
 
 // Re-export for internal use
 pub(crate) use envelope::*;

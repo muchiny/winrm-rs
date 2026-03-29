@@ -92,4 +92,5 @@ pub use secrecy::{ExposeSecret, SecretString};
 pub use shell::Shell;
 // Re-export soap types that are part of the public API
 pub use soap::ReceiveOutput;
+pub use soap::parser::{check_soap_fault, parse_command_id, parse_receive_output, parse_shell_id};
 

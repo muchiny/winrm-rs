@@ -29,8 +29,22 @@ doc = false
 bench = false
 
 [[bin]]
+name = "fuzz_ntlm_challenge_header"
+path = "fuzz_targets/fuzz_ntlm_challenge_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "fuzz_powershell_encode"
 path = "fuzz_targets/fuzz_powershell_encode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_soap_parse"
+path = "fuzz_targets/fuzz_soap_parse.rs"
 test = false
 doc = false
 bench = false

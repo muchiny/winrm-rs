@@ -31,5 +31,6 @@ zeroize = "1.8"
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 wiremock = "0.6"
+serde_json = "1"
 tracing-test = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

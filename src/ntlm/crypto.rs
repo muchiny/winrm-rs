@@ -4,7 +4,7 @@
 
 use hmac::{Hmac, Mac};
 use md4::{Digest, Md4};
-use md5::{Digest as Md5Digest, Md5};
+use md5::Md5;
 
 pub(crate) type HmacMd5 = Hmac<Md5>;
 

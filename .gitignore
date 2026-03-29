@@ -1,4 +1,21 @@
+# Build artifacts
 /target
 /mutants.out
 /mutants.out.old
-Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Coverage
+lcov.info
+*.profraw
+*.profdata
+tarpaulin-report.html

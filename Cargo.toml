@@ -8,22 +8,33 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/muchini/winrm-rs"
 keywords = ["winrm", "windows", "remote-management", "ntlm", "kerberos"]
 categories = ["network-programming", "os::windows-apis"]
+readme = "README.md"
+documentation = "https://docs.rs/winrm-rs"
+homepage = "https://github.com/muchini/winrm-rs"
+include = [
+    "src/**/*.rs",
+    "Cargo.toml",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+    "README.md",
+    "CHANGELOG.md",
+]
 
 [features]
 default = []
 kerberos = ["dep:cross-krb5"]
 
 [dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots"] }
 cross-krb5 = { version = "0.4", optional = true }
 tokio = { version = "1", features = ["time"] }
 base64 = "0.22"
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
-md4 = "0.10"
+md4 = "0.11.0"
 md-5 = "0.10"
 hmac = "0.12"
-rand = "0.9"
+rand = "0.10"
 secrecy = { version = "0.10", features = ["serde"] }
 tracing = "0.1"
 zeroize = "1.8"

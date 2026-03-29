@@ -43,6 +43,7 @@ rustls = { version = "0.23.37", features = ["ring"] }
 sha2 = "0.11.0"
 webpki-roots = "1.0.6"
 
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 wiremock = "0.6"

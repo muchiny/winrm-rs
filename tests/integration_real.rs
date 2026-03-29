@@ -19,6 +19,7 @@
 //! cargo test --test integration_real -- --ignored
 //! ```
 
+use std::path::Path;
 use winrm_rs::{AuthMethod, WinrmClient, WinrmConfig, WinrmCredentials};
 
 fn test_client() -> Option<(WinrmClient, String)> {
@@ -243,4 +244,256 @@ $facts | ConvertTo-Json -Compress
     assert!(json["hostname"].is_string());
     assert!(json["ps_version"].is_string());
     assert!(json["os_language"].is_number());
+}
+
+// === NTLM authentication ===
+
+fn test_client_ntlm() -> Option<(WinrmClient, String)> {
+    let host = std::env::var("WINRM_TEST_HOST").ok()?;
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    let pass = std::env::var("WINRM_TEST_PASS").ok()?;
+    let port: u16 = std::env::var("WINRM_TEST_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(5985);
+
+    let config = WinrmConfig {
+        auth_method: AuthMethod::Ntlm,
+        port,
+        ..Default::default()
+    };
+    let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).ok()?;
+    Some((client, host))
+}
+
+#[tokio::test]
+#[ignore]
+async fn ntlm_run_command_whoami() {
+    let (client, host) = test_client_ntlm().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let output = client
+        .run_command(&host, "whoami", &[])
+        .await
+        .expect("ntlm whoami");
+    assert_eq!(output.exit_code, 0);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.trim().is_empty(), "whoami should return a username");
+}
+
+#[tokio::test]
+#[ignore]
+async fn ntlm_run_powershell() {
+    let (client, host) = test_client_ntlm().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let output = client
+        .run_powershell(&host, "$PSVersionTable.PSVersion.ToString()")
+        .await
+        .expect("ntlm PSVersion");
+    assert_eq!(output.exit_code, 0);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains('.'), "expected version, got: {stdout}");
+}
+
+#[tokio::test]
+#[ignore]
+async fn ntlm_shell_reuse() {
+    let (client, host) = test_client_ntlm().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let shell = client.open_shell(&host).await.expect("ntlm open shell");
+    let out = shell
+        .run_command("cmd.exe", &["/c", "echo", "ntlm-test"])
+        .await
+        .expect("ntlm command");
+    assert_eq!(out.exit_code, 0);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("ntlm-test"));
+    shell.close().await.expect("close shell");
+}
+
+// === File transfer ===
+
+#[tokio::test]
+#[ignore]
+async fn upload_and_download_file() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+
+    // Create a temp file to upload
+    let local_upload = std::env::temp_dir().join("winrm_rs_test_upload.txt");
+    let test_content = b"Hello from winrm-rs file transfer test!\n";
+    std::fs::write(&local_upload, test_content).expect("write local file");
+
+    let remote_path = "C:\\Windows\\Temp\\winrm_rs_test.txt";
+
+    // Upload
+    let bytes_up = client
+        .upload_file(&host, &local_upload, remote_path)
+        .await
+        .expect("upload file");
+    assert_eq!(bytes_up, test_content.len() as u64);
+
+    // Download
+    let local_download = std::env::temp_dir().join("winrm_rs_test_download.txt");
+    let bytes_down = client
+        .download_file(&host, remote_path, &local_download)
+        .await
+        .expect("download file");
+    assert_eq!(bytes_down, test_content.len() as u64);
+
+    let downloaded = std::fs::read(&local_download).expect("read downloaded file");
+    assert_eq!(downloaded, test_content);
+
+    // Cleanup
+    let _ = client
+        .run_powershell(&host, &format!("Remove-Item '{remote_path}' -Force"))
+        .await;
+    let _ = std::fs::remove_file(&local_upload);
+    let _ = std::fs::remove_file(&local_download);
+}
+
+// === CLIXML stderr parsing ===
+
+#[tokio::test]
+#[ignore]
+async fn powershell_stderr_clixml_parsed() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let output = client
+        .run_powershell(&host, "Write-Error 'test error message'")
+        .await
+        .expect("run Write-Error");
+    // Write-Error produces exit code 0 but writes to stderr
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // CLIXML should be parsed into readable text
+    assert!(
+        stderr.contains("test error message"),
+        "stderr should contain parsed error, got: {stderr}"
+    );
+    // Should NOT contain raw CLIXML tags
+    assert!(
+        !stderr.contains("#< CLIXML"),
+        "stderr should not contain raw CLIXML header"
+    );
+}
+
+// === Working directory ===
+
+#[tokio::test]
+#[ignore]
+async fn shell_with_working_directory() {
+    let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    let pass = std::env::var("WINRM_TEST_PASS").expect("WINRM_TEST_PASS");
+    let port: u16 = std::env::var("WINRM_TEST_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(5985);
+
+    let config = WinrmConfig {
+        auth_method: AuthMethod::Basic,
+        port,
+        working_directory: Some("C:\\Windows".into()),
+        ..Default::default()
+    };
+    let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
+    let output = client
+        .run_command(&host, "cmd.exe", &["/c", "cd"])
+        .await
+        .expect("run cd");
+    assert_eq!(output.exit_code, 0);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.trim().eq_ignore_ascii_case("C:\\Windows"),
+        "expected C:\\Windows, got: {stdout}"
+    );
+}
+
+// === Environment variables ===
+
+#[tokio::test]
+#[ignore]
+async fn shell_with_env_vars() {
+    let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    let pass = std::env::var("WINRM_TEST_PASS").expect("WINRM_TEST_PASS");
+    let port: u16 = std::env::var("WINRM_TEST_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(5985);
+
+    let config = WinrmConfig {
+        auth_method: AuthMethod::Basic,
+        port,
+        env_vars: vec![("WINRM_RS_TEST_VAR".into(), "hello_from_rust".into())],
+        ..Default::default()
+    };
+    let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
+    let output = client
+        .run_command(&host, "cmd.exe", &["/c", "echo", "%WINRM_RS_TEST_VAR%"])
+        .await
+        .expect("run echo env var");
+    assert_eq!(output.exit_code, 0);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("hello_from_rust"),
+        "expected env var value, got: {stdout}"
+    );
+}
+
+// === Stdin piping ===
+
+#[tokio::test]
+#[ignore]
+async fn shell_send_input_stdin() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let shell = client.open_shell(&host).await.expect("open shell");
+
+    // Start a command that reads stdin
+    let cmd_id = shell
+        .start_command("cmd.exe", &["/c", "findstr", "hello"])
+        .await
+        .expect("start findstr");
+
+    // Send input with end-of-stream
+    shell
+        .send_input(&cmd_id, b"hello world\r\n", true)
+        .await
+        .expect("send input");
+
+    // Collect output
+    let mut stdout = Vec::new();
+    for _ in 0..10 {
+        let chunk = shell.receive_next(&cmd_id).await.expect("receive");
+        stdout.extend_from_slice(&chunk.stdout);
+        if chunk.done {
+            break;
+        }
+    }
+
+    let output = String::from_utf8_lossy(&stdout);
+    assert!(output.contains("hello"), "expected stdin echo, got: {output}");
+
+    shell.close().await.expect("close");
+}
+
+// === Retry on transient errors ===
+
+#[tokio::test]
+#[ignore]
+async fn retry_config_works_with_real_server() {
+    let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    let pass = std::env::var("WINRM_TEST_PASS").expect("WINRM_TEST_PASS");
+    let port: u16 = std::env::var("WINRM_TEST_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(5985);
+
+    let config = WinrmConfig {
+        auth_method: AuthMethod::Basic,
+        port,
+        max_retries: 2,
+        ..Default::default()
+    };
+    let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
+    // Should work normally — retries don't interfere with successful requests
+    let output = client
+        .run_command(&host, "whoami", &[])
+        .await
+        .expect("run with retries");
+    assert_eq!(output.exit_code, 0);
 }

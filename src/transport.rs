@@ -141,6 +141,13 @@ impl HttpTransport {
                 let auth = CertificateAuth;
                 auth.send_authenticated(&self.http, &url, body).await?
             }
+            AuthMethod::CredSsp => {
+                return Err(WinrmError::AuthFailed(
+                    "CredSSP authentication is not yet implemented. \
+                     See https://github.com/muchini/winrm-rs/issues for tracking."
+                        .into(),
+                ));
+            }
         };
 
         trace!(response = %response_text, "SOAP response body");

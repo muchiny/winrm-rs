@@ -27,6 +27,11 @@ pub(crate) const TYPE1_FLAGS: u32 = NEGOTIATE_UNICODE
 pub(crate) const AV_EOL: u16 = 0x0000;
 pub(crate) const AV_NB_DOMAIN_NAME: u16 = 0x0002;
 pub(crate) const AV_TIMESTAMP: u16 = 0x0007;
+// Reserved for TLS Channel Binding Tokens (CBT) — MS-NLMP 2.2.2.1
+#[allow(dead_code)]
+pub(crate) const AV_TARGET_NAME: u16 = 0x0009;
+#[allow(dead_code)]
+pub(crate) const AV_CHANNEL_BINDINGS: u16 = 0x000A;
 
 /// NT Hash = MD4(UTF-16LE(password)) (MS-NLMP 3.3.1, NTOWFv1).
 pub(crate) fn compute_nt_hash(password: &str) -> [u8; 16] {

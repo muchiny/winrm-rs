@@ -131,6 +131,14 @@ pub enum AuthMethod {
     /// The `reqwest::Client` is configured with the client cert at construction
     /// time. No `Authorization` header is sent; the TLS handshake authenticates.
     Certificate,
+    /// CredSSP authentication for double-hop credential delegation.
+    ///
+    /// Wraps NTLM or Kerberos inside a TLS channel, allowing credentials
+    /// to be delegated to the remote host for accessing network resources.
+    /// Requires HTTPS (`use_tls = true`).
+    ///
+    /// **Not yet implemented** — will return an error at runtime.
+    CredSsp,
 }
 
 /// Credentials for WinRM authentication.

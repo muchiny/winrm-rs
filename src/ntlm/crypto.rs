@@ -4,7 +4,7 @@
 
 use hmac::{Hmac, Mac};
 use md4::{Digest, Md4};
-use md5::Md5;
+use md5::{Digest as Md5Digest, Md5};
 
 pub(crate) type HmacMd5 = Hmac<Md5>;
 
@@ -141,6 +141,42 @@ pub(crate) fn current_windows_filetime() -> [u8; 8] {
     // FILETIME epoch offset: seconds between 1601-01-01 and 1970-01-01
     let filetime = (unix_secs + 11_644_473_600) * 10_000_000;
     filetime.to_le_bytes()
+}
+
+/// Compute the 16-byte NTLM Channel Binding Token (CBT) from a DER-encoded
+/// server certificate.
+///
+/// Per RFC 5929 (`tls-server-end-point`) and MS-NLMP 2.2.2.2:
+/// 1. SHA-256 hash of the DER-encoded end-entity certificate
+/// 2. Prepend `tls-server-end-point:` prefix to get the application data
+/// 3. Build `SEC_CHANNEL_BINDINGS` structure with the application data
+/// 4. MD5 hash of the entire structure → 16 bytes for `AV_CHANNEL_BINDINGS`
+pub(crate) fn compute_channel_bindings(cert_der: &[u8]) -> [u8; 16] {
+    use sha2::{Digest as Sha2Digest, Sha256};
+
+    // Step 1-2: SHA-256(cert) prefixed with channel binding type
+    let cert_hash = Sha256::digest(cert_der);
+    let mut app_data = b"tls-server-end-point:".to_vec();
+    app_data.extend_from_slice(&cert_hash);
+
+    // Step 3: SEC_CHANNEL_BINDINGS structure (MS-NLMP 2.2.2.2)
+    // 8 fields × 4 bytes = 32 bytes header, then application data
+    let mut bindings = Vec::with_capacity(32 + app_data.len());
+    bindings.extend_from_slice(&0u32.to_le_bytes()); // dwInitiatorAddrType
+    bindings.extend_from_slice(&0u32.to_le_bytes()); // cbInitiatorLength
+    bindings.extend_from_slice(&0u32.to_le_bytes()); // dwInitiatorOffset
+    bindings.extend_from_slice(&0u32.to_le_bytes()); // dwAcceptorAddrType
+    bindings.extend_from_slice(&0u32.to_le_bytes()); // cbAcceptorLength
+    bindings.extend_from_slice(&0u32.to_le_bytes()); // dwAcceptorOffset
+    bindings.extend_from_slice(&(app_data.len() as u32).to_le_bytes()); // cbApplicationDataLength
+    bindings.extend_from_slice(&32u32.to_le_bytes()); // dwApplicationDataOffset
+    bindings.extend_from_slice(&app_data);
+
+    // Step 4: MD5 of the whole structure
+    let md5_result = Md5::digest(&bindings);
+    let mut output = [0u8; 16];
+    output.copy_from_slice(&md5_result);
+    output
 }
 
 /// RC4 (arcfour) cipher state for NTLM message sealing.

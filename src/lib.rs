@@ -77,6 +77,7 @@ mod error;
 mod ntlm;
 mod shell;
 mod soap;
+mod tls;
 mod transfer;
 mod transport;
 

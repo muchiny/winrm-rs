@@ -101,6 +101,7 @@ fn create_authenticate_message_internal(
     username: &str,
     password: &str,
     domain: &str,
+    channel_bindings: Option<[u8; 16]>,
 ) -> (Vec<u8>, [u8; 16]) {
     let nt_hash = compute_nt_hash(password);
     let ntlmv2_hash = compute_ntlmv2_hash(&nt_hash, username, domain);
@@ -111,8 +112,28 @@ fn create_authenticate_message_internal(
     // Timestamp: use server's if available, otherwise compute current
     let timestamp = challenge.timestamp.unwrap_or_else(current_windows_filetime);
 
+    // If channel bindings provided, inject AV_CHANNEL_BINDINGS into target_info
+    // before the AV_EOL terminator (MS-NLMP 2.2.2.1)
+    let target_info = if let Some(cb) = channel_bindings {
+        let mut ti = challenge.target_info.clone();
+        // Find and remove AV_EOL (last 4 bytes: id=0x0000 len=0x0000)
+        if ti.len() >= 4 {
+            ti.truncate(ti.len() - 4);
+        }
+        // Append AV_CHANNEL_BINDINGS (id=0x000A, len=16, value=MD5 hash)
+        ti.extend_from_slice(&AV_CHANNEL_BINDINGS.to_le_bytes());
+        ti.extend_from_slice(&16u16.to_le_bytes());
+        ti.extend_from_slice(&cb);
+        // Re-add AV_EOL
+        ti.extend_from_slice(&AV_EOL.to_le_bytes());
+        ti.extend_from_slice(&0u16.to_le_bytes());
+        ti
+    } else {
+        challenge.target_info.clone()
+    };
+
     // Build the NTLMv2 blob (temp)
-    let blob = build_ntlmv2_blob(&timestamp, &client_challenge, &challenge.target_info);
+    let blob = build_ntlmv2_blob(&timestamp, &client_challenge, &target_info);
 
     // NTProofStr = HMAC-MD5(NTLMv2Hash, ServerChallenge + blob)
     let mut proof_input = Vec::with_capacity(8 + blob.len());
@@ -205,7 +226,23 @@ pub fn create_authenticate_message(
     password: &str,
     domain: &str,
 ) -> Vec<u8> {
-    create_authenticate_message_internal(challenge, username, password, domain).0
+    create_authenticate_message_internal(challenge, username, password, domain, None).0
+}
+
+/// Create an NTLM Type 3 (Authenticate) message with TLS Channel Binding Token.
+///
+/// Like [`create_authenticate_message`] but injects `AV_CHANNEL_BINDINGS`
+/// into the target info to bind the authentication to the TLS channel.
+/// The `channel_bindings` parameter is the 16-byte MD5 hash of the
+/// `SEC_CHANNEL_BINDINGS` structure (computed via [`super::crypto::compute_channel_bindings`]).
+pub fn create_authenticate_message_with_cbt(
+    challenge: &ChallengeMessage,
+    username: &str,
+    password: &str,
+    domain: &str,
+    channel_bindings: [u8; 16],
+) -> Vec<u8> {
+    create_authenticate_message_internal(challenge, username, password, domain, Some(channel_bindings)).0
 }
 
 /// Create an NTLM Type 3 (Authenticate) message and return the exported session key.
@@ -219,7 +256,7 @@ pub fn create_authenticate_message_with_key(
     password: &str,
     domain: &str,
 ) -> (Vec<u8>, [u8; 16]) {
-    create_authenticate_message_internal(challenge, username, password, domain)
+    create_authenticate_message_internal(challenge, username, password, domain, None)
 }
 
 /// Encode an NTLM message (Type 1 or Type 3) for the HTTP `Authorization` header.

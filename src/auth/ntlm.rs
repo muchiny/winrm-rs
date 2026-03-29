@@ -16,6 +16,9 @@ pub(crate) struct NtlmAuth {
     pub(crate) username: String,
     pub(crate) password: Zeroizing<String>,
     pub(crate) domain: String,
+    /// TLS server certificate handle for computing Channel Binding Tokens.
+    /// `None` when using plain HTTP (no TLS).
+    pub(crate) cert_handle: Option<crate::tls::CertHandle>,
 }
 
 impl AuthTransport for NtlmAuth {
@@ -64,8 +67,25 @@ impl AuthTransport for NtlmAuth {
         } else {
             self.domain.clone()
         };
-        let type3 =
-            ntlm::create_authenticate_message(&challenge, &self.username, &self.password, &domain);
+
+        // Compute Channel Binding Token if TLS certificate was captured
+        let type3 = if let Some(cert_der) = self.cert_handle.as_ref().and_then(|h| h.get()) {
+            let cbt = crate::ntlm::crypto::compute_channel_bindings(&cert_der);
+            ntlm::create_authenticate_message_with_cbt(
+                &challenge,
+                &self.username,
+                &self.password,
+                &domain,
+                cbt,
+            )
+        } else {
+            ntlm::create_authenticate_message(
+                &challenge,
+                &self.username,
+                &self.password,
+                &domain,
+            )
+        };
         let auth_header = ntlm::encode_authorization(&type3);
 
         let resp = http

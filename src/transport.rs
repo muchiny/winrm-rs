@@ -3,6 +3,7 @@
 // Manages the reqwest HTTP client, authentication dispatch, and retry logic.
 // Extracted from client.rs.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use secrecy::ExposeSecret;
@@ -17,6 +18,7 @@ use crate::auth::ntlm::NtlmAuth;
 use crate::config::{AuthMethod, WinrmConfig, WinrmCredentials};
 use crate::error::WinrmError;
 use crate::soap;
+use crate::tls::CertHandle;
 
 /// HTTP transport for WinRM SOAP requests.
 ///
@@ -25,6 +27,9 @@ pub(crate) struct HttpTransport {
     http: reqwest::Client,
     config: WinrmConfig,
     credentials: WinrmCredentials,
+    /// Handle to retrieve the captured TLS server certificate (for CBT).
+    /// `None` when using plain HTTP (no TLS).
+    cert_handle: Option<CertHandle>,
 }
 
 impl HttpTransport {
@@ -83,12 +88,40 @@ impl HttpTransport {
             );
         }
 
+        // When using TLS, inject a CertCapturingVerifier to enable Channel Binding Tokens.
+        let cert_handle = if config.use_tls {
+            // Ensure a rustls CryptoProvider is installed (idempotent)
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let root_store = rustls::RootCertStore::from_iter(
+                webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
+            );
+            let inner_verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
+                if config.accept_invalid_certs {
+                    Arc::new(crate::tls::NoVerifier)
+                } else {
+                    rustls::client::WebPkiServerVerifier::builder(Arc::new(root_store))
+                        .build()
+                        .map_err(|e| WinrmError::AuthFailed(format!("TLS verifier error: {e}")))?
+                };
+            let capturing_verifier = crate::tls::CertCapturingVerifier::new(inner_verifier);
+            let handle = capturing_verifier.cert_handle();
+            let tls_config = rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(capturing_verifier))
+                .with_no_client_auth();
+            builder = builder.tls_backend_preconfigured(tls_config);
+            Some(handle)
+        } else {
+            None
+        };
+
         let http = builder.build().map_err(WinrmError::Http)?;
 
         Ok(Self {
             http,
             config,
             credentials,
+            cert_handle,
         })
     }
 
@@ -127,6 +160,7 @@ impl HttpTransport {
                     username: self.credentials.username.clone(),
                     password: Zeroizing::new(self.credentials.password.expose_secret().to_string()),
                     domain: self.credentials.domain.clone(),
+                    cert_handle: self.cert_handle.clone(),
                 };
                 auth.send_authenticated(&self.http, &url, body).await?
             }

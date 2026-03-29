@@ -60,7 +60,13 @@ pub fn parse_receive_output(xml: &str) -> Result<ReceiveOutput, SoapError> {
             .map_err(|e| SoapError::ParseError(format!("base64 decode: {e}")))?;
         match name.as_str() {
             "stdout" => stdout.extend_from_slice(&decoded),
-            "stderr" => stderr.extend_from_slice(&decoded),
+            "stderr" => {
+                if decoded.starts_with(b"#< CLIXML") {
+                    stderr.extend_from_slice(&parse_clixml(&decoded));
+                } else {
+                    stderr.extend_from_slice(&decoded);
+                }
+            }
             _ => {}
         }
     }
@@ -97,6 +103,41 @@ pub fn check_soap_fault(xml: &str) -> Result<(), SoapError> {
         return Err(fault);
     }
     Ok(())
+}
+
+/// Parse PowerShell CLIXML stderr into human-readable text.
+///
+/// PowerShell wraps errors in CLIXML format (`#< CLIXML\r\n<Objs>...`).
+/// This function extracts the text from `<S S="Error">` tags and decodes
+/// CLIXML escape sequences like `_x000D_` (CR) and `_x000A_` (LF).
+fn parse_clixml(data: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(data);
+    let mut result = String::new();
+
+    // Extract content from <S S="Error">...</S> tags
+    let error_tag = "<S S=\"Error\">";
+    let close_tag = "</S>";
+    let mut search_from = 0;
+
+    while let Some(start) = text[search_from..].find(error_tag) {
+        let content_start = search_from + start + error_tag.len();
+        if let Some(end) = text[content_start..].find(close_tag) {
+            let fragment = &text[content_start..content_start + end];
+            result.push_str(fragment);
+            search_from = content_start + end + close_tag.len();
+        } else {
+            break;
+        }
+    }
+
+    // Decode CLIXML escape sequences
+    let result = result
+        .replace("_x000D_", "\r")
+        .replace("_x000A_", "\n")
+        .replace("_x0009_", "\t")
+        .replace("_x001B_", "\x1b");
+
+    result.into_bytes()
 }
 
 // --- Helpers ---
@@ -638,5 +679,52 @@ mod tests {
         assert_eq!(output.stdout.len(), 30, "should decode 30 bytes of stdout");
         assert_eq!(output.stderr, b"err", "should decode stderr correctly");
         assert_eq!(output.exit_code, Some(0));
+    }
+
+    #[test]
+    fn parse_clixml_basic_error() {
+        let input = b"#< CLIXML\r\n<Objs Version=\"1.1.0.1\" xmlns=\"http://schemas.microsoft.com/powershell/2004/04\"><S S=\"Error\">Something went wrong</S></Objs>";
+        let result = parse_clixml(input);
+        assert_eq!(String::from_utf8_lossy(&result), "Something went wrong");
+    }
+
+    #[test]
+    fn parse_clixml_escaped_newlines() {
+        let input = b"#< CLIXML\r\n<Objs><S S=\"Error\">line1_x000D__x000A_line2</S></Objs>";
+        let result = parse_clixml(input);
+        assert_eq!(String::from_utf8_lossy(&result), "line1\r\nline2");
+    }
+
+    #[test]
+    fn parse_clixml_multiple_errors() {
+        let input = b"#< CLIXML\r\n<Objs><S S=\"Error\">err1</S><S S=\"Error\">err2</S></Objs>";
+        let result = parse_clixml(input);
+        assert_eq!(String::from_utf8_lossy(&result), "err1err2");
+    }
+
+    #[test]
+    fn parse_clixml_not_clixml_passthrough() {
+        // Non-CLIXML data should return empty (no <S S="Error"> tags)
+        let input = b"plain error text without CLIXML";
+        let result = parse_clixml(input);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn parse_receive_output_clixml_stderr() {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD as B64;
+
+        let clixml = b"#< CLIXML\r\n<Objs><S S=\"Error\">PowerShell error_x000D__x000A_</S></Objs>";
+        let encoded = B64.encode(clixml);
+        let xml = format!(
+            r#"<rsp:ReceiveResponse><rsp:Stream Name="stderr">{encoded}</rsp:Stream><rsp:CommandState State="http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Done"><rsp:ExitCode>1</rsp:ExitCode></rsp:CommandState></rsp:ReceiveResponse>"#
+        );
+        let output = parse_receive_output(&xml).unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            "PowerShell error\r\n"
+        );
+        assert_eq!(output.exit_code, Some(1));
     }
 }

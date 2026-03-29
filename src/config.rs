@@ -59,6 +59,10 @@ pub struct WinrmConfig {
     /// Each `(key, value)` pair is injected into the shell's environment
     /// at creation time via `<rsp:Environment>`.
     pub env_vars: Vec<(String, String)>,
+    /// Message encryption mode for NTLM (default: [`EncryptionMode::Auto`]).
+    ///
+    /// Controls whether NTLM sealing is applied to SOAP message bodies.
+    pub encryption: EncryptionMode,
     /// Custom HTTP `User-Agent` header (default: `None` = `winrm-rs/<version>`).
     pub user_agent: Option<String>,
     /// Shell idle timeout in seconds (default: `None` = server default).
@@ -82,6 +86,7 @@ impl Default for WinrmConfig {
             client_cert_pem: None,
             client_key_pem: None,
             proxy: None,
+            encryption: EncryptionMode::Auto,
             user_agent: None,
             codepage: 65001,
             working_directory: None,
@@ -89,6 +94,22 @@ impl Default for WinrmConfig {
             idle_timeout_secs: None,
         }
     }
+}
+
+/// Controls whether NTLM message encryption (sealing) is applied to SOAP bodies.
+///
+/// When using HTTP (not HTTPS), NTLM sealing encrypts the SOAP body to prevent
+/// eavesdropping. When using HTTPS, the TLS layer provides encryption, making
+/// sealing redundant.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum EncryptionMode {
+    /// Encrypt when using HTTP, skip when using HTTPS (default).
+    #[default]
+    Auto,
+    /// Always encrypt SOAP bodies, even over HTTPS.
+    Always,
+    /// Never encrypt SOAP bodies. **Use only for debugging.**
+    Never,
 }
 
 /// Authentication method for the WinRM HTTP transport.

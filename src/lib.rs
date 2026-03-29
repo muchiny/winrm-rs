@@ -83,7 +83,7 @@ mod transport;
 pub use builder::{NeedsCredentials, Ready, WinrmClientBuilder};
 pub use client::WinrmClient;
 pub use command::{CommandOutput, encode_powershell_command};
-pub use config::{AuthMethod, WinrmConfig, WinrmCredentials};
+pub use config::{AuthMethod, EncryptionMode, WinrmConfig, WinrmCredentials};
 pub use error::{NtlmError, SoapError, WinrmError};
 pub use ntlm::{
     ChallengeMessage, NtlmSession, create_authenticate_message_with_key, parse_challenge,

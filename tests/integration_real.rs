@@ -25,9 +25,14 @@ fn test_client() -> Option<(WinrmClient, String)> {
     let host = std::env::var("WINRM_TEST_HOST").ok()?;
     let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
     let pass = std::env::var("WINRM_TEST_PASS").ok()?;
+    let port: u16 = std::env::var("WINRM_TEST_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(5985);
 
     let config = WinrmConfig {
         auth_method: AuthMethod::Basic,
+        port,
         ..Default::default()
     };
     let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).ok()?;

@@ -1,6 +1,7 @@
 // NTLM authentication transport for WinRM (3-step handshake).
 
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
+use zeroize::Zeroizing;
 
 use crate::auth::AuthTransport;
 use crate::error::WinrmError;
@@ -9,10 +10,11 @@ use crate::ntlm;
 /// NTLM authentication transport.
 ///
 /// Performs the NTLMv2 three-step handshake (negotiate, challenge, authenticate)
-/// for each SOAP request.
+/// for each SOAP request. The password is wrapped in [`Zeroizing`] to ensure
+/// it is cleared from memory when dropped.
 pub(crate) struct NtlmAuth {
     pub(crate) username: String,
-    pub(crate) password: String,
+    pub(crate) password: Zeroizing<String>,
     pub(crate) domain: String,
 }
 

@@ -4,7 +4,6 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
-use rand::Rng;
 
 use super::crypto::*;
 use crate::error::NtlmError;
@@ -60,6 +59,7 @@ pub fn parse_challenge(data: &[u8]) -> Result<ChallengeMessage, NtlmError> {
     if &data[0..8] != SIGNATURE {
         return Err(NtlmError::InvalidMessage("bad NTLMSSP signature".into()));
     }
+    // SAFETY: fixed-size slices from bounds-checked data (len >= 32 verified above)
     let msg_type = u32::from_le_bytes(data[8..12].try_into().unwrap());
     if msg_type != 2 {
         return Err(NtlmError::InvalidMessage(format!(
@@ -74,6 +74,7 @@ pub fn parse_challenge(data: &[u8]) -> Result<ChallengeMessage, NtlmError> {
 
     // Target info security buffer at offset 40
     let (target_info, target_domain, timestamp) = if data.len() >= 48 {
+        // SAFETY: fixed-size slices from bounds-checked data (len >= 48 verified above)
         let ti_len = u16::from_le_bytes(data[40..42].try_into().unwrap()) as usize;
         let ti_offset = u32::from_le_bytes(data[44..48].try_into().unwrap()) as usize;
         if ti_offset + ti_len <= data.len() {
@@ -107,7 +108,7 @@ fn create_authenticate_message_internal(
     let ntlmv2_hash = compute_ntlmv2_hash(&nt_hash, username, domain);
 
     // Client challenge (random 8 bytes)
-    let client_challenge: [u8; 8] = rand::rng().random();
+    let client_challenge: [u8; 8] = rand::random();
 
     // Timestamp: use server's if available, otherwise compute current
     let timestamp = challenge.timestamp.unwrap_or_else(current_windows_filetime);

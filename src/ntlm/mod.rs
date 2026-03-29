@@ -137,11 +137,7 @@ impl NtlmSession {
     /// - The message is shorter than 16 bytes
     /// - The signature version is not 1
     /// - The sequence number does not match the expected value
-    ///
-    /// TODO: Full checksum verification (requires computing expected
-    /// HMAC-MD5 and comparing with the decrypted signature checksum).
-    /// Currently only version and sequence number are verified, which
-    /// is sufficient to detect replay attacks and protocol errors.
+    /// - The HMAC-MD5 checksum does not match the expected value
     pub fn unseal(&mut self, sealed: &[u8]) -> Result<Vec<u8>, NtlmError> {
         if sealed.len() < 16 {
             return Err(NtlmError::InvalidMessage("sealed message too short".into()));
@@ -150,20 +146,36 @@ impl NtlmSession {
         let signature = &sealed[..16];
         let ciphertext = &sealed[16..];
 
-        // Decrypt the payload
-        let mut plaintext = ciphertext.to_vec();
-        self.server_seal_handle.process(&mut plaintext);
-
-        // Verify signature version
+        // Verify signature version (unencrypted field)
+        // SAFETY: slice [0..4] is exactly 4 bytes, guaranteed by length check above
         let version = u32::from_le_bytes(signature[0..4].try_into().unwrap());
         if version != 1 {
             return Err(NtlmError::InvalidMessage("bad signature version".into()));
         }
 
-        // Verify sequence number
+        // Verify sequence number (unencrypted field)
+        // SAFETY: slice [12..16] is exactly 4 bytes, guaranteed by length check above
         let sig_seq = u32::from_le_bytes(signature[12..16].try_into().unwrap());
         if sig_seq != self.server_seq_num {
             return Err(NtlmError::InvalidMessage("sequence number mismatch".into()));
+        }
+
+        // Decrypt checksum first (RC4 stream order must match seal: checksum then payload)
+        let mut sig_checksum = [0u8; 8];
+        sig_checksum.copy_from_slice(&signature[4..12]);
+        self.server_seal_handle.process(&mut sig_checksum);
+
+        // Decrypt the payload
+        let mut plaintext = ciphertext.to_vec();
+        self.server_seal_handle.process(&mut plaintext);
+
+        // Verify HMAC-MD5 checksum against decrypted plaintext
+        let mut expected_sig_input = Vec::with_capacity(4 + plaintext.len());
+        expected_sig_input.extend_from_slice(&self.server_seq_num.to_le_bytes());
+        expected_sig_input.extend_from_slice(&plaintext);
+        let expected_checksum = hmac_md5(&self.server_sign_key, &expected_sig_input);
+        if sig_checksum != expected_checksum[..8] {
+            return Err(NtlmError::InvalidMessage("checksum mismatch".into()));
         }
 
         self.server_seq_num += 1;
@@ -269,14 +281,21 @@ mod tests {
 
     #[test]
     fn ntlm_session_unseal_exact_16_bytes() {
+        // Build a properly sealed empty message using client keys, then unseal
+        // by constructing the "server side" manually. Since seal uses client
+        // keys and unseal uses server keys, we simulate by sealing with
+        // a session where client keys match the other session's server keys.
+        // For simplicity, test that an invalid checksum on a 16-byte message
+        // is now correctly rejected.
         let session_key: [u8; 16] = [0xEE; 16];
         let mut session = NtlmSession::from_auth(&session_key);
         let mut msg = vec![0u8; 16];
         msg[0..4].copy_from_slice(&1u32.to_le_bytes());
         msg[12..16].copy_from_slice(&0u32.to_le_bytes());
         let result = session.unseal(&msg);
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_empty());
+        assert!(result.is_err(), "fake checksum should be rejected");
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("checksum mismatch"));
     }
 
     #[test]
@@ -309,10 +328,9 @@ mod tests {
     }
 
     #[test]
-    fn ntlm_session_multiple_seal_unseal() {
+    fn ntlm_session_multiple_seal_sequence_numbers() {
         let key = [0xAA; 16];
         let mut sealer = NtlmSession::from_auth(&key);
-        let mut unsealer = NtlmSession::from_auth(&key);
 
         let msg1 = sealer.seal(b"first");
         let msg2 = sealer.seal(b"second");
@@ -321,26 +339,32 @@ mod tests {
         let seq2 = u32::from_le_bytes(msg2[12..16].try_into().unwrap());
         assert_eq!(seq1, 0);
         assert_eq!(seq2, 1);
+    }
 
-        let mut fake_msg_0 = vec![0u8; 20];
-        fake_msg_0[0..4].copy_from_slice(&1u32.to_le_bytes());
-        fake_msg_0[12..16].copy_from_slice(&0u32.to_le_bytes());
-        let result0 = unsealer.unseal(&fake_msg_0);
-        assert!(result0.is_ok(), "first unseal should succeed");
+    #[test]
+    fn ntlm_session_unseal_rejects_stale_sequence() {
+        let key = [0xAA; 16];
+        let mut session = NtlmSession::from_auth(&key);
+        // Fake message with seq_num=99 (expected 0)
+        let mut fake = vec![0u8; 20];
+        fake[0..4].copy_from_slice(&1u32.to_le_bytes());
+        fake[12..16].copy_from_slice(&99u32.to_le_bytes());
+        let result = session.unseal(&fake);
+        assert!(result.is_err(), "stale seq_num should be rejected");
+    }
 
-        let mut fake_msg_1 = vec![0u8; 20];
-        fake_msg_1[0..4].copy_from_slice(&1u32.to_le_bytes());
-        fake_msg_1[12..16].copy_from_slice(&1u32.to_le_bytes());
-        let result1 = unsealer.unseal(&fake_msg_1);
-        assert!(
-            result1.is_ok(),
-            "second unseal should succeed with seq_num=1 (kills *= mutant)"
-        );
-
-        let mut fake_msg_stale = vec![0u8; 20];
-        fake_msg_stale[0..4].copy_from_slice(&1u32.to_le_bytes());
-        fake_msg_stale[12..16].copy_from_slice(&1u32.to_le_bytes());
-        let result_stale = unsealer.unseal(&fake_msg_stale);
-        assert!(result_stale.is_err(), "stale seq_num should be rejected");
+    #[test]
+    fn ntlm_session_unseal_rejects_tampered_checksum() {
+        let key = [0xBB; 16];
+        let mut session = NtlmSession::from_auth(&key);
+        // Fake message with valid version and seq_num but wrong checksum
+        let mut fake = vec![0u8; 32];
+        fake[0..4].copy_from_slice(&1u32.to_le_bytes());
+        fake[4..12].copy_from_slice(&[0xFF; 8]); // garbage checksum
+        fake[12..16].copy_from_slice(&0u32.to_le_bytes());
+        let result = session.unseal(&fake);
+        assert!(result.is_err(), "tampered checksum should be rejected");
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("checksum mismatch"));
     }
 }

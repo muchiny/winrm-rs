@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use secrecy::ExposeSecret;
 use tracing::{debug, trace};
+use zeroize::Zeroizing;
 
 use crate::auth::AuthTransport;
 use crate::auth::basic::BasicAuth;
@@ -70,6 +71,12 @@ impl HttpTransport {
             builder = builder.proxy(proxy);
         }
 
+        if matches!(config.auth_method, AuthMethod::Basic) && !config.use_tls {
+            tracing::warn!(
+                "Basic auth over HTTP transmits credentials in cleartext — use HTTPS in production"
+            );
+        }
+
         let http = builder.build().map_err(WinrmError::Http)?;
 
         Ok(Self {
@@ -112,7 +119,7 @@ impl HttpTransport {
             AuthMethod::Ntlm => {
                 let auth = NtlmAuth {
                     username: self.credentials.username.clone(),
-                    password: self.credentials.password.expose_secret().to_string(),
+                    password: Zeroizing::new(self.credentials.password.expose_secret().to_string()),
                     domain: self.credentials.domain.clone(),
                 };
                 auth.send_authenticated(&self.http, &url, body).await?

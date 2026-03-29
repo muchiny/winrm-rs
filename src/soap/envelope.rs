@@ -4,6 +4,15 @@ use uuid::Uuid;
 
 use super::namespaces::*;
 
+/// Escape special XML characters to prevent injection in SOAP envelopes.
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
 /// XML namespace declarations used in envelopes that include the shell namespace.
 const NS_DECL_WITH_RSP: &str = r#"xmlns:s="http://www.w3.org/2003/05/soap-envelope"
   xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing"
@@ -28,18 +37,20 @@ fn build_header(
 ) -> String {
     let message_id = Uuid::new_v4();
     let selector = if let Some(sid) = shell_id {
+        let escaped_sid = xml_escape(sid);
         format!(
             r#"
     <wsman:SelectorSet>
-      <wsman:Selector Name="ShellId">{sid}</wsman:Selector>
+      <wsman:Selector Name="ShellId">{escaped_sid}</wsman:Selector>
     </wsman:SelectorSet>"#
         )
     } else {
         String::new()
     };
+    let escaped_endpoint = xml_escape(endpoint);
     format!(
         r#"  <s:Header>
-    <wsa:To>{endpoint}</wsa:To>
+    <wsa:To>{escaped_endpoint}</wsa:To>
     <wsman:ResourceURI s:mustUnderstand="true">{RESOURCE_URI_CMD}</wsman:ResourceURI>
     <wsa:ReplyTo>
       <wsa:Address s:mustUnderstand="true">{REPLY_TO_ANONYMOUS}</wsa:Address>
@@ -107,15 +118,16 @@ pub(crate) fn execute_command_request(
     );
     let args_xml: String = args
         .iter()
-        .map(|a| format!("      <rsp:Arguments>{a}</rsp:Arguments>"))
+        .map(|a| format!("      <rsp:Arguments>{}</rsp:Arguments>", xml_escape(a)))
         .collect::<Vec<_>>()
         .join("\n");
+    let escaped_command = xml_escape(command);
     format!(
         r#"<s:Envelope {NS_DECL_WITH_RSP}>
 {header}
   <s:Body>
     <rsp:CommandLine>
-      <rsp:Command>{command}</rsp:Command>
+      <rsp:Command>{escaped_command}</rsp:Command>
 {args_xml}
     </rsp:CommandLine>
   </s:Body>
@@ -142,12 +154,13 @@ pub(crate) fn receive_output_request(
         timeout_secs,
         max_envelope_size,
     );
+    let escaped_command_id = xml_escape(command_id);
     format!(
         r#"<s:Envelope {NS_DECL_WITH_RSP}>
 {header}
   <s:Body>
     <rsp:Receive>
-      <rsp:DesiredStream CommandId="{command_id}">stdout stderr</rsp:DesiredStream>
+      <rsp:DesiredStream CommandId="{escaped_command_id}">stdout stderr</rsp:DesiredStream>
     </rsp:Receive>
   </s:Body>
 </s:Envelope>"#
@@ -173,11 +186,12 @@ pub(crate) fn signal_terminate_request(
         timeout_secs,
         max_envelope_size,
     );
+    let escaped_command_id = xml_escape(command_id);
     format!(
         r#"<s:Envelope {NS_DECL_WITH_RSP}>
 {header}
   <s:Body>
-    <rsp:Signal CommandId="{command_id}">
+    <rsp:Signal CommandId="{escaped_command_id}">
       <rsp:Code>{SIGNAL_TERMINATE}</rsp:Code>
     </rsp:Signal>
   </s:Body>
@@ -235,12 +249,13 @@ pub(crate) fn send_input_request(
     );
     let encoded_data = B64.encode(data);
     let end_attr = if end_of_stream { r#" End="true""# } else { "" };
+    let escaped_command_id = xml_escape(command_id);
     format!(
         r#"<s:Envelope {NS_DECL_WITH_RSP}>
 {header}
   <s:Body>
     <rsp:Send>
-      <rsp:Stream Name="stdin" CommandId="{command_id}"{end_attr}>{encoded_data}</rsp:Stream>
+      <rsp:Stream Name="stdin" CommandId="{escaped_command_id}"{end_attr}>{encoded_data}</rsp:Stream>
     </rsp:Send>
   </s:Body>
 </s:Envelope>"#
@@ -265,11 +280,12 @@ pub(crate) fn signal_ctrl_c_request(
         timeout_secs,
         max_envelope_size,
     );
+    let escaped_command_id = xml_escape(command_id);
     format!(
         r#"<s:Envelope {NS_DECL_WITH_RSP}>
 {header}
   <s:Body>
-    <rsp:Signal CommandId="{command_id}">
+    <rsp:Signal CommandId="{escaped_command_id}">
       <rsp:Code>{SIGNAL_CTRL_C}</rsp:Code>
     </rsp:Signal>
   </s:Body>
@@ -426,5 +442,70 @@ mod tests {
             600000,
         );
         assert!(xml.contains("600000"));
+    }
+
+    #[test]
+    fn xml_escape_special_characters() {
+        assert_eq!(xml_escape("<"), "&lt;");
+        assert_eq!(xml_escape(">"), "&gt;");
+        assert_eq!(xml_escape("&"), "&amp;");
+        assert_eq!(xml_escape("\""), "&quot;");
+        assert_eq!(xml_escape("'"), "&apos;");
+        assert_eq!(xml_escape("a<b>c&d\"e'f"), "a&lt;b&gt;c&amp;d&quot;e&apos;f");
+        assert_eq!(xml_escape("normal text"), "normal text");
+    }
+
+    #[test]
+    fn execute_command_escapes_xml_in_args() {
+        let xml = execute_command_request(
+            "http://host:5985/wsman",
+            "SHELL-1",
+            "cmd",
+            &["arg</rsp:Arguments><injected>"],
+            60,
+            153600,
+        );
+        assert!(!xml.contains("</rsp:Arguments><injected>"));
+        assert!(xml.contains("&lt;/rsp:Arguments&gt;&lt;injected&gt;"));
+    }
+
+    #[test]
+    fn execute_command_escapes_xml_in_command() {
+        let xml = execute_command_request(
+            "http://host:5985/wsman",
+            "SHELL-1",
+            "cmd<evil>",
+            &[],
+            60,
+            153600,
+        );
+        assert!(!xml.contains("<evil>"));
+        assert!(xml.contains("cmd&lt;evil&gt;"));
+    }
+
+    #[test]
+    fn build_header_escapes_shell_id() {
+        let xml = receive_output_request(
+            "http://host:5985/wsman",
+            "SHELL<injected>",
+            "CMD-1",
+            60,
+            153600,
+        );
+        assert!(!xml.contains("SHELL<injected>"));
+        assert!(xml.contains("SHELL&lt;injected&gt;"));
+    }
+
+    #[test]
+    fn receive_output_escapes_command_id() {
+        let xml = receive_output_request(
+            "http://host:5985/wsman",
+            "S1",
+            "CMD\"injected",
+            60,
+            153600,
+        );
+        assert!(!xml.contains("CMD\"injected"));
+        assert!(xml.contains("CMD&quot;injected"));
     }
 }

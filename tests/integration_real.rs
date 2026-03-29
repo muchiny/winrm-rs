@@ -136,14 +136,17 @@ async fn run_powershell_json_output() {
 #[ignore]
 async fn run_powershell_unicode() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    // Force UTF-8 output encoding — default OEM codepage (437) mangles accented chars.
+    // This is the recommended pattern for users who need Unicode output.
+    let script = "[Console]::OutputEncoding = [Text.Encoding]::UTF8; Write-Output 'héllo wörld café'";
     let output = client
-        .run_powershell(&host, "Write-Output 'héllo wörld café'")
+        .run_powershell(&host, script)
         .await
         .expect("run unicode");
     assert_eq!(output.exit_code, 0);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("héllo") || stdout.contains("hello"),
+        stdout.contains("héllo"),
         "expected unicode output, got: {stdout}"
     );
 }

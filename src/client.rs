@@ -287,6 +287,61 @@ impl WinrmClient {
             .await
     }
 
+    /// Execute a WQL query against WMI via WS-Enumeration.
+    ///
+    /// Returns the raw XML response items as a string. The response contains
+    /// WMI object instances matching the query. Use a `namespace` of `None`
+    /// for the default `root/cimv2`.
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// # use winrm_rs::{WinrmClient, WinrmConfig, WinrmCredentials};
+    /// # async fn example() -> Result<(), winrm_rs::WinrmError> {
+    /// # let client = WinrmClient::new(WinrmConfig::default(), WinrmCredentials::new("u","p",""))?;
+    /// let xml = client.run_wql("server", "SELECT Name,State FROM Win32_Service", None).await?;
+    /// println!("{xml}");
+    /// # Ok(()) }
+    /// ```
+    #[tracing::instrument(level = "debug", skip(self))]
+    pub async fn run_wql(
+        &self,
+        host: &str,
+        query: &str,
+        namespace: Option<&str>,
+    ) -> Result<String, WinrmError> {
+        let config = self.transport.config();
+        let endpoint = self.transport.endpoint(host);
+
+        // Phase 1: Enumerate with WQL filter
+        let envelope = soap::enumerate_wql_request(
+            &endpoint,
+            query,
+            namespace,
+            config.operation_timeout_secs,
+            config.max_envelope_size,
+        );
+        let response = self.transport.send_soap_with_retry(host, envelope).await?;
+        let (mut items, mut context) =
+            soap::parse_enumerate_response(&response).map_err(WinrmError::Soap)?;
+
+        // Phase 2: Pull remaining items if enumeration is not complete
+        while let Some(ctx) = context {
+            let pull_envelope = soap::pull_request(
+                &endpoint,
+                &ctx,
+                config.operation_timeout_secs,
+                config.max_envelope_size,
+            );
+            let pull_response = self.transport.send_soap_with_retry(host, pull_envelope).await?;
+            let (more_items, next_ctx) =
+                soap::parse_enumerate_response(&pull_response).map_err(WinrmError::Soap)?;
+            items.push_str(&more_items);
+            context = next_ctx;
+        }
+
+        Ok(items)
+    }
+
     /// Open a reusable shell session on the given host.
     ///
     /// Returns a [`Shell`] that can execute multiple commands without the

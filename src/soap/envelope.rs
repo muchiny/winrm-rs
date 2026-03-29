@@ -44,6 +44,17 @@ fn build_header(
     timeout_secs: u64,
     max_envelope_size: u32,
 ) -> String {
+    build_header_with_resource_uri(endpoint, action, RESOURCE_URI_CMD, shell_id, timeout_secs, max_envelope_size)
+}
+
+fn build_header_with_resource_uri(
+    endpoint: &str,
+    action: &str,
+    resource_uri: &str,
+    shell_id: Option<&str>,
+    timeout_secs: u64,
+    max_envelope_size: u32,
+) -> String {
     let message_id = Uuid::new_v4();
     let selector = if let Some(sid) = shell_id {
         let escaped_sid = xml_escape(sid);
@@ -60,7 +71,7 @@ fn build_header(
     format!(
         r#"  <s:Header>
     <wsa:To>{escaped_endpoint}</wsa:To>
-    <wsman:ResourceURI s:mustUnderstand="true">{RESOURCE_URI_CMD}</wsman:ResourceURI>
+    <wsman:ResourceURI s:mustUnderstand="true">{resource_uri}</wsman:ResourceURI>
     <wsa:ReplyTo>
       <wsa:Address s:mustUnderstand="true">{REPLY_TO_ANONYMOUS}</wsa:Address>
     </wsa:ReplyTo>
@@ -333,6 +344,73 @@ pub(crate) fn signal_ctrl_c_request(
     <rsp:Signal CommandId="{escaped_command_id}">
       <rsp:Code>{SIGNAL_CTRL_C}</rsp:Code>
     </rsp:Signal>
+  </s:Body>
+</s:Envelope>"#
+    )
+}
+
+/// Build a WS-Enumeration Enumerate request with a WQL filter (MS-WSMV).
+///
+/// Used to query WMI classes via WQL (e.g., `SELECT * FROM Win32_Service`).
+/// The `wql_namespace` defaults to `root/cimv2` if `None`.
+pub(crate) fn enumerate_wql_request(
+    endpoint: &str,
+    wql_query: &str,
+    wql_namespace: Option<&str>,
+    timeout_secs: u64,
+    max_envelope_size: u32,
+) -> String {
+    let ns = wql_namespace.unwrap_or("root/cimv2");
+    let resource_uri = format!("http://schemas.microsoft.com/wbem/wsman/1/wmi/{ns}/*");
+    let header = build_header_with_resource_uri(
+        endpoint,
+        ACTION_ENUMERATE,
+        &resource_uri,
+        None,
+        timeout_secs,
+        max_envelope_size,
+    );
+    let escaped_query = xml_escape(wql_query);
+    format!(
+        r#"<s:Envelope {NS_DECL_NO_RSP}
+  xmlns:n="http://schemas.xmlsoap.org/ws/2004/09/enumeration">
+{header}
+  <s:Body>
+    <n:Enumerate>
+      <wsman:OptimizeEnumeration/>
+      <wsman:MaxElements>32000</wsman:MaxElements>
+      <wsman:Filter Dialect="{WQL_DIALECT}">{escaped_query}</wsman:Filter>
+    </n:Enumerate>
+  </s:Body>
+</s:Envelope>"#
+    )
+}
+
+/// Build a WS-Enumeration Pull request to continue a WQL enumeration.
+pub(crate) fn pull_request(
+    endpoint: &str,
+    enumeration_context: &str,
+    timeout_secs: u64,
+    max_envelope_size: u32,
+) -> String {
+    let header = build_header_with_resource_uri(
+        endpoint,
+        ACTION_PULL,
+        RESOURCE_URI_WMI,
+        None,
+        timeout_secs,
+        max_envelope_size,
+    );
+    let escaped_ctx = xml_escape(enumeration_context);
+    format!(
+        r#"<s:Envelope {NS_DECL_NO_RSP}
+  xmlns:n="http://schemas.xmlsoap.org/ws/2004/09/enumeration">
+{header}
+  <s:Body>
+    <n:Pull>
+      <n:EnumerationContext>{escaped_ctx}</n:EnumerationContext>
+      <n:MaxElements>32000</n:MaxElements>
+    </n:Pull>
   </s:Body>
 </s:Envelope>"#
     )

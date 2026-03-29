@@ -43,3 +43,19 @@ pub(crate) const COMMAND_STATE_DONE: &str =
 /// Anonymous reply-to address.
 pub(crate) const REPLY_TO_ANONYMOUS: &str =
     "http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous";
+
+/// WMI resource URI for WQL queries (root/cimv2 wildcard).
+pub(crate) const RESOURCE_URI_WMI: &str =
+    "http://schemas.microsoft.com/wbem/wsman/1/wmi/root/cimv2/*";
+
+/// SOAP action for WS-Enumeration Enumerate request.
+pub(crate) const ACTION_ENUMERATE: &str =
+    "http://schemas.xmlsoap.org/ws/2004/09/enumeration/Enumerate";
+
+/// SOAP action for WS-Enumeration Pull request.
+pub(crate) const ACTION_PULL: &str =
+    "http://schemas.xmlsoap.org/ws/2004/09/enumeration/Pull";
+
+/// WQL filter dialect URI.
+pub(crate) const WQL_DIALECT: &str =
+    "http://schemas.microsoft.com/wbem/wsman/1/WQL";

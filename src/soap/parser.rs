@@ -94,6 +94,27 @@ pub fn parse_receive_output(xml: &str) -> Result<ReceiveOutput, SoapError> {
     })
 }
 
+/// Parse a WS-Enumeration Enumerate response.
+///
+/// Returns the XML items (raw text between `<w:Items>` tags) and an optional
+/// `EnumerationContext` for continuation via Pull.
+pub fn parse_enumerate_response(xml: &str) -> Result<(String, Option<String>), SoapError> {
+    check_soap_fault(xml)?;
+
+    // Extract items — may be inside <w:Items>, <wsen:Items>, or <n:Items>
+    let items = extract_element_text(xml, "Items").unwrap_or_default();
+
+    // Extract EnumerationContext for Pull continuation
+    let context = extract_element_text(xml, "EnumerationContext");
+
+    // Check for EndOfSequence — means no more items
+    let end_of_seq = xml.contains("EndOfSequence");
+
+    let context = if end_of_seq { None } else { context };
+
+    Ok((items, context))
+}
+
 /// Check a SOAP response for fault elements and return an error if found.
 ///
 /// Scans the XML for `<Fault>` or `<s:Fault>` elements and extracts the

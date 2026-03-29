@@ -246,6 +246,36 @@ $facts | ConvertTo-Json -Compress
     assert!(json["os_language"].is_number());
 }
 
+// === WQL/WMI queries ===
+
+#[tokio::test]
+#[ignore]
+async fn wql_query_win32_operatingsystem() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let result = client
+        .run_wql(&host, "SELECT Caption,Version FROM Win32_OperatingSystem", None)
+        .await
+        .expect("WQL query");
+    assert!(
+        result.contains("Caption") || result.contains("Windows"),
+        "expected OS info in WQL result, got: {result}"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn wql_query_win32_service() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let result = client
+        .run_wql(&host, "SELECT Name,State FROM Win32_Service WHERE Name='WinRM'", None)
+        .await
+        .expect("WQL service query");
+    assert!(
+        result.contains("WinRM") || result.contains("winrm"),
+        "expected WinRM service in result, got: {result}"
+    );
+}
+
 // === NTLM authentication ===
 
 fn test_client_ntlm() -> Option<(WinrmClient, String)> {

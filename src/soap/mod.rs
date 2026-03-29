@@ -11,7 +11,8 @@ pub mod parser;
 // Re-export for internal use
 pub(crate) use envelope::*;
 pub(crate) use parser::{
-    check_soap_fault, parse_command_id, parse_receive_output, parse_shell_id,
+    check_soap_fault, parse_command_id, parse_enumerate_response, parse_receive_output,
+    parse_shell_id,
 };
 // Re-export ReceiveOutput as fully public so lib.rs can `pub use` it.
 pub use parser::ReceiveOutput;

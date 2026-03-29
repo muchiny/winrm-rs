@@ -67,9 +67,7 @@ impl<'a> Shell<'a> {
                 stdout.extend_from_slice(&output.stdout);
                 stderr.extend_from_slice(&output.stderr);
 
-                if output.exit_code.is_some() {
-                    exit_code = output.exit_code;
-                }
+                exit_code = output.exit_code.or(exit_code);
 
                 if output.done {
                     break;

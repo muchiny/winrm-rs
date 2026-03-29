@@ -26,10 +26,10 @@ pub struct CommandOutput {
 /// The input is converted to UTF-16LE and then base64-encoded, which avoids
 /// shell quoting and character escaping issues.
 pub fn encode_powershell_command(script: &str) -> String {
-    let utf16: Vec<u8> = script
-        .encode_utf16()
-        .flat_map(|c| c.to_le_bytes())
-        .collect();
+    let mut utf16 = Vec::with_capacity(script.len() * 2);
+    for c in script.encode_utf16() {
+        utf16.extend_from_slice(&c.to_le_bytes());
+    }
     B64.encode(&utf16)
 }
 

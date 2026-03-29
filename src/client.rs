@@ -194,9 +194,10 @@ impl WinrmClient {
         let result = self.run_in_shell(host, &shell_id, command, args).await;
 
         // Always clean up the shell
-        if let Err(e) = self.delete_shell(host, &shell_id).await {
-            debug!(error = %e, "failed to delete WinRM shell (best-effort)");
-        }
+        self.delete_shell(host, &shell_id)
+            .await
+            .inspect_err(|e| debug!(error = %e, "failed to delete WinRM shell (best-effort)"))
+            .ok();
 
         result
     }

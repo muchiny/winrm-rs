@@ -20,7 +20,8 @@
 //! ```
 
 use std::path::Path;
-use winrm_rs::{AuthMethod, WinrmClient, WinrmConfig, WinrmCredentials};
+use std::time::Duration;
+use winrm_rs::{AuthMethod, CancellationToken, WinrmClient, WinrmConfig, WinrmCredentials};
 
 fn test_client() -> Option<(WinrmClient, String)> {
     let host = std::env::var("WINRM_TEST_HOST").ok()?;
@@ -526,4 +527,206 @@ async fn retry_config_works_with_real_server() {
         .await
         .expect("run with retries");
     assert_eq!(output.exit_code, 0);
+}
+
+// === CancellationToken ===
+
+#[tokio::test]
+#[ignore]
+async fn cancel_long_running_command() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let cancel = CancellationToken::new();
+    let cancel2 = cancel.clone();
+
+    // Cancel after 2 seconds
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        cancel2.cancel();
+    });
+
+    // ping -n 30 = ~30 seconds
+    let result = client
+        .run_command_with_cancel(&host, "ping", &["-n", "30", "127.0.0.1"], cancel)
+        .await;
+
+    assert!(
+        result.is_err(),
+        "should have been cancelled"
+    );
+    let err = format!("{}", result.unwrap_err());
+    assert!(err.contains("cancelled"), "expected Cancelled error, got: {err}");
+}
+
+// === Idle timeout ===
+
+#[tokio::test]
+#[ignore]
+async fn shell_with_idle_timeout_works() {
+    let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    let pass = std::env::var("WINRM_TEST_PASS").expect("WINRM_TEST_PASS");
+    let port: u16 = std::env::var("WINRM_TEST_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(5985);
+
+    let config = WinrmConfig {
+        auth_method: AuthMethod::Basic,
+        port,
+        idle_timeout_secs: Some(300),
+        ..Default::default()
+    };
+    let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
+    let output = client
+        .run_command(&host, "whoami", &[])
+        .await
+        .expect("run with idle timeout");
+    assert_eq!(output.exit_code, 0);
+}
+
+// === Custom User-Agent ===
+
+#[tokio::test]
+#[ignore]
+async fn custom_user_agent_does_not_break() {
+    let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    let pass = std::env::var("WINRM_TEST_PASS").expect("WINRM_TEST_PASS");
+    let port: u16 = std::env::var("WINRM_TEST_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(5985);
+
+    let config = WinrmConfig {
+        auth_method: AuthMethod::Basic,
+        port,
+        user_agent: Some("winrm-rs-test/0.1".into()),
+        ..Default::default()
+    };
+    let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
+    let output = client
+        .run_command(&host, "whoami", &[])
+        .await
+        .expect("run with custom user-agent");
+    assert_eq!(output.exit_code, 0);
+}
+
+// === Proxy error test ===
+
+#[tokio::test]
+#[ignore]
+async fn invalid_proxy_returns_http_error() {
+    let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    let pass = std::env::var("WINRM_TEST_PASS").expect("WINRM_TEST_PASS");
+    let port: u16 = std::env::var("WINRM_TEST_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(5985);
+
+    let config = WinrmConfig {
+        auth_method: AuthMethod::Basic,
+        port,
+        proxy: Some("http://127.0.0.1:19999".into()),
+        ..Default::default()
+    };
+    let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
+    let result = client.run_command(&host, "whoami", &[]).await;
+    assert!(result.is_err(), "should fail with unreachable proxy");
+}
+
+// === HTTPS setup helper (run once to enable HTTPS tests) ===
+
+#[tokio::test]
+#[ignore]
+async fn setup_https_listener() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let script = r#"
+        # Check if HTTPS listener already exists
+        $existing = Get-WSManInstance winrm/config/Listener -SelectorSet @{Address="*"; Transport="HTTPS"} -ErrorAction SilentlyContinue
+        if ($existing) {
+            Write-Output "HTTPS listener already exists"
+            return
+        }
+        $cert = New-SelfSignedCertificate -DnsName "winrm-test" -CertStoreLocation Cert:\LocalMachine\My
+        New-WSManInstance winrm/config/Listener -SelectorSet @{Address="*"; Transport="HTTPS"} -ValueSet @{CertificateThumbprint=$cert.Thumbprint}
+        New-NetFirewallRule -DisplayName "WinRM HTTPS" -Direction Inbound -LocalPort 5986 -Protocol TCP -Action Allow -ErrorAction SilentlyContinue
+        Write-Output "HTTPS listener created: $($cert.Thumbprint)"
+        # Ensure firewall allows 5986
+        Remove-NetFirewallRule -DisplayName "WinRM HTTPS" -ErrorAction SilentlyContinue
+        New-NetFirewallRule -DisplayName "WinRM HTTPS" -Direction Inbound -LocalPort 5986 -Protocol TCP -Action Allow -Profile Any
+        # Also try disabling firewall for testing
+        Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False
+    "#;
+    let output = client
+        .run_powershell(&host, script)
+        .await
+        .expect("setup HTTPS");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    eprintln!("HTTPS setup: {}", stdout.trim());
+    assert_eq!(output.exit_code, 0);
+}
+
+// === HTTPS tests (require setup_https_listener to have run first) ===
+
+#[tokio::test]
+#[ignore]
+async fn check_https_listener_status() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+
+    // Disable firewall for testing
+    let fw = client
+        .run_powershell(&host, "Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False; 'ok'")
+        .await
+        .expect("disable firewall");
+    eprintln!("Firewall disabled: {}", String::from_utf8_lossy(&fw.stdout).trim());
+
+    let script = r#"
+        $listeners = @(Get-ChildItem WSMan:\localhost\Listener | ForEach-Object {
+            $details = Get-ChildItem $_.PSPath
+            @{
+                Transport = ($details | Where-Object Name -eq Transport).Value
+                Port = ($details | Where-Object Name -eq Port).Value
+                Enabled = ($details | Where-Object Name -eq Enabled).Value
+            }
+        })
+        $listeners | ConvertTo-Json -Compress
+    "#;
+    let output = client.run_powershell(&host, script).await.expect("check listeners");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    eprintln!("WinRM listeners: {}", stdout.trim());
+}
+
+fn test_client_https_ntlm() -> Option<(WinrmClient, String)> {
+    let host = std::env::var("WINRM_TEST_HOST").ok()?;
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    let pass = std::env::var("WINRM_TEST_PASS").ok()?;
+    let port: u16 = std::env::var("WINRM_TEST_HTTPS_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(55986);
+
+    let config = WinrmConfig {
+        auth_method: AuthMethod::Ntlm,
+        use_tls: true,
+        accept_invalid_certs: true, // self-signed cert
+        port,
+        ..Default::default()
+    };
+    let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).ok()?;
+    Some((client, host))
+}
+
+#[tokio::test]
+#[ignore]
+async fn ntlm_over_https_with_cbt() {
+    let (client, host) =
+        test_client_https_ntlm().expect("set WINRM_TEST_HOST, WINRM_TEST_PASS, WINRM_TEST_HTTPS_PORT");
+    let output = client
+        .run_command(&host, "whoami", &[])
+        .await
+        .expect("NTLM over HTTPS with CBT");
+    assert_eq!(output.exit_code, 0);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.trim().is_empty(), "whoami should return username");
 }

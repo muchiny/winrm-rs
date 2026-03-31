@@ -16,7 +16,7 @@ use crate::auth::certificate::CertificateAuth;
 use crate::auth::credssp::CredSspAuth;
 use crate::auth::kerberos::KerberosAuth;
 use crate::auth::ntlm::NtlmAuth;
-use crate::config::{AuthMethod, WinrmConfig, WinrmCredentials};
+use crate::config::{AuthMethod, EncryptionMode, WinrmConfig, WinrmCredentials};
 use crate::error::WinrmError;
 use crate::soap;
 use crate::tls::CertHandle;
@@ -163,11 +163,13 @@ impl HttpTransport {
                 auth.send_authenticated(&self.http, &url, body).await?
             }
             AuthMethod::Ntlm => {
+                let encrypt = matches!(self.config.encryption, EncryptionMode::Always);
                 let auth = NtlmAuth {
                     username: self.credentials.username.clone(),
                     password: Zeroizing::new(self.credentials.password.expose_secret().to_string()),
                     domain: self.credentials.domain.clone(),
                     cert_handle: self.cert_handle.clone(),
+                    encrypt,
                 };
                 auth.send_authenticated(&self.http, &url, body).await?
             }

@@ -154,25 +154,28 @@ pub(crate) fn current_windows_filetime() -> [u8; 8] {
 pub(crate) fn compute_channel_bindings(cert_der: &[u8]) -> [u8; 16] {
     use sha2::{Digest as Sha2Digest, Sha256};
 
-    // Step 1-2: SHA-256(cert) prefixed with channel binding type
+    // Step 1: SHA-256 hash of the DER-encoded server certificate
     let cert_hash = Sha256::digest(cert_der);
+
+    // Step 2: Build channel binding application data per RFC 5929 §4
     let mut app_data = b"tls-server-end-point:".to_vec();
     app_data.extend_from_slice(&cert_hash);
 
-    // Step 3: SEC_CHANNEL_BINDINGS structure (MS-NLMP 2.2.2.2)
-    // 8 fields × 4 bytes = 32 bytes header, then application data
-    let mut bindings = Vec::with_capacity(32 + app_data.len());
-    bindings.extend_from_slice(&0u32.to_le_bytes()); // dwInitiatorAddrType
-    bindings.extend_from_slice(&0u32.to_le_bytes()); // cbInitiatorLength
-    bindings.extend_from_slice(&0u32.to_le_bytes()); // dwInitiatorOffset
-    bindings.extend_from_slice(&0u32.to_le_bytes()); // dwAcceptorAddrType
-    bindings.extend_from_slice(&0u32.to_le_bytes()); // cbAcceptorLength
-    bindings.extend_from_slice(&0u32.to_le_bytes()); // dwAcceptorOffset
-    bindings.extend_from_slice(&(app_data.len() as u32).to_le_bytes()); // cbApplicationDataLength
-    bindings.extend_from_slice(&32u32.to_le_bytes()); // dwApplicationDataOffset
+    // Step 3: Build gss_channel_bindings_struct per RFC 2744 §3.11
+    // Format (as used by SSPI/pyspnego, NOT the Windows SEC_CHANNEL_BINDINGS struct):
+    //   [initiator_addrtype:u32 LE][initiator_len:u32 LE][initiator_data]
+    //   [acceptor_addrtype:u32 LE][acceptor_len:u32 LE][acceptor_data]
+    //   [application_data_len:u32 LE][application_data]
+    // For TLS-only CBT, initiator and acceptor are empty (length 0).
+    let mut bindings = Vec::with_capacity(20 + app_data.len());
+    bindings.extend_from_slice(&0u32.to_le_bytes()); // initiator addrtype = 0
+    bindings.extend_from_slice(&0u32.to_le_bytes()); // initiator length = 0
+    bindings.extend_from_slice(&0u32.to_le_bytes()); // acceptor addrtype = 0
+    bindings.extend_from_slice(&0u32.to_le_bytes()); // acceptor length = 0
+    bindings.extend_from_slice(&(app_data.len() as u32).to_le_bytes()); // app_data length
     bindings.extend_from_slice(&app_data);
 
-    // Step 4: MD5 of the whole structure
+    // Step 4: MD5 of the entire gss_channel_bindings_struct
     let md5_result = Md5::digest(&bindings);
     let mut output = [0u8; 16];
     output.copy_from_slice(&md5_result);

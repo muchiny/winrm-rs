@@ -719,6 +719,136 @@ fn test_client_https_ntlm() -> Option<(WinrmClient, String)> {
 
 #[tokio::test]
 #[ignore]
+async fn enable_credssp_server() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let script = r#"
+        Set-Item -Path WSMan:\localhost\Service\Auth\CredSSP -Value $true
+        (Get-Item WSMan:\localhost\Service\Auth\CredSSP).Value
+    "#;
+    let output = client.run_powershell(&host, script).await.expect("enable credssp");
+    eprintln!("CredSSP enabled: {}", String::from_utf8_lossy(&output.stdout).trim());
+}
+
+#[tokio::test]
+#[ignore]
+async fn enable_cbt_hardening_strict() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let script = r#"
+        Set-Item -Path WSMan:\localhost\Service\CbtHardeningLevel -Value Strict
+        (Get-Item WSMan:\localhost\Service\CbtHardeningLevel).Value
+    "#;
+    let output = client.run_powershell(&host, script).await.expect("set cbt level");
+    eprintln!("CBT level: {}", String::from_utf8_lossy(&output.stdout).trim());
+}
+
+#[tokio::test]
+#[ignore]
+async fn compute_server_cbt_hash() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let script = r#"
+        $listener = Get-ChildItem WSMan:\localhost\Listener | Where-Object { (Get-ChildItem $_.PSPath | Where-Object Name -eq Transport).Value -eq 'HTTPS' }
+        $thumb = (Get-ChildItem $listener.PSPath | Where-Object Name -eq CertificateThumbprint).Value
+        $cert = Get-ChildItem Cert:\LocalMachine\My | Where-Object Thumbprint -eq $thumb
+        $der = $cert.RawData
+        $sha256 = [System.Security.Cryptography.SHA256]::Create()
+        $hash = $sha256.ComputeHash($der)
+        @{
+            CertSize = $der.Length
+            CertSha256 = ($hash | ForEach-Object { $_.ToString("x2") }) -join ""
+        } | ConvertTo-Json -Compress
+    "#;
+    let output = client.run_powershell(&host, script).await.expect("compute hash");
+    eprintln!("Server cert info: {}", String::from_utf8_lossy(&output.stdout).trim());
+}
+
+#[tokio::test]
+#[ignore]
+async fn dump_https_cert_info() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let script = r#"
+        $listener = Get-ChildItem WSMan:\localhost\Listener | Where-Object { (Get-ChildItem $_.PSPath | Where-Object Name -eq Transport).Value -eq 'HTTPS' }
+        $thumb = (Get-ChildItem $listener.PSPath | Where-Object Name -eq CertificateThumbprint).Value
+        $cert = Get-ChildItem Cert:\LocalMachine\My | Where-Object Thumbprint -eq $thumb
+        @{
+            Thumbprint = $cert.Thumbprint
+            Subject = $cert.Subject
+            SignatureAlgorithm = $cert.SignatureAlgorithm.FriendlyName
+            PublicKey = $cert.PublicKey.Oid.FriendlyName
+        } | ConvertTo-Json -Compress
+    "#;
+    let output = client.run_powershell(&host, script).await.expect("dump cert");
+    eprintln!("HTTPS cert: {}", String::from_utf8_lossy(&output.stdout).trim());
+}
+
+#[tokio::test]
+#[ignore]
+async fn dump_winrm_service_config() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let script = r#"
+        $svc = Get-Item WSMan:\localhost\Service
+        $auth = Get-ChildItem WSMan:\localhost\Service\Auth | ForEach-Object { @{Name=$_.Name; Value=$_.Value} }
+        @{
+            AllowUnencrypted = (Get-Item WSMan:\localhost\Service\AllowUnencrypted).Value
+            CbtHardeningLevel = (Get-Item WSMan:\localhost\Service\CbtHardeningLevel -ErrorAction SilentlyContinue).Value
+            Auth = $auth
+        } | ConvertTo-Json -Compress -Depth 3
+    "#;
+    let output = client.run_powershell(&host, script).await.expect("dump config");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    eprintln!("WinRM config: {}", stdout.trim());
+}
+
+#[tokio::test]
+#[ignore]
+async fn basic_over_https_works() {
+    let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    let pass = std::env::var("WINRM_TEST_PASS").expect("WINRM_TEST_PASS");
+    let port: u16 = std::env::var("WINRM_TEST_HTTPS_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(55986);
+
+    let config = WinrmConfig {
+        auth_method: AuthMethod::Basic,
+        use_tls: true,
+        accept_invalid_certs: true,
+        port,
+        ..Default::default()
+    };
+    let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
+    let output = client.run_command(&host, "whoami", &[]).await.expect("basic over https");
+    assert_eq!(output.exit_code, 0);
+}
+
+#[cfg(feature = "credssp")]
+#[tokio::test]
+#[ignore]
+async fn credssp_run_command_whoami() {
+    let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    let pass = std::env::var("WINRM_TEST_PASS").expect("WINRM_TEST_PASS");
+    let port: u16 = std::env::var("WINRM_TEST_HTTPS_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(55986);
+
+    let config = WinrmConfig {
+        auth_method: AuthMethod::CredSsp,
+        use_tls: true,
+        accept_invalid_certs: true,
+        port,
+        ..Default::default()
+    };
+    let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
+    let output = client.run_command(&host, "whoami", &[]).await.expect("credssp whoami");
+    assert_eq!(output.exit_code, 0);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.trim().is_empty());
+}
+
+#[tokio::test]
+#[ignore]
 async fn ntlm_over_https_with_cbt() {
     let (client, host) =
         test_client_https_ntlm().expect("set WINRM_TEST_HOST, WINRM_TEST_PASS, WINRM_TEST_HTTPS_PORT");

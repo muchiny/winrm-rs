@@ -144,18 +144,12 @@ impl AuthTransport for NtlmAuth {
             self.domain.clone()
         };
 
-        // Use _with_key variant to get the session key for sealing
         let (type3, session_key) = if let Some(cert_der) = self.cert_handle.as_ref().and_then(|h| h.get()) {
             let cbt = crate::ntlm::crypto::compute_channel_bindings(&cert_der);
-            // CBT + key: build type3 with CBT and extract key
-            let (msg, key) = ntlm::create_authenticate_message_with_key(
-                &challenge, &self.username, &self.password, &domain,
-            );
-            // Re-create with CBT (we need both CBT and key — use internal fn via with_key)
             let msg_cbt = ntlm::create_authenticate_message_with_cbt(
                 &challenge, &self.username, &self.password, &domain, cbt,
             );
-            (msg_cbt, key)
+            (msg_cbt, [0u8; 16])
         } else {
             ntlm::create_authenticate_message_with_key(
                 &challenge, &self.username, &self.password, &domain,
@@ -183,7 +177,7 @@ impl AuthTransport for NtlmAuth {
 
         if resp.status().as_u16() == 401 {
             return Err(WinrmError::AuthFailed(
-                "NTLM authentication rejected (bad credentials?)".into(),
+                "NTLM authentication rejected (bad credentials or CBT mismatch)".into(),
             ));
         }
 

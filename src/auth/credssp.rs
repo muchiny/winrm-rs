@@ -352,13 +352,9 @@ impl AuthTransport for CredSspAuth {
         let challenge = ntlm::parse_challenge(&type2).map_err(WinrmError::Ntlm)?;
 
         // === Step 6: Build NTLM Type 3 + pubKeyAuth + clientNonce ===
-        // NTOWFv2 hash uses target_domain (server's NetBIOS name) for local accounts.
-        // Type 3 Domain SB stays empty (matches pywinrm structure).
-        let domain = if self.domain.is_empty() {
-            challenge.target_domain.clone()
-        } else {
-            self.domain.clone()
-        };
+        // CONFIRMED via forensic hash analysis: pywinrm uses username.upper()+empty
+        // for NTOWFv2 (NTProofStr matches when computed this way). Empty domain.
+        let domain = self.domain.clone();
         // Compute SPN from URL hostname
         let host = url
             .strip_prefix("https://")

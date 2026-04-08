@@ -53,13 +53,17 @@ fn create_negotiate_message_with_flags(flags: u32, include_version: bool) -> Vec
     msg.extend_from_slice(SIGNATURE); // 0-7: signature
     msg.extend_from_slice(&1u32.to_le_bytes()); // 8-11: type
     msg.extend_from_slice(&flags.to_le_bytes()); // 12-15: flags
-    // Domain security buffer (empty): len=0, max=0, offset=0
-    msg.extend_from_slice(&[0u8; 8]); // 16-23
-    // Workstation security buffer (empty)
-    msg.extend_from_slice(&[0u8; 8]); // 24-31
+    // Domain/workstation SBs: empty (len=0) but offset = end-of-header (matches pywinrm).
+    let sb_offset: u32 = if include_version { 40 } else { 32 };
+    msg.extend_from_slice(&0u16.to_le_bytes()); // domain len
+    msg.extend_from_slice(&0u16.to_le_bytes()); // domain max
+    msg.extend_from_slice(&sb_offset.to_le_bytes()); // domain offset
+    msg.extend_from_slice(&0u16.to_le_bytes()); // ws len
+    msg.extend_from_slice(&0u16.to_le_bytes()); // ws max
+    msg.extend_from_slice(&sb_offset.to_le_bytes()); // ws offset
     if include_version {
         // Version (MS-NLMP 2.2.2.10): MajorVer=10, MinorVer=0, BuildNumber=0, NTLMRevision=15
-        msg.extend_from_slice(&[10, 0, 0, 0, 0, 0, 0, 15]); // 32-39
+        msg.extend_from_slice(&[0, 12, 1, 0, 0, 0, 0, 15]); // 32-39
     }
     msg
 }
@@ -155,7 +159,13 @@ pub(crate) fn create_authenticate_message_full(
     let nt_hash = compute_nt_hash(password);
     let ntlmv2_hash = compute_ntlmv2_hash(&nt_hash, username, domain);
 
-    let client_challenge: [u8; 8] = rand::random();
+    let client_challenge: [u8; 8] = std::env::var("CREDSSP_FIXED_CC")
+        .ok()
+        .and_then(|s| {
+            let bytes = (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i+2], 16).ok()).collect::<Option<Vec<_>>>()?;
+            bytes.try_into().ok()
+        })
+        .unwrap_or_else(rand::random);
     let timestamp = challenge.timestamp.unwrap_or_else(current_windows_filetime);
 
     // Build target_info: start from server's, optionally inject CBT,
@@ -206,7 +216,13 @@ pub(crate) fn create_authenticate_message_full(
     // If NEGOTIATE_KEY_EXCH: generate random ExportedSessionKey, encrypt with RC4
     // Otherwise: ExportedSessionKey = KeyExchangeKey
     let (exported_session_key, encrypted_random_session_key) = if with_key_exch {
-        let random_key: [u8; 16] = rand::random();
+        let random_key: [u8; 16] = std::env::var("CREDSSP_FIXED_RSK")
+            .ok()
+            .and_then(|s| {
+                let bytes = (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i+2], 16).ok()).collect::<Option<Vec<_>>>()?;
+                bytes.try_into().ok()
+            })
+            .unwrap_or_else(rand::random);
         let mut encrypted = random_key;
         let mut rc4 = Rc4State::new(&key_exchange_key);
         rc4.process(&mut encrypted);
@@ -221,13 +237,21 @@ pub(crate) fn create_authenticate_message_full(
     nt_response.extend_from_slice(&blob);
 
     // LM response
-    let mut lm_input = Vec::with_capacity(16);
-    lm_input.extend_from_slice(&challenge.server_challenge);
-    lm_input.extend_from_slice(&client_challenge);
-    let lm_hash = hmac_md5(&ntlmv2_hash, &lm_input);
-    let mut lm_response = Vec::with_capacity(24);
-    lm_response.extend_from_slice(&lm_hash);
-    lm_response.extend_from_slice(&client_challenge);
+    // When a MIC is required (CredSSP / NTLMv2 with timestamp present in target_info)
+    // the LM response MUST be 24 zero bytes to prevent replay attacks (MS-NLMP 3.1.5.1.2,
+    // and matches pyspnego._ntlm._compute_response).
+    let lm_response: Vec<u8> = if mic_input.is_some() {
+        vec![0u8; 24]
+    } else {
+        let mut lm_input = Vec::with_capacity(16);
+        lm_input.extend_from_slice(&challenge.server_challenge);
+        lm_input.extend_from_slice(&client_challenge);
+        let lm_hash = hmac_md5(&ntlmv2_hash, &lm_input);
+        let mut v = Vec::with_capacity(24);
+        v.extend_from_slice(&lm_hash);
+        v.extend_from_slice(&client_challenge);
+        v
+    };
 
     // Domain shown in the Type 3 SB (may differ from `domain` used for the hash)
     let domain_for_sb = display_domain.unwrap_or(domain);
@@ -289,7 +313,7 @@ pub(crate) fn create_authenticate_message_full(
     write_security_buffer(&mut msg, encrypted_random_session_key.len() as u16, session_offset);
     msg.extend_from_slice(&flags.to_le_bytes());
     if include_version {
-        msg.extend_from_slice(&[10, 0, 0, 0, 0, 0, 0, 15]);
+        msg.extend_from_slice(&[0, 12, 1, 0, 0, 0, 0, 15]);
     }
     let mic_pos = msg.len();
     if include_mic {
@@ -312,9 +336,26 @@ pub(crate) fn create_authenticate_message_full(
         input.extend_from_slice(&msg);
         let mic = hmac_md5(&exported_session_key, &input);
         msg[mic_pos..mic_pos + 16].copy_from_slice(&mic);
+
+        if std::env::var("CREDSSP_DEBUG").is_ok() {
+            eprintln!("[CREDSSP_DEBUG] type1 ({}B): {}", type1.len(), hex(type1));
+            eprintln!("[CREDSSP_DEBUG] type2 ({}B): {}", type2.len(), hex(type2));
+            eprintln!("[CREDSSP_DEBUG] type3 ({}B): {}", msg.len(), hex(&msg));
+            eprintln!("[CREDSSP_DEBUG] nt_proof: {}", hex(&nt_proof_str));
+            eprintln!("[CREDSSP_DEBUG] session_base_key: {}", hex(&session_base_key));
+            eprintln!("[CREDSSP_DEBUG] exported_session_key: {}", hex(&exported_session_key));
+            eprintln!("[CREDSSP_DEBUG] enc_random_sk: {}", hex(&encrypted_random_session_key));
+            eprintln!("[CREDSSP_DEBUG] mic: {}", hex(&mic));
+            eprintln!("[CREDSSP_DEBUG] client_challenge: {}", hex(&client_challenge));
+            eprintln!("[CREDSSP_DEBUG] timestamp: {}", hex(&timestamp));
+        }
     }
 
     (msg, exported_session_key)
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{:02x}", x)).collect()
 }
 
 /// Create an NTLM Type 3 (Authenticate) message (MS-NLMP 2.2.1.3).
@@ -782,5 +823,166 @@ mod tests {
         // Both should be valid Type 3
         assert_eq!(&without[0..8], SIGNATURE);
         assert_eq!(&with_cbt[0..8], SIGNATURE);
+    }
+
+    fn build_test_challenge_for_credssp() -> ChallengeMessage {
+        // Build a Type 2 with target_info containing standard AV pairs
+        let mut target_info = Vec::new();
+        // AV_NB_DOMAIN_NAME (2)
+        target_info.extend_from_slice(&2u16.to_le_bytes());
+        target_info.extend_from_slice(&30u16.to_le_bytes());
+        target_info.extend_from_slice(&to_utf16le("WIN-TTSTANUQ08S"));
+        // AV_TIMESTAMP (7)
+        target_info.extend_from_slice(&7u16.to_le_bytes());
+        target_info.extend_from_slice(&8u16.to_le_bytes());
+        target_info.extend_from_slice(&[0xAA; 8]);
+        // AV_EOL
+        target_info.extend_from_slice(&[0u8; 4]);
+
+        let mut msg = vec![0u8; 32];
+        msg[0..8].copy_from_slice(b"NTLMSSP\0");
+        msg[8..12].copy_from_slice(&2u32.to_le_bytes());
+        // negotiate flags include CredSSP-required bits
+        msg[20..24].copy_from_slice(&0xe28a8235u32.to_le_bytes());
+        msg[24..32].copy_from_slice(&[0xCC; 8]);
+        // Append target_info at offset 32
+        let ti_off = msg.len() as u32;
+        let ti_len = target_info.len() as u16;
+        msg.extend_from_slice(&target_info);
+        // Set target_info SB (offset 40-47)
+        msg[40..42].copy_from_slice(&ti_len.to_le_bytes());
+        msg[42..44].copy_from_slice(&ti_len.to_le_bytes());
+        msg[44..48].copy_from_slice(&ti_off.to_le_bytes());
+
+        parse_challenge(&msg).unwrap()
+    }
+
+    #[test]
+    fn create_negotiate_message_credssp_has_credssp_flags() {
+        let msg = create_negotiate_message_credssp();
+        assert_eq!(msg.len(), 40, "should be 40 bytes (32 base + 8 version)");
+        assert_eq!(&msg[0..8], SIGNATURE);
+        let flags = u32::from_le_bytes([msg[12], msg[13], msg[14], msg[15]]);
+        // Must include KEY_EXCH, SEAL, SIGN, 128, 56, VERSION
+        assert_ne!(flags & 0x40000000, 0, "NEGOTIATE_KEY_EXCH");
+        assert_ne!(flags & 0x00000020, 0, "NEGOTIATE_SEAL");
+        assert_ne!(flags & 0x00000010, 0, "NEGOTIATE_SIGN");
+        assert_ne!(flags & 0x20000000, 0, "NEGOTIATE_128");
+        assert_ne!(flags & 0x80000000, 0, "NEGOTIATE_56");
+        assert_ne!(flags & 0x02000000, 0, "NEGOTIATE_VERSION");
+    }
+
+    #[test]
+    fn create_authenticate_message_credssp_has_random_session_key() {
+        let challenge = build_test_challenge_for_credssp();
+        let type1 = create_negotiate_message_credssp();
+        let type2_bytes = vec![0u8; 32]; // dummy
+
+        let (msg1, key1) = create_authenticate_message_credssp(
+            &challenge, "vagrant", "vagrant", "", "HTTP/host", &type1, &type2_bytes,
+        );
+        let (msg2, key2) = create_authenticate_message_credssp(
+            &challenge, "vagrant", "vagrant", "", "HTTP/host", &type1, &type2_bytes,
+        );
+        // Random session keys must differ between calls
+        assert_ne!(key1, key2, "session keys should be random");
+        // But messages should have same structure (different content)
+        assert_eq!(msg1.len(), msg2.len());
+    }
+
+    #[test]
+    fn create_authenticate_message_credssp_includes_session_key_sb() {
+        let challenge = build_test_challenge_for_credssp();
+        let type1 = create_negotiate_message_credssp();
+        let type2_bytes = vec![0u8; 32];
+
+        let (msg, _) = create_authenticate_message_credssp(
+            &challenge, "vagrant", "vagrant", "", "HTTP/host", &type1, &type2_bytes,
+        );
+        // Session SB at offset 52: should have len=16
+        let sk_len = u16::from_le_bytes([msg[52], msg[53]]);
+        assert_eq!(sk_len, 16, "EncryptedRandomSessionKey is 16 bytes");
+    }
+
+    #[test]
+    fn create_authenticate_message_credssp_uses_server_flags() {
+        let challenge = build_test_challenge_for_credssp();
+        let type1 = create_negotiate_message_credssp();
+        let type2_bytes = vec![0u8; 32];
+
+        let (msg, _) = create_authenticate_message_credssp(
+            &challenge, "vagrant", "vagrant", "", "HTTP/host", &type1, &type2_bytes,
+        );
+        // Type 3 flags at offset 60
+        let flags = u32::from_le_bytes([msg[60], msg[61], msg[62], msg[63]]);
+        // Should include the server's flags + required CredSSP bits
+        assert_ne!(flags & 0x40000000, 0, "NEGOTIATE_KEY_EXCH");
+        assert_ne!(flags & 0x00000020, 0, "NEGOTIATE_SEAL");
+    }
+
+    #[test]
+    fn create_authenticate_message_credssp_has_version_field() {
+        let challenge = build_test_challenge_for_credssp();
+        let type1 = create_negotiate_message_credssp();
+        let type2_bytes = vec![0u8; 32];
+
+        let (msg, _) = create_authenticate_message_credssp(
+            &challenge, "vagrant", "vagrant", "", "HTTP/host", &type1, &type2_bytes,
+        );
+        // Version field at offset 64-71
+        // NTLMRevision = 15 (0x0f) at byte 71
+        assert_eq!(msg[71], 0x0f, "NTLMRevision should be 15");
+    }
+
+    #[test]
+    fn create_authenticate_message_credssp_has_mic() {
+        let challenge = build_test_challenge_for_credssp();
+        let type1 = create_negotiate_message_credssp();
+        let type2_bytes = vec![0u8; 32];
+
+        let (msg, _) = create_authenticate_message_credssp(
+            &challenge, "vagrant", "vagrant", "", "HTTP/host", &type1, &type2_bytes,
+        );
+        // MIC at offset 72-87 (after version field)
+        let mic = &msg[72..88];
+        // MIC should not be all zeros (it was computed)
+        assert!(mic.iter().any(|&b| b != 0), "MIC should be non-zero");
+    }
+
+    #[test]
+    fn create_authenticate_message_credssp_target_info_has_av_target_name() {
+        let challenge = build_test_challenge_for_credssp();
+        let type1 = create_negotiate_message_credssp();
+        let type2_bytes = vec![0u8; 32];
+
+        let (msg, _) = create_authenticate_message_credssp(
+            &challenge, "vagrant", "vagrant", "", "HTTP/somehost", &type1, &type2_bytes,
+        );
+        // The NT response contains the blob with AV pairs including AV_TARGET_NAME
+        // Just check that "somehost" UTF-16LE bytes appear somewhere in the message
+        let target_utf16 = to_utf16le("somehost");
+        let found = msg.windows(target_utf16.len()).any(|w| w == target_utf16);
+        assert!(found, "AV_TARGET_NAME should contain 'somehost'");
+    }
+
+    #[test]
+    fn create_authenticate_message_credssp_domain_sb_uses_display_domain() {
+        let challenge = build_test_challenge_for_credssp();
+        let type1 = create_negotiate_message_credssp();
+        let type2_bytes = vec![0u8; 32];
+
+        // pass non-empty domain to hash
+        let (msg, _) = create_authenticate_message_credssp(
+            &challenge, "vagrant", "vagrant", "DOMAIN", "HTTP/host", &type1, &type2_bytes,
+        );
+        // Domain SB at offset 28: should be 0 because display_domain is empty
+        let dom_len = u16::from_le_bytes([msg[28], msg[29]]);
+        assert_eq!(dom_len, 0, "Type 3 Domain SB should be empty for CredSSP");
+    }
+
+    #[test]
+    fn create_negotiate_message_default_no_version() {
+        let msg = create_negotiate_message();
+        assert_eq!(msg.len(), 32, "default Type 1 is 32 bytes (no version)");
     }
 }

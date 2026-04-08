@@ -421,6 +421,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn enumerate_wql_request_default_namespace() {
+        let xml = enumerate_wql_request("http://h:5985/wsman", "SELECT * FROM Win32_Service", None, 60, 153600);
+        assert!(xml.contains("wbem/wsman/1/wmi/root/cimv2/*"));
+        assert!(xml.contains("SELECT * FROM Win32_Service"));
+        assert!(xml.contains("OptimizeEnumeration"));
+        assert!(xml.contains("Enumerate"));
+    }
+
+    #[test]
+    fn enumerate_wql_request_custom_namespace_and_escapes() {
+        let xml = enumerate_wql_request("http://h/wsman", "a < b & c", Some("root/StandardCimv2"), 30, 153600);
+        assert!(xml.contains("root/StandardCimv2"));
+        assert!(xml.contains("a &lt; b &amp; c"));
+    }
+
+    #[test]
+    fn pull_request_includes_context() {
+        let xml = pull_request("http://h/wsman", "ctx-<id>", 60, 153600);
+        assert!(xml.contains("Pull"));
+        assert!(xml.contains("ctx-&lt;id&gt;"));
+        assert!(xml.contains("EnumerationContext"));
+    }
+
+    #[test]
     fn create_shell_contains_required_elements() {
         let xml = create_shell_request("http://host:5985/wsman", &crate::config::WinrmConfig::default());
         assert!(xml.contains("transfer/Create"));

@@ -165,12 +165,31 @@ pub(crate) fn encode_spnego_init(ntlm_token: &[u8]) -> Vec<u8> {
 }
 
 /// Wrap an NTLM Type 3 message in SPNEGO NegTokenResp (RFC 4178).
-pub(crate) fn encode_spnego_response(ntlm_token: &[u8]) -> Vec<u8> {
+///
+/// `mech_list_mic` if Some is the 16-byte NTLMSSP signature computed over
+/// the encoded mech_type_list (DER SEQUENCE OF OID containing NTLM). It is
+/// REQUIRED by Windows CredSSP servers — without it the server returns
+/// STATUS_LOGON_FAILURE / SubStatus 0xC000006A.
+pub(crate) fn encode_spnego_response(ntlm_token: &[u8], mech_list_mic: Option<&[u8]>) -> Vec<u8> {
+    // negState: [0] ENUMERATED (1 = accept-incomplete)
+    let neg_state = encode_context_tag(0, &[0x0a, 0x01, 0x01]);
     // responseToken: [2] OCTET STRING
     let resp_token = encode_context_tag(2, &encode_octet_string(ntlm_token));
-    // NegTokenResp ::= [1] SEQUENCE { responseToken }
-    encode_context_tag(1, &encode_sequence(&resp_token))
+    let mut contents = Vec::new();
+    contents.extend_from_slice(&neg_state);
+    contents.extend_from_slice(&resp_token);
+    if let Some(mic) = mech_list_mic {
+        // mechListMIC: [3] OCTET STRING
+        contents.extend_from_slice(&encode_context_tag(3, &encode_octet_string(mic)));
+    }
+    encode_context_tag(1, &encode_sequence(&contents))
 }
+
+/// DER-encoded mech_type_list containing only NTLM OID — used as input to
+/// the SPNEGO mechListMIC HMAC. Matches `pack_mech_type_list([NTLM])` in pyspnego.
+pub(crate) const MECH_TYPE_LIST_NTLM: &[u8] = &[
+    0x30, 0x0c, 0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a,
+];
 
 // --- DER Decoding Primitives ---
 
@@ -434,7 +453,7 @@ mod tests {
     #[test]
     fn spnego_response_roundtrip() {
         let ntlm_token = b"test_ntlm_type3_token";
-        let wrapped = encode_spnego_response(ntlm_token);
+        let wrapped = encode_spnego_response(ntlm_token, None);
         let unwrapped = decode_spnego_token(&wrapped).unwrap();
         assert_eq!(unwrapped, ntlm_token);
     }

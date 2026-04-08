@@ -48,7 +48,10 @@ impl HttpTransport {
             .danger_accept_invalid_certs(config.accept_invalid_certs)
             .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
             .timeout(Duration::from_secs(config.operation_timeout_secs + 10))
-            .pool_max_idle_per_host(1)
+            .http1_only()
+            .tcp_keepalive(Duration::from_secs(60))
+            .pool_max_idle_per_host(10)
+            .pool_idle_timeout(Duration::from_secs(90))
             .user_agent(
                 config
                     .user_agent

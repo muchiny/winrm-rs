@@ -199,3 +199,75 @@ impl AuthTransport for NtlmAuth {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ntlm::NtlmSession;
+
+    #[test]
+    fn seal_body_produces_multipart_format() {
+        let mut session = NtlmSession::from_auth(&[0xAB; 16]);
+        let body = "<soap>hello</soap>";
+        let (content_type, mime_body) = seal_body(&mut session, body);
+
+        // Content-Type should be multipart/encrypted with HTTP-SPNEGO
+        assert!(content_type.contains("multipart/encrypted"));
+        assert!(content_type.contains("HTTP-SPNEGO-session-encrypted"));
+        assert!(content_type.contains("Encrypted Boundary"));
+
+        // Body should contain the boundary marker
+        let body_str = String::from_utf8_lossy(&mime_body);
+        assert!(body_str.contains("--Encrypted Boundary"));
+        assert!(body_str.contains("application/HTTP-SPNEGO-session-encrypted"));
+        assert!(body_str.contains("application/octet-stream"));
+        assert!(body_str.contains(&format!("Length={}", body.len())));
+    }
+
+    #[test]
+    fn seal_body_includes_signature_length_prefix() {
+        let mut session = NtlmSession::from_auth(&[0xCD; 16]);
+        let (_, mime_body) = seal_body(&mut session, "test");
+        // Find the octet-stream marker, the next 4 bytes are the signature length (LE u32 = 16)
+        let marker = b"application/octet-stream\r\n";
+        let pos = mime_body
+            .windows(marker.len())
+            .position(|w| w == marker)
+            .expect("octet-stream marker present");
+        let sig_len_bytes = &mime_body[pos + marker.len()..pos + marker.len() + 4];
+        let sig_len = u32::from_le_bytes([
+            sig_len_bytes[0],
+            sig_len_bytes[1],
+            sig_len_bytes[2],
+            sig_len_bytes[3],
+        ]);
+        assert_eq!(sig_len, 16, "NTLM signature is always 16 bytes");
+    }
+
+    #[test]
+    fn seal_body_ends_with_closing_boundary() {
+        let mut session = NtlmSession::from_auth(&[0xEF; 16]);
+        let (_, mime_body) = seal_body(&mut session, "x");
+        let body_str = String::from_utf8_lossy(&mime_body);
+        assert!(body_str.trim_end().ends_with("--Encrypted Boundary--"));
+    }
+
+    #[test]
+    fn unseal_body_rejects_missing_octet_stream_marker() {
+        let mut session = NtlmSession::from_auth(&[0u8; 16]);
+        let bad = b"no marker here";
+        let result = unseal_body(&mut session, bad);
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("octet-stream marker"));
+    }
+
+    #[test]
+    fn unseal_body_rejects_truncated_data() {
+        let mut session = NtlmSession::from_auth(&[0u8; 16]);
+        // Has the marker but no signature length after
+        let bad = b"application/octet-stream\r\n\x01\x02";
+        let result = unseal_body(&mut session, bad);
+        assert!(result.is_err());
+    }
+}

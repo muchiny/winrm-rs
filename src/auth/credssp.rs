@@ -18,10 +18,23 @@
 // - NTLM Type 1 → Type 2 exchange wrapped in TLS-encrypted TSRequest
 // - SubjectPublicKey extraction from inner TLS server cert
 //
-// **Failing (debug needed against real server with Wireshark):**
-// - After sending NTLM Type 3 + pubKeyAuth, the server returns 401 without
-//   a CredSSP token, indicating it has abandoned the session. The exact
-//   cause requires byte-level comparison with a working pywinrm session.
+// **Working:**
+// - Inner TLS handshake (rustls in memory) — completes in 2 rounds
+// - NTLM Type 1 with CredSSP-required flags (KEY_EXCH, SEAL, SIGN, 128, 56)
+// - NTLM Type 1 → 2 exchange wrapped in TLS-encrypted TSRequest
+// - Server accepts our Type 1 and returns valid Type 2 challenge
+//
+// **Remaining work (validated against pywinrm reference capture):**
+// - NTLM Type 3 must use the same CredSSP flags as Type 1 (currently uses
+//   default TYPE1_FLAGS without KEY_EXCH/SEAL)
+// - Type 3 must include EncryptedRandomSessionKey (NEGOTIATE_KEY_EXCH):
+//   generate 16 random bytes, encrypt with RC4(KeyExchangeKey), put in
+//   the session_key security buffer of Type 3
+// - This requires refactoring create_authenticate_message_internal() to
+//   accept custom flags and generate the encrypted session key
+//
+// Server currently returns SEC_E_INVALID_TOKEN (0x80090308) because our
+// Type 3 has incompatible flags with the Type 1 we sent.
 //
 // Use Basic, NTLM (with HTTPS+CBT for EPA), Kerberos, or Certificate
 // authentication for production. CredSSP is provided as a foundation for
@@ -170,26 +183,26 @@ pub(crate) struct CredSspAuth {
 
 #[cfg(feature = "credssp")]
 impl CredSspAuth {
-    /// Send the current outgoing TLS bytes (or empty if just polling) and
-    /// return the server's response token (decoded from base64).
+    /// Send the current outgoing TLS bytes with the SOAP body (always).
+    ///
+    /// pywinrm sends the SOAP body in EVERY HTTP round during CredSSP auth.
+    /// This appears to be required by the WinRM CredSSP integration on Windows.
     async fn http_round(
         http: &reqwest::Client,
         url: &str,
         outgoing: &[u8],
-        body: Option<String>,
+        body: &str,
     ) -> Result<reqwest::Response, WinrmError> {
         let auth_value = format!("CredSSP {}", B64.encode(outgoing));
-        let mut req = http
+        http
             .post(url)
             .header(CONTENT_TYPE, "application/soap+xml;charset=UTF-8")
             .header(AUTHORIZATION, &auth_value)
-            .header("Connection", "Keep-Alive");
-        if let Some(b) = body {
-            req = req.body(b);
-        } else {
-            req = req.header("Content-Length", "0");
-        }
-        req.send().await.map_err(WinrmError::Http)
+            .header("Connection", "Keep-Alive")
+            .body(body.to_string())
+            .send()
+            .await
+            .map_err(WinrmError::Http)
     }
 }
 
@@ -202,11 +215,12 @@ impl AuthTransport for CredSspAuth {
         body: String,
     ) -> Result<String, WinrmError> {
         // === Step 0: Primer — discover that the server advertises CredSSP ===
+        // pywinrm sends the SOAP body in this primer too (no Authorization header)
         let primer = http
             .post(url)
             .header(CONTENT_TYPE, "application/soap+xml;charset=UTF-8")
-            .header("Content-Length", "0")
             .header("Connection", "Keep-Alive")
+            .body(body.clone())
             .send()
             .await
             .map_err(WinrmError::Http)?;
@@ -264,7 +278,7 @@ impl AuthTransport for CredSspAuth {
                 ));
             }
 
-            let resp = Self::http_round(http, url, &outgoing, None).await?;
+            let resp = Self::http_round(http, url, &outgoing, &body).await?;
             if resp.status().as_u16() != 401 {
                 return Err(WinrmError::AuthFailed(format!(
                     "CredSSP: TLS handshake round {round}: expected 401, got {}",
@@ -300,7 +314,9 @@ impl AuthTransport for CredSspAuth {
             .map_err(WinrmError::CredSsp)?;
 
         // === Step 4: Inner TLS established. Build NTLM Type 1 in TSRequest ===
-        let type1 = ntlm::create_negotiate_message();
+        // Use the CredSSP-specific Type 1 with KEY_EXCH/SEAL/SIGN flags required
+        // for the sealing of pubKeyAuth and TSCredentials.
+        let type1 = ntlm::create_negotiate_message_credssp();
         let spnego_init = asn1::encode_spnego_init(&type1);
         let ts_req1 =
             asn1::encode_ts_request(CREDSSP_VERSION, Some(&spnego_init), None, None, None);
@@ -308,7 +324,7 @@ impl AuthTransport for CredSspAuth {
         let outgoing = drain_tls_output(&mut inner_tls)?;
 
         // Send through HTTP
-        let resp = Self::http_round(http, url, &outgoing, None).await?;
+        let resp = Self::http_round(http, url, &outgoing, &body).await?;
         if resp.status().as_u16() != 401 {
             return Err(WinrmError::AuthFailed(format!(
                 "CredSSP: NTLM negotiate: expected 401, got {}", resp.status()
@@ -370,7 +386,7 @@ impl AuthTransport for CredSspAuth {
         tls_write_plaintext(&mut inner_tls, &ts_req3)?;
         let outgoing = drain_tls_output(&mut inner_tls)?;
 
-        let resp = Self::http_round(http, url, &outgoing, None).await?;
+        let resp = Self::http_round(http, url, &outgoing, &body).await?;
         if resp.status().as_u16() != 401 {
             return Err(WinrmError::AuthFailed(format!(
                 "CredSSP: NTLM authenticate: expected 401, got {}", resp.status()
@@ -416,24 +432,15 @@ impl AuthTransport for CredSspAuth {
         tls_write_plaintext(&mut inner_tls, &ts_req5)?;
         let outgoing = drain_tls_output(&mut inner_tls)?;
 
-        let resp = Self::http_round(http, url, &outgoing, None).await?;
+        let resp = Self::http_round(http, url, &outgoing, &body).await?;
         if resp.status().as_u16() == 401 {
             return Err(WinrmError::AuthFailed(
                 "CredSSP: credentials rejected after delegation".into(),
             ));
         }
-        let _ = resp.bytes().await;
 
-        // === Step 9: Auth complete. Send the actual SOAP body ===
-        let resp = http
-            .post(url)
-            .header(CONTENT_TYPE, "application/soap+xml;charset=UTF-8")
-            .header("Connection", "Keep-Alive")
-            .body(body)
-            .send()
-            .await
-            .map_err(WinrmError::Http)?;
-
+        // The server processes auth + SOAP body in this same response.
+        // Status 200 = auth complete and SOAP processed, return the SOAP response.
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();

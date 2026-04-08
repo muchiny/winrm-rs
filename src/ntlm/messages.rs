@@ -35,14 +35,32 @@ pub struct ChallengeMessage {
 /// and negotiate flags requesting Unicode, NTLM, extended session security,
 /// and target name. Domain and workstation security buffers are empty.
 pub fn create_negotiate_message() -> Vec<u8> {
-    let mut msg = Vec::with_capacity(32);
+    create_negotiate_message_with_flags(TYPE1_FLAGS, false)
+}
+
+/// Create a Type 1 message for use inside CredSSP.
+///
+/// CredSSP requires NEGOTIATE_KEY_EXCH, NEGOTIATE_SEAL, NEGOTIATE_SIGN,
+/// NEGOTIATE_128, NEGOTIATE_56 to enable the sealing of pubKeyAuth and
+/// TSCredentials. Also includes NEGOTIATE_VERSION which adds the 8-byte
+/// OS version field at the end of the message (40 bytes total).
+pub fn create_negotiate_message_credssp() -> Vec<u8> {
+    create_negotiate_message_with_flags(TYPE1_FLAGS_CREDSSP, true)
+}
+
+fn create_negotiate_message_with_flags(flags: u32, include_version: bool) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(if include_version { 40 } else { 32 });
     msg.extend_from_slice(SIGNATURE); // 0-7: signature
     msg.extend_from_slice(&1u32.to_le_bytes()); // 8-11: type
-    msg.extend_from_slice(&TYPE1_FLAGS.to_le_bytes()); // 12-15: flags
+    msg.extend_from_slice(&flags.to_le_bytes()); // 12-15: flags
     // Domain security buffer (empty): len=0, max=0, offset=0
     msg.extend_from_slice(&[0u8; 8]); // 16-23
     // Workstation security buffer (empty)
     msg.extend_from_slice(&[0u8; 8]); // 24-31
+    if include_version {
+        // Version (MS-NLMP 2.2.2.10): MajorVer=10, MinorVer=0, BuildNumber=0, NTLMRevision=15
+        msg.extend_from_slice(&[10, 0, 0, 0, 0, 0, 0, 15]); // 32-39
+    }
     msg
 }
 

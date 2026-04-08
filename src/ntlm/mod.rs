@@ -10,7 +10,8 @@ pub(crate) mod messages;
 // Re-export public API
 pub use messages::{
     ChallengeMessage, create_authenticate_message, create_authenticate_message_with_cbt,
-    create_authenticate_message_with_key, create_negotiate_message, decode_challenge_header,
+    create_authenticate_message_with_key, create_negotiate_message,
+    create_negotiate_message_credssp, decode_challenge_header,
     encode_authorization, parse_challenge,
 };
 

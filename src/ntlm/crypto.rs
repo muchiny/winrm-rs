@@ -12,16 +12,38 @@ pub(crate) const SIGNATURE: &[u8; 8] = b"NTLMSSP\0";
 
 // Negotiate flags (MS-NLMP 2.2.2.5)
 pub(crate) const NEGOTIATE_UNICODE: u32 = 0x0000_0001;
+pub(crate) const NEGOTIATE_OEM: u32 = 0x0000_0002;
 pub(crate) const REQUEST_TARGET: u32 = 0x0000_0004;
+pub(crate) const NEGOTIATE_SIGN: u32 = 0x0000_0010;
+pub(crate) const NEGOTIATE_SEAL: u32 = 0x0000_0020;
 pub(crate) const NEGOTIATE_NTLM: u32 = 0x0000_0200;
 pub(crate) const NEGOTIATE_ALWAYS_SIGN: u32 = 0x0000_8000;
 pub(crate) const NEGOTIATE_EXTENDED_SESSIONSECURITY: u32 = 0x0008_0000;
+pub(crate) const NEGOTIATE_VERSION: u32 = 0x0200_0000;
+pub(crate) const NEGOTIATE_128: u32 = 0x2000_0000;
+pub(crate) const NEGOTIATE_KEY_EXCH: u32 = 0x4000_0000;
+pub(crate) const NEGOTIATE_56: u32 = 0x8000_0000;
 
 pub(crate) const TYPE1_FLAGS: u32 = NEGOTIATE_UNICODE
     | REQUEST_TARGET
     | NEGOTIATE_NTLM
     | NEGOTIATE_ALWAYS_SIGN
     | NEGOTIATE_EXTENDED_SESSIONSECURITY;
+
+/// Flags required for NTLM inside CredSSP — needs sealing/key exchange.
+/// Matches what pyspnego/Windows SSPI sends: 0xe2088237
+pub(crate) const TYPE1_FLAGS_CREDSSP: u32 = NEGOTIATE_UNICODE
+    | NEGOTIATE_OEM
+    | REQUEST_TARGET
+    | NEGOTIATE_SIGN
+    | NEGOTIATE_SEAL
+    | NEGOTIATE_NTLM
+    | NEGOTIATE_ALWAYS_SIGN
+    | NEGOTIATE_EXTENDED_SESSIONSECURITY
+    | NEGOTIATE_VERSION
+    | NEGOTIATE_128
+    | NEGOTIATE_KEY_EXCH
+    | NEGOTIATE_56;
 
 // AV_PAIR IDs (MS-NLMP 2.2.2.1)
 pub(crate) const AV_EOL: u16 = 0x0000;

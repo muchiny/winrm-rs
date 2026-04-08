@@ -1,8 +1,14 @@
 // CredSSP authentication transport for WinRM (MS-CSSP).
 //
-// Implements the CredSSP protocol for credential delegation (double-hop).
-// Uses our existing NTLM implementation wrapped in SPNEGO, with ASN.1 DER
-// encoding for TSRequest messages.
+// **EXPERIMENTAL**: This implementation follows MS-CSSP and matches the
+// requests-credssp Python reference for the HTTP framing (Authorization: CredSSP
+// scheme, primer request, multiple WWW-Authenticate header parsing). However,
+// it has not been validated end-to-end against a Windows Server. The pure
+// MS-CSSP spec is for raw TLS-over-TCP (used by RDP), not HTTP, and the WinRM
+// integration of CredSSP requires server-specific handling that is not fully
+// documented publicly.
+//
+// Use Basic, NTLM, Kerberos, or Certificate authentication for production use.
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
@@ -19,6 +25,43 @@ use crate::tls::CertHandle;
 
 /// CredSSP protocol version (v6 = modern Windows 10+).
 const CREDSSP_VERSION: u32 = 6;
+
+/// Extract a CredSSP token from a response's WWW-Authenticate headers.
+///
+/// HTTP allows multiple WWW-Authenticate headers and multiple schemes per
+/// header value (e.g., "Negotiate, CredSSP <token>, Basic"). This function
+/// handles all cases: case-insensitive scheme name, multiple headers,
+/// comma-separated schemes.
+#[cfg(feature = "credssp")]
+fn extract_credssp_token(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let all: String = headers
+        .get_all("WWW-Authenticate")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    // Case-insensitive search for "CredSSP " (with trailing space)
+    let upper = all.to_uppercase();
+    let pos = upper.find("CREDSSP ")?;
+    let after = &all[pos + "CREDSSP ".len()..];
+    // Token = chars until comma or whitespace
+    let token: String = after
+        .chars()
+        .take_while(|c| !c.is_whitespace() && *c != ',')
+        .collect();
+    if token.is_empty() { None } else { Some(token) }
+}
+
+/// Check if the server advertises CredSSP in any WWW-Authenticate header.
+#[cfg(feature = "credssp")]
+fn advertises_credssp(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get_all("WWW-Authenticate")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .any(|v| v.to_uppercase().contains("CREDSSP"))
+}
 
 /// CredSSP authentication transport.
 ///
@@ -40,7 +83,39 @@ impl AuthTransport for CredSspAuth {
         url: &str,
         body: String,
     ) -> Result<String, WinrmError> {
-        // === Phase 1: Send NTLM Type 1 in SPNEGO in TSRequest ===
+        // === Phase 0: Primer — discover CredSSP support via unauthenticated request ===
+        // requests-credssp does this first to ensure the server advertises CredSSP.
+        // Without this, the server may not recognize our Authorization: CredSSP header.
+        let primer = http
+            .post(url)
+            .header(CONTENT_TYPE, "application/soap+xml;charset=UTF-8")
+            .header("Content-Length", "0")
+            .header("Connection", "Keep-Alive")
+            .send()
+            .await
+            .map_err(WinrmError::Http)?;
+
+        if primer.status().as_u16() != 401 {
+            return Err(WinrmError::AuthFailed(format!(
+                "CredSSP: expected 401 from primer request, got {}", primer.status()
+            )));
+        }
+
+        if !advertises_credssp(primer.headers()) {
+            let advertised: String = primer
+                .headers()
+                .get_all("WWW-Authenticate")
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(WinrmError::AuthFailed(format!(
+                "CredSSP: server does not advertise CredSSP. WWW-Authenticate: {advertised}"
+            )));
+        }
+        let _ = primer.bytes().await;
+
+        // === Phase 1: Send NTLM Type 1 in SPNEGO in TSRequest, with the SOAP body ===
         let type1 = ntlm::create_negotiate_message();
         let spnego_init = asn1::encode_spnego_init(&type1);
         let ts_req1 = asn1::encode_ts_request(CREDSSP_VERSION, Some(&spnego_init), None, None, None);
@@ -50,7 +125,8 @@ impl AuthTransport for CredSspAuth {
             .post(url)
             .header(CONTENT_TYPE, "application/soap+xml;charset=UTF-8")
             .header(AUTHORIZATION, &auth_value)
-            .header("Content-Length", "0")
+            .header("Connection", "Keep-Alive")
+            .body(body.clone())
             .send()
             .await
             .map_err(WinrmError::Http)?;
@@ -62,17 +138,21 @@ impl AuthTransport for CredSspAuth {
         }
 
         // === Phase 2: Parse server's SPNEGO(NTLM Type 2) from TSRequest ===
-        let www_auth = resp
-            .headers()
-            .get("WWW-Authenticate")
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| WinrmError::AuthFailed("CredSSP: missing WWW-Authenticate".into()))?
-            .to_string();
+        let server_token = extract_credssp_token(resp.headers())
+            .ok_or_else(|| {
+                let advertised: String = resp
+                    .headers()
+                    .get_all("WWW-Authenticate")
+                    .iter()
+                    .filter_map(|v| v.to_str().ok())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                WinrmError::AuthFailed(format!(
+                    "CredSSP: phase 2 — no CredSSP token in WWW-Authenticate: {advertised}"
+                ))
+            })?;
         let _ = resp.bytes().await;
 
-        let server_token = www_auth
-            .strip_prefix("CredSSP ")
-            .ok_or_else(|| WinrmError::AuthFailed("CredSSP: unexpected auth scheme".into()))?;
         let ts_resp_bytes = B64.decode(server_token.trim_ascii())
             .map_err(|e| WinrmError::AuthFailed(format!("CredSSP: bad base64: {e}")))?;
         let ts_resp = asn1::decode_ts_request(&ts_resp_bytes).map_err(WinrmError::CredSsp)?;
@@ -136,6 +216,7 @@ impl AuthTransport for CredSspAuth {
             .header(CONTENT_TYPE, "application/soap+xml;charset=UTF-8")
             .header(AUTHORIZATION, &auth_value)
             .header("Content-Length", "0")
+            .header("Connection", "Keep-Alive")
             .send()
             .await
             .map_err(WinrmError::Http)?;
@@ -147,17 +228,21 @@ impl AuthTransport for CredSspAuth {
         }
 
         // === Phase 4: Verify server's pubKeyAuth ===
-        let www_auth = resp
-            .headers()
-            .get("WWW-Authenticate")
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| WinrmError::AuthFailed("CredSSP: missing WWW-Authenticate phase 4".into()))?
-            .to_string();
+        let server_token = extract_credssp_token(resp.headers())
+            .ok_or_else(|| {
+                let advertised: String = resp
+                    .headers()
+                    .get_all("WWW-Authenticate")
+                    .iter()
+                    .filter_map(|v| v.to_str().ok())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                WinrmError::AuthFailed(format!(
+                    "CredSSP: phase 4 — no CredSSP token in WWW-Authenticate: {advertised}"
+                ))
+            })?;
         let _ = resp.bytes().await;
 
-        let server_token = www_auth
-            .strip_prefix("CredSSP ")
-            .ok_or_else(|| WinrmError::AuthFailed("CredSSP: unexpected auth scheme phase 4".into()))?;
         let ts_resp_bytes = B64.decode(server_token.trim_ascii())
             .map_err(|e| WinrmError::AuthFailed(format!("CredSSP: bad base64 phase 4: {e}")))?;
         let ts_resp = asn1::decode_ts_request(&ts_resp_bytes).map_err(WinrmError::CredSsp)?;
@@ -202,6 +287,7 @@ impl AuthTransport for CredSspAuth {
             .header(CONTENT_TYPE, "application/soap+xml;charset=UTF-8")
             .header(AUTHORIZATION, &auth_value)
             .header("Content-Length", "0")
+            .header("Connection", "Keep-Alive")
             .send()
             .await
             .map_err(WinrmError::Http)?;
@@ -220,6 +306,7 @@ impl AuthTransport for CredSspAuth {
         let resp = http
             .post(url)
             .header(CONTENT_TYPE, "application/soap+xml;charset=UTF-8")
+            .header("Connection", "Keep-Alive")
             .body(body)
             .send()
             .await

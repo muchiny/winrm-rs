@@ -22,3 +22,17 @@ lcov.info
 *.profraw
 *.profdata
 tarpaulin-report.html
+
+# Claude Code local workspace
+.claude/
+
+# Network debug captures
+*.pcap
+*.pcapng
+*.etl
+*.keys
+
+# Local notes / scratch
+TODO.local.md
+*.local.md
+notes.md

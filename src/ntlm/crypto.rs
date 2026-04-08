@@ -48,12 +48,13 @@ pub(crate) const TYPE1_FLAGS_CREDSSP: u32 = NEGOTIATE_UNICODE
 // AV_PAIR IDs (MS-NLMP 2.2.2.1)
 pub(crate) const AV_EOL: u16 = 0x0000;
 pub(crate) const AV_NB_DOMAIN_NAME: u16 = 0x0002;
+pub(crate) const AV_FLAGS_ID: u16 = 0x0006;
 pub(crate) const AV_TIMESTAMP: u16 = 0x0007;
-// Reserved for TLS Channel Binding Tokens (CBT) — MS-NLMP 2.2.2.1
-#[allow(dead_code)]
 pub(crate) const AV_TARGET_NAME: u16 = 0x0009;
-#[allow(dead_code)]
 pub(crate) const AV_CHANNEL_BINDINGS: u16 = 0x000A;
+
+/// Bit in AV_FLAGS indicating that a MIC is present in the AUTHENTICATE_MESSAGE.
+pub(crate) const AV_FLAG_MIC: u32 = 0x0000_0002;
 
 /// NT Hash = MD4(UTF-16LE(password)) (MS-NLMP 3.3.1, NTOWFv1).
 pub(crate) fn compute_nt_hash(password: &str) -> [u8; 16] {

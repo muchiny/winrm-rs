@@ -13,7 +13,8 @@ use crate::error::NtlmError;
 /// Produced by `parse_challenge` from the raw bytes of a server challenge.
 /// Contains the fields needed to compute the Type 3 (Authenticate) response.
 #[derive(Debug)]
-pub(crate) struct ChallengeMessage {
+#[allow(unreachable_pub)] // exposed under the `__internal` feature for fuzz targets
+pub struct ChallengeMessage {
     /// 8-byte nonce from the server, used as input to NTProofStr (MS-NLMP 3.3.2).
     pub server_challenge: [u8; 8],
     /// Negotiated capability flags (MS-NLMP 2.2.2.5).

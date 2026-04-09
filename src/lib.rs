@@ -113,7 +113,7 @@ pub use soap::ReceiveOutput;
 // bump. Enabled via the `__internal` feature, consumed only by `fuzz/`.
 #[cfg(feature = "__internal")]
 #[doc(hidden)]
-pub use ntlm::{create_authenticate_message_with_key, parse_challenge};
+pub use ntlm::parse_challenge;
 #[cfg(feature = "__internal")]
 #[doc(hidden)]
-pub use soap::parser::{check_soap_fault, parse_command_id, parse_receive_output, parse_shell_id};
+pub use soap::{check_soap_fault, parse_command_id, parse_receive_output, parse_shell_id};

@@ -263,6 +263,27 @@ mod tests {
     }
 
     #[test]
+    fn unseal_body_rejects_truncated_signature_after_marker() {
+        let mut session = NtlmSession::from_auth(&[0u8; 16]);
+        // Marker + only 3 bytes of signature length (need 4)
+        let bad = b"application/octet-stream\r\n\x10\x00\x00";
+        let err = unseal_body(&mut session, bad).unwrap_err();
+        assert!(format!("{err}").contains("truncated"));
+    }
+
+    #[test]
+    fn unseal_body_rejects_data_too_short_for_signature() {
+        // Marker + 4 bytes (sig_len = 100, claiming 100-byte sig) but no data after
+        let mut session = NtlmSession::from_auth(&[0u8; 16]);
+        let mut data = b"application/octet-stream\r\n".to_vec();
+        data.extend_from_slice(&100u32.to_le_bytes());
+        // Empty sealed payload — sealed_data.len() (0) < sig_len (100)
+        data.extend_from_slice(format!("\r\n{ENCRYPTED_BOUNDARY}--").as_bytes());
+        let err = unseal_body(&mut session, &data).unwrap_err();
+        assert!(format!("{err}").contains("too short"));
+    }
+
+    #[test]
     fn unseal_body_rejects_truncated_data() {
         let mut session = NtlmSession::from_auth(&[0u8; 16]);
         // Has the marker but no signature length after

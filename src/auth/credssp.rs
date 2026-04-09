@@ -863,6 +863,134 @@ mod tests {
     }
 
     #[test]
+    fn parse_url_https_with_port_and_path() {
+        let (h, p, path) = parse_url("https://host.example:5986/wsman").unwrap();
+        assert_eq!(h, "host.example");
+        assert_eq!(p, 5986);
+        assert_eq!(path, "/wsman");
+    }
+
+    #[test]
+    fn parse_url_http_scheme_also_accepted() {
+        let (h, p, path) = parse_url("http://h:80/x").unwrap();
+        assert_eq!((h.as_str(), p, path.as_str()), ("h", 80, "/x"));
+    }
+
+    #[test]
+    fn parse_url_defaults_port_5986_when_missing() {
+        let (h, p, path) = parse_url("https://host/wsman").unwrap();
+        assert_eq!(h, "host");
+        assert_eq!(p, 5986);
+        assert_eq!(path, "/wsman");
+    }
+
+    #[test]
+    fn parse_url_defaults_path_when_missing() {
+        let (h, p, path) = parse_url("https://host:5986").unwrap();
+        assert_eq!((h.as_str(), p, path.as_str()), ("host", 5986, "/"));
+    }
+
+    #[test]
+    fn parse_url_rejects_bad_scheme() {
+        assert!(parse_url("ftp://host/path").is_err());
+    }
+
+    #[test]
+    fn parse_url_rejects_bad_port() {
+        assert!(parse_url("https://host:notaport/x").is_err());
+    }
+
+    #[test]
+    fn extract_credssp_token_str_simple() {
+        assert_eq!(
+            extract_credssp_token_str("CredSSP YWJjZGVm"),
+            Some("YWJjZGVm".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_credssp_token_str_case_insensitive_and_mixed() {
+        assert_eq!(
+            extract_credssp_token_str("Negotiate, credssp ABCDEF, Basic"),
+            Some("ABCDEF".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_credssp_token_str_returns_none_when_no_token() {
+        assert_eq!(extract_credssp_token_str("Negotiate, Basic"), None);
+        assert_eq!(extract_credssp_token_str("CredSSP "), None);
+    }
+
+    #[test]
+    fn find_double_crlf_locates_separator() {
+        let buf = b"GET / HTTP/1.1\r\nHost: x\r\n\r\nbody";
+        let pos = find_double_crlf(buf).unwrap();
+        assert_eq!(&buf[pos..pos + 4], b"\r\n\r\n");
+    }
+
+    #[test]
+    fn find_double_crlf_returns_none_when_absent() {
+        assert!(find_double_crlf(b"no separator here").is_none());
+        // Single CRLF only is not enough
+        assert!(find_double_crlf(b"a\r\nb").is_none());
+    }
+
+    #[test]
+    fn header_get_is_case_insensitive() {
+        let mut h = std::collections::HashMap::new();
+        h.insert("content-length".to_string(), "42".to_string());
+        assert_eq!(header_get(&h, "Content-Length"), Some("42"));
+        assert_eq!(header_get(&h, "CONTENT-LENGTH"), Some("42"));
+        assert_eq!(header_get(&h, "missing"), None);
+    }
+
+    #[test]
+    fn membio_write_appends_to_outgoing_and_read_drains_incoming() {
+        use std::io::{Read, Write};
+        let mut bio = MemBio {
+            incoming: std::collections::VecDeque::new(),
+            outgoing: Vec::new(),
+        };
+        // Write extends outgoing
+        assert_eq!(bio.write(b"hello").unwrap(), 5);
+        bio.flush().unwrap();
+        assert_eq!(bio.outgoing, b"hello");
+
+        // Read on empty incoming returns WouldBlock
+        let mut buf = [0u8; 4];
+        let err = bio.read(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+
+        // Feed incoming and read it back
+        bio.incoming.extend(b"abcdef".iter().copied());
+        let n = bio.read(&mut buf).unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(&buf, b"abcd");
+        // Remaining 2 bytes still queued
+        assert_eq!(bio.incoming.len(), 2);
+    }
+
+    #[test]
+    fn openssl_inner_tls_peer_cert_before_handshake_errors() {
+        let tls = build_inner_openssl_tls().expect("build inner tls");
+        // No handshake completed → no peer cert available
+        assert!(tls.peer_cert_der().is_err());
+    }
+
+    #[test]
+    fn openssl_inner_tls_feed_incoming_then_drain_clears_outgoing() {
+        let mut tls = build_inner_openssl_tls().expect("build inner tls");
+        let _ = tls.handshake_step();
+        let first = tls.drain_outgoing();
+        assert!(!first.is_empty());
+        // After draining, outgoing buffer should be empty
+        assert!(tls.drain_outgoing().is_empty());
+        // feed_incoming with garbage doesn't panic
+        tls.feed_incoming(&[0u8; 8]);
+    }
+
+    #[test]
     fn openssl_inner_tls_handshake_starts() {
         let mut tls = build_inner_openssl_tls().expect("build inner tls");
         let _ = tls.handshake_step();

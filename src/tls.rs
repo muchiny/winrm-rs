@@ -232,6 +232,14 @@ mod tests {
     }
 
     #[test]
+    fn cert_handle_returns_none_when_nothing_captured() {
+        let inner = Arc::new(AcceptAllVerifier);
+        let verifier = CertCapturingVerifier::new(inner);
+        let handle = verifier.cert_handle();
+        assert!(handle.get().is_none());
+    }
+
+    #[test]
     fn capturing_verifier_delegates_supported_schemes() {
         let inner = Arc::new(AcceptAllVerifier);
         let verifier = CertCapturingVerifier::new(inner);

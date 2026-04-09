@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.0] - Unreleased
+
+### Breaking
+
+- Public surface reduced. The following items are no longer re-exported
+  from the crate root and are now crate-internal:
+  `create_authenticate_message_with_key`, `parse_challenge`,
+  `parse_shell_id`, `parse_command_id`, `parse_receive_output`,
+  `check_soap_fault`. They remain accessible to fuzz targets via the
+  internal-only `__internal` feature (not part of the SemVer contract).
+
+### Changed
+
+- CredSSP (`--features credssp`) is now explicitly marked **experimental**
+  in the crate docs and README. The handshake is not yet validated
+  end-to-end; do not rely on it in production.
+
+### Documentation
+
+- `lib.rs` now documents the purpose of the `secrecy::SecretString` /
+  `ExposeSecret` and `tokio_util::sync::CancellationToken` re-exports.
+- README documents integration-test environment variables
+  (`WINRM_TEST_HOST`, `WINRM_TEST_USER`, `WINRM_TEST_PASS`,
+  `WINRM_TEST_PORT`) and how to invoke them.
+- `Cargo.toml` now explains why `credssp` needs `openssl` (Microsoft
+  CredSSP server incompatibility with `rustls` in-memory TLS).
+
 ## [0.5.0] - 2026-03-29
 
 ### Added

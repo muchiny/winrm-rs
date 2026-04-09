@@ -47,10 +47,23 @@
 //! # Cargo features
 //!
 //! - **`kerberos`** -- Enables Kerberos authentication via `cross-krb5`.
+//! - **`credssp`** -- *Experimental.* Enables CredSSP authentication for
+//!   double-hop delegation. Pulls in `openssl` as a C dependency
+//!   (required because Microsoft's CredSSP server has proven incompatible
+//!   with `rustls` in-memory TLS — see `src/auth/credssp.rs`).
+//!   The handshake is not yet fully validated end-to-end; treat as
+//!   preview-quality and do not use in production.
 //!
-//! # Feature roadmap
+//! # Re-exports
 //!
-//! - **CredSSP/TLS channel binding**: For double-hop delegation scenarios (v0.6).
+//! A few third-party types appear in this crate's public API and are
+//! re-exported for convenience:
+//!
+//! - [`SecretString`] / [`ExposeSecret`] from the `secrecy` crate —
+//!   used for the `password` field of [`WinrmCredentials`].
+//! - [`CancellationToken`] from `tokio_util` — used as a parameter to
+//!   the `*_with_cancel` methods of [`WinrmClient`] so callers can
+//!   cooperatively cancel in-flight operations.
 //!
 //! # Example
 //! ```no_run
@@ -87,13 +100,20 @@ pub use client::WinrmClient;
 pub use command::{CommandOutput, encode_powershell_command};
 pub use config::{AuthMethod, EncryptionMode, WinrmConfig, WinrmCredentials};
 pub use error::{CredSspError, NtlmError, SoapError, WinrmError};
-pub use ntlm::{
-    ChallengeMessage, NtlmSession, create_authenticate_message_with_key, parse_challenge,
-};
+pub use ntlm::{ChallengeMessage, NtlmSession};
 pub use secrecy::{ExposeSecret, SecretString};
 pub use shell::Shell;
 pub use tokio_util::sync::CancellationToken;
 // Re-export soap types that are part of the public API
 pub use soap::ReceiveOutput;
+
+// Internal re-exports for fuzz targets only. These are NOT part of the
+// public API and may be removed or changed at any time without a SemVer
+// bump. Enabled via the `__internal` feature, consumed only by `fuzz/`.
+#[cfg(feature = "__internal")]
+#[doc(hidden)]
+pub use ntlm::{create_authenticate_message_with_key, parse_challenge};
+#[cfg(feature = "__internal")]
+#[doc(hidden)]
 pub use soap::parser::{check_soap_fault, parse_command_id, parse_receive_output, parse_shell_id};
 

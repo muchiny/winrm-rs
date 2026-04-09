@@ -23,7 +23,18 @@ include = [
 [features]
 default = []
 kerberos = ["dep:cross-krb5"]
+# EXPERIMENTAL. CredSSP (double-hop delegation) is not yet end-to-end
+# validated. The OpenSSL dependency is required for the inner TLS 1.2
+# in-memory handshake: a `rustls` implementation was attempted and the
+# Microsoft CredSSP server silently drops the context after Type3 +
+# pubKeyAuth. See the comment block in `src/auth/credssp.rs` around the
+# `build_inner_openssl_tls` function for the full background.
 credssp = ["dep:hyper", "dep:hyper-util", "dep:tokio-rustls", "dep:http-body-util", "dep:bytes", "dep:http", "dep:x509-cert", "dep:openssl"]
+# Internal-only. Re-exports crate internals needed by `fuzz/` targets.
+# NOT part of the public API. Do not enable from downstream code — any
+# item gated by this feature may change or disappear without a SemVer
+# bump.
+__internal = []
 
 [dependencies]
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "socks"] }

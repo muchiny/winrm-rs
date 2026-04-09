@@ -36,3 +36,9 @@ tarpaulin-report.html
 TODO.local.md
 *.local.md
 notes.md
+/todo/
+
+# Fuzz artefacts
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/

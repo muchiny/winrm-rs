@@ -173,7 +173,8 @@ let bytes = client.download_file("win-server", "C:\\remote\\file.bin", Path::new
 | **v0.3** | NTLM sealing, credentials security, retry | Done |
 | **v0.4** | Kerberos + Certificate auth | Done |
 | **v0.5** | File transfer, streaming output, proxy | Done |
-| **v0.6** | CredSSP/TLS channel binding | Planned |
+| **v0.6** | CredSSP/TLS channel binding | Experimental (`--features credssp`, not production-ready) |
+| **v1.0** | API freeze, CredSSP stabilization | Planned |
 
 ## Comparison
 
@@ -200,6 +201,35 @@ cargo test --workspace    # run tests
 cargo clippy --workspace  # lint
 cargo fmt --check         # format check
 ```
+
+## Integration tests
+
+Most tests run against `wiremock` and need no external setup. The file
+[`tests/integration_real.rs`](tests/integration_real.rs) targets a real
+Windows host and is ignored by default. To run it, set the following
+environment variables and use `--ignored`:
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `WINRM_TEST_HOST` | yes | — | Hostname or IP of the target Windows box |
+| `WINRM_TEST_PASS` | yes | — | Password for the test account |
+| `WINRM_TEST_USER` | no | `vagrant` | Username |
+| `WINRM_TEST_PORT` | no | `5985` | WinRM port (`5985` = HTTP, `5986` = HTTPS) |
+
+```sh
+WINRM_TEST_HOST=192.0.2.10 \
+WINRM_TEST_USER=Administrator \
+WINRM_TEST_PASS='secret' \
+cargo test --test integration_real -- --ignored
+```
+
+## Cargo features
+
+| Feature | Status | Notes |
+|---|---|---|
+| *(default)* | stable | NTLMv2, Basic, Certificate auth; no optional deps |
+| `kerberos` | stable | Pulls `cross-krb5`; requires a working `kinit` |
+| `credssp` | **experimental** | Double-hop delegation. End-to-end handshake is not yet fully validated — **do not use in production**. Pulls `openssl` (C dep: `libssl-dev` on Debian). |
 
 ## License
 

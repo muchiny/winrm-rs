@@ -24,7 +24,7 @@ pub struct ReceiveOutput {
 ///
 /// Searches for a `<ShellId>` element (with or without namespace prefix) and
 /// returns its text content. Returns [`SoapError::MissingElement`] if not found.
-pub fn parse_shell_id(xml: &str) -> Result<String, SoapError> {
+pub(crate) fn parse_shell_id(xml: &str) -> Result<String, SoapError> {
     extract_element_text(xml, "ShellId").ok_or_else(|| SoapError::MissingElement("ShellId".into()))
 }
 
@@ -32,7 +32,7 @@ pub fn parse_shell_id(xml: &str) -> Result<String, SoapError> {
 ///
 /// Searches for a `<CommandId>` element (with or without namespace prefix) and
 /// returns its text content. Returns [`SoapError::MissingElement`] if not found.
-pub fn parse_command_id(xml: &str) -> Result<String, SoapError> {
+pub(crate) fn parse_command_id(xml: &str) -> Result<String, SoapError> {
     extract_element_text(xml, "CommandId")
         .ok_or_else(|| SoapError::MissingElement("CommandId".into()))
 }
@@ -43,7 +43,7 @@ pub fn parse_command_id(xml: &str) -> Result<String, SoapError> {
 /// `CommandState` for the `Done` URI, and extracts the `ExitCode` if present.
 /// Returns [`SoapError::ParseError`] if a stream contains invalid base64, or
 /// a [`SoapError::Fault`] if the response body contains a SOAP fault.
-pub fn parse_receive_output(xml: &str) -> Result<ReceiveOutput, SoapError> {
+pub(crate) fn parse_receive_output(xml: &str) -> Result<ReceiveOutput, SoapError> {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD as B64;
 
@@ -98,7 +98,7 @@ pub fn parse_receive_output(xml: &str) -> Result<ReceiveOutput, SoapError> {
 ///
 /// Returns the XML items (raw text between `<w:Items>` tags) and an optional
 /// `EnumerationContext` for continuation via Pull.
-pub fn parse_enumerate_response(xml: &str) -> Result<(String, Option<String>), SoapError> {
+pub(crate) fn parse_enumerate_response(xml: &str) -> Result<(String, Option<String>), SoapError> {
     check_soap_fault(xml)?;
 
     // Extract items — may be inside <w:Items>, <wsen:Items>, or <n:Items>
@@ -119,7 +119,7 @@ pub fn parse_enumerate_response(xml: &str) -> Result<(String, Option<String>), S
 ///
 /// Scans the XML for `<Fault>` or `<s:Fault>` elements and extracts the
 /// fault code and reason text. Returns `Ok(())` if no fault is present.
-pub fn check_soap_fault(xml: &str) -> Result<(), SoapError> {
+pub(crate) fn check_soap_fault(xml: &str) -> Result<(), SoapError> {
     if let Some(fault) = extract_soap_fault(xml) {
         return Err(fault);
     }

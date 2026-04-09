@@ -341,10 +341,9 @@ pub(crate) fn decode_spnego_token(data: &[u8]) -> Result<Vec<u8>, CredSspError> 
         let oid_tlv =
             read_tlv(contents).map_err(|_| CredSspError::Asn1Decode("bad OID in SPNEGO".into()))?;
         let after_oid = &contents[oid_tlv.2..];
-        // [0] NegTokenInit
+        // [0] NegTokenInit → mechToken [2]
         if let Some(init_data) = find_context_tag(after_oid, 0) {
             let (_, seq_data, _) = read_tlv(init_data)?;
-            // mechToken is [2]
             if let Some(token_data) = find_context_tag(seq_data, 2) {
                 return Ok(decode_octet_string(token_data)?.to_vec());
             }

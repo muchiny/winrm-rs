@@ -23,7 +23,7 @@ pub(crate) struct CertCapturingVerifier {
 
 impl CertCapturingVerifier {
     /// Wrap an existing verifier, capturing the server certificate on each handshake.
-    pub fn new(inner: Arc<dyn ServerCertVerifier>) -> Self {
+    pub(crate) fn new(inner: Arc<dyn ServerCertVerifier>) -> Self {
         Self {
             inner,
             captured_cert: Arc::new(Mutex::new(None)),
@@ -31,7 +31,7 @@ impl CertCapturingVerifier {
     }
 
     /// Return a clone-able handle to retrieve the captured certificate.
-    pub fn cert_handle(&self) -> CertHandle {
+    pub(crate) fn cert_handle(&self) -> CertHandle {
         CertHandle {
             captured_cert: Arc::clone(&self.captured_cert),
         }
@@ -87,7 +87,7 @@ pub(crate) struct CertHandle {
 
 impl CertHandle {
     /// Return the DER-encoded server certificate, if one has been captured.
-    pub fn get(&self) -> Option<Vec<u8>> {
+    pub(crate) fn get(&self) -> Option<Vec<u8>> {
         self.captured_cert.lock().ok()?.clone()
     }
 }

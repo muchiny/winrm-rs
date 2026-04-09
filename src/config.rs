@@ -81,7 +81,7 @@ impl Default for WinrmConfig {
             connect_timeout_secs: 30,
             operation_timeout_secs: 60,
             auth_method: AuthMethod::Ntlm,
-            max_envelope_size: 153600,
+            max_envelope_size: 153_600,
             max_retries: 0,
             client_cert_pem: None,
             client_key_pem: None,

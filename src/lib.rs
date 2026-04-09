@@ -1,7 +1,7 @@
-//! Async WinRM (WS-Management) client for Rust.
+//! Async `WinRM` (WS-Management) client for Rust.
 //!
-//! Provides remote command execution on Windows hosts via the WinRM protocol
-//! with NTLMv2, Basic, Kerberos, and Certificate authentication support.
+//! Provides remote command execution on Windows hosts via the `WinRM` protocol
+//! with `NTLMv2`, Basic, Kerberos, and Certificate authentication support.
 //!
 //! # Architecture
 //!
@@ -16,8 +16,8 @@
 //!   corresponding responses. Envelope construction uses raw `format!` strings
 //!   rather than a full XML library to keep dependencies minimal.
 //!
-//! - **`ntlm`** (internal) -- implements the NTLMv2 challenge/response handshake
-//!   per MS-NLMP. Only NTLMv2 is supported; NTLMv1 is intentionally excluded.
+//! - **`ntlm`** (internal) -- implements the `NTLMv2` challenge/response handshake
+//!   per MS-NLMP. Only `NTLMv2` is supported; `NTLMv1` is intentionally excluded.
 //!
 //! HTTP transport is provided by `reqwest` with `rustls-tls`.
 //!
@@ -26,7 +26,7 @@
 //! | Method | Enum variant | Notes |
 //! |--------|-------------|-------|
 //! | HTTP Basic | [`AuthMethod::Basic`] | Credentials sent base64-encoded per request. Use only over HTTPS. |
-//! | NTLMv2 | [`AuthMethod::Ntlm`] | Three-step handshake (negotiate / challenge / authenticate). Default. |
+//! | `NTLMv2` | [`AuthMethod::Ntlm`] | Three-step handshake (negotiate / challenge / authenticate). Default. |
 //! | Kerberos | [`AuthMethod::Kerberos`] | SPNEGO Negotiate via system Kerberos. Requires `kerberos` feature + `kinit`. |
 //! | Certificate | [`AuthMethod::Certificate`] | TLS client certificate. Set `client_cert_pem` and `client_key_pem` on config. |
 //!
@@ -47,9 +47,9 @@
 //! # Cargo features
 //!
 //! - **`kerberos`** -- Enables Kerberos authentication via `cross-krb5`.
-//! - **`credssp`** -- *Experimental.* Enables CredSSP authentication for
+//! - **`credssp`** -- *Experimental.* Enables `CredSSP` authentication for
 //!   double-hop delegation. Pulls in `openssl` as a C dependency
-//!   (required because Microsoft's CredSSP server has proven incompatible
+//!   (required because Microsoft's `CredSSP` server has proven incompatible
 //!   with `rustls` in-memory TLS — see `src/auth/credssp.rs`).
 //!   The handshake is not yet fully validated end-to-end; treat as
 //!   preview-quality and do not use in production.
@@ -101,7 +101,7 @@ pub use client::WinrmClient;
 pub use command::{CommandOutput, encode_powershell_command};
 pub use config::{AuthMethod, EncryptionMode, WinrmConfig, WinrmCredentials};
 pub use error::{CredSspError, NtlmError, SoapError, WinrmError};
-pub use ntlm::{ChallengeMessage, NtlmSession};
+pub use ntlm::NtlmSession;
 pub use secrecy::{ExposeSecret, SecretString};
 pub use shell::Shell;
 pub use tokio_util::sync::CancellationToken;

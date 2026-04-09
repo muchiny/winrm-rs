@@ -7,17 +7,19 @@
 pub(crate) mod crypto;
 pub(crate) mod messages;
 
-// Re-export public API
-pub use messages::{
-    ChallengeMessage, create_authenticate_message_with_cbt, create_authenticate_message_with_key,
+// Re-export crate-internal API
+pub(crate) use messages::{
+    create_authenticate_message_with_cbt, create_authenticate_message_with_key,
     create_negotiate_message, decode_challenge_header, encode_authorization,
 };
 // `parse_challenge` is only reached from outside `ntlm::messages` by the
 // CredSSP path and by fuzz targets via the internal feature. Tests inside
 // the module reach it through `super::`, so the reexport is feature-gated.
 #[cfg(any(feature = "credssp", feature = "__internal"))]
+#[allow(unreachable_pub)] // re-exported via lib.rs under `__internal`; used in-crate under `credssp`
 pub use messages::parse_challenge;
 #[cfg(feature = "credssp")]
+#[allow(unreachable_pub)] // used in-crate by auth/credssp.rs
 pub use messages::{create_authenticate_message_credssp, create_negotiate_message_credssp};
 
 // NtlmSession uses crypto internals

@@ -192,7 +192,7 @@ pub(crate) fn execute_command_request(
     }
     let escaped_command = xml_escape(command);
     format!(
-        r#"<s:Envelope {NS_DECL_WITH_RSP}>
+        r"<s:Envelope {NS_DECL_WITH_RSP}>
 {header}
   <s:Body>
     <rsp:CommandLine>
@@ -200,7 +200,7 @@ pub(crate) fn execute_command_request(
 {args_xml}
     </rsp:CommandLine>
   </s:Body>
-</s:Envelope>"#
+</s:Envelope>"
     )
 }
 
@@ -286,10 +286,10 @@ pub(crate) fn delete_shell_request(
         max_envelope_size,
     );
     format!(
-        r#"<s:Envelope {NS_DECL_NO_RSP}>
+        r"<s:Envelope {NS_DECL_NO_RSP}>
 {header}
   <s:Body/>
-</s:Envelope>"#
+</s:Envelope>"
     )
 }
 

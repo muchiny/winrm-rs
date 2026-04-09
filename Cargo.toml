@@ -64,6 +64,17 @@ x509-cert = { version = "0.2", optional = true }
 openssl = { version = "0.10", optional = true }
 
 
+[lints.rust]
+unsafe_code = "forbid"
+unreachable_pub = "warn"
+
+[lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unreadable_literal = "warn"
+needless_raw_string_hashes = "warn"
+map_unwrap_or = "warn"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 wiremock = "0.6"

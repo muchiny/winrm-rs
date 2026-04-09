@@ -327,7 +327,7 @@ impl CredSspConnection {
 
         // ---- Build the request bytes ----
         let mut req =
-            String::with_capacity(512 + body.len() + auth_header.map(|a| a.len()).unwrap_or(0));
+            String::with_capacity(512 + body.len() + auth_header.map_or(0, |a| a.len()));
         use std::fmt::Write as _;
         // pywinrm/urllib3 puts Authorization BEFORE Content-Type/Content-Length.
         // Microsoft HTTPAPI may rely on this ordering for CredSSP context tracking.

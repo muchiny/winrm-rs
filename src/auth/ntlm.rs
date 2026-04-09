@@ -12,7 +12,7 @@ use crate::ntlm;
 
 /// NTLM authentication transport.
 ///
-/// Performs the NTLMv2 three-step handshake (negotiate, challenge, authenticate)
+/// Performs the `NTLMv2` three-step handshake (negotiate, challenge, authenticate)
 /// for each SOAP request. The password is wrapped in [`Zeroizing`] to ensure
 /// it is cleared from memory when dropped.
 pub(crate) struct NtlmAuth {
@@ -84,8 +84,7 @@ fn unseal_body(session: &mut ntlm::NtlmSession, data: &[u8]) -> Result<String, W
     let sealed_end = data[sealed_start..]
         .windows(end_marker.len())
         .position(|w| w == end_marker.as_slice())
-        .map(|p| sealed_start + p)
-        .unwrap_or(data.len());
+        .map_or(data.len(), |p| sealed_start + p);
 
     let sealed_data = &data[sealed_start..sealed_end];
     if sealed_data.len() < sig_len {

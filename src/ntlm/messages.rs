@@ -13,7 +13,7 @@ use crate::error::NtlmError;
 /// Produced by `parse_challenge` from the raw bytes of a server challenge.
 /// Contains the fields needed to compute the Type 3 (Authenticate) response.
 #[derive(Debug)]
-pub struct ChallengeMessage {
+pub(crate) struct ChallengeMessage {
     /// 8-byte nonce from the server, used as input to NTProofStr (MS-NLMP 3.3.2).
     pub server_challenge: [u8; 8],
     /// Negotiated capability flags (MS-NLMP 2.2.2.5).
@@ -34,7 +34,7 @@ pub struct ChallengeMessage {
 /// Returns a 32-byte message with the `NTLMSSP` signature, message type 1,
 /// and negotiate flags requesting Unicode, NTLM, extended session security,
 /// and target name. Domain and workstation security buffers are empty.
-pub fn create_negotiate_message() -> Vec<u8> {
+pub(crate) fn create_negotiate_message() -> Vec<u8> {
     create_negotiate_message_with_flags(TYPE1_FLAGS, false)
 }
 
@@ -45,6 +45,7 @@ pub fn create_negotiate_message() -> Vec<u8> {
 /// TSCredentials. Also includes NEGOTIATE_VERSION which adds the 8-byte
 /// OS version field at the end of the message (40 bytes total).
 #[cfg(feature = "credssp")]
+#[allow(unreachable_pub)] // re-exported under the `credssp` feature for the CredSSP path
 pub fn create_negotiate_message_credssp() -> Vec<u8> {
     create_negotiate_message_with_flags(TYPE1_FLAGS_CREDSSP, true)
 }
@@ -75,6 +76,7 @@ fn create_negotiate_message_with_flags(flags: u32, include_version: bool) -> Vec
 /// NetBIOS domain name, and optional server timestamp. Returns
 /// [`NtlmError::InvalidMessage`] if the message is too short, has an invalid
 /// signature, or is not message type 2.
+#[allow(unreachable_pub)] // re-exported `pub` under the `__internal` feature for fuzz targets
 pub fn parse_challenge(data: &[u8]) -> Result<ChallengeMessage, NtlmError> {
     if data.len() < 32 {
         return Err(NtlmError::InvalidMessage("Type 2 message too short".into()));
@@ -392,7 +394,7 @@ fn hex(b: &[u8]) -> String {
 /// in its Type 2 message, that timestamp is reused; otherwise the current
 /// system time is converted to Windows FILETIME format.
 #[cfg(test)]
-pub fn create_authenticate_message(
+pub(crate) fn create_authenticate_message(
     challenge: &ChallengeMessage,
     username: &str,
     password: &str,
@@ -407,7 +409,7 @@ pub fn create_authenticate_message(
 /// into the target info to bind the authentication to the TLS channel.
 /// The `channel_bindings` parameter is the 16-byte MD5 hash of the
 /// `SEC_CHANNEL_BINDINGS` structure (computed via [`super::crypto::compute_channel_bindings`]).
-pub fn create_authenticate_message_with_cbt(
+pub(crate) fn create_authenticate_message_with_cbt(
     challenge: &ChallengeMessage,
     username: &str,
     password: &str,
@@ -429,7 +431,7 @@ pub fn create_authenticate_message_with_cbt(
 /// Identical to `create_authenticate_message_with_cbt` but also returns the 16-byte
 /// `ExportedSessionKey = HMAC-MD5(NTLMv2Hash, NTProofStr)` needed to derive
 /// message encryption/signing keys for [`super::NtlmSession`].
-pub fn create_authenticate_message_with_key(
+pub(crate) fn create_authenticate_message_with_key(
     challenge: &ChallengeMessage,
     username: &str,
     password: &str,
@@ -447,6 +449,7 @@ pub fn create_authenticate_message_with_key(
 /// `type1_bytes` and `type2_bytes` are the raw NTLMSSP messages exchanged
 /// previously, used as input for the MIC HMAC.
 #[cfg(feature = "credssp")]
+#[allow(unreachable_pub)] // re-exported under the `credssp` feature for the CredSSP path
 pub fn create_authenticate_message_credssp(
     challenge: &ChallengeMessage,
     username: &str,
@@ -479,7 +482,7 @@ pub fn create_authenticate_message_credssp(
 ///
 /// Returns the string `"Negotiate <base64>"` suitable for direct use as the
 /// `Authorization` header value in the NTLM/SPNEGO HTTP handshake.
-pub fn encode_authorization(msg: &[u8]) -> String {
+pub(crate) fn encode_authorization(msg: &[u8]) -> String {
     format!("Negotiate {}", B64.encode(msg))
 }
 
@@ -489,7 +492,7 @@ pub fn encode_authorization(msg: &[u8]) -> String {
 /// base64-encoded Type 2 message. Returns [`NtlmError::InvalidMessage`] if
 /// the prefix is missing, the base64 is invalid, or the decoded bytes fail
 /// `parse_challenge` validation.
-pub fn decode_challenge_header(header: &str) -> Result<ChallengeMessage, NtlmError> {
+pub(crate) fn decode_challenge_header(header: &str) -> Result<ChallengeMessage, NtlmError> {
     let token = header
         .strip_prefix("Negotiate ")
         .ok_or_else(|| NtlmError::InvalidMessage("missing Negotiate prefix".into()))?;

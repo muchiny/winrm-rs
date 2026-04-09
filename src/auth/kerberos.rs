@@ -28,7 +28,7 @@ impl AuthTransport for KerberosAuth {
         use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 
         // Step 1: Initialize Kerberos context and get token
-        let (mut ctx, token) = ClientCtx::new(
+        let (ctx, token) = ClientCtx::new(
             InitiateFlags::empty(),
             None, // use default credentials (from kinit)
             &self.service_principal,
@@ -53,13 +53,11 @@ impl AuthTransport for KerberosAuth {
             .headers()
             .get("WWW-Authenticate")
             .and_then(|v| v.to_str().ok())
+            && let Some(token_b64) = www_auth.strip_prefix("Negotiate ")
+            && let Ok(server_token) = B64.decode(token_b64.trim_ascii())
         {
-            if let Some(token_b64) = www_auth.strip_prefix("Negotiate ") {
-                if let Ok(server_token) = B64.decode(token_b64.trim_ascii()) {
-                    // Complete the Kerberos handshake
-                    let _ = ctx.step(&server_token);
-                }
-            }
+            // Complete the Kerberos handshake
+            let _ = ctx.step(&server_token);
         }
 
         if resp.status().as_u16() == 401 {

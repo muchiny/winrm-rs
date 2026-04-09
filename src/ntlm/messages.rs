@@ -403,7 +403,7 @@ pub fn create_authenticate_message(
 
 /// Create an NTLM Type 3 (Authenticate) message with TLS Channel Binding Token.
 ///
-/// Like [`create_authenticate_message_with_key`] but injects `AV_CHANNEL_BINDINGS`
+/// Like `create_authenticate_message_with_key` but injects `AV_CHANNEL_BINDINGS`
 /// into the target info to bind the authentication to the TLS channel.
 /// The `channel_bindings` parameter is the 16-byte MD5 hash of the
 /// `SEC_CHANNEL_BINDINGS` structure (computed via [`super::crypto::compute_channel_bindings`]).
@@ -426,7 +426,7 @@ pub fn create_authenticate_message_with_cbt(
 
 /// Create an NTLM Type 3 (Authenticate) message and return the exported session key.
 ///
-/// Identical to [`create_authenticate_message_with_cbt`] but also returns the 16-byte
+/// Identical to `create_authenticate_message_with_cbt` but also returns the 16-byte
 /// `ExportedSessionKey = HMAC-MD5(NTLMv2Hash, NTProofStr)` needed to derive
 /// message encryption/signing keys for [`super::NtlmSession`].
 pub fn create_authenticate_message_with_key(
@@ -488,7 +488,7 @@ pub fn encode_authorization(msg: &[u8]) -> String {
 /// Expects the header value to start with `"Negotiate "` followed by a
 /// base64-encoded Type 2 message. Returns [`NtlmError::InvalidMessage`] if
 /// the prefix is missing, the base64 is invalid, or the decoded bytes fail
-/// [`parse_challenge`] validation.
+/// `parse_challenge` validation.
 pub fn decode_challenge_header(header: &str) -> Result<ChallengeMessage, NtlmError> {
     let token = header
         .strip_prefix("Negotiate ")

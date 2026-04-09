@@ -43,16 +43,16 @@ tokio = { version = "1", features = ["time", "macros"] }
 base64 = "0.22"
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
-md4 = "0.10"
-md-5 = "0.10"
-hmac = "0.12"
+md4 = "0.11"
+md-5 = "0.11"
+hmac = "0.13"
 rand = "0.9"
 secrecy = { version = "0.10", features = ["serde"] }
 tracing = "0.1"
 zeroize = "1.8"
 tokio-util = { version = "0.7.18", features = ["rt"] }
 rustls = { version = "0.23", features = ["ring"] }
-sha2 = "0.10"
+sha2 = "0.11"
 webpki-roots = "1.0.6"
 hyper = { version = "1", features = ["client", "http1"], optional = true }
 hyper-util = { version = "0.1", features = ["tokio"], optional = true }

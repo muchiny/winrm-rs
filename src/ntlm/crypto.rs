@@ -8,7 +8,7 @@
 // this is a low-level primitives module, not public API.
 #![allow(dead_code)]
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use md4::{Digest, Md4};
 use md5::Md5;
 

@@ -80,7 +80,7 @@ mod tests {
         let config = WinrmConfig {
             port: 5986,
             use_tls: true,
-            max_envelope_size: 512000,
+            max_envelope_size: 512_000,
             ..Default::default()
         };
         let client = WinrmClientBuilder::new(config)
@@ -88,7 +88,7 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(client.endpoint("srv"), "https://srv:5986/wsman");
-        assert_eq!(client.config().max_envelope_size, 512000);
+        assert_eq!(client.config().max_envelope_size, 512_000);
     }
 
     #[test]

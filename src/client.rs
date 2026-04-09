@@ -372,6 +372,50 @@ impl WinrmClient {
     ) -> Result<(), WinrmError> {
         self.delete_shell(host, shell_id).await
     }
+
+    /// Disconnect a shell (used internally by `Shell::disconnect`).
+    ///
+    /// Sends a WS-Man `Disconnect` SOAP request that leaves the
+    /// server-side shell alive so it can be reconnected later via
+    /// [`reconnect_shell`](Self::reconnect_shell).
+    pub(crate) async fn disconnect_shell_raw(
+        &self,
+        host: &str,
+        shell_id: &str,
+    ) -> Result<(), WinrmError> {
+        let config = self.transport.config();
+        let envelope = soap::disconnect_shell_request(
+            &self.transport.endpoint(host),
+            shell_id,
+            config.operation_timeout_secs,
+            config.max_envelope_size,
+        );
+        self.transport.send_soap_with_retry(host, envelope).await?;
+        Ok(())
+    }
+
+    /// Reconnect to a previously-disconnected shell.
+    ///
+    /// Sends a WS-Man `Reconnect` SOAP request to validate that the
+    /// server-side shell identified by `shell_id` is still alive and
+    /// returns a [`Shell`] handle that resumes operations on it.
+    #[tracing::instrument(level = "debug", skip(self))]
+    pub async fn reconnect_shell(
+        &self,
+        host: &str,
+        shell_id: &str,
+    ) -> Result<Shell<'_>, WinrmError> {
+        let config = self.transport.config();
+        let envelope = soap::reconnect_shell_request(
+            &self.transport.endpoint(host),
+            shell_id,
+            config.operation_timeout_secs,
+            config.max_envelope_size,
+        );
+        self.transport.send_soap_with_retry(host, envelope).await?;
+        debug!(shell_id = %shell_id, "WinRM shell reconnected");
+        Ok(Shell::new(self, host.to_string(), shell_id.to_string()))
+    }
 }
 
 #[cfg(test)]
@@ -435,7 +479,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(header("Authorization", "Basic YWRtaW46cGFzcw=="))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>SHELL-1</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>SHELL-1</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
             ))
             .mount(&server)
             .await;
@@ -470,7 +514,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><s:Fault><s:Code><s:Value>s:Receiver</s:Value></s:Code><s:Reason><s:Text>Access denied</s:Text></s:Reason></s:Fault></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><s:Fault><s:Code><s:Value>s:Receiver</s:Value></s:Code><s:Reason><s:Text>Access denied</s:Text></s:Reason></s:Fault></s:Body></s:Envelope>",
             ))
             .mount(&server)
             .await;
@@ -490,7 +534,7 @@ mod tests {
         // Mock: create_shell
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>S1</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>S1</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -499,7 +543,7 @@ mod tests {
         // Mock: execute_command
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>C1</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>C1</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -523,7 +567,7 @@ mod tests {
         // Mock: signal_terminate + delete_shell (just return 200 with empty envelope)
         Mock::given(method("POST"))
             .respond_with(
-                ResponseTemplate::new(200).set_body_string(r#"<s:Envelope><s:Body/></s:Envelope>"#),
+                ResponseTemplate::new(200).set_body_string(r"<s:Envelope><s:Body/></s:Envelope>"),
             )
             .mount(&server)
             .await;
@@ -545,7 +589,7 @@ mod tests {
         // Shell create
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>S2</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>S2</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -554,7 +598,7 @@ mod tests {
         // Command execute
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>C2</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>C2</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -632,7 +676,7 @@ mod tests {
         let mut type2 = vec![0u8; 48];
         type2[0..8].copy_from_slice(b"NTLMSSP\0");
         type2[8..12].copy_from_slice(&2u32.to_le_bytes());
-        type2[20..24].copy_from_slice(&0x00088201u32.to_le_bytes()); // flags
+        type2[20..24].copy_from_slice(&0x0008_8201_u32.to_le_bytes()); // flags
         type2[24..32].copy_from_slice(&[0x01; 8]); // server challenge
         // no target info (ti_len=0)
         let type2_b64 = B64.encode(&type2);
@@ -650,7 +694,7 @@ mod tests {
         // Step 2: 200 with shell response
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>NTLM-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>NTLM-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
             ))
             .mount(&server)
             .await;
@@ -668,7 +712,7 @@ mod tests {
         let mut type2 = vec![0u8; 48];
         type2[0..8].copy_from_slice(b"NTLMSSP\0");
         type2[8..12].copy_from_slice(&2u32.to_le_bytes());
-        type2[20..24].copy_from_slice(&0x00088201u32.to_le_bytes());
+        type2[20..24].copy_from_slice(&0x0008_8201_u32.to_le_bytes());
         type2[24..32].copy_from_slice(&[0x01; 8]);
         let type2_b64 = B64.encode(&type2);
 
@@ -739,7 +783,7 @@ mod tests {
         let mut type2 = vec![0u8; 48];
         type2[0..8].copy_from_slice(b"NTLMSSP\0");
         type2[8..12].copy_from_slice(&2u32.to_le_bytes());
-        type2[20..24].copy_from_slice(&0x00088201u32.to_le_bytes());
+        type2[20..24].copy_from_slice(&0x0008_8201_u32.to_le_bytes());
         type2[24..32].copy_from_slice(&[0x01; 8]);
         let type2_b64 = B64.encode(&type2);
 
@@ -774,7 +818,7 @@ mod tests {
         let mut type2 = vec![0u8; 48];
         type2[0..8].copy_from_slice(b"NTLMSSP\0");
         type2[8..12].copy_from_slice(&2u32.to_le_bytes());
-        type2[20..24].copy_from_slice(&0x00088201u32.to_le_bytes());
+        type2[20..24].copy_from_slice(&0x0008_8201_u32.to_le_bytes());
         type2[24..32].copy_from_slice(&[0x01; 8]);
         let type2_b64 = B64.encode(&type2);
 
@@ -791,7 +835,7 @@ mod tests {
         // Step 2: 200 success
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>DOMAIN-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>DOMAIN-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
             ))
             .mount(&server)
             .await;
@@ -825,7 +869,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>EXACT-CMD-ID-789</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>EXACT-CMD-ID-789</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
             ))
             .mount(&server)
             .await;
@@ -890,7 +934,7 @@ mod tests {
         // Shell create
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>S1</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>S1</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -899,7 +943,7 @@ mod tests {
         // Command execute
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>C1</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>C1</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -940,7 +984,7 @@ mod tests {
         // Shell create
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>REUSE-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>REUSE-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -949,7 +993,7 @@ mod tests {
         // Command execute (first)
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>CMD-1</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>CMD-1</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -972,7 +1016,7 @@ mod tests {
         // Signal terminate + command execute (second) + receive (second) + signal + delete
         Mock::given(method("POST"))
             .respond_with(
-                ResponseTemplate::new(200).set_body_string(r#"<s:Envelope><s:Body/></s:Envelope>"#),
+                ResponseTemplate::new(200).set_body_string(r"<s:Envelope><s:Body/></s:Envelope>"),
             )
             .mount(&server)
             .await;
@@ -997,7 +1041,7 @@ mod tests {
         // Shell create
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>CLOSE-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>CLOSE-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -1006,7 +1050,7 @@ mod tests {
         // Delete
         let delete_mock = Mock::given(method("POST"))
             .respond_with(
-                ResponseTemplate::new(200).set_body_string(r#"<s:Envelope><s:Body/></s:Envelope>"#),
+                ResponseTemplate::new(200).set_body_string(r"<s:Envelope><s:Body/></s:Envelope>"),
             )
             .expect(1)
             .mount_as_scoped(&server)
@@ -1028,7 +1072,7 @@ mod tests {
         // Shell create
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>INPUT-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>INPUT-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -1037,7 +1081,7 @@ mod tests {
         // Send input (just return OK)
         let input_mock = Mock::given(method("POST"))
             .respond_with(
-                ResponseTemplate::new(200).set_body_string(r#"<s:Envelope><s:Body/></s:Envelope>"#),
+                ResponseTemplate::new(200).set_body_string(r"<s:Envelope><s:Body/></s:Envelope>"),
             )
             .expect(1)
             .mount_as_scoped(&server)
@@ -1059,7 +1103,7 @@ mod tests {
         // Shell create
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>CTRLC-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>CTRLC-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -1068,7 +1112,7 @@ mod tests {
         // Ctrl+C signal (just return OK)
         let signal_mock = Mock::given(method("POST"))
             .respond_with(
-                ResponseTemplate::new(200).set_body_string(r#"<s:Envelope><s:Body/></s:Envelope>"#),
+                ResponseTemplate::new(200).set_body_string(r"<s:Envelope><s:Body/></s:Envelope>"),
             )
             .expect(1)
             .mount_as_scoped(&server)
@@ -1099,7 +1143,7 @@ mod tests {
         // Shell create
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>PS-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>PS-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -1108,7 +1152,7 @@ mod tests {
         // Command execute
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>PS-CMD</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>PS-CMD</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -1130,7 +1174,7 @@ mod tests {
         // Cleanup
         Mock::given(method("POST"))
             .respond_with(
-                ResponseTemplate::new(200).set_body_string(r#"<s:Envelope><s:Body/></s:Envelope>"#),
+                ResponseTemplate::new(200).set_body_string(r"<s:Envelope><s:Body/></s:Envelope>"),
             )
             .mount(&server)
             .await;
@@ -1163,7 +1207,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(header("Authorization", "Basic YWRtaW46cGFzcw=="))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>RETRY-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>RETRY-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
             ))
             .mount(&server)
             .await;
@@ -1201,7 +1245,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(header("Authorization", "Basic YWRtaW46cGFzcw=="))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><s:Fault><s:Code><s:Value>s:Receiver</s:Value></s:Code><s:Reason><s:Text>Access denied</s:Text></s:Reason></s:Fault></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><s:Fault><s:Code><s:Value>s:Receiver</s:Value></s:Code><s:Reason><s:Text>Access denied</s:Text></s:Reason></s:Fault></s:Body></s:Envelope>",
             ))
             .mount(&server)
             .await;
@@ -1222,7 +1266,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(header("Authorization", "Basic YWRtaW46cGFzcw=="))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>NO-RETRY</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>NO-RETRY</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
             ))
             .mount(&server)
             .await;
@@ -1346,7 +1390,7 @@ mod tests {
         // Shell create
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>STREAM-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>STREAM-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -1355,7 +1399,7 @@ mod tests {
         // Command execute
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>STREAM-CMD</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>STREAM-CMD</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -1392,7 +1436,7 @@ mod tests {
         // Cleanup
         Mock::given(method("POST"))
             .respond_with(
-                ResponseTemplate::new(200).set_body_string(r#"<s:Envelope><s:Body/></s:Envelope>"#),
+                ResponseTemplate::new(200).set_body_string(r"<s:Envelope><s:Body/></s:Envelope>"),
             )
             .mount(&server)
             .await;
@@ -1430,7 +1474,7 @@ mod tests {
         // Shell create
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>DL-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>DL-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -1439,7 +1483,7 @@ mod tests {
         // Command execute
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>DL-CMD</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>DL-CMD</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -1463,7 +1507,7 @@ mod tests {
         // Cleanup (signal + delete)
         Mock::given(method("POST"))
             .respond_with(
-                ResponseTemplate::new(200).set_body_string(r#"<s:Envelope><s:Body/></s:Envelope>"#),
+                ResponseTemplate::new(200).set_body_string(r"<s:Envelope><s:Body/></s:Envelope>"),
             )
             .mount(&server)
             .await;
@@ -1629,7 +1673,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>CERT-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>CERT-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
             ))
             .mount(&server)
             .await;
@@ -1667,7 +1711,7 @@ mod tests {
         // Shell create
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>RUN-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>RUN-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -1676,7 +1720,7 @@ mod tests {
         // Command execute
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>RUN-CMD</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>RUN-CMD</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -1736,7 +1780,7 @@ mod tests {
         // Shell create
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>START-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>START-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -1745,7 +1789,7 @@ mod tests {
         // Command execute
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>START-CMD-123</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>START-CMD-123</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -1778,7 +1822,7 @@ mod tests {
         // Shell create
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>UL-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>UL-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -1787,7 +1831,7 @@ mod tests {
         // Command execute
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>UL-CMD</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>UL-CMD</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -1836,7 +1880,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>ULF-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>ULF-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -1844,7 +1888,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>ULF-CMD</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>ULF-CMD</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -1891,7 +1935,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>DLF-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>DLF-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -1899,7 +1943,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>DLF-CMD</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>DLF-CMD</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -1950,7 +1994,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>MC-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>MC-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -1958,7 +2002,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>MC-CMD</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>MC-CMD</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -2003,7 +2047,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>DL2-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>DL2-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -2011,7 +2055,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>DL2-CMD</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>DL2-CMD</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -2058,7 +2102,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>DEL-FAIL-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>DEL-FAIL-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -2066,7 +2110,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>DEL-FAIL-CMD</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>DEL-FAIL-CMD</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -2095,7 +2139,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><s:Fault><s:Code><s:Value>s:Receiver</s:Value></s:Code><s:Reason><s:Text>Shell not found</s:Text></s:Reason></s:Fault></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><s:Fault><s:Code><s:Value>s:Receiver</s:Value></s:Code><s:Reason><s:Text>Shell not found</s:Text></s:Reason></s:Fault></s:Body></s:Envelope>",
             ))
             .mount(&server)
             .await;
@@ -2135,7 +2179,7 @@ mod tests {
                     drop(stream);
                 } else {
                     use tokio::io::AsyncWriteExt;
-                    let body = r#"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>RETRY-BACKOFF</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>"#;
+                    let body = r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>RETRY-BACKOFF</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>";
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/xml\r\n\r\n{}",
                         body.len(),
@@ -2183,7 +2227,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>MCH-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>MCH-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -2191,7 +2235,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>MCH-CMD1</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>MCH-CMD1</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -2219,7 +2263,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>MCH-CMD2</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>MCH-CMD2</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -2264,7 +2308,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>DLW-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>DLW-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -2272,7 +2316,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>DLW-CMD</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>DLW-CMD</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -2454,7 +2498,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>TO-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>TO-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -2462,7 +2506,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>TO-CMD</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>TO-CMD</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -2519,7 +2563,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>WB-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>WB-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -2527,7 +2571,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>WB-CMD</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>WB-CMD</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)

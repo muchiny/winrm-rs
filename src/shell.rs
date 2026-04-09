@@ -232,6 +232,21 @@ impl<'a> Shell<'a> {
             .delete_shell_raw(&self.host, &self.shell_id)
             .await
     }
+
+    /// Disconnect from the shell while leaving it alive on the server.
+    ///
+    /// Returns the `shell_id` so the caller can later reconnect via
+    /// [`WinrmClient::reconnect_shell`]. The local `Shell` value is
+    /// consumed; calling [`close`](Self::close) on a disconnected shell
+    /// is unnecessary because the server-side resources are still
+    /// owned by the runspace.
+    pub async fn disconnect(mut self) -> Result<String, WinrmError> {
+        self.closed = true;
+        self.client
+            .disconnect_shell_raw(&self.host, &self.shell_id)
+            .await?;
+        Ok(std::mem::take(&mut self.shell_id))
+    }
 }
 
 impl Drop for Shell<'_> {
@@ -274,7 +289,7 @@ mod tests {
         // Shell create
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>SH-RUN</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>SH-RUN</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -283,7 +298,7 @@ mod tests {
         // Execute command
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>SH-CMD</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>SH-CMD</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -338,7 +353,7 @@ mod tests {
         // Shell create
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>SH-INP</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>SH-INP</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -359,6 +374,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disconnect_returns_shell_id_and_suppresses_drop_warning() {
+        let server = MockServer::start().await;
+        let port = server.address().port();
+
+        // Shell create
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>SH-DISC</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
+            ))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Disconnect response
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("<s:Envelope><s:Body/></s:Envelope>"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = WinrmClient::new(basic_config(port), test_creds()).unwrap();
+        let shell = client.open_shell("127.0.0.1").await.unwrap();
+        let id = shell.disconnect().await.unwrap();
+        assert_eq!(id, "SH-DISC");
+    }
+
+    #[tokio::test]
+    async fn reconnect_shell_returns_handle_with_existing_id() {
+        let server = MockServer::start().await;
+        let port = server.address().port();
+
+        // Reconnect response
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("<s:Envelope><s:Body/></s:Envelope>"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = WinrmClient::new(basic_config(port), test_creds()).unwrap();
+        let shell = client
+            .reconnect_shell("127.0.0.1", "SH-EXISTING")
+            .await
+            .unwrap();
+        assert_eq!(shell.shell_id(), "SH-EXISTING");
+        // Close cleanly so the drop warning doesn't fire.
+        shell.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn signal_ctrl_c_exercises_shell_method() {
         let server = MockServer::start().await;
         let port = server.address().port();
@@ -366,7 +432,7 @@ mod tests {
         // Shell create
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>SH-SIG</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>SH-SIG</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -393,7 +459,7 @@ mod tests {
         // Shell create
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>SH-START</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>SH-START</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -402,7 +468,7 @@ mod tests {
         // Execute command
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>SH-START-CMD</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>SH-START-CMD</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -434,7 +500,7 @@ mod tests {
         // Shell create
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>SH-NEG1</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>SH-NEG1</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -443,7 +509,7 @@ mod tests {
         // Execute command
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>SH-NEG1-CMD</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>SH-NEG1-CMD</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -487,7 +553,7 @@ mod tests {
         // Shell create
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>TO2-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>TO2-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -496,7 +562,7 @@ mod tests {
         // Command execute
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>TO2-CMD</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>TO2-CMD</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -563,7 +629,7 @@ mod tests {
         // Shell create
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>TO3-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>TO3-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -572,7 +638,7 @@ mod tests {
         // Command execute
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>TO3-CMD</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>TO3-CMD</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -631,7 +697,7 @@ mod tests {
         // Shell create
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>DROP-WARN</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>DROP-WARN</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)
@@ -671,7 +737,7 @@ mod tests {
         // Shell create
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>DROP-OK</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>"#,
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>DROP-OK</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
             ))
             .up_to_n_times(1)
             .mount(&server)

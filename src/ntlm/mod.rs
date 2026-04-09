@@ -16,7 +16,8 @@ pub(crate) use messages::{
 // CredSSP path and by fuzz targets via the internal feature. Tests inside
 // the module reach it through `super::`, so the reexport is feature-gated.
 #[cfg(any(feature = "credssp", feature = "__internal"))]
-#[allow(unreachable_pub)] // re-exported via lib.rs under `__internal`; used in-crate under `credssp`
+#[allow(unreachable_pub)]
+// re-exported via lib.rs under `__internal`; used in-crate under `credssp`
 pub use messages::parse_challenge;
 #[cfg(feature = "credssp")]
 #[allow(unreachable_pub)] // used in-crate by auth/credssp.rs

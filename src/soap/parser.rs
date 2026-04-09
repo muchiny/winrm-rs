@@ -300,18 +300,18 @@ mod tests {
 
     #[test]
     fn parse_shell_id_from_response() {
-        let xml = r#"<s:Envelope><s:Body><rsp:Shell>
+        let xml = r"<s:Envelope><s:Body><rsp:Shell>
             <rsp:ShellId>ABC-DEF-123</rsp:ShellId>
-        </rsp:Shell></s:Body></s:Envelope>"#;
+        </rsp:Shell></s:Body></s:Envelope>";
         let id = parse_shell_id(xml).unwrap();
         assert_eq!(id, "ABC-DEF-123");
     }
 
     #[test]
     fn parse_command_id_from_response() {
-        let xml = r#"<s:Envelope><s:Body><rsp:CommandResponse>
+        let xml = r"<s:Envelope><s:Body><rsp:CommandResponse>
             <rsp:CommandId>CMD-456</rsp:CommandId>
-        </rsp:CommandResponse></s:Body></s:Envelope>"#;
+        </rsp:CommandResponse></s:Body></s:Envelope>";
         let id = parse_command_id(xml).unwrap();
         assert_eq!(id, "CMD-456");
     }
@@ -350,10 +350,10 @@ mod tests {
 
     #[test]
     fn detect_soap_fault() {
-        let xml = r#"<s:Envelope><s:Body><s:Fault>
+        let xml = r"<s:Envelope><s:Body><s:Fault>
             <s:Code><s:Value>s:Receiver</s:Value></s:Code>
             <s:Reason><s:Text>Access denied</s:Text></s:Reason>
-        </s:Fault></s:Body></s:Envelope>"#;
+        </s:Fault></s:Body></s:Envelope>";
 
         let result = check_soap_fault(xml);
         assert!(result.is_err());
@@ -377,33 +377,33 @@ mod tests {
 
     #[test]
     fn parse_receive_output_with_soap_fault() {
-        let xml = r#"<s:Envelope><s:Body>
+        let xml = r"<s:Envelope><s:Body>
             <s:Fault>
                 <s:Code><s:Value>s:Sender</s:Value></s:Code>
                 <s:Reason><s:Text>Invalid input</s:Text></s:Reason>
             </s:Fault>
-        </s:Body></s:Envelope>"#;
+        </s:Body></s:Envelope>";
         let result = parse_receive_output(xml);
         assert!(result.is_err());
     }
 
     #[test]
     fn check_soap_fault_no_fault() {
-        let xml = r#"<s:Envelope><s:Body><Data>ok</Data></s:Body></s:Envelope>"#;
+        let xml = r"<s:Envelope><s:Body><Data>ok</Data></s:Body></s:Envelope>";
         assert!(check_soap_fault(xml).is_ok());
     }
 
     #[test]
     fn extract_element_text_closing_tag_first() {
         // Test where closing tag appears before opening tag
-        let xml = r#"</rsp:ShellId><rsp:ShellId>ABC</rsp:ShellId>"#;
+        let xml = r"</rsp:ShellId><rsp:ShellId>ABC</rsp:ShellId>";
         let result = parse_shell_id(xml).unwrap();
         assert_eq!(result, "ABC");
     }
 
     #[test]
     fn extract_element_text_empty_content() {
-        let xml = r#"<rsp:ShellId></rsp:ShellId>"#;
+        let xml = r"<rsp:ShellId></rsp:ShellId>";
         assert!(parse_shell_id(xml).is_err());
     }
 
@@ -450,8 +450,7 @@ mod tests {
 
     #[test]
     fn detect_soap_fault_with_legacy_tags() {
-        let xml =
-            r#"<Fault><faultcode>s:Client</faultcode><faultstring>oops</faultstring></Fault>"#;
+        let xml = r"<Fault><faultcode>s:Client</faultcode><faultstring>oops</faultstring></Fault>";
         let result = check_soap_fault(xml);
         assert!(result.is_err());
     }
@@ -491,13 +490,13 @@ mod tests {
 
     #[test]
     fn extract_element_text_skips_empty_finds_second() {
-        let xml = r#"<rsp:ShellId></rsp:ShellId><rsp:ShellId>FOUND</rsp:ShellId>"#;
+        let xml = r"<rsp:ShellId></rsp:ShellId><rsp:ShellId>FOUND</rsp:ShellId>";
         assert_eq!(parse_shell_id(xml).unwrap(), "FOUND");
     }
 
     #[test]
     fn extract_element_bare_element() {
-        let xml = r#"<ShellId>BARE-ID</ShellId>"#;
+        let xml = r"<ShellId>BARE-ID</ShellId>";
         assert_eq!(parse_shell_id(xml).unwrap(), "BARE-ID");
     }
 
@@ -534,7 +533,7 @@ mod tests {
 
     #[test]
     fn extract_element_text_multiple_closing_before_opening() {
-        let xml = r#"</rsp:CommandId></rsp:CommandId><rsp:CommandId>REAL-CMD</rsp:CommandId>"#;
+        let xml = r"</rsp:CommandId></rsp:CommandId><rsp:CommandId>REAL-CMD</rsp:CommandId>";
         assert_eq!(parse_command_id(xml).unwrap(), "REAL-CMD");
     }
 
@@ -556,7 +555,7 @@ mod tests {
 
     #[test]
     fn extract_element_text_trims_whitespace() {
-        let xml = r#"<rsp:ShellId>  TRIMMED  </rsp:ShellId>"#;
+        let xml = r"<rsp:ShellId>  TRIMMED  </rsp:ShellId>";
         assert_eq!(parse_shell_id(xml).unwrap(), "TRIMMED");
     }
 

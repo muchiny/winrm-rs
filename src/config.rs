@@ -202,16 +202,16 @@ mod tests {
     #[test]
     fn default_config_max_envelope_size() {
         let config = WinrmConfig::default();
-        assert_eq!(config.max_envelope_size, 153600);
+        assert_eq!(config.max_envelope_size, 153_600);
     }
 
     #[test]
     fn custom_max_envelope_size() {
         let config = WinrmConfig {
-            max_envelope_size: 512000,
+            max_envelope_size: 512_000,
             ..Default::default()
         };
-        assert_eq!(config.max_envelope_size, 512000);
+        assert_eq!(config.max_envelope_size, 512_000);
     }
 
     #[test]

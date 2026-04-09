@@ -665,7 +665,7 @@ mod tests {
     fn authenticate_message_security_buffer_offsets() {
         let challenge = ChallengeMessage {
             server_challenge: [0x01; 8],
-            negotiate_flags: 0x00088205,
+            negotiate_flags: 0x0008_8205,
             target_info: vec![0, 0, 0, 0],
             target_domain: "DOM".to_string(),
             timestamp: Some([0x42; 8]),
@@ -780,7 +780,7 @@ mod tests {
     fn authenticate_message_with_key_security_buffer_offsets() {
         let challenge = ChallengeMessage {
             server_challenge: [0x01; 8],
-            negotiate_flags: 0x00088205,
+            negotiate_flags: 0x0008_8205,
             target_info: vec![0, 0, 0, 0],
             target_domain: "DOM".to_string(),
             timestamp: Some([0x42; 8]),
@@ -876,7 +876,7 @@ mod tests {
         msg[0..8].copy_from_slice(b"NTLMSSP\0");
         msg[8..12].copy_from_slice(&2u32.to_le_bytes());
         // negotiate flags include CredSSP-required bits
-        msg[20..24].copy_from_slice(&0xe28a8235u32.to_le_bytes());
+        msg[20..24].copy_from_slice(&0xe28a_8235_u32.to_le_bytes());
         msg[24..32].copy_from_slice(&[0xCC; 8]);
         // Append target_info at offset 32
         let ti_off = msg.len() as u32;
@@ -898,12 +898,12 @@ mod tests {
         assert_eq!(&msg[0..8], SIGNATURE);
         let flags = u32::from_le_bytes([msg[12], msg[13], msg[14], msg[15]]);
         // Must include KEY_EXCH, SEAL, SIGN, 128, 56, VERSION
-        assert_ne!(flags & 0x40000000, 0, "NEGOTIATE_KEY_EXCH");
-        assert_ne!(flags & 0x00000020, 0, "NEGOTIATE_SEAL");
-        assert_ne!(flags & 0x00000010, 0, "NEGOTIATE_SIGN");
-        assert_ne!(flags & 0x20000000, 0, "NEGOTIATE_128");
-        assert_ne!(flags & 0x80000000, 0, "NEGOTIATE_56");
-        assert_ne!(flags & 0x02000000, 0, "NEGOTIATE_VERSION");
+        assert_ne!(flags & 0x4000_0000, 0, "NEGOTIATE_KEY_EXCH");
+        assert_ne!(flags & 0x0000_0020, 0, "NEGOTIATE_SEAL");
+        assert_ne!(flags & 0x0000_0010, 0, "NEGOTIATE_SIGN");
+        assert_ne!(flags & 0x2000_0000, 0, "NEGOTIATE_128");
+        assert_ne!(flags & 0x8000_0000, 0, "NEGOTIATE_56");
+        assert_ne!(flags & 0x0200_0000, 0, "NEGOTIATE_VERSION");
     }
 
     #[cfg(feature = "credssp")]
@@ -977,8 +977,8 @@ mod tests {
         // Type 3 flags at offset 60
         let flags = u32::from_le_bytes([msg[60], msg[61], msg[62], msg[63]]);
         // Should include the server's flags + required CredSSP bits
-        assert_ne!(flags & 0x40000000, 0, "NEGOTIATE_KEY_EXCH");
-        assert_ne!(flags & 0x00000020, 0, "NEGOTIATE_SEAL");
+        assert_ne!(flags & 0x4000_0000, 0, "NEGOTIATE_KEY_EXCH");
+        assert_ne!(flags & 0x0000_0020, 0, "NEGOTIATE_SEAL");
     }
 
     #[cfg(feature = "credssp")]

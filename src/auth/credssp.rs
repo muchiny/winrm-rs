@@ -326,8 +326,7 @@ impl CredSspConnection {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         // ---- Build the request bytes ----
-        let mut req =
-            String::with_capacity(512 + body.len() + auth_header.map_or(0, |a| a.len()));
+        let mut req = String::with_capacity(512 + body.len() + auth_header.map_or(0, |a| a.len()));
         use std::fmt::Write as _;
         // pywinrm/urllib3 puts Authorization BEFORE Content-Type/Content-Length.
         // Microsoft HTTPAPI may rely on this ordering for CredSSP context tracking.

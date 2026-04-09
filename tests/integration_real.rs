@@ -221,7 +221,7 @@ async fn shell_start_command_and_receive() {
 #[ignore]
 async fn gather_host_facts_json() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
-    let script = r#"
+    let script = r"
 $facts = @{
     hostname    = $env:COMPUTERNAME
     ps_version  = $PSVersionTable.PSVersion.ToString()
@@ -232,7 +232,7 @@ $facts = @{
     os_version  = [Environment]::OSVersion.Version.ToString()
 }
 $facts | ConvertTo-Json -Compress
-"#;
+";
     let output = client
         .run_powershell(&host, script)
         .await
@@ -696,7 +696,7 @@ async fn check_https_listener_status() {
         String::from_utf8_lossy(&fw.stdout).trim()
     );
 
-    let script = r#"
+    let script = r"
         $listeners = @(Get-ChildItem WSMan:\localhost\Listener | ForEach-Object {
             $details = Get-ChildItem $_.PSPath
             @{
@@ -706,7 +706,7 @@ async fn check_https_listener_status() {
             }
         })
         $listeners | ConvertTo-Json -Compress
-    "#;
+    ";
     let output = client
         .run_powershell(&host, script)
         .await
@@ -739,10 +739,10 @@ fn test_client_https_ntlm() -> Option<(WinrmClient, String)> {
 #[ignore]
 async fn enable_credssp_server() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
-    let script = r#"
+    let script = r"
         Set-Item -Path WSMan:\localhost\Service\Auth\CredSSP -Value $true
         (Get-Item WSMan:\localhost\Service\Auth\CredSSP).Value
-    "#;
+    ";
     let output = client
         .run_powershell(&host, script)
         .await
@@ -757,10 +757,10 @@ async fn enable_credssp_server() {
 #[ignore]
 async fn enable_cbt_hardening_strict() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
-    let script = r#"
+    let script = r"
         Set-Item -Path WSMan:\localhost\Service\CbtHardeningLevel -Value Strict
         (Get-Item WSMan:\localhost\Service\CbtHardeningLevel).Value
-    "#;
+    ";
     let output = client
         .run_powershell(&host, script)
         .await
@@ -801,7 +801,7 @@ async fn compute_server_cbt_hash() {
 #[ignore]
 async fn dump_https_cert_info() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
-    let script = r#"
+    let script = r"
         $listener = Get-ChildItem WSMan:\localhost\Listener | Where-Object { (Get-ChildItem $_.PSPath | Where-Object Name -eq Transport).Value -eq 'HTTPS' }
         $thumb = (Get-ChildItem $listener.PSPath | Where-Object Name -eq CertificateThumbprint).Value
         $cert = Get-ChildItem Cert:\LocalMachine\My | Where-Object Thumbprint -eq $thumb
@@ -811,7 +811,7 @@ async fn dump_https_cert_info() {
             SignatureAlgorithm = $cert.SignatureAlgorithm.FriendlyName
             PublicKey = $cert.PublicKey.Oid.FriendlyName
         } | ConvertTo-Json -Compress
-    "#;
+    ";
     let output = client
         .run_powershell(&host, script)
         .await
@@ -826,7 +826,7 @@ async fn dump_https_cert_info() {
 #[ignore]
 async fn dump_winrm_service_config() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
-    let script = r#"
+    let script = r"
         $svc = Get-Item WSMan:\localhost\Service
         $auth = Get-ChildItem WSMan:\localhost\Service\Auth | ForEach-Object { @{Name=$_.Name; Value=$_.Value} }
         @{
@@ -834,7 +834,7 @@ async fn dump_winrm_service_config() {
             CbtHardeningLevel = (Get-Item WSMan:\localhost\Service\CbtHardeningLevel -ErrorAction SilentlyContinue).Value
             Auth = $auth
         } | ConvertTo-Json -Compress -Depth 3
-    "#;
+    ";
     let output = client
         .run_powershell(&host, script)
         .await

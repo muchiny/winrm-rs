@@ -293,6 +293,64 @@ pub(crate) fn delete_shell_request(
     )
 }
 
+/// Build a WS-Management Disconnect Shell SOAP envelope (MS-WSMV 3.1.4.26).
+///
+/// Disconnects the client from a running shell while leaving the shell
+/// alive on the server so it can be reconnected later.
+pub(crate) fn disconnect_shell_request(
+    endpoint: &str,
+    shell_id: &str,
+    timeout_secs: u64,
+    max_envelope_size: u32,
+) -> String {
+    let header = build_header(
+        endpoint,
+        ACTION_DISCONNECT,
+        Some(shell_id),
+        timeout_secs,
+        max_envelope_size,
+    );
+    // The body carries the idle timeout the server should honour while
+    // the shell is disconnected. We reuse `timeout_secs` for both so the
+    // shell stays alive for at least as long as a normal operation.
+    format!(
+        r"<s:Envelope {NS_DECL_WITH_RSP}>
+{header}
+  <s:Body>
+    <rsp:Disconnect>
+      <rsp:IdleTimeOut>PT{timeout_secs}S</rsp:IdleTimeOut>
+    </rsp:Disconnect>
+  </s:Body>
+</s:Envelope>"
+    )
+}
+
+/// Build a WS-Management Reconnect Shell SOAP envelope (MS-WSMV 3.1.4.27).
+///
+/// Rejoins a previously disconnected shell identified by `shell_id`.
+pub(crate) fn reconnect_shell_request(
+    endpoint: &str,
+    shell_id: &str,
+    timeout_secs: u64,
+    max_envelope_size: u32,
+) -> String {
+    let header = build_header(
+        endpoint,
+        ACTION_RECONNECT,
+        Some(shell_id),
+        timeout_secs,
+        max_envelope_size,
+    );
+    format!(
+        r"<s:Envelope {NS_DECL_WITH_RSP}>
+{header}
+  <s:Body>
+    <rsp:Reconnect/>
+  </s:Body>
+</s:Envelope>"
+    )
+}
+
 /// Build a WS-Management Send Input SOAP envelope (MS-WSMV 3.1.4.6).
 ///
 /// Sends stdin data to a running command. The data is base64-encoded
@@ -440,7 +498,7 @@ mod tests {
             "SELECT * FROM Win32_Service",
             None,
             60,
-            153600,
+            153_600,
         );
         assert!(xml.contains("wbem/wsman/1/wmi/root/cimv2/*"));
         assert!(xml.contains("SELECT * FROM Win32_Service"));
@@ -455,7 +513,7 @@ mod tests {
             "a < b & c",
             Some("root/StandardCimv2"),
             30,
-            153600,
+            153_600,
         );
         assert!(xml.contains("root/StandardCimv2"));
         assert!(xml.contains("a &lt; b &amp; c"));
@@ -463,7 +521,7 @@ mod tests {
 
     #[test]
     fn pull_request_includes_context() {
-        let xml = pull_request("http://h/wsman", "ctx-<id>", 60, 153600);
+        let xml = pull_request("http://h/wsman", "ctx-<id>", 60, 153_600);
         assert!(xml.contains("Pull"));
         assert!(xml.contains("ctx-&lt;id&gt;"));
         assert!(xml.contains("EnumerationContext"));
@@ -490,7 +548,7 @@ mod tests {
             "powershell.exe",
             &["-EncodedCommand", "dGVzdA=="],
             60,
-            153600,
+            153_600,
         );
         assert!(xml.contains("SHELL-123"));
         assert!(xml.contains("powershell.exe"));
@@ -500,7 +558,7 @@ mod tests {
 
     #[test]
     fn receive_request_contains_ids() {
-        let xml = receive_output_request("http://host:5985/wsman", "SHELL-1", "CMD-1", 60, 153600);
+        let xml = receive_output_request("http://host:5985/wsman", "SHELL-1", "CMD-1", 60, 153_600);
         assert!(xml.contains("SHELL-1"));
         assert!(xml.contains("CMD-1"));
         assert!(xml.contains("Receive"));
@@ -508,14 +566,14 @@ mod tests {
 
     #[test]
     fn delete_shell_contains_shell_id() {
-        let xml = delete_shell_request("http://host:5985/wsman", "SHELL-1", 60, 153600);
+        let xml = delete_shell_request("http://host:5985/wsman", "SHELL-1", 60, 153_600);
         assert!(xml.contains("SHELL-1"));
         assert!(xml.contains("transfer/Delete"));
     }
 
     #[test]
     fn signal_terminate_contains_required_elements() {
-        let xml = signal_terminate_request("http://host:5985/wsman", "S1", "C1", 60, 153600);
+        let xml = signal_terminate_request("http://host:5985/wsman", "S1", "C1", 60, 153_600);
         assert!(xml.contains("Signal"));
         assert!(xml.contains("S1"));
         assert!(xml.contains("C1"));
@@ -525,7 +583,7 @@ mod tests {
     #[test]
     fn max_envelope_size_appears_in_create_shell() {
         let config = crate::config::WinrmConfig {
-            max_envelope_size: 512000,
+            max_envelope_size: 512_000,
             ..Default::default()
         };
         let xml = create_shell_request("http://host:5985/wsman", &config);
@@ -535,25 +593,25 @@ mod tests {
 
     #[test]
     fn max_envelope_size_appears_in_execute_command() {
-        let xml = execute_command_request("http://host:5985/wsman", "S1", "cmd", &[], 60, 256000);
+        let xml = execute_command_request("http://host:5985/wsman", "S1", "cmd", &[], 60, 256_000);
         assert!(xml.contains("256000"));
     }
 
     #[test]
     fn max_envelope_size_appears_in_receive_output() {
-        let xml = receive_output_request("http://host:5985/wsman", "S1", "C1", 60, 999999);
+        let xml = receive_output_request("http://host:5985/wsman", "S1", "C1", 60, 999_999);
         assert!(xml.contains("999999"));
     }
 
     #[test]
     fn max_envelope_size_appears_in_signal_terminate() {
-        let xml = signal_terminate_request("http://host:5985/wsman", "S1", "C1", 60, 200000);
+        let xml = signal_terminate_request("http://host:5985/wsman", "S1", "C1", 60, 200_000);
         assert!(xml.contains("200000"));
     }
 
     #[test]
     fn max_envelope_size_appears_in_delete_shell() {
-        let xml = delete_shell_request("http://host:5985/wsman", "S1", 60, 300000);
+        let xml = delete_shell_request("http://host:5985/wsman", "S1", 60, 300_000);
         assert!(xml.contains("300000"));
     }
 
@@ -566,7 +624,7 @@ mod tests {
             b"hello",
             false,
             60,
-            153600,
+            153_600,
         );
         assert!(xml.contains("Send"));
         assert!(xml.contains("S1"));
@@ -587,14 +645,14 @@ mod tests {
             b"bye",
             true,
             60,
-            153600,
+            153_600,
         );
         assert!(xml.contains(r#"End="true""#));
     }
 
     #[test]
     fn signal_ctrl_c_contains_required_elements() {
-        let xml = signal_ctrl_c_request("http://host:5985/wsman", "S1", "C1", 60, 153600);
+        let xml = signal_ctrl_c_request("http://host:5985/wsman", "S1", "C1", 60, 153_600);
         assert!(xml.contains("Signal"));
         assert!(xml.contains("S1"));
         assert!(xml.contains("C1"));
@@ -604,7 +662,7 @@ mod tests {
 
     #[test]
     fn signal_ctrl_c_max_envelope_size() {
-        let xml = signal_ctrl_c_request("http://host:5985/wsman", "S1", "C1", 60, 400000);
+        let xml = signal_ctrl_c_request("http://host:5985/wsman", "S1", "C1", 60, 400_000);
         assert!(xml.contains("400000"));
         assert!(!xml.contains("153600"));
     }
@@ -618,7 +676,7 @@ mod tests {
             b"data",
             false,
             60,
-            600000,
+            600_000,
         );
         assert!(xml.contains("600000"));
     }
@@ -645,7 +703,7 @@ mod tests {
             "cmd",
             &["arg</rsp:Arguments><injected>"],
             60,
-            153600,
+            153_600,
         );
         assert!(!xml.contains("</rsp:Arguments><injected>"));
         assert!(xml.contains("&lt;/rsp:Arguments&gt;&lt;injected&gt;"));
@@ -659,7 +717,7 @@ mod tests {
             "cmd<evil>",
             &[],
             60,
-            153600,
+            153_600,
         );
         assert!(!xml.contains("<evil>"));
         assert!(xml.contains("cmd&lt;evil&gt;"));
@@ -672,7 +730,7 @@ mod tests {
             "SHELL<injected>",
             "CMD-1",
             60,
-            153600,
+            153_600,
         );
         assert!(!xml.contains("SHELL<injected>"));
         assert!(xml.contains("SHELL&lt;injected&gt;"));
@@ -681,7 +739,7 @@ mod tests {
     #[test]
     fn receive_output_escapes_command_id() {
         let xml =
-            receive_output_request("http://host:5985/wsman", "S1", "CMD\"injected", 60, 153600);
+            receive_output_request("http://host:5985/wsman", "S1", "CMD\"injected", 60, 153_600);
         assert!(!xml.contains("CMD\"injected"));
         assert!(xml.contains("CMD&quot;injected"));
     }

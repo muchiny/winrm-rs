@@ -25,6 +25,14 @@ pub(crate) const ACTION_SIGNAL: &str =
 /// SOAP action for input delivery.
 pub(crate) const ACTION_SEND: &str = "http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Send";
 
+/// SOAP action for shell disconnect (leave server-side shell alive).
+pub(crate) const ACTION_DISCONNECT: &str =
+    "http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Disconnect";
+
+/// SOAP action for shell reconnect.
+pub(crate) const ACTION_RECONNECT: &str =
+    "http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Reconnect";
+
 /// Signal code: terminate command.
 pub(crate) const SIGNAL_TERMINATE: &str =
     "http://schemas.microsoft.com/wbem/wsman/1/windows/shell/signal/terminate";

@@ -3,6 +3,10 @@
 // Handles only the structures needed by CredSSP: TSRequest, TSCredentials,
 // TSPasswordCreds, SPNEGO NegTokenInit/NegTokenResp. Not a general-purpose
 // ASN.1 library.
+//
+// CredSSP is still WIP — some encoder/decoder helpers here are not yet
+// wired into a happy path. Silence dead_code at module level.
+#![allow(dead_code)]
 
 use crate::error::CredSspError;
 
@@ -17,7 +21,9 @@ const TAG_BIT_STRING: u8 = 0x03;
 // SPNEGO OID: 1.3.6.1.5.5.2
 const SPNEGO_OID: &[u8] = &[0x06, 0x06, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x02];
 // NTLM mechanism OID: 1.3.6.1.4.1.311.2.2.10
-const NTLM_OID: &[u8] = &[0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a];
+const NTLM_OID: &[u8] = &[
+    0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a,
+];
 
 /// Parsed TSRequest structure.
 #[derive(Debug, Clone)]
@@ -138,7 +144,10 @@ pub(crate) fn encode_ts_credentials(domain: &str, username: &str, password: &str
     // TSCredentials { credType: 1, credentials: DER(TSPasswordCreds) }
     let mut cred_contents = Vec::new();
     cred_contents.extend_from_slice(&encode_context_tag(0, &encode_integer_value(1)));
-    cred_contents.extend_from_slice(&encode_context_tag(1, &encode_octet_string(&ts_password_creds)));
+    cred_contents.extend_from_slice(&encode_context_tag(
+        1,
+        &encode_octet_string(&ts_password_creds),
+    ));
     encode_sequence(&cred_contents)
 }
 
@@ -224,14 +233,15 @@ fn read_tlv(data: &[u8]) -> Result<(u8, &[u8], usize), CredSspError> {
     let end = start + len;
     if end > data.len() {
         return Err(CredSspError::Asn1Decode(format!(
-            "TLV length {len} exceeds data ({})", data.len() - start
+            "TLV length {len} exceeds data ({})",
+            data.len() - start
         )));
     }
     Ok((tag, &data[start..end], end))
 }
 
 /// Find a context-tagged field [tag] within a SEQUENCE's contents.
-fn find_context_tag<'a>(data: &'a [u8], tag: u8) -> Option<&'a [u8]> {
+fn find_context_tag(data: &[u8], tag: u8) -> Option<&[u8]> {
     let target = 0xA0 | tag;
     let mut pos = 0;
     while pos < data.len() {
@@ -277,7 +287,9 @@ fn decode_integer(data: &[u8]) -> Result<u32, CredSspError> {
 pub(crate) fn decode_ts_request(data: &[u8]) -> Result<TsRequest, CredSspError> {
     let (tag, seq_data, _) = read_tlv(data)?;
     if tag != TAG_SEQUENCE {
-        return Err(CredSspError::Asn1Decode("TSRequest: expected SEQUENCE".into()));
+        return Err(CredSspError::Asn1Decode(
+            "TSRequest: expected SEQUENCE".into(),
+        ));
     }
 
     let version = find_context_tag(seq_data, 0)
@@ -326,7 +338,8 @@ pub(crate) fn decode_spnego_token(data: &[u8]) -> Result<Vec<u8>, CredSspError> 
     if tag == 0x60 {
         // GSS-API APPLICATION[0] wrapper — skip OID, parse NegTokenInit inside [0]
         // Find the [0] context tag after the OID
-        let oid_tlv = read_tlv(contents).map_err(|_| CredSspError::Asn1Decode("bad OID in SPNEGO".into()))?;
+        let oid_tlv =
+            read_tlv(contents).map_err(|_| CredSspError::Asn1Decode("bad OID in SPNEGO".into()))?;
         let after_oid = &contents[oid_tlv.2..];
         // [0] NegTokenInit
         if let Some(init_data) = find_context_tag(after_oid, 0) {
@@ -336,7 +349,9 @@ pub(crate) fn decode_spnego_token(data: &[u8]) -> Result<Vec<u8>, CredSspError> 
                 return Ok(decode_octet_string(token_data)?.to_vec());
             }
         }
-        Err(CredSspError::Asn1Decode("no mechToken in NegTokenInit".into()))
+        Err(CredSspError::Asn1Decode(
+            "no mechToken in NegTokenInit".into(),
+        ))
     } else if tag == 0xA1 {
         // NegTokenResp [1]
         let (_, seq_data, _) = read_tlv(contents)?;
@@ -344,7 +359,9 @@ pub(crate) fn decode_spnego_token(data: &[u8]) -> Result<Vec<u8>, CredSspError> 
         if let Some(token_data) = find_context_tag(seq_data, 2) {
             return Ok(decode_octet_string(token_data)?.to_vec());
         }
-        Err(CredSspError::Asn1Decode("no responseToken in NegTokenResp".into()))
+        Err(CredSspError::Asn1Decode(
+            "no responseToken in NegTokenResp".into(),
+        ))
     } else {
         Err(CredSspError::Asn1Decode(format!(
             "unexpected SPNEGO tag: 0x{tag:02x}"
@@ -389,7 +406,9 @@ pub(crate) fn extract_subject_public_key(cert_der: &[u8]) -> Result<Vec<u8>, Cre
         field_idx += 1;
     }
 
-    Err(CredSspError::Asn1Decode("SubjectPublicKey not found in certificate".into()))
+    Err(CredSspError::Asn1Decode(
+        "SubjectPublicKey not found in certificate".into(),
+    ))
 }
 
 #[cfg(test)]
@@ -653,7 +672,7 @@ mod tests {
         // But let's verify the output bytes are correct for roundtrip.
         let encoded = encode_context_tag(3, &[0x42]);
         assert_eq!(encoded[0], 0xA3); // 0xA0 | 3
-        assert_eq!(encoded[1], 1);    // length
+        assert_eq!(encoded[1], 1); // length
         assert_eq!(encoded[2], 0x42); // content
     }
 }

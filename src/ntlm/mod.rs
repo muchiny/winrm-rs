@@ -9,15 +9,23 @@ pub(crate) mod messages;
 
 // Re-export public API
 pub use messages::{
-    ChallengeMessage, create_authenticate_message, create_authenticate_message_credssp,
-    create_authenticate_message_with_cbt, create_authenticate_message_with_key,
-    create_negotiate_message, create_negotiate_message_credssp, decode_challenge_header,
-    encode_authorization, parse_challenge,
+    ChallengeMessage, create_authenticate_message_with_cbt, create_authenticate_message_with_key,
+    create_negotiate_message, decode_challenge_header, encode_authorization,
 };
+// `parse_challenge` is only used by consumers outside of `ntlm::messages`
+// in the CredSSP path, inside tests (via `super::`), and from fuzz targets
+// via the internal feature. Gate the reexport to avoid dead_code warnings
+// in the default build.
+#[cfg(test)]
+pub use messages::create_authenticate_message;
+#[cfg(any(test, feature = "credssp", feature = "__internal"))]
+pub use messages::parse_challenge;
+#[cfg(feature = "credssp")]
+pub use messages::{create_authenticate_message_credssp, create_negotiate_message_credssp};
 
 // NtlmSession uses crypto internals
 use crate::error::NtlmError;
-use crypto::{hmac_md5, Rc4State};
+use crypto::{Rc4State, hmac_md5};
 
 /// NTLM session state for message encryption/decryption after authentication.
 ///
@@ -178,7 +186,8 @@ impl NtlmSession {
         }
 
         // Verify sequence number (unencrypted field)
-        let sig_seq = u32::from_le_bytes([signature[12], signature[13], signature[14], signature[15]]);
+        let sig_seq =
+            u32::from_le_bytes([signature[12], signature[13], signature[14], signature[15]]);
         if sig_seq != self.server_seq_num {
             return Err(NtlmError::InvalidMessage("sequence number mismatch".into()));
         }
@@ -211,16 +220,25 @@ mod tests {
     use super::*;
 
     fn unhex(s: &str) -> Vec<u8> {
-        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i+2], 16).unwrap()).collect()
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
     }
 
     #[test]
     fn mic_hmac_md5_matches_pywinrm_vector() {
         // Vector captured from pywinrm oracle:
         let session_key = unhex("101112131415161718191a1b1c1d1e1f");
-        let neg = unhex("4e544c4d5353500001000000378208e200000000280000000000000028000000000c01000000000f");
-        let chal = unhex("4e544c4d53535000020000001e001e003800000035828ae28dc091106adfffd0000000000000000098009800560000000a00f4650000000f570049004e002d00540054005300540041004e005500510030003800530002001e00570049004e002d00540054005300540041004e005500510030003800530001001e00570049004e002d00540054005300540041004e005500510030003800530004001e00570049004e002d00540054005300540041004e005500510030003800530003001e00570049004e002d00540054005300540041004e00550051003000380053000700080000f8c4ba9dc7dc0100000000");
-        let auth = unhex("4e544c4d53535000030000001800180058000000f600f6007000000000000000660100000e000e00660100001e001e0074010000100010009201000035828ae2000c01000000000f000000000000000000000000000000000000000000000000000000000000000000000000000000008d3613113b1608b1afb92a5f0eb02477010100000000000000f8c4ba9dc7dc0120212223242526270000000002001e00570049004e002d00540054005300540041004e005500510030003800530001001e00570049004e002d00540054005300540041004e005500510030003800530004001e00570049004e002d00540054005300540041004e005500510030003800530003001e00570049004e002d00540054005300540041004e00550051003000380053000700080000f8c4ba9dc7dc010900220048005400540050002f003100390032002e003100360038002e00390036002e00310006000400020000000000000000000000760061006700720061006e00740050004f005300540045002d0046004900580045002d004c004f004900430017dc1c37061dbbea1b965421d8311908");
+        let neg = unhex(
+            "4e544c4d5353500001000000378208e200000000280000000000000028000000000c01000000000f",
+        );
+        let chal = unhex(
+            "4e544c4d53535000020000001e001e003800000035828ae28dc091106adfffd0000000000000000098009800560000000a00f4650000000f570049004e002d00540054005300540041004e005500510030003800530002001e00570049004e002d00540054005300540041004e005500510030003800530001001e00570049004e002d00540054005300540041004e005500510030003800530004001e00570049004e002d00540054005300540041004e005500510030003800530003001e00570049004e002d00540054005300540041004e00550051003000380053000700080000f8c4ba9dc7dc0100000000",
+        );
+        let auth = unhex(
+            "4e544c4d53535000030000001800180058000000f600f6007000000000000000660100000e000e00660100001e001e0074010000100010009201000035828ae2000c01000000000f000000000000000000000000000000000000000000000000000000000000000000000000000000008d3613113b1608b1afb92a5f0eb02477010100000000000000f8c4ba9dc7dc0120212223242526270000000002001e00570049004e002d00540054005300540041004e005500510030003800530001001e00570049004e002d00540054005300540041004e005500510030003800530004001e00570049004e002d00540054005300540041004e005500510030003800530003001e00570049004e002d00540054005300540041004e00550051003000380053000700080000f8c4ba9dc7dc010900220048005400540050002f003100390032002e003100360038002e00390036002e00310006000400020000000000000000000000760061006700720061006e00740050004f005300540045002d0046004900580045002d004c004f004900430017dc1c37061dbbea1b965421d8311908",
+        );
         let expected = unhex("a235369e56d2a0fad48a755b6b4c63e6");
         let mut input = Vec::new();
         input.extend_from_slice(&neg);
@@ -234,34 +252,77 @@ mod tests {
     #[test]
     fn ntlm_session_keys_match_pywinrm_vector() {
         // Vector captured from pywinrm/spnego with exported_session_key = 0x10..0x1f
-        let key: [u8; 16] = [0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,0x18,0x19,0x1a,0x1b,0x1c,0x1d,0x1e,0x1f];
-        let cli_seal = NtlmSession::derive_key(&key, b"session key to client-to-server sealing key magic constant\0");
-        let srv_seal = NtlmSession::derive_key(&key, b"session key to server-to-client sealing key magic constant\0");
-        let cli_sign = NtlmSession::derive_key(&key, b"session key to client-to-server signing key magic constant\0");
-        let srv_sign = NtlmSession::derive_key(&key, b"session key to server-to-client signing key magic constant\0");
+        let key: [u8; 16] = [
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+            0x1e, 0x1f,
+        ];
+        let cli_seal = NtlmSession::derive_key(
+            &key,
+            b"session key to client-to-server sealing key magic constant\0",
+        );
+        let srv_seal = NtlmSession::derive_key(
+            &key,
+            b"session key to server-to-client sealing key magic constant\0",
+        );
+        let cli_sign = NtlmSession::derive_key(
+            &key,
+            b"session key to client-to-server signing key magic constant\0",
+        );
+        let srv_sign = NtlmSession::derive_key(
+            &key,
+            b"session key to server-to-client signing key magic constant\0",
+        );
         let h = |b: &[u8]| b.iter().map(|x| format!("{:02x}", x)).collect::<String>();
-        assert_eq!(h(&cli_seal), "af22a2127a4b090cccdfa26c427969c7", "client seal key");
-        assert_eq!(h(&srv_seal), "b9e4af6ccd5f5edeb067d13815036db5", "server seal key");
-        assert_eq!(h(&cli_sign), "a14c3d1e1b365279873f7dcf51aed29d", "client sign key");
-        assert_eq!(h(&srv_sign), "dbfeaa5883b889757ff1d849f31d6d53", "server sign key");
+        assert_eq!(
+            h(&cli_seal),
+            "af22a2127a4b090cccdfa26c427969c7",
+            "client seal key"
+        );
+        assert_eq!(
+            h(&srv_seal),
+            "b9e4af6ccd5f5edeb067d13815036db5",
+            "server seal key"
+        );
+        assert_eq!(
+            h(&cli_sign),
+            "a14c3d1e1b365279873f7dcf51aed29d",
+            "client sign key"
+        );
+        assert_eq!(
+            h(&srv_sign),
+            "dbfeaa5883b889757ff1d849f31d6d53",
+            "server sign key"
+        );
     }
 
     #[test]
     fn sign_matches_pyspnego_mech_list_mic() {
-        let key: [u8; 16] = [0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,0x18,0x19,0x1a,0x1b,0x1c,0x1d,0x1e,0x1f];
+        let key: [u8; 16] = [
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+            0x1e, 0x1f,
+        ];
         let mut s = NtlmSession::from_auth(&key);
         let mech = unhex("300c060a2b06010401823702020a");
         let sig = s.sign(&mech);
-        assert_eq!(sig.to_vec(), unhex("0100000002f81117bb3953f700000000"), "mechListMIC mismatch");
+        assert_eq!(
+            sig.to_vec(),
+            unhex("0100000002f81117bb3953f700000000"),
+            "mechListMIC mismatch"
+        );
     }
 
     #[test]
     fn seal_matches_pywinrm_vector() {
-        let key: [u8; 16] = [0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,0x18,0x19,0x1a,0x1b,0x1c,0x1d,0x1e,0x1f];
+        let key: [u8; 16] = [
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+            0x1e, 0x1f,
+        ];
         let mut session = NtlmSession::from_auth(&key);
         let plaintext: Vec<u8> = (0u8..32).collect();
         let sealed = session.seal(&plaintext);
-        let expected = unhex("010000000f62d40713d158d4000000001b23173031109ef42a884e223417c37909fada44f3180048ab67dc2d64ea9c41");
+        let expected = unhex(
+            "010000000f62d40713d158d4000000001b23173031109ef42a884e223417c37909fada44f3180048ab67dc2d64ea9c41",
+        );
         assert_eq!(sealed, expected, "seal output mismatch");
     }
 

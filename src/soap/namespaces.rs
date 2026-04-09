@@ -5,12 +5,10 @@ pub(crate) const RESOURCE_URI_CMD: &str =
     "http://schemas.microsoft.com/wbem/wsman/1/windows/shell/cmd";
 
 /// SOAP action for shell creation.
-pub(crate) const ACTION_CREATE: &str =
-    "http://schemas.xmlsoap.org/ws/2004/09/transfer/Create";
+pub(crate) const ACTION_CREATE: &str = "http://schemas.xmlsoap.org/ws/2004/09/transfer/Create";
 
 /// SOAP action for shell deletion.
-pub(crate) const ACTION_DELETE: &str =
-    "http://schemas.xmlsoap.org/ws/2004/09/transfer/Delete";
+pub(crate) const ACTION_DELETE: &str = "http://schemas.xmlsoap.org/ws/2004/09/transfer/Delete";
 
 /// SOAP action for command execution.
 pub(crate) const ACTION_COMMAND: &str =
@@ -25,8 +23,7 @@ pub(crate) const ACTION_SIGNAL: &str =
     "http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Signal";
 
 /// SOAP action for input delivery.
-pub(crate) const ACTION_SEND: &str =
-    "http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Send";
+pub(crate) const ACTION_SEND: &str = "http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Send";
 
 /// Signal code: terminate command.
 pub(crate) const SIGNAL_TERMINATE: &str =
@@ -53,9 +50,7 @@ pub(crate) const ACTION_ENUMERATE: &str =
     "http://schemas.xmlsoap.org/ws/2004/09/enumeration/Enumerate";
 
 /// SOAP action for WS-Enumeration Pull request.
-pub(crate) const ACTION_PULL: &str =
-    "http://schemas.xmlsoap.org/ws/2004/09/enumeration/Pull";
+pub(crate) const ACTION_PULL: &str = "http://schemas.xmlsoap.org/ws/2004/09/enumeration/Pull";
 
 /// WQL filter dialect URI.
-pub(crate) const WQL_DIALECT: &str =
-    "http://schemas.microsoft.com/wbem/wsman/1/WQL";
+pub(crate) const WQL_DIALECT: &str = "http://schemas.microsoft.com/wbem/wsman/1/WQL";

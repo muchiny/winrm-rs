@@ -223,7 +223,11 @@ fn extract_streams(xml: &str) -> Vec<(String, String)> {
     while search_from < xml.len() {
         let found = stream_tags
             .iter()
-            .filter_map(|tag| xml[search_from..].find(tag).map(|pos| (search_from + pos, *tag)))
+            .filter_map(|tag| {
+                xml[search_from..]
+                    .find(tag)
+                    .map(|pos| (search_from + pos, *tag))
+            })
             .min_by_key(|(pos, _)| *pos);
 
         let Some((tag_start, _)) = found else {

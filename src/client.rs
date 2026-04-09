@@ -283,8 +283,13 @@ impl WinrmClient {
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<CommandOutput, WinrmError> {
         let encoded = encode_powershell_command(script);
-        self.run_command_with_cancel(host, "powershell.exe", &["-EncodedCommand", &encoded], cancel)
-            .await
+        self.run_command_with_cancel(
+            host,
+            "powershell.exe",
+            &["-EncodedCommand", &encoded],
+            cancel,
+        )
+        .await
     }
 
     /// Execute a WQL query against WMI via WS-Enumeration.
@@ -332,7 +337,10 @@ impl WinrmClient {
                 config.operation_timeout_secs,
                 config.max_envelope_size,
             );
-            let pull_response = self.transport.send_soap_with_retry(host, pull_envelope).await?;
+            let pull_response = self
+                .transport
+                .send_soap_with_retry(host, pull_envelope)
+                .await?;
             let (more_items, next_ctx) =
                 soap::parse_enumerate_response(&pull_response).map_err(WinrmError::Soap)?;
             items.push_str(&more_items);

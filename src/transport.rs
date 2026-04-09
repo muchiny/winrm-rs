@@ -13,6 +13,7 @@ use zeroize::Zeroizing;
 use crate::auth::AuthTransport;
 use crate::auth::basic::BasicAuth;
 use crate::auth::certificate::CertificateAuth;
+#[cfg(feature = "credssp")]
 use crate::auth::credssp::CredSspAuth;
 use crate::auth::kerberos::KerberosAuth;
 use crate::auth::ntlm::NtlmAuth;
@@ -102,9 +103,8 @@ impl HttpTransport {
         let cert_handle = if config.use_tls {
             // Ensure a rustls CryptoProvider is installed (idempotent)
             let _ = rustls::crypto::ring::default_provider().install_default();
-            let root_store = rustls::RootCertStore::from_iter(
-                webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
-            );
+            let root_store =
+                rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
             let inner_verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
                 if config.accept_invalid_certs {
                     Arc::new(crate::tls::NoVerifier)
@@ -187,6 +187,7 @@ impl HttpTransport {
                 let auth = CertificateAuth;
                 auth.send_authenticated(&self.http, &url, body).await?
             }
+            #[cfg(feature = "credssp")]
             AuthMethod::CredSsp => {
                 let auth = CredSspAuth {
                     username: self.credentials.username.clone(),
@@ -195,6 +196,12 @@ impl HttpTransport {
                     cert_handle: self.cert_handle.clone(),
                 };
                 auth.send_authenticated(&self.http, &url, body).await?
+            }
+            #[cfg(not(feature = "credssp"))]
+            AuthMethod::CredSsp => {
+                return Err(WinrmError::AuthFailed(
+                    "CredSSP authentication requires the `credssp` cargo feature".into(),
+                ));
             }
         };
 

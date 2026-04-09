@@ -7,7 +7,6 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use zeroize::Zeroizing;
 
 use crate::auth::AuthTransport;
-use crate::config::EncryptionMode;
 use crate::error::WinrmError;
 use crate::ntlm;
 
@@ -27,8 +26,7 @@ pub(crate) struct NtlmAuth {
 }
 
 const ENCRYPTED_BOUNDARY: &str = "--Encrypted Boundary";
-const ENCRYPTED_CONTENT_TYPE: &str =
-    "multipart/encrypted;protocol=\"application/HTTP-SPNEGO-session-encrypted\";boundary=\"Encrypted Boundary\"";
+const ENCRYPTED_CONTENT_TYPE: &str = "multipart/encrypted;protocol=\"application/HTTP-SPNEGO-session-encrypted\";boundary=\"Encrypted Boundary\"";
 
 /// Wrap a SOAP body in NTLM-sealed multipart/encrypted format (MS-WSMV 2.2.9.1).
 fn seal_body(session: &mut ntlm::NtlmSession, body: &str) -> (String, Vec<u8>) {
@@ -63,7 +61,9 @@ fn unseal_body(session: &mut ntlm::NtlmSession, data: &[u8]) -> Result<String, W
     let pos = data
         .windows(marker.len())
         .position(|w| w == marker)
-        .ok_or_else(|| WinrmError::AuthFailed("sealed response: missing octet-stream marker".into()))?;
+        .ok_or_else(|| {
+            WinrmError::AuthFailed("sealed response: missing octet-stream marker".into())
+        })?;
     let encrypted_start = pos + marker.len();
 
     // First 4 bytes = signature length (LE u32)
@@ -89,7 +89,9 @@ fn unseal_body(session: &mut ntlm::NtlmSession, data: &[u8]) -> Result<String, W
 
     let sealed_data = &data[sealed_start..sealed_end];
     if sealed_data.len() < sig_len {
-        return Err(WinrmError::AuthFailed("sealed response: data too short for signature".into()));
+        return Err(WinrmError::AuthFailed(
+            "sealed response: data too short for signature".into(),
+        ));
     }
 
     let plaintext = session.unseal(sealed_data).map_err(WinrmError::Ntlm)?;
@@ -144,17 +146,25 @@ impl AuthTransport for NtlmAuth {
             self.domain.clone()
         };
 
-        let (type3, session_key) = if let Some(cert_der) = self.cert_handle.as_ref().and_then(|h| h.get()) {
-            let cbt = crate::ntlm::crypto::compute_channel_bindings(&cert_der);
-            let msg_cbt = ntlm::create_authenticate_message_with_cbt(
-                &challenge, &self.username, &self.password, &domain, cbt,
-            );
-            (msg_cbt, [0u8; 16])
-        } else {
-            ntlm::create_authenticate_message_with_key(
-                &challenge, &self.username, &self.password, &domain,
-            )
-        };
+        let (type3, session_key) =
+            if let Some(cert_der) = self.cert_handle.as_ref().and_then(|h| h.get()) {
+                let cbt = crate::ntlm::crypto::compute_channel_bindings(&cert_der);
+                let msg_cbt = ntlm::create_authenticate_message_with_cbt(
+                    &challenge,
+                    &self.username,
+                    &self.password,
+                    &domain,
+                    cbt,
+                );
+                (msg_cbt, [0u8; 16])
+            } else {
+                ntlm::create_authenticate_message_with_key(
+                    &challenge,
+                    &self.username,
+                    &self.password,
+                    &domain,
+                )
+            };
         let auth_header = ntlm::encode_authorization(&type3);
 
         // Apply NTLM sealing if encryption is enabled
@@ -163,7 +173,10 @@ impl AuthTransport for NtlmAuth {
             let (ct, sealed) = seal_body(&mut session, &body);
             (ct, sealed)
         } else {
-            ("application/soap+xml;charset=UTF-8".to_string(), body.into_bytes())
+            (
+                "application/soap+xml;charset=UTF-8".to_string(),
+                body.into_bytes(),
+            )
         };
 
         let resp = http

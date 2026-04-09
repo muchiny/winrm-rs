@@ -2,6 +2,11 @@
 //
 // **STATUS: EXPERIMENTAL — INCOMPLETE**
 //
+// Several fields and helpers below are part of a WIP implementation and
+// are not yet on the active path. Silence dead_code at module level
+// rather than scattering attributes.
+#![allow(dead_code)]
+//
 // This implements the CredSSP protocol with TLS-in-TLS architecture:
 //
 // - **Outer channel**: HTTPS via reqwest (regular WinRM connection)
@@ -44,9 +49,10 @@
 #[cfg(feature = "credssp")]
 use std::sync::Arc;
 
+#[cfg(feature = "credssp")]
 use base64::Engine;
+#[cfg(feature = "credssp")]
 use base64::engine::general_purpose::STANDARD as B64;
-use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
 #[cfg(feature = "credssp")]
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
@@ -122,7 +128,10 @@ struct MemBio {
 impl std::io::Read for MemBio {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if self.incoming.is_empty() {
-            return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "no data"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "no data",
+            ));
         }
         let n = std::cmp::min(buf.len(), self.incoming.len());
         for slot in buf.iter_mut().take(n) {
@@ -138,7 +147,9 @@ impl std::io::Write for MemBio {
         self.outgoing.extend_from_slice(buf);
         Ok(buf.len())
     }
-    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(feature = "credssp")]
@@ -185,16 +196,11 @@ impl OpenSslMemTls {
             match self.ssl.ssl_read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => out.extend_from_slice(&buf[..n]),
-                Err(e)
-                    if e.code() == ErrorCode::WANT_READ
-                        || e.code() == ErrorCode::WANT_WRITE =>
-                {
-                    break
+                Err(e) if e.code() == ErrorCode::WANT_READ || e.code() == ErrorCode::WANT_WRITE => {
+                    break;
                 }
                 Err(e) => {
-                    return Err(WinrmError::AuthFailed(format!(
-                        "inner TLS read: {e}"
-                    )));
+                    return Err(WinrmError::AuthFailed(format!("inner TLS read: {e}")));
                 }
             }
         }
@@ -320,7 +326,8 @@ impl CredSspConnection {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         // ---- Build the request bytes ----
-        let mut req = String::with_capacity(512 + body.len() + auth_header.map(|a| a.len()).unwrap_or(0));
+        let mut req =
+            String::with_capacity(512 + body.len() + auth_header.map(|a| a.len()).unwrap_or(0));
         use std::fmt::Write as _;
         // pywinrm/urllib3 puts Authorization BEFORE Content-Type/Content-Length.
         // Microsoft HTTPAPI may rely on this ordering for CredSSP context tracking.
@@ -373,7 +380,9 @@ impl CredSspConnection {
                 break pos + 4;
             }
             if buf.len() > 1024 * 1024 {
-                return Err(WinrmError::AuthFailed("CredSSP: response head too large".into()));
+                return Err(WinrmError::AuthFailed(
+                    "CredSSP: response head too large".into(),
+                ));
             }
         };
 
@@ -385,7 +394,9 @@ impl CredSspConnection {
             .split_whitespace()
             .nth(1)
             .and_then(|s| s.parse().ok())
-            .ok_or_else(|| WinrmError::AuthFailed(format!("CredSSP: bad status line: {status_line}")))?;
+            .ok_or_else(|| {
+                WinrmError::AuthFailed(format!("CredSSP: bad status line: {status_line}"))
+            })?;
 
         let mut headers: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
@@ -551,7 +562,9 @@ impl AuthTransport for CredSspAuth {
                 continue;
             }
 
-            let (status, headers, _) = conn.post(Some(&encode_auth(&outgoing)), body_for_auth).await?;
+            let (status, headers, _) = conn
+                .post(Some(&encode_auth(&outgoing)), body_for_auth)
+                .await?;
             if status != 401 {
                 return Err(WinrmError::AuthFailed(format!(
                     "CredSSP: TLS handshake round {round}: expected 401, got {status}"
@@ -597,10 +610,12 @@ impl AuthTransport for CredSspAuth {
         let ts_req1 =
             asn1::encode_ts_request(CREDSSP_VERSION, Some(&spnego_init), None, None, None);
         inner_tls.write_plaintext(&ts_req1)?;
-        let outgoing = Ok::<_,WinrmError>(inner_tls.drain_outgoing())?;
+        let outgoing = Ok::<_, WinrmError>(inner_tls.drain_outgoing())?;
 
         // Send through HTTP
-        let (status, headers, _) = conn.post(Some(&encode_auth(&outgoing)), body_for_auth).await?;
+        let (status, headers, _) = conn
+            .post(Some(&encode_auth(&outgoing)), body_for_auth)
+            .await?;
         if status != 401 {
             return Err(WinrmError::AuthFailed(format!(
                 "CredSSP: NTLM negotiate: expected 401, got {status}"
@@ -612,7 +627,10 @@ impl AuthTransport for CredSspAuth {
         let server_bytes = B64
             .decode(server_token.trim_ascii())
             .map_err(|e| WinrmError::AuthFailed(format!("CredSSP: bad b64 NTLM nego: {e}")))?;
-        { inner_tls.feed_incoming(&server_bytes); Ok::<_,WinrmError>(()) }?;
+        {
+            inner_tls.feed_incoming(&server_bytes);
+            Ok::<_, WinrmError>(())
+        }?;
         let plaintext = inner_tls.read_plaintext()?;
 
         // === Step 5: Decode TSRequest containing NTLM Type 2 ===
@@ -680,7 +698,6 @@ impl AuthTransport for CredSspAuth {
         };
         let encrypted_pub_key_auth = ntlm_session.seal(&client_hash);
 
-
         let spnego_authenticate = asn1::encode_spnego_response(&type3, Some(&mech_list_mic));
         let ts_req3 = asn1::encode_ts_request(
             CREDSSP_VERSION,
@@ -691,16 +708,28 @@ impl AuthTransport for CredSspAuth {
         );
         if std::env::var("CREDSSP_DUMP").is_ok() {
             let h = |b: &[u8]| b.iter().map(|x| format!("{:02x}", x)).collect::<String>();
-            eprintln!("[CREDSSP_DUMP] ts_req3 ({}B): {}", ts_req3.len(), h(&ts_req3));
+            eprintln!(
+                "[CREDSSP_DUMP] ts_req3 ({}B): {}",
+                ts_req3.len(),
+                h(&ts_req3)
+            );
             eprintln!("[CREDSSP_DUMP] nonce: {}", h(&nonce));
-            eprintln!("[CREDSSP_DUMP] subject_public_key: {}", h(&subject_public_key));
+            eprintln!(
+                "[CREDSSP_DUMP] subject_public_key: {}",
+                h(&subject_public_key)
+            );
             eprintln!("[CREDSSP_DUMP] client_hash: {}", h(&client_hash));
-            eprintln!("[CREDSSP_DUMP] sealed_pub_key_auth: {}", h(&encrypted_pub_key_auth));
+            eprintln!(
+                "[CREDSSP_DUMP] sealed_pub_key_auth: {}",
+                h(&encrypted_pub_key_auth)
+            );
         }
         inner_tls.write_plaintext(&ts_req3)?;
-        let outgoing = Ok::<_,WinrmError>(inner_tls.drain_outgoing())?;
+        let outgoing = Ok::<_, WinrmError>(inner_tls.drain_outgoing())?;
 
-        let (status, headers, _) = conn.post(Some(&encode_auth(&outgoing)), body_for_auth).await?;
+        let (status, headers, _) = conn
+            .post(Some(&encode_auth(&outgoing)), body_for_auth)
+            .await?;
         if status != 401 {
             return Err(WinrmError::AuthFailed(format!(
                 "CredSSP: NTLM authenticate: expected 401, got {status}"
@@ -708,13 +737,14 @@ impl AuthTransport for CredSspAuth {
         }
         let server_token = header_get(&headers, "www-authenticate")
             .and_then(extract_credssp_token_str)
-            .ok_or_else(|| {
-                WinrmError::AuthFailed("CredSSP: NTLM auth: no CredSSP token".into())
-            })?;
+            .ok_or_else(|| WinrmError::AuthFailed("CredSSP: NTLM auth: no CredSSP token".into()))?;
         let server_bytes = B64
             .decode(server_token.trim_ascii())
             .map_err(|e| WinrmError::AuthFailed(format!("CredSSP: bad b64 auth: {e}")))?;
-        { inner_tls.feed_incoming(&server_bytes); Ok::<_,WinrmError>(()) }?;
+        {
+            inner_tls.feed_incoming(&server_bytes);
+            Ok::<_, WinrmError>(())
+        }?;
         let plaintext = inner_tls.read_plaintext()?;
 
         // === Step 7: Verify server pubKeyAuth ===
@@ -745,10 +775,9 @@ impl AuthTransport for CredSspAuth {
         let ts_req5 =
             asn1::encode_ts_request(CREDSSP_VERSION, None, None, Some(&encrypted_creds), None);
         inner_tls.write_plaintext(&ts_req5)?;
-        let outgoing = Ok::<_,WinrmError>(inner_tls.drain_outgoing())?;
+        let outgoing = Ok::<_, WinrmError>(inner_tls.drain_outgoing())?;
 
-        let (status, _headers, resp_body) =
-            conn.post(Some(&encode_auth(&outgoing)), &body).await?;
+        let (status, _headers, resp_body) = conn.post(Some(&encode_auth(&outgoing)), &body).await?;
         if status == 401 {
             return Err(WinrmError::AuthFailed(
                 "CredSSP: credentials rejected after delegation".into(),

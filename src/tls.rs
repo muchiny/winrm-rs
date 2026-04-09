@@ -189,13 +189,8 @@ mod tests {
         // Simulate a handshake
         let fake_cert = CertificateDer::from(vec![0xDE, 0xAD, 0xBE, 0xEF]);
         let server_name = ServerName::try_from("example.com").unwrap();
-        let result = verifier.verify_server_cert(
-            &fake_cert,
-            &[],
-            &server_name,
-            &[],
-            UnixTime::now(),
-        );
+        let result =
+            verifier.verify_server_cert(&fake_cert, &[], &server_name, &[], UnixTime::now());
         assert!(result.is_ok());
 
         // Cert should be captured
@@ -222,7 +217,11 @@ mod tests {
         let verifier = NoVerifier;
         let cert = CertificateDer::from(vec![0xFF; 100]);
         let name = ServerName::try_from("any.host").unwrap();
-        assert!(verifier.verify_server_cert(&cert, &[], &name, &[], UnixTime::now()).is_ok());
+        assert!(
+            verifier
+                .verify_server_cert(&cert, &[], &name, &[], UnixTime::now())
+                .is_ok()
+        );
     }
 
     #[test]
@@ -243,6 +242,9 @@ mod tests {
     fn capturing_verifier_delegates_supported_schemes() {
         let inner = Arc::new(AcceptAllVerifier);
         let verifier = CertCapturingVerifier::new(inner);
-        assert_eq!(verifier.supported_verify_schemes(), vec![SignatureScheme::RSA_PKCS1_SHA256]);
+        assert_eq!(
+            verifier.supported_verify_schemes(),
+            vec![SignatureScheme::RSA_PKCS1_SHA256]
+        );
     }
 }

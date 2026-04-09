@@ -1,6 +1,12 @@
 // Cryptographic primitives for NTLMv2 authentication.
 //
 // Hash functions, RC4 cipher, AV_PAIR parsing, and encoding helpers.
+//
+// NOTE: Several constants and helpers here are only referenced from the
+// `credssp`-gated code path. Rather than scatter `#[cfg(feature = "credssp")]`
+// across every individual item, we silence `dead_code` for the whole file —
+// this is a low-level primitives module, not public API.
+#![allow(dead_code)]
 
 use hmac::{Hmac, Mac};
 use md4::{Digest, Md4};
@@ -262,8 +268,8 @@ mod tests {
         assert_eq!(
             hash,
             [
-                0xA4, 0xF4, 0x9C, 0x40, 0x65, 0x10, 0xBD, 0xCA, 0xB6, 0x82, 0x4E, 0xE7, 0xC3,
-                0x0F, 0xD8, 0x52
+                0xA4, 0xF4, 0x9C, 0x40, 0x65, 0x10, 0xBD, 0xCA, 0xB6, 0x82, 0x4E, 0xE7, 0xC3, 0x0F,
+                0xD8, 0x52
             ]
         );
     }

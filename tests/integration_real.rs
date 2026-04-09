@@ -128,8 +128,7 @@ async fn run_powershell_json_output() {
         .expect("run JSON");
     assert_eq!(output.exit_code, 0);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let json: serde_json::Value =
-        serde_json::from_str(stdout.trim()).expect("valid JSON output");
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON output");
     assert!(json["hostname"].is_string());
     assert!(json["pid"].is_number());
 }
@@ -140,7 +139,8 @@ async fn run_powershell_unicode() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     // Force UTF-8 output encoding — default OEM codepage (437) mangles accented chars.
     // This is the recommended pattern for users who need Unicode output.
-    let script = "[Console]::OutputEncoding = [Text.Encoding]::UTF8; Write-Output 'héllo wörld café'";
+    let script =
+        "[Console]::OutputEncoding = [Text.Encoding]::UTF8; Write-Output 'héllo wörld café'";
     let output = client
         .run_powershell(&host, script)
         .await
@@ -240,8 +240,7 @@ $facts | ConvertTo-Json -Compress
         .expect("gather facts");
     assert_eq!(output.exit_code, 0);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let json: serde_json::Value =
-        serde_json::from_str(stdout.trim()).expect("valid facts JSON");
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid facts JSON");
     assert!(json["hostname"].is_string());
     assert!(json["ps_version"].is_string());
     assert!(json["os_language"].is_number());
@@ -254,7 +253,11 @@ $facts | ConvertTo-Json -Compress
 async fn wql_query_win32_operatingsystem() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let result = client
-        .run_wql(&host, "SELECT Caption,Version FROM Win32_OperatingSystem", None)
+        .run_wql(
+            &host,
+            "SELECT Caption,Version FROM Win32_OperatingSystem",
+            None,
+        )
         .await
         .expect("WQL query");
     assert!(
@@ -268,7 +271,11 @@ async fn wql_query_win32_operatingsystem() {
 async fn wql_query_win32_service() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let result = client
-        .run_wql(&host, "SELECT Name,State FROM Win32_Service WHERE Name='WinRM'", None)
+        .run_wql(
+            &host,
+            "SELECT Name,State FROM Win32_Service WHERE Name='WinRM'",
+            None,
+        )
         .await
         .expect("WQL service query");
     assert!(
@@ -496,7 +503,10 @@ async fn shell_send_input_stdin() {
     }
 
     let output = String::from_utf8_lossy(&stdout);
-    assert!(output.contains("hello"), "expected stdin echo, got: {output}");
+    assert!(
+        output.contains("hello"),
+        "expected stdin echo, got: {output}"
+    );
 
     shell.close().await.expect("close");
 }
@@ -549,12 +559,12 @@ async fn cancel_long_running_command() {
         .run_command_with_cancel(&host, "ping", &["-n", "30", "127.0.0.1"], cancel)
         .await;
 
-    assert!(
-        result.is_err(),
-        "should have been cancelled"
-    );
+    assert!(result.is_err(), "should have been cancelled");
     let err = format!("{}", result.unwrap_err());
-    assert!(err.contains("cancelled"), "expected Cancelled error, got: {err}");
+    assert!(
+        err.contains("cancelled"),
+        "expected Cancelled error, got: {err}"
+    );
 }
 
 // === Idle timeout ===
@@ -676,10 +686,16 @@ async fn check_https_listener_status() {
 
     // Disable firewall for testing
     let fw = client
-        .run_powershell(&host, "Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False; 'ok'")
+        .run_powershell(
+            &host,
+            "Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False; 'ok'",
+        )
         .await
         .expect("disable firewall");
-    eprintln!("Firewall disabled: {}", String::from_utf8_lossy(&fw.stdout).trim());
+    eprintln!(
+        "Firewall disabled: {}",
+        String::from_utf8_lossy(&fw.stdout).trim()
+    );
 
     let script = r#"
         $listeners = @(Get-ChildItem WSMan:\localhost\Listener | ForEach-Object {
@@ -692,7 +708,10 @@ async fn check_https_listener_status() {
         })
         $listeners | ConvertTo-Json -Compress
     "#;
-    let output = client.run_powershell(&host, script).await.expect("check listeners");
+    let output = client
+        .run_powershell(&host, script)
+        .await
+        .expect("check listeners");
     let stdout = String::from_utf8_lossy(&output.stdout);
     eprintln!("WinRM listeners: {}", stdout.trim());
 }
@@ -725,8 +744,14 @@ async fn enable_credssp_server() {
         Set-Item -Path WSMan:\localhost\Service\Auth\CredSSP -Value $true
         (Get-Item WSMan:\localhost\Service\Auth\CredSSP).Value
     "#;
-    let output = client.run_powershell(&host, script).await.expect("enable credssp");
-    eprintln!("CredSSP enabled: {}", String::from_utf8_lossy(&output.stdout).trim());
+    let output = client
+        .run_powershell(&host, script)
+        .await
+        .expect("enable credssp");
+    eprintln!(
+        "CredSSP enabled: {}",
+        String::from_utf8_lossy(&output.stdout).trim()
+    );
 }
 
 #[tokio::test]
@@ -737,8 +762,14 @@ async fn enable_cbt_hardening_strict() {
         Set-Item -Path WSMan:\localhost\Service\CbtHardeningLevel -Value Strict
         (Get-Item WSMan:\localhost\Service\CbtHardeningLevel).Value
     "#;
-    let output = client.run_powershell(&host, script).await.expect("set cbt level");
-    eprintln!("CBT level: {}", String::from_utf8_lossy(&output.stdout).trim());
+    let output = client
+        .run_powershell(&host, script)
+        .await
+        .expect("set cbt level");
+    eprintln!(
+        "CBT level: {}",
+        String::from_utf8_lossy(&output.stdout).trim()
+    );
 }
 
 #[tokio::test]
@@ -757,8 +788,14 @@ async fn compute_server_cbt_hash() {
             CertSha256 = ($hash | ForEach-Object { $_.ToString("x2") }) -join ""
         } | ConvertTo-Json -Compress
     "#;
-    let output = client.run_powershell(&host, script).await.expect("compute hash");
-    eprintln!("Server cert info: {}", String::from_utf8_lossy(&output.stdout).trim());
+    let output = client
+        .run_powershell(&host, script)
+        .await
+        .expect("compute hash");
+    eprintln!(
+        "Server cert info: {}",
+        String::from_utf8_lossy(&output.stdout).trim()
+    );
 }
 
 #[tokio::test]
@@ -776,8 +813,14 @@ async fn dump_https_cert_info() {
             PublicKey = $cert.PublicKey.Oid.FriendlyName
         } | ConvertTo-Json -Compress
     "#;
-    let output = client.run_powershell(&host, script).await.expect("dump cert");
-    eprintln!("HTTPS cert: {}", String::from_utf8_lossy(&output.stdout).trim());
+    let output = client
+        .run_powershell(&host, script)
+        .await
+        .expect("dump cert");
+    eprintln!(
+        "HTTPS cert: {}",
+        String::from_utf8_lossy(&output.stdout).trim()
+    );
 }
 
 #[tokio::test]
@@ -793,7 +836,10 @@ async fn dump_winrm_service_config() {
             Auth = $auth
         } | ConvertTo-Json -Compress -Depth 3
     "#;
-    let output = client.run_powershell(&host, script).await.expect("dump config");
+    let output = client
+        .run_powershell(&host, script)
+        .await
+        .expect("dump config");
     let stdout = String::from_utf8_lossy(&output.stdout);
     eprintln!("WinRM config: {}", stdout.trim());
 }
@@ -817,7 +863,10 @@ async fn basic_over_https_works() {
         ..Default::default()
     };
     let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
-    let output = client.run_command(&host, "whoami", &[]).await.expect("basic over https");
+    let output = client
+        .run_command(&host, "whoami", &[])
+        .await
+        .expect("basic over https");
     assert_eq!(output.exit_code, 0);
 }
 
@@ -841,7 +890,10 @@ async fn credssp_run_command_whoami() {
         ..Default::default()
     };
     let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
-    let output = client.run_command(&host, "whoami", &[]).await.expect("credssp whoami");
+    let output = client
+        .run_command(&host, "whoami", &[])
+        .await
+        .expect("credssp whoami");
     assert_eq!(output.exit_code, 0);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!stdout.trim().is_empty());
@@ -850,8 +902,8 @@ async fn credssp_run_command_whoami() {
 #[tokio::test]
 #[ignore]
 async fn ntlm_over_https_with_cbt() {
-    let (client, host) =
-        test_client_https_ntlm().expect("set WINRM_TEST_HOST, WINRM_TEST_PASS, WINRM_TEST_HTTPS_PORT");
+    let (client, host) = test_client_https_ntlm()
+        .expect("set WINRM_TEST_HOST, WINRM_TEST_PASS, WINRM_TEST_HTTPS_PORT");
     let output = client
         .run_command(&host, "whoami", &[])
         .await

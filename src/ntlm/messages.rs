@@ -44,6 +44,7 @@ pub fn create_negotiate_message() -> Vec<u8> {
 /// NEGOTIATE_128, NEGOTIATE_56 to enable the sealing of pubKeyAuth and
 /// TSCredentials. Also includes NEGOTIATE_VERSION which adds the 8-byte
 /// OS version field at the end of the message (40 bytes total).
+#[cfg(feature = "credssp")]
 pub fn create_negotiate_message_credssp() -> Vec<u8> {
     create_negotiate_message_with_flags(TYPE1_FLAGS_CREDSSP, true)
 }
@@ -144,6 +145,7 @@ fn create_authenticate_message_internal(
 /// `domain` is used for the NTOWFv2 hash computation. `display_domain` (if Some)
 /// is used in the Domain security buffer of Type 3 (often empty for local
 /// accounts even when the hash uses the server's target domain).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn create_authenticate_message_full(
     challenge: &ChallengeMessage,
     username: &str,
@@ -162,7 +164,10 @@ pub(crate) fn create_authenticate_message_full(
     let client_challenge: [u8; 8] = std::env::var("CREDSSP_FIXED_CC")
         .ok()
         .and_then(|s| {
-            let bytes = (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i+2], 16).ok()).collect::<Option<Vec<_>>>()?;
+            let bytes = (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+                .collect::<Option<Vec<_>>>()?;
             bytes.try_into().ok()
         })
         .unwrap_or_else(rand::random);
@@ -219,7 +224,10 @@ pub(crate) fn create_authenticate_message_full(
         let random_key: [u8; 16] = std::env::var("CREDSSP_FIXED_RSK")
             .ok()
             .and_then(|s| {
-                let bytes = (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i+2], 16).ok()).collect::<Option<Vec<_>>>()?;
+                let bytes = (0..s.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+                    .collect::<Option<Vec<_>>>()?;
                 bytes.try_into().ok()
             })
             .unwrap_or_else(rand::random);
@@ -282,9 +290,8 @@ pub(crate) fn create_authenticate_message_full(
     //   - +16 bytes for MIC if mic_input is provided
     let include_version = flags & NEGOTIATE_VERSION != 0;
     let include_mic = mic_input.is_some();
-    let header_size: u32 = 64
-        + (if include_version { 8 } else { 0 })
-        + (if include_mic { 16 } else { 0 });
+    let header_size: u32 =
+        64 + (if include_version { 8 } else { 0 }) + (if include_mic { 16 } else { 0 });
 
     let mut offset = header_size;
     let lm_offset = offset;
@@ -310,7 +317,11 @@ pub(crate) fn create_authenticate_message_full(
     write_security_buffer(&mut msg, domain_bytes.len() as u16, domain_offset);
     write_security_buffer(&mut msg, user_bytes.len() as u16, user_offset);
     write_security_buffer(&mut msg, workstation_bytes.len() as u16, ws_offset);
-    write_security_buffer(&mut msg, encrypted_random_session_key.len() as u16, session_offset);
+    write_security_buffer(
+        &mut msg,
+        encrypted_random_session_key.len() as u16,
+        session_offset,
+    );
     msg.extend_from_slice(&flags.to_le_bytes());
     if include_version {
         msg.extend_from_slice(&[0, 12, 1, 0, 0, 0, 0, 15]);
@@ -342,11 +353,23 @@ pub(crate) fn create_authenticate_message_full(
             eprintln!("[CREDSSP_DEBUG] type2 ({}B): {}", type2.len(), hex(type2));
             eprintln!("[CREDSSP_DEBUG] type3 ({}B): {}", msg.len(), hex(&msg));
             eprintln!("[CREDSSP_DEBUG] nt_proof: {}", hex(&nt_proof_str));
-            eprintln!("[CREDSSP_DEBUG] session_base_key: {}", hex(&session_base_key));
-            eprintln!("[CREDSSP_DEBUG] exported_session_key: {}", hex(&exported_session_key));
-            eprintln!("[CREDSSP_DEBUG] enc_random_sk: {}", hex(&encrypted_random_session_key));
+            eprintln!(
+                "[CREDSSP_DEBUG] session_base_key: {}",
+                hex(&session_base_key)
+            );
+            eprintln!(
+                "[CREDSSP_DEBUG] exported_session_key: {}",
+                hex(&exported_session_key)
+            );
+            eprintln!(
+                "[CREDSSP_DEBUG] enc_random_sk: {}",
+                hex(&encrypted_random_session_key)
+            );
             eprintln!("[CREDSSP_DEBUG] mic: {}", hex(&mic));
-            eprintln!("[CREDSSP_DEBUG] client_challenge: {}", hex(&client_challenge));
+            eprintln!(
+                "[CREDSSP_DEBUG] client_challenge: {}",
+                hex(&client_challenge)
+            );
             eprintln!("[CREDSSP_DEBUG] timestamp: {}", hex(&timestamp));
         }
     }
@@ -368,6 +391,7 @@ fn hex(b: &[u8]) -> String {
 /// The client challenge is 8 random bytes. If the server provided a timestamp
 /// in its Type 2 message, that timestamp is reused; otherwise the current
 /// system time is converted to Windows FILETIME format.
+#[cfg(test)]
 pub fn create_authenticate_message(
     challenge: &ChallengeMessage,
     username: &str,
@@ -390,7 +414,14 @@ pub fn create_authenticate_message_with_cbt(
     domain: &str,
     channel_bindings: [u8; 16],
 ) -> Vec<u8> {
-    create_authenticate_message_internal(challenge, username, password, domain, Some(channel_bindings)).0
+    create_authenticate_message_internal(
+        challenge,
+        username,
+        password,
+        domain,
+        Some(channel_bindings),
+    )
+    .0
 }
 
 /// Create an NTLM Type 3 (Authenticate) message and return the exported session key.
@@ -415,6 +446,7 @@ pub fn create_authenticate_message_with_key(
 ///
 /// `type1_bytes` and `type2_bytes` are the raw NTLMSSP messages exchanged
 /// previously, used as input for the MIC HMAC.
+#[cfg(feature = "credssp")]
 pub fn create_authenticate_message_credssp(
     challenge: &ChallengeMessage,
     username: &str,
@@ -795,9 +827,7 @@ mod tests {
             parse_challenge(&msg).unwrap()
         };
         let cbt = [0xAA; 16];
-        let msg = create_authenticate_message_with_cbt(
-            &challenge, "user", "pass", "DOMAIN", cbt,
-        );
+        let msg = create_authenticate_message_with_cbt(&challenge, "user", "pass", "DOMAIN", cbt);
         // Should be a valid NTLM Type 3 message
         assert_eq!(&msg[0..8], SIGNATURE);
         let msg_type = u32::from_le_bytes([msg[8], msg[9], msg[10], msg[11]]);
@@ -815,9 +845,8 @@ mod tests {
             parse_challenge(&msg).unwrap()
         };
         let without = create_authenticate_message(&challenge, "user", "pass", "DOMAIN");
-        let with_cbt = create_authenticate_message_with_cbt(
-            &challenge, "user", "pass", "DOMAIN", [0xBB; 16],
-        );
+        let with_cbt =
+            create_authenticate_message_with_cbt(&challenge, "user", "pass", "DOMAIN", [0xBB; 16]);
         // Messages should differ because target_info is modified
         assert_ne!(without, with_cbt);
         // Both should be valid Type 3
@@ -857,6 +886,7 @@ mod tests {
         parse_challenge(&msg).unwrap()
     }
 
+    #[cfg(feature = "credssp")]
     #[test]
     fn create_negotiate_message_credssp_has_credssp_flags() {
         let msg = create_negotiate_message_credssp();
@@ -872,6 +902,7 @@ mod tests {
         assert_ne!(flags & 0x02000000, 0, "NEGOTIATE_VERSION");
     }
 
+    #[cfg(feature = "credssp")]
     #[test]
     fn create_authenticate_message_credssp_has_random_session_key() {
         let challenge = build_test_challenge_for_credssp();
@@ -879,10 +910,22 @@ mod tests {
         let type2_bytes = vec![0u8; 32]; // dummy
 
         let (msg1, key1) = create_authenticate_message_credssp(
-            &challenge, "vagrant", "vagrant", "", "HTTP/host", &type1, &type2_bytes,
+            &challenge,
+            "vagrant",
+            "vagrant",
+            "",
+            "HTTP/host",
+            &type1,
+            &type2_bytes,
         );
         let (msg2, key2) = create_authenticate_message_credssp(
-            &challenge, "vagrant", "vagrant", "", "HTTP/host", &type1, &type2_bytes,
+            &challenge,
+            "vagrant",
+            "vagrant",
+            "",
+            "HTTP/host",
+            &type1,
+            &type2_bytes,
         );
         // Random session keys must differ between calls
         assert_ne!(key1, key2, "session keys should be random");
@@ -890,6 +933,7 @@ mod tests {
         assert_eq!(msg1.len(), msg2.len());
     }
 
+    #[cfg(feature = "credssp")]
     #[test]
     fn create_authenticate_message_credssp_includes_session_key_sb() {
         let challenge = build_test_challenge_for_credssp();
@@ -897,13 +941,20 @@ mod tests {
         let type2_bytes = vec![0u8; 32];
 
         let (msg, _) = create_authenticate_message_credssp(
-            &challenge, "vagrant", "vagrant", "", "HTTP/host", &type1, &type2_bytes,
+            &challenge,
+            "vagrant",
+            "vagrant",
+            "",
+            "HTTP/host",
+            &type1,
+            &type2_bytes,
         );
         // Session SB at offset 52: should have len=16
         let sk_len = u16::from_le_bytes([msg[52], msg[53]]);
         assert_eq!(sk_len, 16, "EncryptedRandomSessionKey is 16 bytes");
     }
 
+    #[cfg(feature = "credssp")]
     #[test]
     fn create_authenticate_message_credssp_uses_server_flags() {
         let challenge = build_test_challenge_for_credssp();
@@ -911,7 +962,13 @@ mod tests {
         let type2_bytes = vec![0u8; 32];
 
         let (msg, _) = create_authenticate_message_credssp(
-            &challenge, "vagrant", "vagrant", "", "HTTP/host", &type1, &type2_bytes,
+            &challenge,
+            "vagrant",
+            "vagrant",
+            "",
+            "HTTP/host",
+            &type1,
+            &type2_bytes,
         );
         // Type 3 flags at offset 60
         let flags = u32::from_le_bytes([msg[60], msg[61], msg[62], msg[63]]);
@@ -920,6 +977,7 @@ mod tests {
         assert_ne!(flags & 0x00000020, 0, "NEGOTIATE_SEAL");
     }
 
+    #[cfg(feature = "credssp")]
     #[test]
     fn create_authenticate_message_credssp_has_version_field() {
         let challenge = build_test_challenge_for_credssp();
@@ -927,13 +985,20 @@ mod tests {
         let type2_bytes = vec![0u8; 32];
 
         let (msg, _) = create_authenticate_message_credssp(
-            &challenge, "vagrant", "vagrant", "", "HTTP/host", &type1, &type2_bytes,
+            &challenge,
+            "vagrant",
+            "vagrant",
+            "",
+            "HTTP/host",
+            &type1,
+            &type2_bytes,
         );
         // Version field at offset 64-71
         // NTLMRevision = 15 (0x0f) at byte 71
         assert_eq!(msg[71], 0x0f, "NTLMRevision should be 15");
     }
 
+    #[cfg(feature = "credssp")]
     #[test]
     fn create_authenticate_message_credssp_has_mic() {
         let challenge = build_test_challenge_for_credssp();
@@ -941,7 +1006,13 @@ mod tests {
         let type2_bytes = vec![0u8; 32];
 
         let (msg, _) = create_authenticate_message_credssp(
-            &challenge, "vagrant", "vagrant", "", "HTTP/host", &type1, &type2_bytes,
+            &challenge,
+            "vagrant",
+            "vagrant",
+            "",
+            "HTTP/host",
+            &type1,
+            &type2_bytes,
         );
         // MIC at offset 72-87 (after version field)
         let mic = &msg[72..88];
@@ -949,6 +1020,7 @@ mod tests {
         assert!(mic.iter().any(|&b| b != 0), "MIC should be non-zero");
     }
 
+    #[cfg(feature = "credssp")]
     #[test]
     fn create_authenticate_message_credssp_target_info_has_av_target_name() {
         let challenge = build_test_challenge_for_credssp();
@@ -956,7 +1028,13 @@ mod tests {
         let type2_bytes = vec![0u8; 32];
 
         let (msg, _) = create_authenticate_message_credssp(
-            &challenge, "vagrant", "vagrant", "", "HTTP/somehost", &type1, &type2_bytes,
+            &challenge,
+            "vagrant",
+            "vagrant",
+            "",
+            "HTTP/somehost",
+            &type1,
+            &type2_bytes,
         );
         // The NT response contains the blob with AV pairs including AV_TARGET_NAME
         // Just check that "somehost" UTF-16LE bytes appear somewhere in the message
@@ -965,6 +1043,7 @@ mod tests {
         assert!(found, "AV_TARGET_NAME should contain 'somehost'");
     }
 
+    #[cfg(feature = "credssp")]
     #[test]
     fn create_authenticate_message_credssp_domain_sb_uses_display_domain() {
         let challenge = build_test_challenge_for_credssp();
@@ -973,7 +1052,13 @@ mod tests {
 
         // pass non-empty domain to hash
         let (msg, _) = create_authenticate_message_credssp(
-            &challenge, "vagrant", "vagrant", "DOMAIN", "HTTP/host", &type1, &type2_bytes,
+            &challenge,
+            "vagrant",
+            "vagrant",
+            "DOMAIN",
+            "HTTP/host",
+            &type1,
+            &type2_bytes,
         );
         // Domain SB at offset 28: should be 0 because display_domain is empty
         let dom_len = u16::from_le_bytes([msg[28], msg[29]]);

@@ -5,6 +5,7 @@
 
 pub(crate) mod basic;
 pub(crate) mod certificate;
+#[cfg(feature = "credssp")]
 pub(crate) mod credssp;
 pub(crate) mod kerberos;
 pub(crate) mod ntlm;

@@ -44,7 +44,14 @@ fn build_header(
     timeout_secs: u64,
     max_envelope_size: u32,
 ) -> String {
-    build_header_with_resource_uri(endpoint, action, RESOURCE_URI_CMD, shell_id, timeout_secs, max_envelope_size)
+    build_header_with_resource_uri(
+        endpoint,
+        action,
+        RESOURCE_URI_CMD,
+        shell_id,
+        timeout_secs,
+        max_envelope_size,
+    )
 }
 
 fn build_header_with_resource_uri(
@@ -93,10 +100,7 @@ fn build_header_with_resource_uri(
 /// # Arguments
 /// * `endpoint` -- full WinRM URL, e.g. `http://host:5985/wsman`
 /// * `config` -- WinRM configuration containing shell options
-pub(crate) fn create_shell_request(
-    endpoint: &str,
-    config: &crate::config::WinrmConfig,
-) -> String {
+pub(crate) fn create_shell_request(endpoint: &str, config: &crate::config::WinrmConfig) -> String {
     let header = build_header(
         endpoint,
         ACTION_CREATE,
@@ -109,7 +113,12 @@ pub(crate) fn create_shell_request(
     let working_dir = config
         .working_directory
         .as_deref()
-        .map(|dir| format!("\n      <rsp:WorkingDirectory>{}</rsp:WorkingDirectory>", xml_escape(dir)))
+        .map(|dir| {
+            format!(
+                "\n      <rsp:WorkingDirectory>{}</rsp:WorkingDirectory>",
+                xml_escape(dir)
+            )
+        })
         .unwrap_or_default();
 
     let env_block = if config.env_vars.is_empty() {
@@ -175,7 +184,11 @@ pub(crate) fn execute_command_request(
         if i > 0 {
             args_xml.push('\n');
         }
-        let _ = write!(args_xml, "      <rsp:Arguments>{}</rsp:Arguments>", xml_escape(a));
+        let _ = write!(
+            args_xml,
+            "      <rsp:Arguments>{}</rsp:Arguments>",
+            xml_escape(a)
+        );
     }
     let escaped_command = xml_escape(command);
     format!(
@@ -422,7 +435,13 @@ mod tests {
 
     #[test]
     fn enumerate_wql_request_default_namespace() {
-        let xml = enumerate_wql_request("http://h:5985/wsman", "SELECT * FROM Win32_Service", None, 60, 153600);
+        let xml = enumerate_wql_request(
+            "http://h:5985/wsman",
+            "SELECT * FROM Win32_Service",
+            None,
+            60,
+            153600,
+        );
         assert!(xml.contains("wbem/wsman/1/wmi/root/cimv2/*"));
         assert!(xml.contains("SELECT * FROM Win32_Service"));
         assert!(xml.contains("OptimizeEnumeration"));
@@ -431,7 +450,13 @@ mod tests {
 
     #[test]
     fn enumerate_wql_request_custom_namespace_and_escapes() {
-        let xml = enumerate_wql_request("http://h/wsman", "a < b & c", Some("root/StandardCimv2"), 30, 153600);
+        let xml = enumerate_wql_request(
+            "http://h/wsman",
+            "a < b & c",
+            Some("root/StandardCimv2"),
+            30,
+            153600,
+        );
         assert!(xml.contains("root/StandardCimv2"));
         assert!(xml.contains("a &lt; b &amp; c"));
     }
@@ -446,7 +471,10 @@ mod tests {
 
     #[test]
     fn create_shell_contains_required_elements() {
-        let xml = create_shell_request("http://host:5985/wsman", &crate::config::WinrmConfig::default());
+        let xml = create_shell_request(
+            "http://host:5985/wsman",
+            &crate::config::WinrmConfig::default(),
+        );
         assert!(xml.contains("transfer/Create"));
         assert!(xml.contains("WINRS_CODEPAGE"));
         assert!(xml.contains("65001"));
@@ -602,7 +630,10 @@ mod tests {
         assert_eq!(xml_escape("&"), "&amp;");
         assert_eq!(xml_escape("\""), "&quot;");
         assert_eq!(xml_escape("'"), "&apos;");
-        assert_eq!(xml_escape("a<b>c&d\"e'f"), "a&lt;b&gt;c&amp;d&quot;e&apos;f");
+        assert_eq!(
+            xml_escape("a<b>c&d\"e'f"),
+            "a&lt;b&gt;c&amp;d&quot;e&apos;f"
+        );
         assert_eq!(xml_escape("normal text"), "normal text");
     }
 
@@ -649,13 +680,8 @@ mod tests {
 
     #[test]
     fn receive_output_escapes_command_id() {
-        let xml = receive_output_request(
-            "http://host:5985/wsman",
-            "S1",
-            "CMD\"injected",
-            60,
-            153600,
-        );
+        let xml =
+            receive_output_request("http://host:5985/wsman", "S1", "CMD\"injected", 60, 153600);
         assert!(!xml.contains("CMD\"injected"));
         assert!(xml.contains("CMD&quot;injected"));
     }
@@ -683,7 +709,10 @@ mod tests {
 
     #[test]
     fn create_shell_without_working_directory() {
-        let xml = create_shell_request("http://host:5985/wsman", &crate::config::WinrmConfig::default());
+        let xml = create_shell_request(
+            "http://host:5985/wsman",
+            &crate::config::WinrmConfig::default(),
+        );
         assert!(!xml.contains("WorkingDirectory"));
     }
 
@@ -704,7 +733,10 @@ mod tests {
 
     #[test]
     fn create_shell_without_env_vars() {
-        let xml = create_shell_request("http://host:5985/wsman", &crate::config::WinrmConfig::default());
+        let xml = create_shell_request(
+            "http://host:5985/wsman",
+            &crate::config::WinrmConfig::default(),
+        );
         assert!(!xml.contains("Environment"));
     }
 
@@ -720,7 +752,10 @@ mod tests {
 
     #[test]
     fn create_shell_without_idle_timeout() {
-        let xml = create_shell_request("http://host:5985/wsman", &crate::config::WinrmConfig::default());
+        let xml = create_shell_request(
+            "http://host:5985/wsman",
+            &crate::config::WinrmConfig::default(),
+        );
         assert!(!xml.contains("IdleTimeOut"));
     }
 }

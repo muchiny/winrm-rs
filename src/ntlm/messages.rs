@@ -10,7 +10,7 @@ use crate::error::NtlmError;
 
 /// Parsed NTLM Type 2 (Challenge) message (MS-NLMP 2.2.1.2).
 ///
-/// Produced by [`parse_challenge`] from the raw bytes of a server challenge.
+/// Produced by `parse_challenge` from the raw bytes of a server challenge.
 /// Contains the fields needed to compute the Type 3 (Authenticate) response.
 #[derive(Debug)]
 pub struct ChallengeMessage {
@@ -403,7 +403,7 @@ pub fn create_authenticate_message(
 
 /// Create an NTLM Type 3 (Authenticate) message with TLS Channel Binding Token.
 ///
-/// Like [`create_authenticate_message`] but injects `AV_CHANNEL_BINDINGS`
+/// Like [`create_authenticate_message_with_key`] but injects `AV_CHANNEL_BINDINGS`
 /// into the target info to bind the authentication to the TLS channel.
 /// The `channel_bindings` parameter is the 16-byte MD5 hash of the
 /// `SEC_CHANNEL_BINDINGS` structure (computed via [`super::crypto::compute_channel_bindings`]).
@@ -426,7 +426,7 @@ pub fn create_authenticate_message_with_cbt(
 
 /// Create an NTLM Type 3 (Authenticate) message and return the exported session key.
 ///
-/// Identical to [`create_authenticate_message`] but also returns the 16-byte
+/// Identical to [`create_authenticate_message_with_cbt`] but also returns the 16-byte
 /// `ExportedSessionKey = HMAC-MD5(NTLMv2Hash, NTProofStr)` needed to derive
 /// message encryption/signing keys for [`super::NtlmSession`].
 pub fn create_authenticate_message_with_key(

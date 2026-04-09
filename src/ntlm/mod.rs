@@ -32,8 +32,9 @@ use crypto::{Rc4State, hmac_md5};
 ///
 /// # Usage
 ///
-/// After completing the NTLM handshake with [`create_authenticate_message_with_key`],
-/// use the returned exported session key to create an `NtlmSession`:
+/// After completing the NTLM handshake with
+/// `create_authenticate_message_with_key`, use the returned exported
+/// session key to create an `NtlmSession`:
 ///
 /// ```ignore
 /// let (type3_msg, session_key) = create_authenticate_message_with_key(...);

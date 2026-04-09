@@ -99,7 +99,7 @@ impl<'a> Shell<'a> {
     /// Execute a command with cancellation support.
     ///
     /// Like [`run_command`](Self::run_command), but can be cancelled via a
-    /// [`CancellationToken`]. When cancelled, a Ctrl+C signal is sent to the
+    /// [`CancellationToken`](crate::CancellationToken). When cancelled, a Ctrl+C signal is sent to the
     /// running command and [`WinrmError::Cancelled`] is returned.
     pub async fn run_command_with_cancel(
         &self,
@@ -128,7 +128,7 @@ impl<'a> Shell<'a> {
     /// Execute a PowerShell script with cancellation support.
     ///
     /// Like [`run_powershell`](Self::run_powershell), but can be cancelled via a
-    /// [`CancellationToken`].
+    /// [`CancellationToken`](crate::CancellationToken).
     pub async fn run_powershell_with_cancel(
         &self,
         script: &str,

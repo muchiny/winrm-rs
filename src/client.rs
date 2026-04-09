@@ -2110,6 +2110,11 @@ mod tests {
     }
 
     #[tokio::test]
+    // Flaky on Windows: dropping a raw TCP stream doesn't reliably produce
+    // the "connection reset" error `reqwest` needs to classify the call as
+    // retryable. The same scenario is covered by the wiremock-based retry
+    // tests which run on all platforms.
+    #[cfg_attr(windows, ignore)]
     async fn retry_backoff_on_http_error() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicU32, Ordering};

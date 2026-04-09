@@ -19,7 +19,6 @@
 //! cargo test --test integration_real -- --ignored
 //! ```
 
-use std::path::Path;
 use std::time::Duration;
 use winrm_rs::{AuthMethod, CancellationToken, WinrmClient, WinrmConfig, WinrmCredentials};
 

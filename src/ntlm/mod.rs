@@ -12,13 +12,10 @@ pub use messages::{
     ChallengeMessage, create_authenticate_message_with_cbt, create_authenticate_message_with_key,
     create_negotiate_message, decode_challenge_header, encode_authorization,
 };
-// `parse_challenge` is only used by consumers outside of `ntlm::messages`
-// in the CredSSP path, inside tests (via `super::`), and from fuzz targets
-// via the internal feature. Gate the reexport to avoid dead_code warnings
-// in the default build.
-#[cfg(test)]
-pub use messages::create_authenticate_message;
-#[cfg(any(test, feature = "credssp", feature = "__internal"))]
+// `parse_challenge` is only reached from outside `ntlm::messages` by the
+// CredSSP path and by fuzz targets via the internal feature. Tests inside
+// the module reach it through `super::`, so the reexport is feature-gated.
+#[cfg(any(feature = "credssp", feature = "__internal"))]
 pub use messages::parse_challenge;
 #[cfg(feature = "credssp")]
 pub use messages::{create_authenticate_message_credssp, create_negotiate_message_credssp};

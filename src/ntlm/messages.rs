@@ -854,6 +854,7 @@ mod tests {
         assert_eq!(&with_cbt[0..8], SIGNATURE);
     }
 
+    #[cfg(feature = "credssp")]
     fn build_test_challenge_for_credssp() -> ChallengeMessage {
         // Build a Type 2 with target_info containing standard AV pairs
         let mut target_info = Vec::new();

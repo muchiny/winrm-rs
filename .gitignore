@@ -25,6 +25,7 @@ tarpaulin-report.html
 
 # Claude Code local workspace
 .claude/
+CLAUDE.md
 
 # Network debug captures
 *.pcap

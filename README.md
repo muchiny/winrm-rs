@@ -12,17 +12,19 @@ Async WinRM (WS-Management) client for Rust.
 ```rust
 use winrm_rs::{WinrmClient, WinrmConfig, WinrmCredentials};
 
-let client = WinrmClient::new(
-    WinrmConfig::default(),
-    WinrmCredentials {
-        username: "administrator".into(),
-        password: "secret".into(),
-        domain: String::new(),
-    },
-)?;
+#[tokio::main]
+async fn main() -> Result<(), winrm_rs::WinrmError> {
+    let client = WinrmClient::new(
+        WinrmConfig::default(),
+        WinrmCredentials::new("administrator", "secret", ""),
+    )?;
 
-let output = client.run_powershell("win-server", "Get-Service | ConvertTo-Json").await?;
-println!("{}", String::from_utf8_lossy(&output.stdout));
+    let output = client
+        .run_powershell("win-server", "Get-Service | ConvertTo-Json")
+        .await?;
+    println!("{}", String::from_utf8_lossy(&output.stdout));
+    Ok(())
+}
 ```
 
 ## Features

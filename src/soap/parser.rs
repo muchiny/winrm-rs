@@ -777,10 +777,10 @@ mod tests {
     // Kills extract_subcode_value returning None
     #[test]
     fn extract_subcode_from_soap_fault() {
-        let xml = r#"<s:Fault>
+        let xml = r"<s:Fault>
             <s:Code><s:Value>s:Sender</s:Value>
             <s:Subcode><s:Value>wsa:DestinationUnreachable</s:Value></s:Subcode></s:Code>
-            <s:Reason><s:Text>no route</s:Text></s:Reason></s:Fault>"#;
+            <s:Reason><s:Text>no route</s:Text></s:Reason></s:Fault>";
         let val = extract_subcode_value(xml);
         assert_eq!(val.as_deref(), Some("wsa:DestinationUnreachable"));
     }

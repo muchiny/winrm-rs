@@ -7,7 +7,6 @@ Async WinRM (WS-Management) client for Rust.
 [![CI](https://github.com/muchiny/winrm-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/muchiny/winrm-rs/actions)
 [![License](https://img.shields.io/crates/l/winrm-rs.svg)](LICENSE-MIT)
 [![MSRV](https://img.shields.io/badge/MSRV-1.94-blue.svg)](https://blog.rust-lang.org/2026/03/20/Rust-1.94.0.html)
-[![codecov](https://codecov.io/gh/muchiny/winrm-rs/branch/main/graph/badge.svg)](https://codecov.io/gh/muchiny/winrm-rs)
 
 ```rust
 use winrm_rs::{WinrmClient, WinrmConfig, WinrmCredentials};

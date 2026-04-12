@@ -44,7 +44,7 @@ fn build_header(
     timeout_secs: u64,
     max_envelope_size: u32,
 ) -> String {
-    build_header_with_resource_uri(
+    build_header_for(
         endpoint,
         action,
         RESOURCE_URI_CMD,
@@ -54,7 +54,7 @@ fn build_header(
     )
 }
 
-fn build_header_with_resource_uri(
+fn build_header_for(
     endpoint: &str,
     action: &str,
     resource_uri: &str,
@@ -108,6 +108,7 @@ pub(crate) fn create_shell_request(endpoint: &str, config: &crate::config::Winrm
         config.operation_timeout_secs,
         config.max_envelope_size,
     );
+
     let codepage = config.codepage;
 
     let working_dir = config
@@ -159,6 +160,149 @@ pub(crate) fn create_shell_request(endpoint: &str, config: &crate::config::Winrm
     )
 }
 
+/// Build a WS-Management Create Shell envelope for **PSRP** (PowerShell
+/// Remoting Protocol).
+///
+/// The key differences from `create_shell_request` (used for CMD shells):
+/// * Resource URI is `http://schemas.microsoft.com/powershell/Microsoft.PowerShell`
+///   (or a custom configuration endpoint).
+/// * The body contains `<creationXml>` with base64-encoded PSRP opening
+///   fragments (SessionCapability + InitRunspacePool).
+/// * Streams are `stdin stdout stderr` via `pr` (PowerShell Remoting) not
+///   `rsp` (RemoteShell Protocol).
+pub(crate) fn create_psrp_shell_request(
+    endpoint: &str,
+    config: &crate::config::WinrmConfig,
+    creation_xml_b64: &str,
+    ps_resource_uri: &str,
+    shell_id: &str,
+) -> String {
+    let header = build_header_for(
+        endpoint,
+        ACTION_CREATE,
+        ps_resource_uri,
+        None,
+        config.operation_timeout_secs,
+        config.max_envelope_size,
+    );
+    let idle_timeout = config
+        .idle_timeout_secs
+        .map(|secs| format!("\n      <rsp:IdleTimeOut>PT{secs}S</rsp:IdleTimeOut>"))
+        .unwrap_or_default();
+
+    // `header` ends with `</s:Header>` — insert the OptionSet before it.
+    let header_with_options = header.replace(
+        "</s:Header>",
+        r#"
+    <wsman:OptionSet s:mustUnderstand="true">
+      <wsman:Option Name="protocolversion" MustComply="true">2.3</wsman:Option>
+    </wsman:OptionSet>
+  </s:Header>"#,
+    );
+    format!(
+        r#"<s:Envelope {NS_DECL_WITH_RSP}>
+{header_with_options}
+  <s:Body>
+    <rsp:Shell ShellId="{shell_id}">
+      <rsp:InputStreams>stdin pr</rsp:InputStreams>
+      <rsp:OutputStreams>stdout</rsp:OutputStreams>{idle_timeout}
+      <creationXml xmlns="http://schemas.microsoft.com/powershell">{creation_xml_b64}</creationXml>
+    </rsp:Shell>
+  </s:Body>
+</s:Envelope>"#
+    )
+}
+
+/// Build a WS-Man Execute Command envelope with a caller-specified CommandId.
+///
+/// Used by PSRP where the CommandId must be the pipeline's UUID and
+/// the first pipeline fragment is passed as a base64 argument.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_command_with_id_request(
+    endpoint: &str,
+    shell_id: &str,
+    command: &str,
+    args: &[&str],
+    command_id: &str,
+    timeout_secs: u64,
+    max_envelope_size: u32,
+    resource_uri: &str,
+) -> String {
+    let header = build_header_for(
+        endpoint,
+        ACTION_COMMAND,
+        resource_uri,
+        Some(shell_id),
+        timeout_secs,
+        max_envelope_size,
+    );
+    let mut args_xml = String::new();
+    for a in args {
+        let _ = write!(
+            args_xml,
+            "\n      <rsp:Arguments>{}</rsp:Arguments>",
+            xml_escape(a)
+        );
+    }
+    let escaped_command = xml_escape(command);
+    let escaped_id = xml_escape(command_id);
+    format!(
+        r#"<s:Envelope {NS_DECL_WITH_RSP}>
+{header}
+  <s:Body>
+    <rsp:CommandLine CommandId="{escaped_id}">
+      <rsp:Command>{escaped_command}</rsp:Command>{args_xml}
+    </rsp:CommandLine>
+  </s:Body>
+</s:Envelope>"#
+    )
+}
+
+/// Build a PSRP-specific Receive SOAP envelope (stdout only, optional CommandId).
+pub(crate) fn receive_psrp_request(
+    endpoint: &str,
+    shell_id: &str,
+    command_id: Option<&str>,
+    timeout_secs: u64,
+    max_envelope_size: u32,
+    resource_uri: &str,
+) -> String {
+    let header = build_header_for(
+        endpoint,
+        ACTION_RECEIVE,
+        resource_uri,
+        Some(shell_id),
+        timeout_secs,
+        max_envelope_size,
+    );
+    let stream = match command_id {
+        Some(cid) => format!(
+            "<rsp:DesiredStream CommandId=\"{}\">stdout</rsp:DesiredStream>",
+            xml_escape(cid)
+        ),
+        None => "<rsp:DesiredStream>stdout</rsp:DesiredStream>".into(),
+    };
+    // Insert KEEPALIVE option inside the header (before </s:Header>).
+    let header_with_opts = header.replace(
+        "</s:Header>",
+        r#"
+    <wsman:OptionSet s:mustUnderstand="true">
+      <wsman:Option Name="WSMAN_CMDSHELL_OPTION_KEEPALIVE">True</wsman:Option>
+    </wsman:OptionSet>
+  </s:Header>"#,
+    );
+    format!(
+        r"<s:Envelope {NS_DECL_WITH_RSP}>
+{header_with_opts}
+  <s:Body>
+    <rsp:Receive>
+      {stream}
+    </rsp:Receive>
+  </s:Body>
+</s:Envelope>"
+    )
+}
+
 /// Build a WS-Management Execute Command SOAP envelope (MS-WSMV 3.1.4.5).
 ///
 /// Runs the given command with optional arguments inside an existing shell
@@ -172,9 +316,30 @@ pub(crate) fn execute_command_request(
     timeout_secs: u64,
     max_envelope_size: u32,
 ) -> String {
-    let header = build_header(
+    execute_command_request_with_uri(
+        endpoint,
+        shell_id,
+        command,
+        args,
+        timeout_secs,
+        max_envelope_size,
+        RESOURCE_URI_CMD,
+    )
+}
+
+pub(crate) fn execute_command_request_with_uri(
+    endpoint: &str,
+    shell_id: &str,
+    command: &str,
+    args: &[&str],
+    timeout_secs: u64,
+    max_envelope_size: u32,
+    resource_uri: &str,
+) -> String {
+    let header = build_header_for(
         endpoint,
         ACTION_COMMAND,
+        resource_uri,
         Some(shell_id),
         timeout_secs,
         max_envelope_size,
@@ -216,9 +381,28 @@ pub(crate) fn receive_output_request(
     timeout_secs: u64,
     max_envelope_size: u32,
 ) -> String {
-    let header = build_header(
+    receive_output_request_with_uri(
+        endpoint,
+        shell_id,
+        command_id,
+        timeout_secs,
+        max_envelope_size,
+        RESOURCE_URI_CMD,
+    )
+}
+
+pub(crate) fn receive_output_request_with_uri(
+    endpoint: &str,
+    shell_id: &str,
+    command_id: &str,
+    timeout_secs: u64,
+    max_envelope_size: u32,
+    resource_uri: &str,
+) -> String {
+    let header = build_header_for(
         endpoint,
         ACTION_RECEIVE,
+        resource_uri,
         Some(shell_id),
         timeout_secs,
         max_envelope_size,
@@ -297,6 +481,7 @@ pub(crate) fn delete_shell_request(
 ///
 /// Disconnects the client from a running shell while leaving the shell
 /// alive on the server so it can be reconnected later.
+#[allow(dead_code)] // Kept for CMD shell path; PSRP uses _with_uri variant.
 pub(crate) fn disconnect_shell_request(
     endpoint: &str,
     shell_id: &str,
@@ -328,15 +513,60 @@ pub(crate) fn disconnect_shell_request(
 /// Build a WS-Management Reconnect Shell SOAP envelope (MS-WSMV 3.1.4.27).
 ///
 /// Rejoins a previously disconnected shell identified by `shell_id`.
+#[allow(dead_code)]
 pub(crate) fn reconnect_shell_request(
     endpoint: &str,
     shell_id: &str,
     timeout_secs: u64,
     max_envelope_size: u32,
 ) -> String {
-    let header = build_header(
+    reconnect_shell_request_with_uri(
+        endpoint,
+        shell_id,
+        timeout_secs,
+        max_envelope_size,
+        RESOURCE_URI_CMD,
+    )
+}
+
+pub(crate) fn disconnect_shell_request_with_uri(
+    endpoint: &str,
+    shell_id: &str,
+    timeout_secs: u64,
+    max_envelope_size: u32,
+    resource_uri: &str,
+) -> String {
+    let header = build_header_for(
+        endpoint,
+        ACTION_DISCONNECT,
+        resource_uri,
+        Some(shell_id),
+        timeout_secs,
+        max_envelope_size,
+    );
+    format!(
+        r"<s:Envelope {NS_DECL_WITH_RSP}>
+{header}
+  <s:Body>
+    <rsp:Disconnect>
+      <rsp:IdleTimeOut>PT{timeout_secs}S</rsp:IdleTimeOut>
+    </rsp:Disconnect>
+  </s:Body>
+</s:Envelope>"
+    )
+}
+
+pub(crate) fn reconnect_shell_request_with_uri(
+    endpoint: &str,
+    shell_id: &str,
+    timeout_secs: u64,
+    max_envelope_size: u32,
+    resource_uri: &str,
+) -> String {
+    let header = build_header_for(
         endpoint,
         ACTION_RECONNECT,
+        resource_uri,
         Some(shell_id),
         timeout_secs,
         max_envelope_size,
@@ -355,6 +585,7 @@ pub(crate) fn reconnect_shell_request(
 ///
 /// Sends stdin data to a running command. The data is base64-encoded
 /// in the request body. Set `end_of_stream` to `true` to signal EOF.
+#[allow(dead_code)] // Kept for existing tests; live code uses send_input_request_with_uri.
 pub(crate) fn send_input_request(
     endpoint: &str,
     shell_id: &str,
@@ -364,12 +595,36 @@ pub(crate) fn send_input_request(
     timeout_secs: u64,
     max_envelope_size: u32,
 ) -> String {
+    send_input_request_with_uri(
+        endpoint,
+        shell_id,
+        command_id,
+        data,
+        end_of_stream,
+        timeout_secs,
+        max_envelope_size,
+        RESOURCE_URI_CMD,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn send_input_request_with_uri(
+    endpoint: &str,
+    shell_id: &str,
+    command_id: &str,
+    data: &[u8],
+    end_of_stream: bool,
+    timeout_secs: u64,
+    max_envelope_size: u32,
+    resource_uri: &str,
+) -> String {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD as B64;
 
-    let header = build_header(
+    let header = build_header_for(
         endpoint,
         ACTION_SEND,
+        resource_uri,
         Some(shell_id),
         timeout_secs,
         max_envelope_size,
@@ -383,6 +638,39 @@ pub(crate) fn send_input_request(
   <s:Body>
     <rsp:Send>
       <rsp:Stream Name="stdin" CommandId="{escaped_command_id}"{end_attr}>{encoded_data}</rsp:Stream>
+    </rsp:Send>
+  </s:Body>
+</s:Envelope>"#
+    )
+}
+
+/// Build a PSRP-specific Send SOAP envelope (no CommandId on the stream).
+pub(crate) fn send_psrp_request(
+    endpoint: &str,
+    shell_id: &str,
+    data: &[u8],
+    timeout_secs: u64,
+    max_envelope_size: u32,
+    resource_uri: &str,
+) -> String {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as B64;
+
+    let header = build_header_for(
+        endpoint,
+        ACTION_SEND,
+        resource_uri,
+        Some(shell_id),
+        timeout_secs,
+        max_envelope_size,
+    );
+    let encoded_data = B64.encode(data);
+    format!(
+        r#"<s:Envelope {NS_DECL_WITH_RSP}>
+{header}
+  <s:Body>
+    <rsp:Send>
+      <rsp:Stream Name="stdin">{encoded_data}</rsp:Stream>
     </rsp:Send>
   </s:Body>
 </s:Envelope>"#
@@ -433,7 +721,7 @@ pub(crate) fn enumerate_wql_request(
 ) -> String {
     let ns = wql_namespace.unwrap_or("root/cimv2");
     let resource_uri = format!("http://schemas.microsoft.com/wbem/wsman/1/wmi/{ns}/*");
-    let header = build_header_with_resource_uri(
+    let header = build_header_for(
         endpoint,
         ACTION_ENUMERATE,
         &resource_uri,
@@ -464,7 +752,7 @@ pub(crate) fn pull_request(
     timeout_secs: u64,
     max_envelope_size: u32,
 ) -> String {
-    let header = build_header_with_resource_uri(
+    let header = build_header_for(
         endpoint,
         ACTION_PULL,
         RESOURCE_URI_WMI,
@@ -815,5 +1103,219 @@ mod tests {
             &crate::config::WinrmConfig::default(),
         );
         assert!(!xml.contains("IdleTimeOut"));
+    }
+
+    #[test]
+    fn create_psrp_shell_contains_required_elements() {
+        let config = crate::config::WinrmConfig {
+            idle_timeout_secs: Some(120),
+            ..Default::default()
+        };
+        let xml = create_psrp_shell_request(
+            "http://host:5985/wsman",
+            &config,
+            "AQAAAA==",
+            "http://schemas.microsoft.com/powershell/Microsoft.PowerShell",
+            "PSRP-SHELL-1",
+        );
+        assert!(xml.contains("transfer/Create"));
+        assert!(xml.contains("schemas.microsoft.com/powershell/Microsoft.PowerShell"));
+        assert!(xml.contains("PSRP-SHELL-1"));
+        assert!(xml.contains("AQAAAA=="));
+        assert!(xml.contains("creationXml"));
+        assert!(xml.contains("stdin pr"));
+        assert!(xml.contains("protocolversion"));
+        assert!(xml.contains("<rsp:IdleTimeOut>PT120S</rsp:IdleTimeOut>"));
+    }
+
+    #[test]
+    fn execute_command_with_id_contains_required_elements() {
+        let xml = execute_command_with_id_request(
+            "http://host:5985/wsman",
+            "SHELL-1",
+            "Invoke-Expression",
+            &["arg1", "arg2"],
+            "CMD-UUID-42",
+            60,
+            153_600,
+            RESOURCE_URI_PSRP,
+        );
+        assert!(xml.contains("SHELL-1"));
+        assert!(xml.contains("Invoke-Expression"));
+        assert!(xml.contains("CMD-UUID-42"));
+        assert!(xml.contains("arg1"));
+        assert!(xml.contains("arg2"));
+        assert!(xml.contains("CommandId=\"CMD-UUID-42\""));
+        assert!(xml.contains("shell/Command"));
+        assert!(xml.contains("schemas.microsoft.com/powershell/Microsoft.PowerShell"));
+
+        // Verify the args are separated by a newline (kills > → >= and > → == mutants)
+        let arg1_tag = "<rsp:Arguments>arg1</rsp:Arguments>";
+        let arg2_tag = "<rsp:Arguments>arg2</rsp:Arguments>";
+        let between = &xml[xml.find(arg1_tag).unwrap() + arg1_tag.len()
+            ..xml.find(arg2_tag).unwrap()];
+        assert_eq!(between, "\n      ", "args should be separated by newline + indent");
+    }
+
+    #[test]
+    fn receive_psrp_request_with_command_id() {
+        let xml = receive_psrp_request(
+            "http://host:5985/wsman",
+            "SHELL-1",
+            Some("CMD-1"),
+            60,
+            153_600,
+            RESOURCE_URI_PSRP,
+        );
+        assert!(xml.contains("SHELL-1"));
+        assert!(xml.contains("CMD-1"));
+        assert!(xml.contains("Receive"));
+        assert!(xml.contains("shell/Receive"));
+        assert!(xml.contains("WSMAN_CMDSHELL_OPTION_KEEPALIVE"));
+        assert!(xml.contains("stdout"));
+        assert!(xml.contains("schemas.microsoft.com/powershell/Microsoft.PowerShell"));
+    }
+
+    #[test]
+    fn receive_psrp_request_without_command_id() {
+        let xml = receive_psrp_request(
+            "http://host:5985/wsman",
+            "SHELL-1",
+            None,
+            60,
+            153_600,
+            RESOURCE_URI_PSRP,
+        );
+        assert!(xml.contains("<rsp:DesiredStream>stdout</rsp:DesiredStream>"));
+        assert!(!xml.contains("CommandId"));
+    }
+
+    #[test]
+    fn execute_command_request_with_uri_contains_required_elements() {
+        let custom_uri = "http://schemas.microsoft.com/powershell/Custom";
+        let xml = execute_command_request_with_uri(
+            "http://host:5985/wsman",
+            "SHELL-1",
+            "Get-Process",
+            &["-Name", "svchost"],
+            60,
+            153_600,
+            custom_uri,
+        );
+        assert!(xml.contains("SHELL-1"));
+        assert!(xml.contains("Get-Process"));
+        assert!(xml.contains("-Name"));
+        assert!(xml.contains("svchost"));
+        assert!(xml.contains("shell/Command"));
+        assert!(xml.contains("schemas.microsoft.com/powershell/Custom"));
+    }
+
+    #[test]
+    fn receive_output_request_with_uri_contains_required_elements() {
+        let custom_uri = "http://schemas.microsoft.com/powershell/Custom";
+        let xml = receive_output_request_with_uri(
+            "http://host:5985/wsman",
+            "SHELL-1",
+            "CMD-1",
+            60,
+            153_600,
+            custom_uri,
+        );
+        assert!(xml.contains("SHELL-1"));
+        assert!(xml.contains("CMD-1"));
+        assert!(xml.contains("Receive"));
+        assert!(xml.contains("stdout stderr"));
+        assert!(xml.contains("schemas.microsoft.com/powershell/Custom"));
+    }
+
+    #[test]
+    fn disconnect_shell_contains_required_elements() {
+        let xml = disconnect_shell_request("http://host:5985/wsman", "SHELL-1", 60, 153_600);
+        assert!(xml.contains("SHELL-1"));
+        assert!(xml.contains("shell/Disconnect"));
+        assert!(xml.contains("Disconnect"));
+        assert!(xml.contains("<rsp:IdleTimeOut>PT60S</rsp:IdleTimeOut>"));
+    }
+
+    #[test]
+    fn reconnect_shell_contains_required_elements() {
+        let xml = reconnect_shell_request("http://host:5985/wsman", "SHELL-1", 60, 153_600);
+        assert!(xml.contains("SHELL-1"));
+        assert!(xml.contains("shell/Reconnect"));
+        assert!(xml.contains("<rsp:Reconnect/>"));
+        assert!(xml.contains(RESOURCE_URI_CMD));
+    }
+
+    #[test]
+    fn disconnect_shell_with_uri_contains_required_elements() {
+        let custom_uri = "http://schemas.microsoft.com/powershell/Custom";
+        let xml = disconnect_shell_request_with_uri(
+            "http://host:5985/wsman",
+            "SHELL-1",
+            90,
+            153_600,
+            custom_uri,
+        );
+        assert!(xml.contains("SHELL-1"));
+        assert!(xml.contains("shell/Disconnect"));
+        assert!(xml.contains("<rsp:IdleTimeOut>PT90S</rsp:IdleTimeOut>"));
+        assert!(xml.contains("schemas.microsoft.com/powershell/Custom"));
+    }
+
+    #[test]
+    fn reconnect_shell_with_uri_contains_required_elements() {
+        let custom_uri = "http://schemas.microsoft.com/powershell/Custom";
+        let xml = reconnect_shell_request_with_uri(
+            "http://host:5985/wsman",
+            "SHELL-1",
+            60,
+            153_600,
+            custom_uri,
+        );
+        assert!(xml.contains("SHELL-1"));
+        assert!(xml.contains("shell/Reconnect"));
+        assert!(xml.contains("<rsp:Reconnect/>"));
+        assert!(xml.contains("schemas.microsoft.com/powershell/Custom"));
+    }
+
+    #[test]
+    fn send_input_with_uri_contains_required_elements() {
+        let custom_uri = "http://schemas.microsoft.com/powershell/Custom";
+        let xml = send_input_request_with_uri(
+            "http://host:5985/wsman",
+            "SHELL-1",
+            "CMD-1",
+            b"hello",
+            true,
+            60,
+            153_600,
+            custom_uri,
+        );
+        assert!(xml.contains("SHELL-1"));
+        assert!(xml.contains("CMD-1"));
+        assert!(xml.contains("Send"));
+        assert!(xml.contains("stdin"));
+        assert!(xml.contains("aGVsbG8=")); // base64 of "hello"
+        assert!(xml.contains(r#"End="true""#));
+        assert!(xml.contains("schemas.microsoft.com/powershell/Custom"));
+    }
+
+    #[test]
+    fn send_psrp_request_contains_required_elements() {
+        let xml = send_psrp_request(
+            "http://host:5985/wsman",
+            "SHELL-1",
+            b"psrp-data",
+            60,
+            153_600,
+            RESOURCE_URI_PSRP,
+        );
+        assert!(xml.contains("SHELL-1"));
+        assert!(xml.contains("Send"));
+        assert!(xml.contains("stdin"));
+        assert!(xml.contains("shell/Send"));
+        assert!(xml.contains("schemas.microsoft.com/powershell/Microsoft.PowerShell"));
+        // No CommandId on the stream element for PSRP send
+        assert!(!xml.contains("CommandId"));
     }
 }

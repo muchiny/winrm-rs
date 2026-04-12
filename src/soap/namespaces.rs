@@ -4,6 +4,9 @@
 pub(crate) const RESOURCE_URI_CMD: &str =
     "http://schemas.microsoft.com/wbem/wsman/1/windows/shell/cmd";
 
+/// PowerShell remoting plugin resource URI (the default PS configuration).
+pub const RESOURCE_URI_PSRP: &str = "http://schemas.microsoft.com/powershell/Microsoft.PowerShell";
+
 /// SOAP action for shell creation.
 pub(crate) const ACTION_CREATE: &str = "http://schemas.xmlsoap.org/ws/2004/09/transfer/Create";
 

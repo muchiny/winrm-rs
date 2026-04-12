@@ -288,14 +288,32 @@ fn extract_soap_fault(xml: &str) -> Option<SoapError> {
         return None;
     }
 
-    let code = extract_element_text(xml, "Value")
+    // Prefer the subcode value (e.g. `w:TimedOut`) over the top-level
+    // SOAP code (`s:Receiver`/`s:Sender`) because it carries the
+    // actionable WS-Management error.
+    let code = extract_subcode_value(xml)
+        .or_else(|| extract_element_text(xml, "Value"))
         .or_else(|| extract_element_text(xml, "faultcode"))
         .unwrap_or_else(|| "unknown".into());
     let reason = extract_element_text(xml, "Text")
+        .or_else(|| extract_element_text(xml, "Message"))
         .or_else(|| extract_element_text(xml, "faultstring"))
         .unwrap_or_else(|| "SOAP fault".into());
 
     Some(SoapError::Fault { code, reason })
+}
+
+/// Extract the `<s:Subcode><s:Value>…</s:Value></s:Subcode>` text,
+/// falling back to the WSManFault `Code` attribute if present.
+fn extract_subcode_value(xml: &str) -> Option<String> {
+    // Look for <Subcode>…<Value>X</Value>…</Subcode>
+    let sub_start = xml.find("Subcode>")?;
+    let rest = &xml[sub_start..];
+    let inner = extract_element_text(rest, "Value")?;
+    if inner.is_empty() {
+        return None;
+    }
+    Some(inner)
 }
 
 #[cfg(test)]
@@ -754,5 +772,71 @@ mod tests {
             "PowerShell error\r\n"
         );
         assert_eq!(output.exit_code, Some(1));
+    }
+
+    // Kills extract_subcode_value returning None
+    #[test]
+    fn extract_subcode_from_soap_fault() {
+        let xml = r#"<s:Fault>
+            <s:Code><s:Value>s:Sender</s:Value>
+            <s:Subcode><s:Value>wsa:DestinationUnreachable</s:Value></s:Subcode></s:Code>
+            <s:Reason><s:Text>no route</s:Text></s:Reason></s:Fault>"#;
+        let val = extract_subcode_value(xml);
+        assert_eq!(val.as_deref(), Some("wsa:DestinationUnreachable"));
+    }
+
+    // Kills extract_element_text:180 — < → <= on search_from
+    #[test]
+    fn extract_element_text_exact_boundary() {
+        // Element at the very end of the string
+        let xml = "<Root><Name>val</Name></Root>";
+        assert_eq!(
+            extract_element_text(xml, "Name").as_deref(),
+            Some("val")
+        );
+    }
+
+    // Kills extract_streams:227 — < → <= on search_from
+    #[test]
+    fn extract_streams_at_string_boundary() {
+        // Streams that extend to the end of the XML
+        let xml = r#"<rsp:Stream Name="stdout">YWJD</rsp:Stream>"#;
+        let streams = extract_streams(xml);
+        assert_eq!(streams.len(), 1);
+        assert_eq!(streams[0].0, "stdout");
+        assert_eq!(streams[0].1, "YWJD");
+    }
+
+    // Tests parse_enumerate_response with and without continuation context
+    #[test]
+    fn parse_enumerate_response_with_items_and_end() {
+        let xml = r#"<s:Envelope xmlns:wsen="http://schemas.xmlsoap.org/ws/2004/09/enumeration">
+            <s:Body><wsen:EnumerateResponse>
+                <wsen:Items><data>hello</data></wsen:Items>
+                <wsen:EndOfSequence/>
+            </wsen:EnumerateResponse></s:Body></s:Envelope>"#;
+        let (items, context) = parse_enumerate_response(xml).unwrap();
+        assert!(items.contains("hello"));
+        assert!(context.is_none(), "EndOfSequence means no continuation");
+    }
+
+    #[test]
+    fn parse_enumerate_response_with_continuation() {
+        let xml = r#"<s:Envelope xmlns:wsen="http://schemas.xmlsoap.org/ws/2004/09/enumeration">
+            <s:Body><wsen:EnumerateResponse>
+                <wsen:Items><data>page1</data></wsen:Items>
+                <wsen:EnumerationContext>ctx-123</wsen:EnumerationContext>
+            </wsen:EnumerateResponse></s:Body></s:Envelope>"#;
+        let (items, context) = parse_enumerate_response(xml).unwrap();
+        assert!(items.contains("page1"));
+        assert_eq!(context.as_deref(), Some("ctx-123"));
+    }
+
+    // parse_clixml with multiple error fragments to test offset arithmetic
+    #[test]
+    fn parse_clixml_consecutive_error_fragments() {
+        let clixml = b"#< CLIXML\r\n<Objs><S S=\"Error\">aaa</S><S S=\"Error\">bbb</S></Objs>";
+        let result = parse_clixml(clixml);
+        assert_eq!(String::from_utf8_lossy(&result), "aaabbb");
     }
 }

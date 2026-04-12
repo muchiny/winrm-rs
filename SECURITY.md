@@ -4,14 +4,14 @@
 
 | Version | Supported |
 |---------|-----------|
-| 0.5.x   | Yes       |
-| < 0.5   | No        |
+| 1.0.x   | Yes       |
+| < 1.0   | No        |
 
 ## Reporting a vulnerability
 
 **Please do not open a public GitHub issue for security vulnerabilities.**
 
-Instead, please report vulnerabilities via [GitHub Security Advisories](https://github.com/muchini/winrm-rs/security/advisories/new).
+Instead, please report vulnerabilities via [GitHub Security Advisories](https://github.com/muchiny/winrm-rs/security/advisories/new).
 
 ### What to include
 

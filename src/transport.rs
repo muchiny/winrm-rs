@@ -408,10 +408,7 @@ mod tests {
     fn config_accessor() {
         let transport = basic_transport(5985);
         assert_eq!(transport.config().port, 5985);
-        assert!(matches!(
-            transport.config().auth_method,
-            AuthMethod::Basic
-        ));
+        assert!(matches!(transport.config().auth_method, AuthMethod::Basic));
     }
 
     #[test]

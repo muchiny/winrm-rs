@@ -7,9 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [0.6.0] - Unreleased
+## [1.0.0] - 2026-04-12
 
-### Breaking
+### Highlights
+
+First stable release. The public API (`WinrmClient`, `WinrmConfig`,
+`WinrmCredentials`, `Shell`, `CommandOutput`, `WinrmError`) is now
+considered stable and covered by SemVer guarantees.
+
+### Breaking (relative to 0.5.0)
 
 - Public surface reduced. The following items are no longer re-exported
   from the crate root and are now crate-internal:
@@ -78,9 +84,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Raw command execution (`cmd.exe` or any executable)
 - Full shell lifecycle: create, execute, receive, signal, delete
 
-[Unreleased]: https://github.com/muchini/winrm-rs/compare/v0.5.0...HEAD
-[0.5.0]: https://github.com/muchini/winrm-rs/compare/v0.4.0...v0.5.0
-[0.4.0]: https://github.com/muchini/winrm-rs/compare/v0.3.0...v0.4.0
-[0.3.0]: https://github.com/muchini/winrm-rs/compare/v0.2.0...v0.3.0
-[0.2.0]: https://github.com/muchini/winrm-rs/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/muchini/winrm-rs/releases/tag/v0.1.0
+[Unreleased]: https://github.com/muchiny/winrm-rs/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/muchiny/winrm-rs/compare/v0.5.0...v1.0.0
+[0.5.0]: https://github.com/muchiny/winrm-rs/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/muchiny/winrm-rs/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/muchiny/winrm-rs/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/muchiny/winrm-rs/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/muchiny/winrm-rs/releases/tag/v0.1.0

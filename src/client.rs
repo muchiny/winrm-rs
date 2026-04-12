@@ -82,7 +82,7 @@ impl WinrmClient {
 
     /// Create a PSRP (PowerShell Remoting) shell on the given host.
     ///
-    /// Unlike [`create_shell`] this uses the PowerShell resource URI and
+    /// Unlike [`Self::create_shell`] this uses the PowerShell resource URI and
     /// embeds the `creationXml` (base64-encoded PSRP opening fragments)
     /// directly in the Create Shell body.
     ///

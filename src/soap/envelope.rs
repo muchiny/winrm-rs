@@ -1152,9 +1152,12 @@ mod tests {
         // Verify the args are separated by a newline (kills > → >= and > → == mutants)
         let arg1_tag = "<rsp:Arguments>arg1</rsp:Arguments>";
         let arg2_tag = "<rsp:Arguments>arg2</rsp:Arguments>";
-        let between = &xml[xml.find(arg1_tag).unwrap() + arg1_tag.len()
-            ..xml.find(arg2_tag).unwrap()];
-        assert_eq!(between, "\n      ", "args should be separated by newline + indent");
+        let between =
+            &xml[xml.find(arg1_tag).unwrap() + arg1_tag.len()..xml.find(arg2_tag).unwrap()];
+        assert_eq!(
+            between, "\n      ",
+            "args should be separated by newline + indent"
+        );
     }
 
     #[test]

@@ -6,6 +6,6 @@ Please read the full text at the link above. By participating in this project, y
 
 ## Reporting
 
-If you experience or witness unacceptable behavior, please report it by emailing the maintainers or by opening a [GitHub Security Advisory](https://github.com/muchini/winrm-rs/security/advisories/new).
+If you experience or witness unacceptable behavior, please report it by emailing the maintainers or by opening a [GitHub Security Advisory](https://github.com/muchiny/winrm-rs/security/advisories/new).
 
 Reports will be reviewed and handled confidentially.

@@ -57,7 +57,13 @@ impl WinrmClientBuilder<Ready> {
     /// Returns [`WinrmError::Http`] if the underlying HTTP client cannot be
     /// constructed.
     pub fn build(self) -> Result<WinrmClient, WinrmError> {
-        WinrmClient::new(self.config, self.credentials.unwrap())
+        // SAFETY: The typestate pattern guarantees that `credentials` is
+        // `Some` when `build()` is callable (state = Ready).
+        WinrmClient::new(
+            self.config,
+            self.credentials
+                .expect("typestate guarantees credentials are set"),
+        )
     }
 }
 

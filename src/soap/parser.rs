@@ -790,10 +790,7 @@ mod tests {
     fn extract_element_text_exact_boundary() {
         // Element at the very end of the string
         let xml = "<Root><Name>val</Name></Root>";
-        assert_eq!(
-            extract_element_text(xml, "Name").as_deref(),
-            Some("val")
-        );
+        assert_eq!(extract_element_text(xml, "Name").as_deref(), Some("val"));
     }
 
     // Kills extract_streams:227 — < → <= on search_from

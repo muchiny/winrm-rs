@@ -1,18 +1,20 @@
 [package]
 name = "winrm-rs"
-version = "0.6.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.94.0"
 description = "Async WinRM (WS-Management) client for Rust with NTLMv2, Basic, Kerberos, and Certificate authentication"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/muchini/winrm-rs"
+repository = "https://github.com/muchiny/winrm-rs"
 keywords = ["winrm", "windows", "remote-management", "ntlm", "kerberos"]
 categories = ["network-programming", "os::windows-apis"]
 readme = "README.md"
 documentation = "https://docs.rs/winrm-rs"
-homepage = "https://github.com/muchini/winrm-rs"
+homepage = "https://github.com/muchiny/winrm-rs"
 include = [
     "src/**/*.rs",
+    "examples/**/*.rs",
+    "tests/**/*.rs",
     "Cargo.toml",
     "LICENSE-MIT",
     "LICENSE-APACHE",

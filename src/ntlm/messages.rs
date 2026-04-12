@@ -770,8 +770,9 @@ mod tests {
             timestamp: Some([0x42; 8]),
         };
 
-        let (msg, session_key) =
-            create_authenticate_message_internal(&challenge, "user", "password", "DOMAIN", None, None, None);
+        let (msg, session_key) = create_authenticate_message_internal(
+            &challenge, "user", "password", "DOMAIN", None, None, None,
+        );
 
         assert_eq!(&msg[0..8], b"NTLMSSP\0");
         assert_eq!(u32::from_le_bytes(msg[8..12].try_into().unwrap()), 3);
@@ -790,8 +791,12 @@ mod tests {
             timestamp: Some([0x11; 8]),
         };
 
-        let (_, key1) = create_authenticate_message_internal(&challenge, "admin", "pass", "DOM", None, None, None);
-        let (_, key2) = create_authenticate_message_internal(&challenge, "admin", "pass", "DOM", None, None, None);
+        let (_, key1) = create_authenticate_message_internal(
+            &challenge, "admin", "pass", "DOM", None, None, None,
+        );
+        let (_, key2) = create_authenticate_message_internal(
+            &challenge, "admin", "pass", "DOM", None, None, None,
+        );
 
         assert_ne!(key1, [0u8; 16]);
         assert_ne!(key2, [0u8; 16]);
@@ -806,7 +811,9 @@ mod tests {
             target_domain: "DOM".to_string(),
             timestamp: Some([0x42; 8]),
         };
-        let (msg, key) = create_authenticate_message_internal(&challenge, "user", "pass", "DOM", None, None, None);
+        let (msg, key) = create_authenticate_message_internal(
+            &challenge, "user", "pass", "DOM", None, None, None,
+        );
 
         let lm_len = u16::from_le_bytes(msg[12..14].try_into().unwrap()) as usize;
         let lm_offset = u32::from_le_bytes(msg[16..20].try_into().unwrap()) as usize;
@@ -857,7 +864,8 @@ mod tests {
             parse_challenge(&msg).unwrap()
         };
         let cbt = [0xAA; 16];
-        let (msg, _) = create_authenticate_message_with_cbt_and_key(&challenge, "user", "pass", "DOMAIN", cbt);
+        let (msg, _) =
+            create_authenticate_message_with_cbt_and_key(&challenge, "user", "pass", "DOMAIN", cbt);
         // Should be a valid NTLM Type 3 message
         assert_eq!(&msg[0..8], SIGNATURE);
         let msg_type = u32::from_le_bytes([msg[8], msg[9], msg[10], msg[11]]);
@@ -875,8 +883,9 @@ mod tests {
             parse_challenge(&msg).unwrap()
         };
         let without = create_authenticate_message(&challenge, "user", "pass", "DOMAIN");
-        let (with_cbt, _) =
-            create_authenticate_message_with_cbt_and_key(&challenge, "user", "pass", "DOMAIN", [0xBB; 16]);
+        let (with_cbt, _) = create_authenticate_message_with_cbt_and_key(
+            &challenge, "user", "pass", "DOMAIN", [0xBB; 16],
+        );
         // Messages should differ because target_info is modified
         assert_ne!(without, with_cbt);
         // Both should be valid Type 3

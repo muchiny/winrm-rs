@@ -974,7 +974,10 @@ mod tests {
             .await
             .unwrap();
         // Send input with command_id == shell_id → takes PSRP path
-        shell.send_input("PSRP-SHELL", b"data", false).await.unwrap();
+        shell
+            .send_input("PSRP-SHELL", b"data", false)
+            .await
+            .unwrap();
         // Send input with empty command_id → also takes PSRP path
         shell.send_input("", b"data", false).await.unwrap();
     }

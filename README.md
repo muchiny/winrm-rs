@@ -4,10 +4,10 @@ Async WinRM (WS-Management) client for Rust.
 
 [![Crates.io](https://img.shields.io/crates/v/winrm-rs.svg)](https://crates.io/crates/winrm-rs)
 [![docs.rs](https://img.shields.io/docsrs/winrm-rs)](https://docs.rs/winrm-rs)
-[![CI](https://github.com/muchini/winrm-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/muchini/winrm-rs/actions)
+[![CI](https://github.com/muchiny/winrm-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/muchiny/winrm-rs/actions)
 [![License](https://img.shields.io/crates/l/winrm-rs.svg)](LICENSE-MIT)
 [![MSRV](https://img.shields.io/badge/MSRV-1.94-blue.svg)](https://blog.rust-lang.org/2026/03/20/Rust-1.94.0.html)
-[![codecov](https://codecov.io/gh/muchini/winrm-rs/branch/main/graph/badge.svg)](https://codecov.io/gh/muchini/winrm-rs)
+[![codecov](https://codecov.io/gh/muchiny/winrm-rs/branch/main/graph/badge.svg)](https://codecov.io/gh/muchiny/winrm-rs)
 
 ```rust
 use winrm_rs::{WinrmClient, WinrmConfig, WinrmCredentials};
@@ -175,8 +175,8 @@ let bytes = client.download_file("win-server", "C:\\remote\\file.bin", Path::new
 | **v0.3** | NTLM sealing, credentials security, retry | Done |
 | **v0.4** | Kerberos + Certificate auth | Done |
 | **v0.5** | File transfer, streaming output, proxy | Done |
-| **v0.6** | CredSSP/TLS channel binding | Experimental (`--features credssp`, not production-ready) |
-| **v1.0** | API freeze, CredSSP stabilization | Planned |
+| **v1.0** | Stable public API, TLS channel binding, CI/CD | **Current** |
+| **v1.x** | CredSSP stabilization (`--features credssp`) | Planned |
 
 ## Comparison
 

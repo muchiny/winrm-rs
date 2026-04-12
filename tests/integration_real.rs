@@ -20,7 +20,9 @@
 //! ```
 
 use std::time::Duration;
-use winrm_rs::{AuthMethod, CancellationToken, WinrmClient, WinrmConfig, WinrmCredentials};
+use winrm_rs::{
+    AuthMethod, CancellationToken, EncryptionMode, WinrmClient, WinrmConfig, WinrmCredentials,
+};
 
 fn test_client() -> Option<(WinrmClient, String)> {
     let host = std::env::var("WINRM_TEST_HOST").ok()?;
@@ -910,4 +912,450 @@ async fn ntlm_over_https_with_cbt() {
     assert_eq!(output.exit_code, 0);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!stdout.trim().is_empty(), "whoami should return username");
+}
+
+// === Disconnect / Reconnect ===
+// NOTE: The WinRS cmd shell plugin does NOT support disconnect/reconnect —
+// only PSRP (PowerShell Remoting) shells do.  This test verifies the error
+// is surfaced correctly when attempting disconnect on a cmd shell.
+
+#[tokio::test]
+#[ignore]
+async fn shell_disconnect_returns_error_on_cmd_shell() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let shell = client.open_shell(&host).await.expect("open shell");
+
+    let out = shell
+        .run_command("cmd.exe", &["/c", "echo", "before-disconnect"])
+        .await
+        .expect("command before disconnect");
+    assert_eq!(out.exit_code, 0);
+
+    // CMD shells don't support disconnect — expect a SOAP fault
+    let result = shell.disconnect().await;
+    assert!(
+        result.is_err(),
+        "disconnect on CMD shell should return an error"
+    );
+}
+
+// === Signal Ctrl+C ===
+
+#[tokio::test]
+#[ignore]
+async fn shell_signal_ctrl_c() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let shell = client.open_shell(&host).await.expect("open shell");
+
+    let cmd_id = shell
+        .start_command("ping", &["-n", "60", "127.0.0.1"])
+        .await
+        .expect("start long ping");
+
+    // Receive at least one chunk to confirm the command started
+    let first = shell.receive_next(&cmd_id).await.expect("first receive");
+    assert!(!first.done, "command should not be done yet");
+
+    // Send Ctrl+C
+    shell.signal_ctrl_c(&cmd_id).await.expect("signal ctrl+c");
+
+    // Poll until done (with a timeout so we don't hang forever)
+    let result = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let chunk = shell
+                .receive_next(&cmd_id)
+                .await
+                .expect("receive after ctrl+c");
+            if chunk.done {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "command should finish within 15s after Ctrl+C"
+    );
+
+    shell.close().await.expect("close shell");
+}
+
+// === Multi-chunk file transfer ===
+
+#[tokio::test]
+#[ignore]
+async fn upload_and_download_large_file() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+
+    // 4001 bytes → 3 chunks (2000 + 2000 + 1), exercises the multi-chunk
+    // append path with the new CHUNK_SIZE of 2000 bytes.
+    let pattern = b"ABCDEFGH";
+    let content: Vec<u8> = pattern.iter().copied().cycle().take(4001).collect();
+
+    let local_upload = std::env::temp_dir().join("winrm_rs_large_upload.bin");
+    std::fs::write(&local_upload, &content).expect("write large local file");
+
+    let remote_path = r"C:\Windows\Temp\winrm_rs_large_test.bin";
+
+    let bytes_up = client
+        .upload_file(&host, &local_upload, remote_path)
+        .await
+        .expect("upload large file");
+    assert_eq!(bytes_up, content.len() as u64);
+
+    let local_download = std::env::temp_dir().join("winrm_rs_large_download.bin");
+    let bytes_down = client
+        .download_file(&host, remote_path, &local_download)
+        .await
+        .expect("download large file");
+    assert_eq!(bytes_down, content.len() as u64);
+
+    let downloaded = std::fs::read(&local_download).expect("read downloaded large file");
+    assert_eq!(downloaded, content, "large file round-trip mismatch");
+
+    // Cleanup
+    let _ = client
+        .run_powershell(&host, &format!("Remove-Item '{remote_path}' -Force"))
+        .await;
+    let _ = std::fs::remove_file(&local_upload);
+    let _ = std::fs::remove_file(&local_download);
+}
+
+// === Binary file transfer (all byte values) ===
+
+#[tokio::test]
+#[ignore]
+async fn upload_and_download_binary_file() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+
+    // All 256 byte values including null, CR, LF
+    let content: Vec<u8> = (0u8..=255).collect();
+
+    let local_upload = std::env::temp_dir().join("winrm_rs_binary_upload.bin");
+    std::fs::write(&local_upload, &content).expect("write binary local file");
+
+    let remote_path = r"C:\Windows\Temp\winrm_rs_binary_test.bin";
+
+    let bytes_up = client
+        .upload_file(&host, &local_upload, remote_path)
+        .await
+        .expect("upload binary file");
+    assert_eq!(bytes_up, 256);
+
+    let local_download = std::env::temp_dir().join("winrm_rs_binary_download.bin");
+    let bytes_down = client
+        .download_file(&host, remote_path, &local_download)
+        .await
+        .expect("download binary file");
+    assert_eq!(bytes_down, 256);
+
+    let downloaded = std::fs::read(&local_download).expect("read downloaded binary file");
+    assert_eq!(downloaded, content, "binary file round-trip mismatch");
+
+    // Cleanup
+    let _ = client
+        .run_powershell(&host, &format!("Remove-Item '{remote_path}' -Force"))
+        .await;
+    let _ = std::fs::remove_file(&local_upload);
+    let _ = std::fs::remove_file(&local_download);
+}
+
+// === Concurrent shells ===
+
+#[tokio::test]
+#[ignore]
+async fn concurrent_shells() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+
+    let shell1 = client.open_shell(&host).await.expect("open shell 1");
+    let shell2 = client.open_shell(&host).await.expect("open shell 2");
+
+    assert_ne!(
+        shell1.shell_id(),
+        shell2.shell_id(),
+        "concurrent shells must have different IDs"
+    );
+
+    let (out1, out2) = tokio::join!(
+        shell1.run_command("cmd.exe", &["/c", "echo", "from-shell-1"]),
+        shell2.run_command("cmd.exe", &["/c", "echo", "from-shell-2"]),
+    );
+
+    let out1 = out1.expect("shell1 command");
+    let out2 = out2.expect("shell2 command");
+
+    assert_eq!(out1.exit_code, 0);
+    assert_eq!(out2.exit_code, 0);
+    assert!(String::from_utf8_lossy(&out1.stdout).contains("from-shell-1"));
+    assert!(String::from_utf8_lossy(&out2.stdout).contains("from-shell-2"));
+
+    shell1.close().await.expect("close shell 1");
+    shell2.close().await.expect("close shell 2");
+}
+
+// === PowerShell with cancellation (Shell-level) ===
+
+#[tokio::test]
+#[ignore]
+async fn shell_run_powershell_with_cancel() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let shell = client.open_shell(&host).await.expect("open shell");
+
+    let cancel = CancellationToken::new();
+    let cancel2 = cancel.clone();
+
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        cancel2.cancel();
+    });
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        shell.run_powershell_with_cancel("Start-Sleep -Seconds 30", cancel),
+    )
+    .await;
+
+    assert!(result.is_ok(), "should complete within 10s timeout");
+    let inner = result.unwrap();
+    assert!(inner.is_err(), "should have been cancelled");
+    let err = format!("{}", inner.unwrap_err());
+    assert!(
+        err.contains("cancelled"),
+        "expected Cancelled error, got: {err}"
+    );
+
+    shell.close().await.expect("close shell");
+}
+
+// === WQL with custom namespace ===
+
+#[tokio::test]
+#[ignore]
+async fn wql_query_custom_namespace() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let result = client
+        .run_wql(
+            &host,
+            "SELECT Name FROM MSFT_NetAdapter",
+            Some("root/StandardCimv2"),
+        )
+        .await
+        .expect("WQL custom namespace query");
+    assert!(
+        !result.is_empty(),
+        "expected non-empty result from MSFT_NetAdapter"
+    );
+}
+
+// === WQL with invalid namespace ===
+
+#[tokio::test]
+#[ignore]
+async fn wql_query_invalid_namespace() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let result = client
+        .run_wql(
+            &host,
+            "SELECT * FROM Win32_OperatingSystem",
+            Some("root/nonexistent"),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "query against invalid namespace should fail"
+    );
+}
+
+// === Small max envelope size ===
+
+#[tokio::test]
+#[ignore]
+async fn small_max_envelope_size() {
+    let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    let pass = std::env::var("WINRM_TEST_PASS").expect("WINRM_TEST_PASS");
+    let port: u16 = std::env::var("WINRM_TEST_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(5985);
+
+    let config = WinrmConfig {
+        auth_method: AuthMethod::Basic,
+        port,
+        max_envelope_size: 8192,
+        ..Default::default()
+    };
+    let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
+    let output = client
+        .run_powershell(&host, "Get-Process | Select-Object -First 5 | Format-Table")
+        .await
+        .expect("run with small envelope");
+    assert_eq!(output.exit_code, 0);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.trim().is_empty(), "expected process output");
+}
+
+// === NTLM encryption modes ===
+
+// EncryptionMode::Always forces NTLM message sealing (multipart/encrypted).
+// The first request authenticates with plaintext, subsequent requests are sealed.
+#[tokio::test]
+#[ignore]
+async fn ntlm_encryption_always() {
+    let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    let pass = std::env::var("WINRM_TEST_PASS").expect("WINRM_TEST_PASS");
+    let port: u16 = std::env::var("WINRM_TEST_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(5985);
+
+    let config = WinrmConfig {
+        auth_method: AuthMethod::Ntlm,
+        port,
+        encryption: EncryptionMode::Always,
+        ..Default::default()
+    };
+    let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
+    let output = client
+        .run_command(&host, "whoami", &[])
+        .await
+        .expect("ntlm encryption always");
+    assert_eq!(output.exit_code, 0);
+    assert!(!String::from_utf8_lossy(&output.stdout).trim().is_empty());
+}
+
+#[tokio::test]
+#[ignore]
+async fn ntlm_encryption_never() {
+    let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    let pass = std::env::var("WINRM_TEST_PASS").expect("WINRM_TEST_PASS");
+    let port: u16 = std::env::var("WINRM_TEST_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(5985);
+
+    let config = WinrmConfig {
+        auth_method: AuthMethod::Ntlm,
+        port,
+        encryption: EncryptionMode::Never,
+        ..Default::default()
+    };
+    let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
+    let output = client
+        .run_command(&host, "whoami", &[])
+        .await
+        .expect("ntlm encryption never");
+    assert_eq!(output.exit_code, 0);
+    assert!(!String::from_utf8_lossy(&output.stdout).trim().is_empty());
+}
+
+#[tokio::test]
+#[ignore]
+async fn ntlm_encryption_auto_over_http() {
+    let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    let pass = std::env::var("WINRM_TEST_PASS").expect("WINRM_TEST_PASS");
+    let port: u16 = std::env::var("WINRM_TEST_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(5985);
+
+    let config = WinrmConfig {
+        auth_method: AuthMethod::Ntlm,
+        port,
+        encryption: EncryptionMode::Auto,
+        ..Default::default()
+    };
+    let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
+    let output = client
+        .run_command(&host, "whoami", &[])
+        .await
+        .expect("ntlm encryption auto over http");
+    assert_eq!(output.exit_code, 0);
+    assert!(!String::from_utf8_lossy(&output.stdout).trim().is_empty());
+}
+
+// === Builder pattern ===
+
+#[tokio::test]
+#[ignore]
+async fn builder_pattern_works() {
+    let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    let pass = std::env::var("WINRM_TEST_PASS").expect("WINRM_TEST_PASS");
+    let port: u16 = std::env::var("WINRM_TEST_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(5985);
+
+    let config = WinrmConfig {
+        auth_method: AuthMethod::Basic,
+        port,
+        ..Default::default()
+    };
+    let client = WinrmClient::builder(config)
+        .credentials(WinrmCredentials::new(user, pass, ""))
+        .build()
+        .expect("build client via builder");
+    let output = client
+        .run_command(&host, "whoami", &[])
+        .await
+        .expect("builder whoami");
+    assert_eq!(output.exit_code, 0);
+    assert!(!String::from_utf8_lossy(&output.stdout).trim().is_empty());
+}
+
+// === Error cases on real server ===
+
+#[tokio::test]
+#[ignore]
+async fn invalid_shell_id_returns_error() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let result = client
+        .delete_shell(&host, "00000000-0000-0000-0000-000000000000")
+        .await;
+    assert!(
+        result.is_err(),
+        "deleting a nonexistent shell should return an error"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn double_delete_shell_returns_error() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let shell_id = client.create_shell(&host).await.expect("create shell");
+
+    client
+        .delete_shell(&host, &shell_id)
+        .await
+        .expect("first delete should succeed");
+
+    let result = client.delete_shell(&host, &shell_id).await;
+    assert!(
+        result.is_err(),
+        "second delete of same shell should return an error"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn command_on_deleted_shell_returns_error() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let shell_id = client.create_shell(&host).await.expect("create shell");
+
+    client
+        .delete_shell(&host, &shell_id)
+        .await
+        .expect("delete shell");
+
+    let result = client
+        .execute_command(&host, &shell_id, "whoami", &[])
+        .await;
+    assert!(
+        result.is_err(),
+        "executing command on deleted shell should return an error"
+    );
 }

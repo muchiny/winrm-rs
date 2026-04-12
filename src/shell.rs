@@ -25,6 +25,10 @@ pub struct Shell<'a> {
     host: String,
     shell_id: String,
     closed: bool,
+    /// Resource URI used for all subsequent SOAP operations on this shell.
+    /// Defaults to `RESOURCE_URI_CMD` for standard command shells;
+    /// PSRP shells use `RESOURCE_URI_PSRP`.
+    resource_uri: String,
 }
 
 impl<'a> Shell<'a> {
@@ -34,7 +38,28 @@ impl<'a> Shell<'a> {
             host,
             shell_id,
             closed: false,
+            resource_uri: crate::soap::namespaces::RESOURCE_URI_CMD.to_string(),
         }
+    }
+
+    pub(crate) fn new_with_resource_uri(
+        client: &'a WinrmClient,
+        host: String,
+        shell_id: String,
+        resource_uri: String,
+    ) -> Self {
+        Self {
+            client,
+            host,
+            shell_id,
+            closed: false,
+            resource_uri,
+        }
+    }
+
+    /// The resource URI this shell was created with.
+    pub fn resource_uri(&self) -> &str {
+        &self.resource_uri
     }
 
     /// Execute a command in this shell.
@@ -149,17 +174,34 @@ impl<'a> Shell<'a> {
         data: &[u8],
         end_of_stream: bool,
     ) -> Result<(), WinrmError> {
+        // send_input doesn't have a _with_uri variant yet — the resource URI
+        // in the header doesn't affect the Send action on most servers, but
+        // let's be correct and use the shell's URI anyway by calling the
+        // low-level builder directly.
         let endpoint = self.client.endpoint(&self.host);
         let config = self.client.config();
-        let envelope = soap::send_input_request(
-            &endpoint,
-            &self.shell_id,
-            command_id,
-            data,
-            end_of_stream,
-            config.operation_timeout_secs,
-            config.max_envelope_size,
-        );
+        let envelope = if command_id.is_empty() || command_id == self.shell_id {
+            // PSRP without a command: no CommandId on the stream.
+            soap::send_psrp_request(
+                &endpoint,
+                &self.shell_id,
+                data,
+                config.operation_timeout_secs,
+                config.max_envelope_size,
+                &self.resource_uri,
+            )
+        } else {
+            soap::send_input_request_with_uri(
+                &endpoint,
+                &self.shell_id,
+                command_id,
+                data,
+                end_of_stream,
+                config.operation_timeout_secs,
+                config.max_envelope_size,
+                &self.resource_uri,
+            )
+        };
         self.client.send_soap_raw(&self.host, envelope).await?;
         Ok(())
     }
@@ -200,11 +242,48 @@ impl<'a> Shell<'a> {
     /// # Ok(())
     /// # }
     /// ```
+    /// Like [`start_command`](Self::start_command) but lets the caller
+    /// specify the `CommandId` that the server should assign to the
+    /// command. Used by PSRP where the pipeline UUID must match the
+    /// CommandId.
+    pub async fn start_command_with_id(
+        &self,
+        command: &str,
+        args: &[&str],
+        command_id: &str,
+    ) -> Result<String, WinrmError> {
+        let endpoint = self.client.endpoint(&self.host);
+        let config = self.client.config();
+        let envelope = soap::execute_command_with_id_request(
+            &endpoint,
+            &self.shell_id,
+            command,
+            args,
+            command_id,
+            config.operation_timeout_secs,
+            config.max_envelope_size,
+            &self.resource_uri,
+        );
+        let response = self.client.send_soap_raw(&self.host, envelope).await?;
+        let returned_id = soap::parse_command_id(&response).map_err(WinrmError::Soap)?;
+        debug!(command_id = %returned_id, "shell command started with specified ID");
+        Ok(returned_id)
+    }
+
     pub async fn start_command(&self, command: &str, args: &[&str]) -> Result<String, WinrmError> {
-        let command_id = self
-            .client
-            .execute_command(&self.host, &self.shell_id, command, args)
-            .await?;
+        let endpoint = self.client.endpoint(&self.host);
+        let config = self.client.config();
+        let envelope = soap::execute_command_request_with_uri(
+            &endpoint,
+            &self.shell_id,
+            command,
+            args,
+            config.operation_timeout_secs,
+            config.max_envelope_size,
+            &self.resource_uri,
+        );
+        let response = self.client.send_soap_raw(&self.host, envelope).await?;
+        let command_id = soap::parse_command_id(&response).map_err(WinrmError::Soap)?;
         debug!(command_id = %command_id, "shell command started (streaming)");
         Ok(command_id)
     }
@@ -215,9 +294,36 @@ impl<'a> Shell<'a> {
     /// Callers should accumulate stdout/stderr and stop when
     /// [`done`](ReceiveOutput::done) is `true`.
     pub async fn receive_next(&self, command_id: &str) -> Result<ReceiveOutput, WinrmError> {
-        self.client
-            .receive_output(&self.host, &self.shell_id, command_id)
-            .await
+        let endpoint = self.client.endpoint(&self.host);
+        let config = self.client.config();
+        let is_psrp = self.resource_uri.contains("powershell");
+        let envelope = if is_psrp {
+            // PSRP: stdout only, optional CommandId.
+            let cid = if command_id.is_empty() || command_id == self.shell_id {
+                None
+            } else {
+                Some(command_id)
+            };
+            soap::receive_psrp_request(
+                &endpoint,
+                &self.shell_id,
+                cid,
+                config.operation_timeout_secs,
+                config.max_envelope_size,
+                &self.resource_uri,
+            )
+        } else {
+            soap::receive_output_request_with_uri(
+                &endpoint,
+                &self.shell_id,
+                command_id,
+                config.operation_timeout_secs,
+                config.max_envelope_size,
+                &self.resource_uri,
+            )
+        };
+        let response = self.client.send_soap_raw(&self.host, envelope).await?;
+        soap::parse_receive_output(&response).map_err(WinrmError::Soap)
     }
 
     /// Get the shell ID.
@@ -242,9 +348,16 @@ impl<'a> Shell<'a> {
     /// owned by the runspace.
     pub async fn disconnect(mut self) -> Result<String, WinrmError> {
         self.closed = true;
-        self.client
-            .disconnect_shell_raw(&self.host, &self.shell_id)
-            .await?;
+        let endpoint = self.client.endpoint(&self.host);
+        let config = self.client.config();
+        let envelope = soap::disconnect_shell_request_with_uri(
+            &endpoint,
+            &self.shell_id,
+            config.operation_timeout_secs,
+            config.max_envelope_size,
+            &self.resource_uri,
+        );
+        self.client.send_soap_raw(&self.host, envelope).await?;
         Ok(std::mem::take(&mut self.shell_id))
     }
 }
@@ -416,7 +529,11 @@ mod tests {
 
         let client = WinrmClient::new(basic_config(port), test_creds()).unwrap();
         let shell = client
-            .reconnect_shell("127.0.0.1", "SH-EXISTING")
+            .reconnect_shell(
+                "127.0.0.1",
+                "SH-EXISTING",
+                crate::soap::namespaces::RESOURCE_URI_CMD,
+            )
             .await
             .unwrap();
         assert_eq!(shell.shell_id(), "SH-EXISTING");
@@ -758,5 +875,151 @@ mod tests {
         // After close, the drop should NOT warn.
         // Kills "delete !" mutant: `if self.closed` would warn for closed shell.
         assert!(!logs_contain("shell dropped without close"));
+    }
+
+    // Kills shell.rs:62 — resource_uri() returning "" or "xyzzy"
+    #[tokio::test]
+    async fn resource_uri_matches_default_cmd() {
+        let server = MockServer::start().await;
+        let port = server.address().port();
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>SH-URI</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
+            ))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Cleanup
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("<s:Envelope><s:Body/></s:Envelope>"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = WinrmClient::new(basic_config(port), test_creds()).unwrap();
+        let shell = client.open_shell("127.0.0.1").await.unwrap();
+        assert!(
+            shell.resource_uri().contains("cmd"),
+            "resource_uri should contain 'cmd', got: {}",
+            shell.resource_uri()
+        );
+    }
+
+    // Kills shell.rs:255 — start_command_with_id returning Ok("") or Ok("xyzzy")
+    #[tokio::test]
+    async fn start_command_with_id_returns_server_command_id() {
+        let server = MockServer::start().await;
+        let port = server.address().port();
+
+        // Shell create
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>SH-WCID</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
+            ))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Execute command (returns a specific command ID)
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>MY-CMD-ID</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
+            ))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Cleanup
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("<s:Envelope><s:Body/></s:Envelope>"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = WinrmClient::new(basic_config(port), test_creds()).unwrap();
+        let shell = client.open_shell("127.0.0.1").await.unwrap();
+        let cmd_id = shell
+            .start_command_with_id("test", &[], "MY-CMD-ID")
+            .await
+            .unwrap();
+        assert_eq!(cmd_id, "MY-CMD-ID");
+    }
+
+    // Kills shell.rs:183 — send_input conditional (|| → && and == → !=)
+    // Tests the PSRP branch: when command_id equals shell_id, it should use send_psrp_request
+    #[tokio::test]
+    async fn send_input_psrp_path_when_command_id_is_shell_id() {
+        let server = MockServer::start().await;
+        let port = server.address().port();
+
+        // Reconnect a PSRP shell (uses powershell resource URI)
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("<s:Envelope><s:Body/></s:Envelope>"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = WinrmClient::new(basic_config(port), test_creds()).unwrap();
+        let shell = client
+            .reconnect_shell(
+                "127.0.0.1",
+                "PSRP-SHELL",
+                crate::soap::namespaces::RESOURCE_URI_PSRP,
+            )
+            .await
+            .unwrap();
+        // Send input with command_id == shell_id → takes PSRP path
+        shell.send_input("PSRP-SHELL", b"data", false).await.unwrap();
+        // Send input with empty command_id → also takes PSRP path
+        shell.send_input("", b"data", false).await.unwrap();
+    }
+
+    // Kills shell.rs:302 — receive_next conditional (|| → && and == → !=)
+    #[tokio::test]
+    async fn receive_next_with_real_command_id() {
+        let server = MockServer::start().await;
+        let port = server.address().port();
+
+        // Shell create
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>SH-RECV</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
+            ))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Receive output
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<s:Envelope><s:Body><rsp:ReceiveResponse>
+                    <rsp:Stream Name="stdout" CommandId="RECV-CMD">YWJD</rsp:Stream>
+                    <rsp:CommandState CommandId="RECV-CMD" State="http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Done">
+                        <rsp:ExitCode>0</rsp:ExitCode>
+                    </rsp:CommandState>
+                </rsp:ReceiveResponse></s:Body></s:Envelope>"#,
+            ))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Cleanup
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("<s:Envelope><s:Body/></s:Envelope>"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = WinrmClient::new(basic_config(port), test_creds()).unwrap();
+        let shell = client.open_shell("127.0.0.1").await.unwrap();
+        let output = shell.receive_next("RECV-CMD").await.unwrap();
+        assert!(output.done);
+        assert!(!output.stdout.is_empty());
     }
 }

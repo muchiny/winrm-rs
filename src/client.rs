@@ -80,6 +80,43 @@ impl WinrmClient {
         soap::parse_shell_id(&response).map_err(WinrmError::Soap)
     }
 
+    /// Create a PSRP (PowerShell Remoting) shell on the given host.
+    ///
+    /// Unlike [`create_shell`] this uses the PowerShell resource URI and
+    /// embeds the `creationXml` (base64-encoded PSRP opening fragments)
+    /// directly in the Create Shell body.
+    ///
+    /// Returns a [`Shell`] whose subsequent operations (Execute, Receive,
+    /// Send, Signal, Delete) will use the PowerShell resource URI.
+    #[tracing::instrument(level = "debug", skip(self, creation_xml_b64))]
+    pub async fn open_psrp_shell(
+        &self,
+        host: &str,
+        creation_xml_b64: &str,
+        resource_uri: &str,
+    ) -> Result<Shell<'_>, WinrmError> {
+        let config = self.transport.config();
+        // The PSRP provider expects the client to propose a ShellId in the
+        // Create body (as an attribute on `<rsp:Shell ShellId="…">`).
+        let proposed_id = uuid::Uuid::new_v4().hyphenated().to_string().to_uppercase();
+        let envelope = soap::create_psrp_shell_request(
+            &self.transport.endpoint(host),
+            config,
+            creation_xml_b64,
+            resource_uri,
+            &proposed_id,
+        );
+        let response = self.transport.send_soap_with_retry(host, envelope).await?;
+        let shell_id = soap::parse_shell_id(&response).map_err(WinrmError::Soap)?;
+        debug!(shell_id = %shell_id, "PSRP shell opened");
+        Ok(Shell::new_with_resource_uri(
+            self,
+            host.to_string(),
+            shell_id,
+            resource_uri.to_string(),
+        ))
+    }
+
     /// Execute a command in an existing remote shell. Returns the command ID.
     ///
     /// The caller is responsible for subsequently calling
@@ -373,27 +410,6 @@ impl WinrmClient {
         self.delete_shell(host, shell_id).await
     }
 
-    /// Disconnect a shell (used internally by `Shell::disconnect`).
-    ///
-    /// Sends a WS-Man `Disconnect` SOAP request that leaves the
-    /// server-side shell alive so it can be reconnected later via
-    /// [`reconnect_shell`](Self::reconnect_shell).
-    pub(crate) async fn disconnect_shell_raw(
-        &self,
-        host: &str,
-        shell_id: &str,
-    ) -> Result<(), WinrmError> {
-        let config = self.transport.config();
-        let envelope = soap::disconnect_shell_request(
-            &self.transport.endpoint(host),
-            shell_id,
-            config.operation_timeout_secs,
-            config.max_envelope_size,
-        );
-        self.transport.send_soap_with_retry(host, envelope).await?;
-        Ok(())
-    }
-
     /// Reconnect to a previously-disconnected shell.
     ///
     /// Sends a WS-Man `Reconnect` SOAP request to validate that the
@@ -404,24 +420,31 @@ impl WinrmClient {
         &self,
         host: &str,
         shell_id: &str,
+        resource_uri: &str,
     ) -> Result<Shell<'_>, WinrmError> {
         let config = self.transport.config();
-        let envelope = soap::reconnect_shell_request(
+        let envelope = soap::reconnect_shell_request_with_uri(
             &self.transport.endpoint(host),
             shell_id,
             config.operation_timeout_secs,
             config.max_envelope_size,
+            resource_uri,
         );
         self.transport.send_soap_with_retry(host, envelope).await?;
         debug!(shell_id = %shell_id, "WinRM shell reconnected");
-        Ok(Shell::new(self, host.to_string(), shell_id.to_string()))
+        Ok(Shell::new_with_resource_uri(
+            self,
+            host.to_string(),
+            shell_id.to_string(),
+            resource_uri.to_string(),
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::AuthMethod;
+    use crate::config::{AuthMethod, EncryptionMode};
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD as B64;
     use wiremock::matchers::{header, method};
@@ -447,6 +470,8 @@ mod tests {
             auth_method: AuthMethod::Ntlm,
             connect_timeout_secs: 5,
             operation_timeout_secs: 10,
+            // Mocks don't support NTLM sealing; disable encryption for unit tests.
+            encryption: EncryptionMode::Never,
             ..Default::default()
         }
     }
@@ -2221,10 +2246,12 @@ mod tests {
 
         let dir = std::env::temp_dir().join("winrm-rs-test-upload-multi-chunk");
         std::fs::create_dir_all(&dir).unwrap();
-        let local_file = dir.join("large.bin");
-        let data = vec![0xABu8; 150 * 1024];
+        let local_file = dir.join("multi.bin");
+        // 4001 bytes = 3 chunks with CHUNK_SIZE=2000 (2000 + 2000 + 1)
+        let data = vec![0xABu8; 4001];
         std::fs::write(&local_file, &data).unwrap();
 
+        // Create shell
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
                 r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>MCH-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
@@ -2233,6 +2260,7 @@ mod tests {
             .mount(&server)
             .await;
 
+        // Chunk 1: execute + receive + signal
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
                 r"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>MCH-CMD1</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
@@ -2240,7 +2268,6 @@ mod tests {
             .up_to_n_times(1)
             .mount(&server)
             .await;
-
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
                 r#"<s:Envelope><s:Body><rsp:ReceiveResponse>
@@ -2252,7 +2279,6 @@ mod tests {
             .up_to_n_times(1)
             .mount(&server)
             .await;
-
         Mock::given(method("POST"))
             .respond_with(
                 ResponseTemplate::new(200).set_body_string("<s:Envelope><s:Body/></s:Envelope>"),
@@ -2261,6 +2287,7 @@ mod tests {
             .mount(&server)
             .await;
 
+        // Chunk 2: execute + receive + signal
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
                 r"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>MCH-CMD2</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
@@ -2268,7 +2295,6 @@ mod tests {
             .up_to_n_times(1)
             .mount(&server)
             .await;
-
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
                 r#"<s:Envelope><s:Body><rsp:ReceiveResponse>
@@ -2280,7 +2306,35 @@ mod tests {
             .up_to_n_times(1)
             .mount(&server)
             .await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("<s:Envelope><s:Body/></s:Envelope>"),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
 
+        // Chunk 3: execute + receive + signal
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>MCH-CMD3</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
+            ))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<s:Envelope><s:Body><rsp:ReceiveResponse>
+                    <rsp:CommandState CommandId="MCH-CMD3" State="http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Done">
+                        <rsp:ExitCode>0</rsp:ExitCode>
+                    </rsp:CommandState>
+                </rsp:ReceiveResponse></s:Body></s:Envelope>"#,
+            ))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Catch-all for signal/delete
         Mock::given(method("POST"))
             .respond_with(
                 ResponseTemplate::new(200).set_body_string("<s:Envelope><s:Body/></s:Envelope>"),
@@ -2290,10 +2344,10 @@ mod tests {
 
         let client = WinrmClient::new(basic_config(port), test_creds()).unwrap();
         let result = client
-            .upload_file("127.0.0.1", &local_file, "C:\\remote\\large.bin")
+            .upload_file("127.0.0.1", &local_file, "C:\\remote\\multi.bin")
             .await;
         assert!(result.is_ok(), "multi-chunk upload failed: {result:?}");
-        assert_eq!(result.unwrap(), 150 * 1024);
+        assert_eq!(result.unwrap(), 4001);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2694,5 +2748,38 @@ mod tests {
         );
 
         handle.abort();
+    }
+
+    // Kills client.rs:354 — run_wql returning Ok("") or Ok("xyzzy")
+    #[tokio::test]
+    async fn run_wql_returns_items() {
+        let server = MockServer::start().await;
+        let port = server.address().port();
+
+        // WQL Enumerate response with items and EndOfSequence
+        let enumerate_response = r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+          xmlns:wsen="http://schemas.xmlsoap.org/ws/2004/09/enumeration">
+          <s:Body>
+            <wsen:EnumerateResponse>
+              <wsen:Items><p:Win32_OS><p:Name>Windows</p:Name></p:Win32_OS></wsen:Items>
+              <wsen:EndOfSequence/>
+            </wsen:EnumerateResponse>
+          </s:Body>
+        </s:Envelope>"#;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(enumerate_response))
+            .mount(&server)
+            .await;
+
+        let client = WinrmClient::new(basic_config(port), test_creds()).unwrap();
+        let result = client
+            .run_wql("127.0.0.1", "SELECT * FROM Win32_OS", None)
+            .await
+            .unwrap();
+        assert!(
+            result.contains("Windows"),
+            "run_wql should return items, got: {result}"
+        );
     }
 }

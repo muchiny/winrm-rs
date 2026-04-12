@@ -104,6 +104,7 @@ pub use error::{CredSspError, NtlmError, SoapError, WinrmError};
 pub use ntlm::NtlmSession;
 pub use secrecy::{ExposeSecret, SecretString};
 pub use shell::Shell;
+pub use soap::namespaces::RESOURCE_URI_PSRP;
 pub use tokio_util::sync::CancellationToken;
 // Re-export soap types that are part of the public API
 pub use soap::ReceiveOutput;

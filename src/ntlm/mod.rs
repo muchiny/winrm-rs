@@ -9,8 +9,9 @@ pub(crate) mod messages;
 
 // Re-export crate-internal API
 pub(crate) use messages::{
-    create_authenticate_message_with_cbt, create_authenticate_message_with_key,
-    create_negotiate_message, decode_challenge_header, encode_authorization,
+    create_authenticate_message_with_cbt_and_key,
+    create_authenticate_message_with_key_and_mic, create_negotiate_message,
+    decode_challenge_header, encode_authorization,
 };
 // `parse_challenge` is only reached from outside `ntlm::messages` by the
 // CredSSP path and by fuzz targets via the internal feature. Tests inside
@@ -507,4 +508,23 @@ mod tests {
         let err = format!("{}", result.unwrap_err());
         assert!(err.contains("checksum mismatch"));
     }
+
+    // Kills ntlm/mod.rs:159 — sign: replace += with *= on client_seq_num
+    // *= 1 keeps seq at 0 forever; += 1 increments. After two signs,
+    // the sequence numbers embedded in the signatures must differ.
+    #[test]
+    fn sign_increments_sequence_number() {
+        let key = [0xDD; 16];
+        let mut session = NtlmSession::from_auth(&key);
+        let sig1 = session.sign(b"msg1");
+        let sig2 = session.sign(b"msg1"); // same data, different seq
+        let seq1 = u32::from_le_bytes(sig1[12..16].try_into().unwrap());
+        let seq2 = u32::from_le_bytes(sig2[12..16].try_into().unwrap());
+        assert_eq!(seq1, 0);
+        assert_eq!(seq2, 1);
+    }
+
+    // Note: unseal's server_seq_num += 1 mutant (line 215) survives because
+    // unseal uses server-side keys that differ from seal's client-side keys.
+    // Killing it requires a real WinRM server or a hand-crafted server-keyed message.
 }

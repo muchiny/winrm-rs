@@ -32,9 +32,15 @@ pub(crate) const NEGOTIATE_56: u32 = 0x8000_0000;
 
 pub(crate) const TYPE1_FLAGS: u32 = NEGOTIATE_UNICODE
     | REQUEST_TARGET
+    | NEGOTIATE_SIGN
+    | NEGOTIATE_SEAL
     | NEGOTIATE_NTLM
     | NEGOTIATE_ALWAYS_SIGN
-    | NEGOTIATE_EXTENDED_SESSIONSECURITY;
+    | NEGOTIATE_EXTENDED_SESSIONSECURITY
+    | NEGOTIATE_VERSION
+    | NEGOTIATE_128
+    | NEGOTIATE_KEY_EXCH
+    | NEGOTIATE_56;
 
 /// Flags required for NTLM inside CredSSP — needs sealing/key exchange.
 /// Matches what pyspnego/Windows SSPI sends: 0xe2088237
@@ -250,6 +256,18 @@ impl Rc4State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Kills | → ^ and | → & mutants on TYPE1_FLAGS and TYPE1_FLAGS_CREDSSP.
+    // Assert against hardcoded hex values so the constant itself is tested.
+    #[test]
+    fn type1_flags_exact_hex_value() {
+        assert_eq!(TYPE1_FLAGS, 0xe208_8235);
+    }
+
+    #[test]
+    fn type1_flags_credssp_exact_hex_value() {
+        assert_eq!(TYPE1_FLAGS_CREDSSP, 0xe208_8237);
+    }
 
     #[test]
     fn nt_hash_known_value() {

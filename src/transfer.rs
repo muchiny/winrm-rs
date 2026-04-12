@@ -10,8 +10,13 @@ use base64::engine::general_purpose::STANDARD as B64;
 use crate::client::WinrmClient;
 use crate::error::WinrmError;
 
-/// File transfer chunk size (bytes before base64 encoding).
-const CHUNK_SIZE: usize = 100 * 1024; // 100 KB
+/// File transfer chunk size (raw bytes before encoding).
+///
+/// Each chunk is base64-encoded, embedded in a PowerShell script, then the
+/// script is UTF-16LE encoded and base64-encoded again for `-EncodedCommand`.
+/// This triple encoding yields ~3.5× expansion. WinRS enforces an ~8191-char
+/// command-line limit, so the raw chunk must stay under ~2 KB.
+const CHUNK_SIZE: usize = 2000;
 
 /// Maximum allowed remote path length (Windows MAX_PATH).
 const MAX_REMOTE_PATH_LEN: usize = 260;
@@ -37,8 +42,10 @@ fn validate_remote_path(path: &str) -> Result<(), WinrmError> {
 impl WinrmClient {
     /// Upload a local file to a remote Windows host.
     ///
-    /// The file is chunked into 100 KB pieces, base64-encoded, and written
+    /// The file is chunked into ~2 KB pieces, base64-encoded, and written
     /// via PowerShell `[IO.File]::WriteAllBytes` / `[IO.File]::Open('Append')`.
+    /// The small chunk size is dictated by the WinRS command-line limit
+    /// (~8191 chars) after triple encoding (base64 → UTF-16LE → base64).
     ///
     /// Returns the number of bytes uploaded.
     pub async fn upload_file(

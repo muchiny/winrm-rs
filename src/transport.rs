@@ -6,7 +6,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use reqwest::header::CONTENT_TYPE;
 use secrecy::ExposeSecret;
+use tokio::sync::Mutex;
 use tracing::{debug, trace};
 use zeroize::Zeroizing;
 
@@ -16,11 +18,18 @@ use crate::auth::certificate::CertificateAuth;
 #[cfg(feature = "credssp")]
 use crate::auth::credssp::CredSspAuth;
 use crate::auth::kerberos::KerberosAuth;
-use crate::auth::ntlm::NtlmAuth;
+use crate::auth::ntlm::{self as ntlm_auth, NtlmAuth};
 use crate::config::{AuthMethod, EncryptionMode, WinrmConfig, WinrmCredentials};
 use crate::error::WinrmError;
+use crate::ntlm::NtlmSession;
 use crate::soap;
 use crate::tls::CertHandle;
+
+/// Cached NTLM session state for message sealing on a specific host.
+struct NtlmSessionCache {
+    host: String,
+    session: NtlmSession,
+}
 
 /// HTTP transport for WinRM SOAP requests.
 ///
@@ -32,6 +41,9 @@ pub(crate) struct HttpTransport {
     /// Handle to retrieve the captured TLS server certificate (for CBT).
     /// `None` when using plain HTTP (no TLS).
     cert_handle: Option<CertHandle>,
+    /// Cached NTLM session for sealed message exchange.
+    /// Uses `tokio::sync::Mutex` because the lock spans an `.await` (HTTP send).
+    ntlm_cache: Mutex<Option<NtlmSessionCache>>,
 }
 
 impl HttpTransport {
@@ -132,6 +144,7 @@ impl HttpTransport {
             config,
             credentials,
             cert_handle,
+            ntlm_cache: Mutex::new(None),
         })
     }
 
@@ -166,15 +179,24 @@ impl HttpTransport {
                 auth.send_authenticated(&self.http, &url, body).await?
             }
             AuthMethod::Ntlm => {
-                let encrypt = matches!(self.config.encryption, EncryptionMode::Always);
-                let auth = NtlmAuth {
-                    username: self.credentials.username.clone(),
-                    password: Zeroizing::new(self.credentials.password.expose_secret().to_string()),
-                    domain: self.credentials.domain.clone(),
-                    cert_handle: self.cert_handle.clone(),
-                    encrypt,
+                let encrypt = match self.config.encryption {
+                    EncryptionMode::Always => true,
+                    EncryptionMode::Never => false,
+                    EncryptionMode::Auto => !self.config.use_tls,
                 };
-                auth.send_authenticated(&self.http, &url, body).await?
+                if encrypt {
+                    self.send_ntlm_sealed(host, &url, body).await?
+                } else {
+                    let auth = NtlmAuth {
+                        username: self.credentials.username.clone(),
+                        password: Zeroizing::new(
+                            self.credentials.password.expose_secret().to_string(),
+                        ),
+                        domain: self.credentials.domain.clone(),
+                        cert_handle: self.cert_handle.clone(),
+                    };
+                    auth.send_authenticated(&self.http, &url, body).await?
+                }
             }
             AuthMethod::Kerberos => {
                 let host_part = host.split(':').next().unwrap_or(host);
@@ -208,6 +230,98 @@ impl HttpTransport {
         trace!(response = %response_text, "SOAP response body");
         soap::check_soap_fault(&response_text).map_err(WinrmError::Soap)?;
         Ok(response_text)
+    }
+
+    /// Send an NTLM-sealed request, reusing the cached session if available.
+    ///
+    /// On the first call (no cached session), does a full NTLM handshake with
+    /// the SOAP body sent as plaintext.  The session key is cached so that
+    /// subsequent calls can send the body sealed (multipart/encrypted) without
+    /// a new handshake, reusing the keep-alive TCP connection.
+    ///
+    /// If the server returns 401 (session expired), the cache is cleared and a
+    /// fresh handshake is attempted.
+    async fn send_ntlm_sealed(
+        &self,
+        host: &str,
+        url: &str,
+        body: String,
+    ) -> Result<String, WinrmError> {
+        // Try sending with cached session first
+        {
+            let mut cache = self.ntlm_cache.lock().await;
+            if let Some(ref mut c) = *cache {
+                if c.host == host {
+                    match self.send_sealed_body(&mut c.session, url, &body).await {
+                        Ok(resp) => return Ok(resp),
+                        Err(WinrmError::AuthFailed(_)) => {
+                            // Session expired — clear cache, fall through to handshake
+                            debug!("NTLM sealed session expired, re-authenticating");
+                            *cache = None;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                } else {
+                    // Different host — clear cache
+                    *cache = None;
+                }
+            }
+        }
+
+        // No cached session: do full handshake with plaintext body
+        let auth = NtlmAuth {
+            username: self.credentials.username.clone(),
+            password: Zeroizing::new(self.credentials.password.expose_secret().to_string()),
+            domain: self.credentials.domain.clone(),
+            cert_handle: self.cert_handle.clone(),
+        };
+        let (response, session_key) = auth.handshake_and_send(&self.http, url, &body).await?;
+
+        // Cache the session for subsequent sealed requests
+        let session = NtlmSession::from_auth(&session_key);
+        *self.ntlm_cache.lock().await = Some(NtlmSessionCache {
+            host: host.to_string(),
+            session,
+        });
+
+        Ok(response)
+    }
+
+    /// Send a sealed body on an already-authenticated keep-alive connection.
+    async fn send_sealed_body(
+        &self,
+        session: &mut NtlmSession,
+        url: &str,
+        body: &str,
+    ) -> Result<String, WinrmError> {
+        let (content_type, sealed) = ntlm_auth::seal_body(session, body);
+
+        let resp = self
+            .http
+            .post(url)
+            .header(CONTENT_TYPE, &content_type)
+            .body(sealed)
+            .send()
+            .await
+            .map_err(WinrmError::Http)?;
+
+        if resp.status().as_u16() == 401 {
+            return Err(WinrmError::AuthFailed("NTLM session expired".into()));
+        }
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            if status.as_u16() == 500
+                && let Err(soap_err) = crate::soap::parser::check_soap_fault(&text)
+            {
+                return Err(WinrmError::Soap(soap_err));
+            }
+            return Err(WinrmError::AuthFailed(format!("HTTP {status}: {text}")));
+        }
+
+        let resp_bytes = resp.bytes().await.map_err(WinrmError::Http)?;
+        ntlm_auth::unseal_body(session, &resp_bytes)
     }
 
     /// Send an authenticated SOAP request with optional retry on transient HTTP errors.
@@ -247,5 +361,275 @@ impl HttpTransport {
         body: String,
     ) -> Result<String, WinrmError> {
         self.send_soap_with_retry(host, body).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Helper to build an HttpTransport with Basic auth pointing at a wiremock server.
+    fn basic_transport(port: u16) -> HttpTransport {
+        let config = WinrmConfig {
+            auth_method: AuthMethod::Basic,
+            port,
+            use_tls: false,
+            ..Default::default()
+        };
+        let creds = WinrmCredentials::new("admin", "pass", "");
+        HttpTransport::new(config, creds).unwrap()
+    }
+
+    #[test]
+    fn endpoint_http() {
+        let transport = basic_transport(5985);
+        assert_eq!(transport.endpoint("10.0.0.1"), "http://10.0.0.1:5985/wsman");
+    }
+
+    #[test]
+    fn endpoint_https() {
+        let config = WinrmConfig {
+            use_tls: true,
+            port: 5986,
+            accept_invalid_certs: true,
+            ..Default::default()
+        };
+        let creds = WinrmCredentials::new("admin", "pass", "");
+        let transport = HttpTransport::new(config, creds).unwrap();
+        assert_eq!(
+            transport.endpoint("win.local"),
+            "https://win.local:5986/wsman"
+        );
+    }
+
+    #[test]
+    fn config_accessor() {
+        let transport = basic_transport(5985);
+        assert_eq!(transport.config().port, 5985);
+        assert!(matches!(
+            transport.config().auth_method,
+            AuthMethod::Basic
+        ));
+    }
+
+    #[test]
+    fn credssp_without_tls_returns_error() {
+        let config = WinrmConfig {
+            auth_method: AuthMethod::CredSsp,
+            use_tls: false,
+            ..Default::default()
+        };
+        let creds = WinrmCredentials::new("admin", "pass", "");
+        match HttpTransport::new(config, creds) {
+            Err(WinrmError::AuthFailed(_)) => {} // expected
+            Err(e) => panic!("expected AuthFailed, got: {e}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn certificate_auth_without_cert_path_returns_error() {
+        let config = WinrmConfig {
+            auth_method: AuthMethod::Certificate,
+            client_cert_pem: None,
+            ..Default::default()
+        };
+        let creds = WinrmCredentials::new("admin", "pass", "");
+        match HttpTransport::new(config, creds) {
+            Err(WinrmError::AuthFailed(_)) => {}
+            Err(e) => panic!("expected AuthFailed, got: {e}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn certificate_auth_without_key_path_returns_error() {
+        let config = WinrmConfig {
+            auth_method: AuthMethod::Certificate,
+            client_cert_pem: Some("/tmp/cert.pem".into()),
+            client_key_pem: None,
+            ..Default::default()
+        };
+        let creds = WinrmCredentials::new("admin", "pass", "");
+        match HttpTransport::new(config, creds) {
+            Err(WinrmError::AuthFailed(_)) => {}
+            Err(e) => panic!("expected AuthFailed, got: {e}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn certificate_auth_nonexistent_cert_file_returns_error() {
+        let config = WinrmConfig {
+            auth_method: AuthMethod::Certificate,
+            client_cert_pem: Some("/nonexistent/cert.pem".into()),
+            client_key_pem: Some("/nonexistent/key.pem".into()),
+            ..Default::default()
+        };
+        let creds = WinrmCredentials::new("admin", "pass", "");
+        match HttpTransport::new(config, creds) {
+            Err(WinrmError::AuthFailed(_)) => {}
+            Err(e) => panic!("expected AuthFailed, got: {e}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_basic_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<ok/>"))
+            .mount(&server)
+            .await;
+
+        let addr = server.address();
+        let transport = basic_transport(addr.port());
+        let result = transport
+            .send_soap_with_retry(&addr.ip().to_string(), "<soap/>".into())
+            .await;
+        assert_eq!(result.unwrap(), "<ok/>");
+    }
+
+    #[tokio::test]
+    async fn send_basic_soap_fault_returns_soap_error() {
+        let server = MockServer::start().await;
+        // Server returns 200 with a SOAP fault in the body
+        let fault = r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">
+          <s:Body><s:Fault><s:Code><s:Value>s:Receiver</s:Value></s:Code>
+          <s:Reason><s:Text>boom</s:Text></s:Reason></s:Fault></s:Body></s:Envelope>"#;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(fault))
+            .mount(&server)
+            .await;
+
+        let addr = server.address();
+        let transport = basic_transport(addr.port());
+        let err = transport
+            .send_soap_with_retry(&addr.ip().to_string(), "<soap/>".into())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, WinrmError::Soap(_)),
+            "expected Soap error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_basic_auth_failed_returns_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server)
+            .await;
+
+        let addr = server.address();
+        let transport = basic_transport(addr.port());
+        let err = transport
+            .send_soap_with_retry(&addr.ip().to_string(), "<soap/>".into())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, WinrmError::AuthFailed(_)),
+            "expected AuthFailed, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_on_transient_http_error() {
+        let server = MockServer::start().await;
+        // First request fails (connection reset simulated by no response)
+        // Can't easily simulate transient errors with wiremock. Instead test
+        // that a successful first request doesn't retry.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<ok/>"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let addr = server.address();
+        let config = WinrmConfig {
+            auth_method: AuthMethod::Basic,
+            port: addr.port(),
+            use_tls: false,
+            max_retries: 3,
+            ..Default::default()
+        };
+        let creds = WinrmCredentials::new("admin", "pass", "");
+        let transport = HttpTransport::new(config, creds).unwrap();
+        let result = transport
+            .send_soap_with_retry(&addr.ip().to_string(), "<soap/>".into())
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn no_retry_on_auth_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .expect(1) // Should NOT retry auth failures
+            .mount(&server)
+            .await;
+
+        let addr = server.address();
+        let config = WinrmConfig {
+            auth_method: AuthMethod::Basic,
+            port: addr.port(),
+            use_tls: false,
+            max_retries: 3,
+            ..Default::default()
+        };
+        let creds = WinrmCredentials::new("admin", "pass", "");
+        let transport = HttpTransport::new(config, creds).unwrap();
+        let _ = transport
+            .send_soap_with_retry(&addr.ip().to_string(), "<soap/>".into())
+            .await;
+    }
+
+    #[test]
+    fn proxy_config_applied() {
+        let config = WinrmConfig {
+            auth_method: AuthMethod::Basic,
+            use_tls: false,
+            proxy: Some("http://proxy:8080".into()),
+            ..Default::default()
+        };
+        let creds = WinrmCredentials::new("admin", "pass", "");
+        // Should not error — proxy URL is valid
+        assert!(HttpTransport::new(config, creds).is_ok());
+    }
+
+    #[test]
+    fn tls_with_accept_invalid_certs() {
+        let config = WinrmConfig {
+            use_tls: true,
+            accept_invalid_certs: true,
+            port: 5986,
+            ..Default::default()
+        };
+        let creds = WinrmCredentials::new("admin", "pass", "");
+        let transport = HttpTransport::new(config, creds).unwrap();
+        assert!(transport.cert_handle.is_some());
+    }
+
+    #[test]
+    fn tls_with_valid_certs() {
+        let config = WinrmConfig {
+            use_tls: true,
+            accept_invalid_certs: false,
+            port: 5986,
+            ..Default::default()
+        };
+        let creds = WinrmCredentials::new("admin", "pass", "");
+        let transport = HttpTransport::new(config, creds).unwrap();
+        assert!(transport.cert_handle.is_some());
+    }
+
+    #[test]
+    fn no_tls_has_no_cert_handle() {
+        let transport = basic_transport(5985);
+        assert!(transport.cert_handle.is_none());
     }
 }

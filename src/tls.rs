@@ -137,6 +137,20 @@ impl ServerCertVerifier for NoVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustls::internal::msgs::codec::{Codec, Reader};
+
+    /// Build a `DigitallySignedStruct` from raw wire bytes.
+    /// Wire format: 2-byte scheme + 2-byte length + signature bytes.
+    fn make_dss() -> DigitallySignedStruct {
+        let mut buf = Vec::new();
+        // RSA_PKCS1_SHA256 = 0x0401
+        buf.extend_from_slice(&[0x04, 0x01]);
+        // 64-byte signature, length prefix
+        buf.extend_from_slice(&[0x00, 0x40]);
+        buf.extend_from_slice(&[0u8; 64]);
+        let mut reader = Reader::init(&buf);
+        DigitallySignedStruct::read(&mut reader).unwrap()
+    }
 
     /// Dummy verifier that always succeeds, for testing.
     #[derive(Debug)]
@@ -246,5 +260,43 @@ mod tests {
             verifier.supported_verify_schemes(),
             vec![SignatureScheme::RSA_PKCS1_SHA256]
         );
+    }
+
+    #[test]
+    fn capturing_verifier_delegates_tls12_signature() {
+        let inner = Arc::new(AcceptAllVerifier);
+        let verifier = CertCapturingVerifier::new(inner);
+        let cert = CertificateDer::from(vec![0xAA; 32]);
+        let dss = make_dss();
+        let result = verifier.verify_tls12_signature(b"hello", &cert, &dss);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn capturing_verifier_delegates_tls13_signature() {
+        let inner = Arc::new(AcceptAllVerifier);
+        let verifier = CertCapturingVerifier::new(inner);
+        let cert = CertificateDer::from(vec![0xBB; 32]);
+        let dss = make_dss();
+        let result = verifier.verify_tls13_signature(b"hello", &cert, &dss);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn no_verifier_accepts_tls12_signature() {
+        let verifier = NoVerifier;
+        let cert = CertificateDer::from(vec![0xCC; 32]);
+        let dss = make_dss();
+        let result = verifier.verify_tls12_signature(b"message", &cert, &dss);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn no_verifier_accepts_tls13_signature() {
+        let verifier = NoVerifier;
+        let cert = CertificateDer::from(vec![0xDD; 32]);
+        let dss = make_dss();
+        let result = verifier.verify_tls13_signature(b"message", &cert, &dss);
+        assert!(result.is_ok());
     }
 }

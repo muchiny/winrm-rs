@@ -40,7 +40,7 @@ __internal = []
 
 [dependencies]
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "socks"] }
-cross-krb5 = { version = "0.4", optional = true }
+cross-krb5 = { version = "0.5", optional = true }
 tokio = { version = "1", features = ["time", "macros"] }
 base64 = "0.22"
 thiserror = "2"

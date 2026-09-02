@@ -4,7 +4,7 @@ Thank you for your interest in contributing to winrm-rs! This document provides 
 
 ## Prerequisites
 
-- **Rust 1.94.0** or later
+- **Rust 1.98.0** or later
 - **libkrb5-dev** (Linux) or equivalent — only needed for the `kerberos` feature
 
 ## Getting started
@@ -34,9 +34,12 @@ cargo clippy --all-targets --features kerberos -- -D warnings
 # Format (requires nightly)
 cargo +nightly fmt --check
 
-# Run fuzz targets (requires cargo-fuzz)
-cargo fuzz run fuzz_ntlm_parse -- -max_total_time=30
-cargo fuzz run fuzz_soap_parse -- -max_total_time=30
+# Fuzzing (requires the nightly toolchain and cargo-fuzz).
+# See fuzz/README.md for the full target list.
+scripts/fuzz.sh list          # 18 targets and their dictionaries
+scripts/fuzz.sh smoke         # replay the committed seed corpora
+scripts/fuzz.sh run           # 60s per target
+scripts/fuzz.sh run fuzz_asn1_ts_request 900
 
 # Check what will be published to crates.io
 cargo package --list

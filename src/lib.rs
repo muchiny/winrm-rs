@@ -109,12 +109,9 @@ pub use tokio_util::sync::CancellationToken;
 // Re-export soap types that are part of the public API
 pub use soap::ReceiveOutput;
 
-// Internal re-exports for fuzz targets only. These are NOT part of the
-// public API and may be removed or changed at any time without a SemVer
-// bump. Enabled via the `__internal` feature, consumed only by `fuzz/`.
+// Internal surface for the in-tree fuzz targets and property tests. NOT
+// part of the public API: anything in `__fuzz` may be removed or changed
+// at any time without a SemVer bump. Enabled via the `__internal` feature.
 #[cfg(feature = "__internal")]
 #[doc(hidden)]
-pub use ntlm::parse_challenge;
-#[cfg(feature = "__internal")]
-#[doc(hidden)]
-pub use soap::{check_soap_fault, parse_command_id, parse_receive_output, parse_shell_id};
+pub mod __fuzz;

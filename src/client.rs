@@ -2703,8 +2703,10 @@ mod tests {
                     let arg_val = &body[content_start..content_start + end];
                     if let Ok(bytes) = B64.decode(arg_val.trim()) {
                         let u16s: Vec<u16> = bytes
-                            .chunks_exact(2)
-                            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .map(|c| u16::from_le_bytes(*c))
                             .collect();
                         if let Ok(script) = String::from_utf16(&u16s) {
                             if script.contains("WriteAllBytes") {

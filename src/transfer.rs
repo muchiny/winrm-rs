@@ -24,8 +24,13 @@ const MAX_REMOTE_PATH_LEN: usize = 260;
 /// Validate a remote file path for safety.
 ///
 /// Rejects paths containing control characters (`\x00`-`\x1F` except `\t`)
-/// or exceeding Windows MAX_PATH (260 characters).
-fn validate_remote_path(path: &str) -> Result<(), WinrmError> {
+/// or exceeding Windows MAX_PATH.
+///
+/// The length bound is applied to the UTF-8 **byte** length, which is at
+/// least as strict as the 260-WCHAR limit Windows enforces: a non-ASCII path
+/// is rejected slightly earlier than the host would reject it. Deliberate —
+/// erring towards refusing a path is the safe direction here.
+pub(crate) fn validate_remote_path(path: &str) -> Result<(), WinrmError> {
     if path.len() > MAX_REMOTE_PATH_LEN {
         return Err(WinrmError::Transfer(format!(
             "remote path exceeds {MAX_REMOTE_PATH_LEN} characters"
@@ -37,6 +42,16 @@ fn validate_remote_path(path: &str) -> Result<(), WinrmError> {
         ));
     }
     Ok(())
+}
+
+/// Escape a value for embedding in a PowerShell single-quoted string literal.
+///
+/// Inside `'...'` PowerShell treats `''` as a literal quote and gives no other
+/// character special meaning, so doubling every `'` is sufficient — and leaves
+/// every maximal run of quotes even-length, which is what keeps the literal
+/// from being terminated early.
+pub(crate) fn escape_ps_single_quoted(s: &str) -> String {
+    s.replace('\'', "''")
 }
 
 impl WinrmClient {
@@ -65,7 +80,7 @@ impl WinrmClient {
 
         let shell = self.open_shell(host).await?;
         let total = data.len() as u64;
-        let escaped_path = remote_path.replace('\'', "''");
+        let escaped_path = escape_ps_single_quoted(remote_path);
 
         for (i, chunk) in data.chunks(CHUNK_SIZE).enumerate() {
             let b64 = B64.encode(chunk);
@@ -110,7 +125,7 @@ impl WinrmClient {
     ) -> Result<u64, WinrmError> {
         validate_remote_path(remote_path)?;
 
-        let escaped = remote_path.replace('\'', "''");
+        let escaped = escape_ps_single_quoted(remote_path);
         let script = format!("[Convert]::ToBase64String([IO.File]::ReadAllBytes('{escaped}'))");
 
         let output = self.run_powershell(host, &script).await?;
@@ -171,5 +186,36 @@ mod tests {
         assert!(validate_remote_path(&exact).is_ok());
         let over = "a".repeat(261);
         assert!(validate_remote_path(&over).is_err());
+    }
+
+    #[test]
+    fn escape_ps_single_quoted_doubles_every_quote() {
+        assert_eq!(escape_ps_single_quoted("plain"), "plain");
+        assert_eq!(escape_ps_single_quoted("it's"), "it''s");
+        assert_eq!(escape_ps_single_quoted("''"), "''''");
+        assert_eq!(
+            escape_ps_single_quoted("'); rm -rf /; ('"),
+            "''); rm -rf /; (''"
+        );
+    }
+
+    // Every run of quotes must come out even-length: an odd one would close
+    // the surrounding '...' literal and let the rest parse as PowerShell.
+    #[test]
+    fn escape_ps_single_quoted_leaves_no_odd_quote_run() {
+        for input in ["'", "''", "'''", "a'b''c'''d", "\\'"] {
+            let escaped = escape_ps_single_quoted(input);
+            let mut run = 0usize;
+            for c in escaped.chars() {
+                if c == '\'' {
+                    run += 1;
+                } else {
+                    assert_eq!(run % 2, 0, "odd quote run in {escaped:?}");
+                    run = 0;
+                }
+            }
+            assert_eq!(run % 2, 0, "odd trailing quote run in {escaped:?}");
+            assert_eq!(escaped.replace("''", "'"), input);
+        }
     }
 }

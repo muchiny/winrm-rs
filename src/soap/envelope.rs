@@ -7,7 +7,7 @@ use uuid::Uuid;
 use super::namespaces::*;
 
 /// Escape special XML characters to prevent injection in SOAP envelopes.
-fn xml_escape(s: &str) -> String {
+pub(crate) fn xml_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -75,10 +75,14 @@ fn build_header_for(
         String::new()
     };
     let escaped_endpoint = xml_escape(endpoint);
+    // The resource URI is caller-influenced: `run_wql` splices the WMI
+    // namespace into it and the PSRP builders take a configuration name.
+    // Escape it like every other interpolated value.
+    let escaped_resource_uri = xml_escape(resource_uri);
     format!(
         r#"  <s:Header>
     <wsa:To>{escaped_endpoint}</wsa:To>
-    <wsman:ResourceURI s:mustUnderstand="true">{resource_uri}</wsman:ResourceURI>
+    <wsman:ResourceURI s:mustUnderstand="true">{escaped_resource_uri}</wsman:ResourceURI>
     <wsa:ReplyTo>
       <wsa:Address s:mustUnderstand="true">{REPLY_TO_ANONYMOUS}</wsa:Address>
     </wsa:ReplyTo>
@@ -810,6 +814,27 @@ mod tests {
         );
         assert!(xml.contains("root/StandardCimv2"));
         assert!(xml.contains("a &lt; b &amp; c"));
+    }
+
+    // The WMI namespace is spliced into the ResourceURI element, which used
+    // to be interpolated raw. A namespace carrying markup must not be able to
+    // add elements to the header.
+    #[test]
+    fn enumerate_wql_request_escapes_resource_uri() {
+        let xml = enumerate_wql_request(
+            "http://h/wsman",
+            "SELECT * FROM Win32_Service",
+            Some("root/cimv2</wsman:ResourceURI><evil>x</evil><wsman:ResourceURI>"),
+            30,
+            153_600,
+        );
+        assert!(!xml.contains("<evil>"), "namespace injected an element");
+        assert!(xml.contains("&lt;evil&gt;"));
+        assert_eq!(
+            xml.matches("<wsman:ResourceURI").count(),
+            1,
+            "namespace opened a second ResourceURI element"
+        );
     }
 
     #[test]

@@ -1,0 +1,8 @@
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+  xmlns:n="http://schemas.xmlsoap.org/ws/2004/09/enumeration"
+  xmlns:w="http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd"><s:Body>
+  <n:EnumerateResponse>
+    <n:EnumerationContext>uuid:8A3B0000-0000-0000-0000-000000000042</n:EnumerationContext>
+    <w:Items><p:Win32_Process><p:Name>explorer.exe</p:Name></p:Win32_Process></w:Items>
+  </n:EnumerateResponse>
+</s:Body></s:Envelope>

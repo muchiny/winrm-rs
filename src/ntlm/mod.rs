@@ -13,11 +13,10 @@ pub(crate) use messages::{
     create_negotiate_message, decode_challenge_header, encode_authorization,
 };
 // `parse_challenge` is only reached from outside `ntlm::messages` by the
-// CredSSP path and by fuzz targets via the internal feature. Tests inside
+// CredSSP path; `crate::__fuzz` calls it through its full path. Tests inside
 // the module reach it through `super::`, so the reexport is feature-gated.
-#[cfg(any(feature = "credssp", feature = "__internal"))]
-#[allow(unreachable_pub)]
-// re-exported via lib.rs under `__internal`; used in-crate under `credssp`
+#[cfg(feature = "credssp")]
+#[allow(unreachable_pub)] // used in-crate by auth/credssp.rs
 pub use messages::parse_challenge;
 #[cfg(feature = "credssp")]
 #[allow(unreachable_pub)] // used in-crate by auth/credssp.rs

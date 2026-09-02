@@ -162,8 +162,10 @@ pub(crate) fn to_utf16le(s: &str) -> Vec<u8> {
 
 pub(crate) fn from_utf16le(data: &[u8]) -> String {
     let u16s: Vec<u16> = data
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
         .collect();
     String::from_utf16_lossy(&u16s)
 }

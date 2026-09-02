@@ -1,0 +1,43 @@
+# libFuzzer dictionary for the host / path / PowerShell input-validation
+# targets.
+# Used by: fuzz_transport_host, fuzz_transfer_path, fuzz_powershell_encode
+
+# URL authority components sanitize_host has to strip
+scheme_sep="://"
+scheme_http="http://"
+scheme_https="https://"
+userinfo="@"
+userinfo_pw="user:password@"
+path_sep="/"
+port_5985=":5985"
+port_5986=":5986"
+ipv6_open="["
+ipv6_loopback="[::1]"
+ipv6_link_local="[fe80::1%25eth0]"
+localhost="localhost"
+metadata_ip="169.254.169.254"
+double_authority="a://b@c/d:e"
+
+# Windows path shapes
+drive="C:\\"
+unc="\\\\server\\share\\"
+device="\\\\?\\C:\\"
+stream_suffix=":$DATA"
+dotdot="..\\"
+env_expand="%SystemRoot%"
+quote="'"
+double_quote="''"
+tab="\x09"
+nul="\x00"
+crlf="\x0d\x0a"
+
+# PowerShell fragments that end up in transfer scripts
+ps_frombase64="[Convert]::FromBase64String('"
+ps_tobase64="[Convert]::ToBase64String("
+ps_writeallbytes="[IO.File]::WriteAllBytes('"
+ps_readallbytes="[IO.File]::ReadAllBytes('"
+ps_open_append="[IO.File]::Open('"
+ps_subexpr="$("
+ps_semicolon="; "
+ps_backtick="`"
+ps_pipe=" | "

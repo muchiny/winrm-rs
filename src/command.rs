@@ -45,8 +45,10 @@ mod tests {
         // Decode and verify
         let decoded_bytes = B64.decode(&encoded).unwrap();
         let u16s: Vec<u16> = decoded_bytes
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
             .collect();
         let decoded = String::from_utf16(&u16s).unwrap();
         assert_eq!(decoded, script);
@@ -59,8 +61,10 @@ mod tests {
         let encoded = encode_powershell_command(script);
         let decoded_bytes = B64.decode(&encoded).unwrap();
         let u16s: Vec<u16> = decoded_bytes
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
             .collect();
         let decoded = String::from_utf16(&u16s).unwrap();
         assert_eq!(decoded, script);

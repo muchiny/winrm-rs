@@ -433,7 +433,7 @@ fn hex(b: &[u8]) -> String {
 /// The client challenge is 8 random bytes. If the server provided a timestamp
 /// in its Type 2 message, that timestamp is reused; otherwise the current
 /// system time is converted to Windows FILETIME format.
-#[cfg(test)]
+#[cfg(any(test, feature = "__internal"))]
 pub(crate) fn create_authenticate_message(
     challenge: &ChallengeMessage,
     username: &str,

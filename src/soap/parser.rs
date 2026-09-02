@@ -206,10 +206,9 @@ fn extract_element_text(xml: &str, element: &str) -> Option<String> {
             }
             let prefix = &xml[lt + 1..abs_pos];
             (abs_pos + suffixed.len(), Some(prefix.to_string()))
-        } else if let Some(pos) = region.find(&bare_open) {
-            (search_from + pos + bare_open.len(), None)
         } else {
-            return None;
+            let pos = region.find(&bare_open)?;
+            (search_from + pos + bare_open.len(), None)
         };
 
         // Build closing tag pattern

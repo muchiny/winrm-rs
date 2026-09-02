@@ -647,8 +647,8 @@ impl AuthTransport for CredSspAuth {
                 .map_err(|e| WinrmError::AuthFailed(format!("CredSSP cert parse: {e}")))?;
             // Per MS-CSSP 2.2.2.5, pubKeyAuth is computed over the bit string
             // contents of subjectPublicKey (PKCS#1 RSAPublicKey for RSA certs).
-            cert.tbs_certificate
-                .subject_public_key_info
+            cert.tbs_certificate()
+                .subject_public_key_info()
                 .subject_public_key
                 .raw_bytes()
                 .to_vec()

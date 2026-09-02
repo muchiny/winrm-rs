@@ -1,0 +1,9 @@
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:wsman="http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd" xmlns:rsp="http://schemas.microsoft.com/wbem/wsman/1/windows/shell"><s:Body>
+  <rsp:ReceiveResponse>
+    <rsp:Stream Name="stdout" CommandId="AAAA1111">aGVsbG8gZnJvbSB3aW5ybQ==</rsp:Stream>
+    <rsp:Stream Name="stderr" CommandId="AAAA1111">YSB3YXJuaW5n</rsp:Stream>
+    <rsp:CommandState State="http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Done">
+      <rsp:ExitCode>0</rsp:ExitCode>
+    </rsp:CommandState>
+  </rsp:ReceiveResponse>
+</s:Body></s:Envelope>

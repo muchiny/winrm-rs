@@ -27,7 +27,8 @@ const NTLM_OID: &[u8] = &[
 
 /// Parsed TSRequest structure.
 #[derive(Debug, Clone)]
-pub(crate) struct TsRequest {
+#[allow(unreachable_pub)] // re-exported by `crate::__fuzz` under the `__internal` feature
+pub struct TsRequest {
     pub version: u32,
     pub nego_token: Option<Vec<u8>>,
     pub auth_info: Option<Vec<u8>>,
@@ -45,8 +46,21 @@ fn encode_length(len: usize) -> Vec<u8> {
         vec![0x81, len as u8]
     } else if len < 0x10000 {
         vec![0x82, (len >> 8) as u8, len as u8]
-    } else {
+    } else if len < 0x100_0000 {
         vec![0x83, (len >> 16) as u8, (len >> 8) as u8, len as u8]
+    } else {
+        // Without this arm the 3-byte form silently dropped the top bits and
+        // emitted a TLV whose declared length was wrong. We never build a
+        // message this large, and `decode_length` deliberately still refuses
+        // to read one (its 3-byte cap bounds what a hostile server can
+        // declare); this arm exists so the encoder cannot lie about a length.
+        vec![
+            0x84,
+            (len >> 24) as u8,
+            (len >> 16) as u8,
+            (len >> 8) as u8,
+            len as u8,
+        ]
     }
 }
 
@@ -280,10 +294,15 @@ fn decode_octet_string(data: &[u8]) -> Result<&[u8], CredSspError> {
 
 /// Extract an INTEGER value from a TLV.
 ///
-/// Restricts the encoded length to 1..=4 bytes so the accumulator never
+/// Restricts the decoded magnitude to 4 bytes so the accumulator never
 /// overflows `u32`. A hostile CredSSP server could otherwise send a 5-byte
 /// or larger DER INTEGER and silently wrap our result, leading to version
 /// or error-code confusion.
+///
+/// The one 5-byte form accepted is DER sign padding: a leading `0x00` in
+/// front of a value whose high bit is set. That is exactly what
+/// `encode_integer_value` emits for `value >= 0x8000_0000`, so rejecting it
+/// would leave the codec unable to read back its own output.
 fn decode_integer(data: &[u8]) -> Result<u32, CredSspError> {
     let (tag, val, _) = read_tlv(data)?;
     if tag != TAG_INTEGER {
@@ -291,14 +310,19 @@ fn decode_integer(data: &[u8]) -> Result<u32, CredSspError> {
             "expected INTEGER (0x02), got 0x{tag:02x}"
         )));
     }
-    if val.is_empty() || val.len() > 4 {
+    // Strip a single leading sign-padding byte before applying the width cap.
+    let magnitude = match val {
+        [0x00, rest @ ..] if !rest.is_empty() => rest,
+        other => other,
+    };
+    if magnitude.is_empty() || magnitude.len() > 4 {
         return Err(CredSspError::Asn1Decode(format!(
             "INTEGER length {} unsupported (expected 1..=4)",
             val.len()
         )));
     }
     let mut result = 0u32;
-    for &b in val {
+    for &b in magnitude {
         result = (result << 8) | b as u32;
     }
     Ok(result)
@@ -533,6 +557,76 @@ mod tests {
         let l = encode_length(70000);
         assert_eq!(l[0], 0x83);
         assert_eq!(l.len(), 4);
+    }
+
+    // The 3-byte arm used to be the fallback for every larger length, which
+    // truncated silently: a 16 MiB body was framed as a 0-byte one.
+    #[test]
+    fn encode_length_beyond_three_bytes_does_not_truncate() {
+        assert_eq!(encode_length(0xFF_FFFF), vec![0x83, 0xFF, 0xFF, 0xFF]);
+        assert_eq!(
+            encode_length(0x100_0000),
+            vec![0x84, 0x01, 0x00, 0x00, 0x00]
+        );
+        assert_eq!(
+            encode_length(0x1234_5678),
+            vec![0x84, 0x12, 0x34, 0x56, 0x78]
+        );
+    }
+
+    // `encode_integer_value` prepends a 0x00 sign pad once the high bit is
+    // set, producing a 5-byte INTEGER. The decoder has to read that back.
+    #[test]
+    fn integer_roundtrip_across_the_sign_boundary() {
+        for value in [0u32, 1, 127, 128, 255, 0x7FFF_FFFF, 0x8000_0000, u32::MAX] {
+            let encoded = encode_integer_value(value);
+            assert_eq!(
+                decode_integer(&encoded).unwrap(),
+                value,
+                "INTEGER {value:#x} did not roundtrip"
+            );
+        }
+    }
+
+    #[test]
+    fn integer_rejects_oversized_magnitude() {
+        // Five significant bytes: does not fit in a u32, must be refused
+        // rather than silently wrapped.
+        let too_big = vec![TAG_INTEGER, 5, 0x01, 0x02, 0x03, 0x04, 0x05];
+        assert!(decode_integer(&too_big).is_err());
+        // ...and a sign pad does not buy an extra byte of magnitude either.
+        let padded_too_big = vec![TAG_INTEGER, 6, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05];
+        assert!(decode_integer(&padded_too_big).is_err());
+    }
+
+    // NTSTATUS error codes have the high bit set, so a compliant CredSSP
+    // server DER-encodes errorCode with a leading 0x00 sign pad. Before the
+    // decode_integer fix the whole TSRequest failed to parse.
+    #[test]
+    fn ts_request_with_ntstatus_error_code_decodes() {
+        // STATUS_LOGON_FAILURE, as a Windows CredSSP server sends it.
+        let error_code: u32 = 0xC000_006A;
+        let encoded_int = encode_integer_value(error_code);
+        assert_eq!(
+            encoded_int,
+            vec![TAG_INTEGER, 5, 0x00, 0xC0, 0x00, 0x00, 0x6A],
+            "sign-padded 5-byte INTEGER is the on-the-wire form"
+        );
+        // Hand-build the TSRequest a server would send: version + [4] errorCode.
+        let mut contents = encode_context_tag(0, &encode_integer_value(6));
+        contents.extend_from_slice(&encode_context_tag(4, &encoded_int));
+        let wire = encode_sequence(&contents);
+
+        let decoded = decode_ts_request(&wire).expect("server TSRequest must decode");
+        assert_eq!(decoded.version, 6);
+        assert_eq!(decoded.error_code, Some(error_code));
+    }
+
+    #[test]
+    fn ts_request_version_roundtrips_with_high_bit_set() {
+        let encoded = encode_ts_request(0x8000_0001, None, None, None, None);
+        let decoded = decode_ts_request(&encoded).unwrap();
+        assert_eq!(decoded.version, 0x8000_0001);
     }
 
     #[test]

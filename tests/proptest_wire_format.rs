@@ -2,8 +2,8 @@
 //!
 //! These complement the libfuzzer crash-hunting targets in `fuzz/` with
 //! positive roundtrip and structural invariants. They run under the
-//! `__internal` feature which re-exports a few crate internals
-//! (`parse_challenge`, `check_soap_fault`, `parse_*`).
+//! `__internal` feature, which exposes crate internals through the
+//! hidden `winrm_rs::__fuzz` module.
 //!
 //! Properties anchor the wire bytes the audit identified as load-bearing:
 //! - NTLM Type-1 negotiate: signature `NTLMSSP\0` and message-type 1
@@ -33,8 +33,10 @@ proptest! {
             .expect("encode_powershell_command output must be valid base64");
         prop_assert_eq!(raw.len() % 2, 0, "UTF-16-LE byte count must be even");
         let utf16: Vec<u16> = raw
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
             .collect();
         let roundtrip = String::from_utf16(&utf16)
             .expect("UTF-16-LE roundtrip must succeed for valid UTF-8 input");
@@ -48,7 +50,7 @@ proptest! {
     #[test]
     fn parse_challenge_never_panics(buf in proptest::collection::vec(any::<u8>(), 0..16384)) {
         // Either an Err result, or an Ok(ChallengeMessage) — but never a panic.
-        let _ = winrm_rs::parse_challenge(&buf);
+        let _ = winrm_rs::__fuzz::parse_challenge(&buf);
     }
 }
 
@@ -57,7 +59,7 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
     #[test]
     fn check_soap_fault_never_panics(s in "\\PC{0,4096}") {
-        let _ = winrm_rs::check_soap_fault(&s);
+        let _ = winrm_rs::__fuzz::check_soap_fault(&s);
     }
 }
 
@@ -73,7 +75,7 @@ proptest! {
         prop_assume!(&bad_prefix[..] != b"NTLMSSP\0");
         let mut buf = bad_prefix.to_vec();
         buf.extend_from_slice(&rest);
-        let result = winrm_rs::parse_challenge(&buf);
+        let result = winrm_rs::__fuzz::parse_challenge(&buf);
         prop_assert!(result.is_err(), "parse_challenge must reject non-NTLMSSP signature");
     }
 }

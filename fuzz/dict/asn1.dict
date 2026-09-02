@@ -1,0 +1,62 @@
+# libFuzzer dictionary for DER / CredSSP (MS-CSSP) and SPNEGO (RFC 4178).
+# Used by: fuzz_asn1_ts_request, fuzz_asn1_spnego, fuzz_asn1_cert
+
+# Universal tags
+tag_boolean="\x01"
+tag_integer="\x02"
+tag_bit_string="\x03"
+tag_octet_string="\x04"
+tag_null="\x05\x00"
+tag_oid="\x06"
+tag_enumerated="\x0a"
+tag_utf8_string="\x0c"
+tag_sequence="\x30"
+tag_set="\x31"
+
+# Context tags [0]..[5] — TSRequest field selectors
+ctx0="\xa0"
+ctx1="\xa1"
+ctx2="\xa2"
+ctx3="\xa3"
+ctx4="\xa4"
+ctx5="\xa5"
+
+# GSS-API APPLICATION[0] wrapper
+gss_app="\x60"
+
+# Long-form lengths, including the boundaries decode_length checks
+len_short="\x7f"
+len_1byte="\x81"
+len_2byte="\x82"
+len_3byte="\x83"
+len_4byte="\x84"
+len_indefinite="\x80"
+len_max3="\x83\xff\xff\xff"
+
+# Whole small structures
+empty_sequence="\x30\x00"
+seq_len2="\x30\x02"
+integer_zero="\x02\x01\x00"
+integer_two="\x02\x01\x02"
+integer_six="\x02\x01\x06"
+integer_signpad="\x02\x05\x00\x80\x00\x00\x01"
+octet_empty="\x04\x00"
+
+# Object identifiers
+oid_spnego="\x06\x06\x2b\x06\x01\x05\x05\x02"
+oid_ntlm="\x06\x0a\x2b\x06\x01\x04\x01\x82\x37\x02\x02\x0a"
+oid_rsa="\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01"
+oid_ecpk="\x06\x07\x2a\x86\x48\xce\x3d\x02\x01"
+
+# SPNEGO negState values
+neg_accept_completed="\x0a\x01\x00"
+neg_accept_incomplete="\x0a\x01\x01"
+neg_reject="\x0a\x01\x02"
+
+# TSRequest versions seen from Windows CredSSP
+ts_version_2="\xa0\x03\x02\x01\x02"
+ts_version_6="\xa0\x03\x02\x01\x06"
+
+# X.509 skeleton fragments
+bit_string_unused0="\x03\x81\x00"
+cert_outer="\x30\x82"

@@ -34,7 +34,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
@@ -53,7 +53,7 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: dtolnay/rust-toolchain@1.98.0
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
       - name: Run tests
@@ -66,7 +66,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: dtolnay/rust-toolchain@1.98.0
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
       - name: Install libkrb5-dev
@@ -79,7 +79,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
@@ -99,7 +99,7 @@ jobs:
       RUSTDOCFLAGS: "-D warnings"
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: dtolnay/rust-toolchain@1.98.0
       - uses: Swatinem/rust-cache@v2
       # The `kerberos` feature pulls `cross-krb5` which needs krb5 dev
       # headers (gssapi.h) to build its `libgssapi-sys` bindings.
@@ -108,11 +108,11 @@ jobs:
       - run: cargo doc --no-deps --all-features
 
   msrv:
-    name: MSRV (1.94.0)
+    name: MSRV (1.98.0)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: dtolnay/rust-toolchain@1.98.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets
 
@@ -135,27 +135,34 @@ jobs:
           command: check advisories bans
 
   fuzz:
-    name: Fuzz (${{ matrix.target }})
+    name: Fuzz (smoke)
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          - fuzz_ntlm_parse
-          - fuzz_ntlm_seal
-          - fuzz_ntlm_challenge_header
-          - fuzz_powershell_encode
-          - fuzz_soap_parse
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fuzz
-      - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz
-      - name: Run fuzzer (${{ matrix.target }})
-        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=30
+      - uses: taiki-e/install-action@cargo-fuzz
+      - name: Install OpenSSL headers (credssp feature)
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+      - name: Build every target
+        run: scripts/fuzz.sh build
+      # Deterministic: replays the committed seeds plus whatever the caches
+      # hold. Fails only when a known input has started to crash.
+      - name: Replay seed corpora
+        run: scripts/fuzz.sh smoke
+      # Short mutation budget per target — enough to catch an obviously broken
+      # invariant on a PR. The real campaign runs nightly in fuzz.yml.
+      - name: Fuzz each target briefly
+        run: FUZZ_TIME=20 scripts/fuzz.sh run
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
 
   semver:
     name: Semver check
@@ -165,7 +172,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: dtolnay/rust-toolchain@1.98.0
       - uses: Swatinem/rust-cache@v2
       - uses: obi1kenobi/cargo-semver-checks-action@v2
 

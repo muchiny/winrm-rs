@@ -44,7 +44,15 @@ TODO.local.md
 notes.md
 /todo/
 
-# Fuzz artefacts
+# Fuzz artefacts (seeds/ and dict/ are tracked)
 /fuzz/target/
 /fuzz/corpus/
 /fuzz/artifacts/
+/fuzz/coverage/
+
+# SonarQube scanner working directory
+/.scannerwork/
+
+# Python bytecode (scripts/)
+__pycache__/
+*.pyc

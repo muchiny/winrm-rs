@@ -52,7 +52,7 @@ pub(crate) struct HttpTransport {
 /// but if they accidentally pass `"http://evil.com/path"` we keep just
 /// `"evil.com"` and log the deviation. IPv6 literals (`[::1]`) are
 /// preserved as-is because `:` inside brackets is part of the address.
-fn sanitize_host(input: &str) -> String {
+pub(crate) fn sanitize_host(input: &str) -> String {
     let mut s = input;
     if let Some(rest) = s.split_once("://") {
         s = rest.1;

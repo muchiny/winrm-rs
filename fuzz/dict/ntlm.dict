@@ -1,0 +1,53 @@
+# libFuzzer dictionary for the NTLM wire format (MS-NLMP).
+# Used by: fuzz_ntlm_parse, fuzz_ntlm_challenge_header, fuzz_ntlm_header_decode,
+#          fuzz_ntlm_av_pairs, fuzz_ntlm_type3
+
+signature="NTLMSSP\x00"
+type1="NTLMSSP\x00\x01\x00\x00\x00"
+type2="NTLMSSP\x00\x02\x00\x00\x00"
+type3="NTLMSSP\x00\x03\x00\x00\x00"
+
+# HTTP authentication header prefixes
+hdr_negotiate="Negotiate "
+hdr_ntlm="NTLM "
+hdr_kerberos="Kerberos "
+hdr_basic="Basic "
+hdr_credssp="CredSSP "
+
+# AV_PAIR identifiers (MS-NLMP 2.2.2.1), little-endian u16 + length field
+av_eol="\x00\x00\x00\x00"
+av_nb_computer="\x01\x00"
+av_nb_domain="\x02\x00"
+av_dns_computer="\x03\x00"
+av_dns_domain="\x04\x00"
+av_dns_tree="\x05\x00"
+av_flags="\x06\x00"
+av_timestamp="\x07\x00\x08\x00"
+av_single_host="\x08\x00"
+av_target_name="\x09\x00"
+av_channel_bindings="\x0a\x00\x10\x00"
+
+# Negotiate flag words seen in the wild (MS-NLMP 2.2.2.5)
+flags_type1="\x37\x82\x08\xe2"
+flags_type2="\x35\x82\x8a\xe2"
+flags_key_exch="\x00\x40\x00\x00"
+flags_unicode="\x01\x00\x00\x00"
+flags_version="\x00\x00\x00\x02"
+
+# Security-buffer shapes: len, maxlen, offset
+sb_empty="\x00\x00\x00\x00\x00\x00\x00\x00"
+sb_overflow="\xff\xff\xff\xff\xff\xff\xff\xff"
+sb_offset_48="\x30\x00\x00\x00"
+sb_offset_56="\x38\x00\x00\x00"
+
+# NTLMv2 client blob header (MS-NLMP 3.3.2)
+blob_header="\x01\x01\x00\x00\x00\x00\x00\x00"
+
+# Windows FILETIME magnitudes
+filetime="\x00\xf8\xc4\xba\x9d\xc7\xdc\x01"
+
+# UTF-16-LE fragments, the encoding of every NTLM string field
+utf16_a="A\x00"
+utf16_domain="D\x00O\x00M\x00A\x00I\x00N\x00"
+utf16_surrogate_hi="\x00\xd8"
+utf16_surrogate_lo="\x00\xdc"

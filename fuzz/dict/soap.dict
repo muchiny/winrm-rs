@@ -1,0 +1,74 @@
+# libFuzzer dictionary for WS-Management SOAP responses and envelopes.
+# Used by: fuzz_soap_parse, fuzz_soap_enumerate, fuzz_soap_envelope,
+#          fuzz_xml_escape
+
+# Envelope skeleton
+env_open="<s:Envelope"
+env_close="</s:Envelope>"
+body_open="<s:Body>"
+body_close="</s:Body>"
+header_open="<s:Header>"
+header_close="</s:Header>"
+
+# Namespaces the parsers key off
+ns_soap="http://www.w3.org/2003/05/soap-envelope"
+ns_wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing"
+ns_wsman="http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd"
+ns_shell="http://schemas.microsoft.com/wbem/wsman/1/windows/shell"
+ns_enum="http://schemas.xmlsoap.org/ws/2004/09/enumeration"
+
+# Elements the hand-rolled parsers search for
+shell_id_open="<rsp:ShellId>"
+shell_id_close="</rsp:ShellId>"
+shell_id_bare="<ShellId>"
+command_id_open="<rsp:CommandId>"
+command_id_close="</rsp:CommandId>"
+stream_open="<rsp:Stream"
+stream_close="</rsp:Stream>"
+command_state="<rsp:CommandState"
+exit_code_open="<rsp:ExitCode>"
+exit_code_close="</rsp:ExitCode>"
+items_open="<w:Items>"
+items_close="</w:Items>"
+enum_ctx_open="<n:EnumerationContext>"
+enum_ctx_close="</n:EnumerationContext>"
+end_of_sequence="EndOfSequence"
+state_done="CommandState/Done"
+
+# Attributes read out of tags
+attr_name="Name=\"stdout\""
+attr_name_err="Name=\"stderr\""
+attr_command_id="CommandId=\""
+attr_end="End=\"true\""
+
+# Faults
+fault_open="<s:Fault>"
+fault_close="</s:Fault>"
+fault_code="<s:Code><s:Value>"
+fault_reason="<s:Reason><s:Text>"
+fault_subcode="<s:Subcode>"
+wsman_fault="<wsmanfault:WSManFault"
+
+# PowerShell CLIXML error stream marker
+clixml="#< CLIXML"
+clixml_objs="<Objs"
+clixml_string="<S S=\"Error\">"
+clixml_crlf="_x000D__x000A_"
+
+# XML escaping / injection shapes
+amp="&amp;"
+lt="&lt;"
+gt="&gt;"
+quot="&quot;"
+apos="&apos;"
+raw_lt="<"
+raw_amp="&"
+cdata_open="<![CDATA["
+cdata_close="]]>"
+comment_open="<!--"
+comment_close="-->"
+doctype="<!DOCTYPE"
+entity="<!ENTITY"
+pi="<?xml"
+close_tag="</"
+self_close="/>"

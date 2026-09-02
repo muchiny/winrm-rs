@@ -1,0 +1,121 @@
+name: Fuzz campaign
+
+# The nightly counterpart to the short `fuzz` job in ci.yml. Every target gets
+# a real mutation budget under two sanitizers, and the corpus each run grows is
+# cached so the next night starts where this one stopped.
+
+on:
+  schedule:
+    # 03:17 UTC daily — off the hour to avoid the scheduler pile-up.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "Seconds to fuzz each target"
+        required: false
+        default: "900"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  campaign:
+    name: ${{ matrix.target }} (${{ matrix.sanitizer }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        sanitizer: [address]
+        target:
+          - fuzz_ntlm_parse
+          - fuzz_ntlm_challenge_header
+          - fuzz_ntlm_header_decode
+          - fuzz_ntlm_av_pairs
+          - fuzz_ntlm_type3
+          - fuzz_ntlm_crypto
+          - fuzz_ntlm_seal
+          - fuzz_ntlm_session
+          - fuzz_soap_parse
+          - fuzz_soap_enumerate
+          - fuzz_soap_envelope
+          - fuzz_xml_escape
+          - fuzz_transport_host
+          - fuzz_transfer_path
+          - fuzz_powershell_encode
+          - fuzz_asn1_ts_request
+          - fuzz_asn1_spnego
+          - fuzz_asn1_cert
+        include:
+          # ASan hides integer/UB classes behind its own allocator poisoning,
+          # so the DER and NTLM parsers also get a sanitizer-free pass where
+          # the release-profile overflow checks are the detector.
+          - target: fuzz_asn1_ts_request
+            sanitizer: none
+          - target: fuzz_asn1_cert
+            sanitizer: none
+          - target: fuzz_ntlm_parse
+            sanitizer: none
+          - target: fuzz_soap_parse
+            sanitizer: none
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - uses: taiki-e/install-action@cargo-fuzz
+
+      - name: Install OpenSSL headers (credssp feature)
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+
+      # A fresh key every run makes the cache write-only-once; the restore-keys
+      # prefix still picks up the most recent corpus for this target.
+      - name: Restore corpus
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ matrix.sanitizer }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-${{ matrix.sanitizer }}-
+            fuzz-corpus-${{ matrix.target }}-
+
+      - name: Fuzz
+        env:
+          FUZZ_SANITIZER: ${{ matrix.sanitizer }}
+        run: |
+          scripts/fuzz.sh run "${{ matrix.target }}" \
+            "${{ github.event.inputs.seconds || '900' }}"
+
+      # Keeps the cached corpus from growing without bound across nights.
+      - name: Minimise corpus
+        if: success()
+        env:
+          FUZZ_SANITIZER: ${{ matrix.sanitizer }}
+        run: scripts/fuzz.sh cmin "${{ matrix.target }}"
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-${{ matrix.target }}-${{ matrix.sanitizer }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
+
+      - name: Upload corpus
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: corpus-${{ matrix.target }}-${{ matrix.sanitizer }}
+          path: fuzz/corpus/${{ matrix.target }}/
+          retention-days: 7
+          if-no-files-found: ignore

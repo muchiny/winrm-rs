@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+
+- **XML injection via `ResourceURI`** — `soap::envelope::build_header_for`
+  interpolated the resource URI into `<wsman:ResourceURI>` without escaping.
+  The URI is caller-influenced: `run_wql` splices the WMI namespace into it
+  and the PSRP builders take a configuration name, so a namespace containing
+  markup could add elements to the outgoing SOAP header. Now escaped like
+  every other interpolated value. Found while auditing the interpolation
+  sites to write the `fuzz_soap_envelope` invariant, which now guards it.
+  (`src/soap/envelope.rs`)
+
+### Fixed
+
+- **DER length truncation** — `asn1::encode_length` fell back to the 3-byte
+  form for any length, silently dropping the high bits above 16 MiB and
+  emitting a TLV whose declared length was wrong. It now emits the 4-byte
+  form. `decode_length` deliberately keeps its 3-byte cap, which bounds what
+  a hostile CredSSP server can declare. (`src/asn1.rs`)
+- **CredSSP `TSRequest` carrying an NTSTATUS error code failed to decode** —
+  `asn1::decode_integer` rejected any DER INTEGER longer than 4 bytes,
+  including the 5-byte sign-padded form a value with the high bit set must
+  use. NTSTATUS codes are exactly that shape, so a `TSRequest` whose
+  `errorCode` was, say, `0xC000006A` (`STATUS_LOGON_FAILURE`) — the response
+  a Windows CredSSP server sends on a rejected logon — failed to parse
+  outright, and the real failure reason surfaced as an ASN.1 decode error
+  instead. The same asymmetry meant the codec could not read back its own
+  output for any `version` or `errorCode` at or above `0x8000_0000`. A single
+  leading `0x00` sign pad is now stripped before the 4-byte magnitude cap is
+  applied; the `u32` overflow guard is unchanged. (`src/asn1.rs`)
+
+### Changed
+
+- **MSRV raised to 1.98.0** (from 1.94.0). CI toolchain pins, the MSRV job and
+  `clippy.toml` follow.
+- Dependencies refreshed: `base64` 0.22 → 0.23, `x509-cert` 0.2 → 0.3
+  (`der` 0.7 → 0.8, `spki` 0.7 → 0.8), plus `tokio` 1.53.1, `hyper` 1.11.1,
+  `rustls` 0.23.43, `uuid` 1.26, `http` 1.5, `thiserror` 2.0.20 and the rest
+  of the lockfile.
+- **Fuzzing expanded from 5 to 18 libFuzzer targets**, now covering the
+  CredSSP DER decoder, SPNEGO token unwrapping, X.509 public-key extraction,
+  `AV_PAIR` parsing, the `WWW-Authenticate` header path, Type 3 construction,
+  multi-message sealing, envelope construction, `xml_escape`, host
+  sanitisation and remote-path quoting. Targets assert protocol invariants
+  rather than only absence of panics. Adds per-surface dictionaries, a
+  committed seed corpus, `scripts/fuzz.sh`, and a nightly campaign workflow.
+  See [`fuzz/README.md`](fuzz/README.md).
+- Crate internals reach the fuzz targets through a new `#[doc(hidden)]`
+  `winrm_rs::__fuzz` module behind the existing `__internal` feature, instead
+  of ad-hoc re-exports at the crate root. Not part of the public API.
+
 ## [1.1.2] - 2026-05-10
 
 ### Fixed

@@ -6,7 +6,7 @@ Async WinRM (WS-Management) client for Rust.
 [![docs.rs](https://img.shields.io/docsrs/winrm-rs)](https://docs.rs/winrm-rs)
 [![CI](https://github.com/muchiny/winrm-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/muchiny/winrm-rs/actions)
 [![License](https://img.shields.io/crates/l/winrm-rs.svg)](LICENSE-MIT)
-[![MSRV](https://img.shields.io/badge/MSRV-1.94-blue.svg)](https://blog.rust-lang.org/2026/03/20/Rust-1.94.0.html)
+[![MSRV](https://img.shields.io/badge/MSRV-1.98-blue.svg)](https://blog.rust-lang.org/2026/08/18/Rust-1.98.0.html)
 
 ```rust
 use winrm_rs::{WinrmClient, WinrmConfig, WinrmCredentials};
@@ -202,6 +202,26 @@ cargo test --workspace    # run tests
 cargo clippy --workspace  # lint
 cargo fmt --check         # format check
 ```
+
+## Fuzzing
+
+Everything the crate parses off the network — NTLM messages, WS-Management
+SOAP responses, CredSSP DER — and everything it splices into an outgoing
+request is covered by 18 libFuzzer targets. They assert protocol invariants
+(no input can inject XML markup into an envelope, no Type 3 security buffer
+escapes its message, `encode`/`decode` roundtrip) rather than only the absence
+of panics.
+
+```sh
+scripts/fuzz.sh list                          # targets and dictionaries
+scripts/fuzz.sh smoke                         # replay the committed seeds
+scripts/fuzz.sh run                           # 60s per target
+scripts/fuzz.sh run fuzz_asn1_ts_request 900  # one target, 15 minutes
+```
+
+Requires the nightly toolchain and `cargo-fuzz`. See
+[`fuzz/README.md`](fuzz/README.md) for the full target table. Every PR runs a
+short pass; a longer campaign runs nightly in CI.
 
 ## Integration tests
 

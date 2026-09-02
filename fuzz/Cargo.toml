@@ -3,28 +3,35 @@ name = "winrm-rs-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
+rust-version = "1.98.0"
 
 [package.metadata]
 cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-base64 = "0.22"
+arbitrary = { version = "1", features = ["derive"] }
+base64 = "0.23"
 
 [dependencies.winrm-rs]
 path = ".."
-features = ["__internal"]
+# `__internal` exposes `winrm_rs::__fuzz`; `credssp` is what compiles the
+# ASN.1/DER code the `fuzz_asn1_*` targets exercise.
+features = ["__internal", "credssp"]
+
+# Fuzz builds keep debug assertions and overflow checks on: the parsers here
+# do a lot of offset arithmetic and a silent wrap is exactly the class of bug
+# these targets exist to catch.
+[profile.release]
+debug = 1
+debug-assertions = true
+overflow-checks = true
+
+# --- NTLM: wire format -------------------------------------------------------
 
 [[bin]]
 name = "fuzz_ntlm_parse"
 path = "fuzz_targets/fuzz_ntlm_parse.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "fuzz_ntlm_seal"
-path = "fuzz_targets/fuzz_ntlm_seal.rs"
 test = false
 doc = false
 bench = false
@@ -37,15 +44,121 @@ doc = false
 bench = false
 
 [[bin]]
+name = "fuzz_ntlm_header_decode"
+path = "fuzz_targets/fuzz_ntlm_header_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_ntlm_av_pairs"
+path = "fuzz_targets/fuzz_ntlm_av_pairs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_ntlm_type3"
+path = "fuzz_targets/fuzz_ntlm_type3.rs"
+test = false
+doc = false
+bench = false
+
+# --- NTLM: crypto & session --------------------------------------------------
+
+[[bin]]
+name = "fuzz_ntlm_crypto"
+path = "fuzz_targets/fuzz_ntlm_crypto.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_ntlm_seal"
+path = "fuzz_targets/fuzz_ntlm_seal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_ntlm_session"
+path = "fuzz_targets/fuzz_ntlm_session.rs"
+test = false
+doc = false
+bench = false
+
+# --- SOAP --------------------------------------------------------------------
+
+[[bin]]
+name = "fuzz_soap_parse"
+path = "fuzz_targets/fuzz_soap_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_soap_enumerate"
+path = "fuzz_targets/fuzz_soap_enumerate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_soap_envelope"
+path = "fuzz_targets/fuzz_soap_envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_xml_escape"
+path = "fuzz_targets/fuzz_xml_escape.rs"
+test = false
+doc = false
+bench = false
+
+# --- Input validation --------------------------------------------------------
+
+[[bin]]
+name = "fuzz_transport_host"
+path = "fuzz_targets/fuzz_transport_host.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_transfer_path"
+path = "fuzz_targets/fuzz_transfer_path.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "fuzz_powershell_encode"
 path = "fuzz_targets/fuzz_powershell_encode.rs"
 test = false
 doc = false
 bench = false
 
+# --- CredSSP ASN.1 / DER -----------------------------------------------------
+
 [[bin]]
-name = "fuzz_soap_parse"
-path = "fuzz_targets/fuzz_soap_parse.rs"
+name = "fuzz_asn1_ts_request"
+path = "fuzz_targets/fuzz_asn1_ts_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_asn1_spnego"
+path = "fuzz_targets/fuzz_asn1_spnego.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_asn1_cert"
+path = "fuzz_targets/fuzz_asn1_cert.rs"
 test = false
 doc = false
 bench = false

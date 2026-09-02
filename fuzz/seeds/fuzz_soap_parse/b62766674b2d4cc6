@@ -1,0 +1,5 @@
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:wsman="http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd" xmlns:rsp="http://schemas.microsoft.com/wbem/wsman/1/windows/shell"><s:Body>
+  <rsp:ReceiveResponse>
+    <rsp:Stream Name="stderr" CommandId="AAAA1111">IzwgQ0xJWE1MPE9ianM+PFMgUz0iRXJyb3IiPmJvb21feDAwMERfX3gwMDBBXzwvUz48L09ianM+</rsp:Stream>
+  </rsp:ReceiveResponse>
+</s:Body></s:Envelope>

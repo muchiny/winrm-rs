@@ -1,0 +1,6 @@
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:wsman="http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd" xmlns:rsp="http://schemas.microsoft.com/wbem/wsman/1/windows/shell"><s:Body>
+  <s:Fault>
+    <s:Code><s:Value>s:Sender</s:Value><s:Subcode><s:Value>wsman:InvalidSelectors</s:Value></s:Subcode></s:Code>
+    <s:Reason><s:Text xml:lang="en-US">The WS-Management service cannot process the request.</s:Text></s:Reason>
+  </s:Fault>
+</s:Body></s:Envelope>

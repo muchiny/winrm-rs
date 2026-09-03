@@ -143,7 +143,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fuzz
-      - uses: taiki-e/install-action@cargo-fuzz
+      # NOT `taiki-e/install-action@cargo-fuzz`: that branch is an unmaintained
+      # 2024-03 snapshot that resolves, exits in 19ms and installs nothing, and
+      # cargo-fuzz is no longer in the action's tool manifest. `cargo install`
+      # is slower but cannot silently no-op; rust-cache keeps ~/.cargo/bin
+      # warm across runs.
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
       - name: Install OpenSSL headers (credssp feature)
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
       - name: Build every target

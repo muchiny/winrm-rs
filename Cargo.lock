@@ -2528,7 +2528,7 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 
 [[package]]
 name = "winrm-rs"
-version = "1.1.2"
+version = "1.2.0"
 dependencies = [
  "base64 0.23.1",
  "bytes",

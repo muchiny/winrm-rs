@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-09-04
+
+Both fixes are shell-lifecycle leaks found by running the crate against live
+Windows hosts — Server 2012 R2 and Server 2025 — rather than by reading it.
+Each one leaks a server-side shell per occurrence, and they accumulate
+silently against `MaxShellsPerUser` (30 by default). Past that ceiling every
+`Create` fails with `InternalError`, which reads like a broken host: the
+symptom appears long after the cause, on an operation that is not at fault.
+
+### Fixed
+
+- **Delete addressed a shell under the wrong ResourceURI, so PSRP shells were
+  never released.** `soap::envelope::delete_shell_request` built its header
+  with `build_header`, which hardcodes `RESOURCE_URI_CMD`. Create, Receive,
+  Send and Signal all carry the shell's own ResourceURI; Delete was the one
+  operation that did not. A PSRP shell deleted under the `cmd` URI makes the
+  server answer `InvalidSelectors: the shell was not found on the server` —
+  and leave the PowerShell shell running. Measured on a live host: 28 orphans
+  after one test campaign, at which point the server refused every new shell.
+  `Shell::close` now passes the URI the shell was created with, through the
+  new `WinrmClient::delete_shell_with_resource_uri`. (`src/soap/envelope.rs`,
+  `src/client.rs`, `src/shell.rs`)
+
+- **A failed `Shell::disconnect` abandoned the shell.** `disconnect` takes
+  `self` and set `closed = true` before sending the request, so an error
+  destroyed the only handle to a shell that was still running — and `Drop`
+  cannot delete it, being synchronous. The WinRS PowerShell plugin rejects
+  Disconnect on both Server 2012 R2 and Server 2025, so this leaked on every
+  attempt. The shell is now deleted before the original error is surfaced.
+  (`src/shell.rs`)
+
+### Testing
+
+- The live suite now runs against a Windows Server 2025 bench as well as the
+  2012 R2 one. That second bench is what the HTTPS and CBT tests need:
+  Server 2012 R2 pairs GCM only with static-RSA key exchange and offers CBC
+  with ECDHE, so rustls has no cipher suite in common with a default 2012 R2
+  listener and the handshake ends in EOF there. (The `Vagrantfile`s and
+  `vm-*.sh` helpers stay untracked, as they have been since `b342a7c`.)
+- Four tests in `tests/integration_real.rs` now skip with an explicit reason
+  rather than failing: three HTTPS ones and `run_powershell_unicode` on
+  Server 2012 R2 (PowerShell 4.0 ignores `[Console]::OutputEncoding` under
+  `-EncodedCommand`, so non-ASCII returns in the OEM code page), and
+  `credssp_run_command_whoami` unless `WINRM_TEST_CREDSSP=1` — CredSSP is
+  still WIP and currently fails at pubKeyAuth verification against Server
+  2025.
+
 ## [1.2.0] - 2026-09-03
 
 ### Security

@@ -461,19 +461,29 @@ pub(crate) fn signal_terminate_request(
     )
 }
 
-/// Build a WS-Management Delete Shell SOAP envelope (MS-WSMV 3.1.4.3).
+/// Build a WS-Management Delete Shell SOAP envelope (MS-WSMV 3.1.4.3) for a
+/// specific ResourceURI.
 ///
 /// Deletes the remote shell identified by `shell_id`, releasing all
 /// server-side resources. This is the WS-Transfer Delete operation.
-pub(crate) fn delete_shell_request(
+///
+/// Delete is addressed to a plugin, exactly like Create, Receive and Send. A
+/// PSRP shell lives under the PowerShell ResourceURI, so deleting it with the
+/// `cmd` URI makes the server answer `InvalidSelectors: the shell was not
+/// found` — and leave the PSRP shell running. Those orphans accumulate until
+/// `MaxShellsPerUser` is reached and every later Create fails with
+/// `InternalError`.
+pub(crate) fn delete_shell_request_for(
     endpoint: &str,
     shell_id: &str,
+    resource_uri: &str,
     timeout_secs: u64,
     max_envelope_size: u32,
 ) -> String {
-    let header = build_header(
+    let header = build_header_for(
         endpoint,
         ACTION_DELETE,
+        resource_uri,
         Some(shell_id),
         timeout_secs,
         max_envelope_size,
@@ -884,9 +894,38 @@ mod tests {
 
     #[test]
     fn delete_shell_contains_shell_id() {
-        let xml = delete_shell_request("http://host:5985/wsman", "SHELL-1", 60, 153_600);
+        let xml = delete_shell_request_for(
+            "http://host:5985/wsman",
+            "SHELL-1",
+            RESOURCE_URI_CMD,
+            60,
+            153_600,
+        );
         assert!(xml.contains("SHELL-1"));
         assert!(xml.contains("transfer/Delete"));
+        assert!(xml.contains(RESOURCE_URI_CMD));
+    }
+
+    /// A PSRP shell must be deleted under the PowerShell ResourceURI. With the
+    /// `cmd` URI the server answers `InvalidSelectors` and leaves the shell
+    /// running until `MaxShellsPerUser` blocks every new Create.
+    #[test]
+    fn delete_shell_uses_the_given_resource_uri() {
+        let xml = delete_shell_request_for(
+            "http://host:5985/wsman",
+            "SHELL-1",
+            crate::soap::namespaces::RESOURCE_URI_PSRP,
+            60,
+            153_600,
+        );
+        assert!(
+            xml.contains(crate::soap::namespaces::RESOURCE_URI_PSRP),
+            "PSRP ResourceURI must reach the Delete envelope, got: {xml}"
+        );
+        assert!(
+            !xml.contains(RESOURCE_URI_CMD),
+            "cmd ResourceURI must not leak into a PSRP Delete, got: {xml}"
+        );
     }
 
     #[test]
@@ -929,7 +968,13 @@ mod tests {
 
     #[test]
     fn max_envelope_size_appears_in_delete_shell() {
-        let xml = delete_shell_request("http://host:5985/wsman", "S1", 60, 300_000);
+        let xml = delete_shell_request_for(
+            "http://host:5985/wsman",
+            "S1",
+            RESOURCE_URI_CMD,
+            60,
+            300_000,
+        );
         assert!(xml.contains("300000"));
     }
 

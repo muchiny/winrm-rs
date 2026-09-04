@@ -349,7 +349,7 @@ impl<'a> Shell<'a> {
     pub async fn close(mut self) -> Result<(), WinrmError> {
         self.closed = true;
         self.client
-            .delete_shell_raw(&self.host, &self.shell_id)
+            .delete_shell_with_resource_uri(&self.host, &self.shell_id, &self.resource_uri)
             .await
     }
 
@@ -371,7 +371,27 @@ impl<'a> Shell<'a> {
             config.max_envelope_size,
             &self.resource_uri,
         );
-        self.client.send_soap_raw(&self.host, envelope).await?;
+        if let Err(e) = self.client.send_soap_raw(&self.host, envelope).await {
+            // `disconnect` consumes the shell, so returning here would drop
+            // the only handle to a shell that is still running — and `Drop`
+            // cannot delete it, being sync. The WinRS PowerShell plugin on
+            // Server 2012 R2 rejects Disconnect outright, so every attempt
+            // leaked a shell against `MaxShellsPerUser` until Create started
+            // failing with `InternalError`. Tear it down, then surface the
+            // original error.
+            if let Err(delete_err) = self
+                .client
+                .delete_shell_with_resource_uri(&self.host, &self.shell_id, &self.resource_uri)
+                .await
+            {
+                tracing::debug!(
+                    shell_id = %self.shell_id,
+                    error = %delete_err,
+                    "shell delete after failed disconnect also failed"
+                );
+            }
+            return Err(e);
+        }
         Ok(std::mem::take(&mut self.shell_id))
     }
 }

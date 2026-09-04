@@ -196,15 +196,12 @@ impl WinrmClient {
     /// automatically.
     #[tracing::instrument(level = "debug", skip(self))]
     pub async fn delete_shell(&self, host: &str, shell_id: &str) -> Result<(), WinrmError> {
-        let config = self.transport.config();
-        let envelope = soap::delete_shell_request(
-            &self.transport.endpoint(host),
+        self.delete_shell_with_resource_uri(
+            host,
             shell_id,
-            config.operation_timeout_secs,
-            config.max_envelope_size,
-        );
-        self.transport.send_soap_with_retry(host, envelope).await?;
-        Ok(())
+            crate::soap::namespaces::RESOURCE_URI_CMD,
+        )
+        .await
     }
 
     // --- High-level operations ---
@@ -431,13 +428,28 @@ impl WinrmClient {
         Ok(Shell::new(self, host.to_string(), shell_id))
     }
 
-    /// Delete a shell (used internally by Shell::close).
-    pub(crate) async fn delete_shell_raw(
+    /// Delete a shell that lives under a non-default ResourceURI.
+    ///
+    /// Delete is plugin-addressed like every other shell operation. A PSRP
+    /// shell deleted with the `cmd` ResourceURI is reported as not found and
+    /// stays alive server-side, so `Shell::close` passes the URI the shell
+    /// was created with.
+    pub(crate) async fn delete_shell_with_resource_uri(
         &self,
         host: &str,
         shell_id: &str,
+        resource_uri: &str,
     ) -> Result<(), WinrmError> {
-        self.delete_shell(host, shell_id).await
+        let config = self.transport.config();
+        let envelope = soap::delete_shell_request_for(
+            &self.transport.endpoint(host),
+            shell_id,
+            resource_uri,
+            config.operation_timeout_secs,
+            config.max_envelope_size,
+        );
+        self.transport.send_soap_with_retry(host, envelope).await?;
+        Ok(())
     }
 
     /// Reconnect to a previously-disconnected shell.

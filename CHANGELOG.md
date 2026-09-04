@@ -9,12 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [1.2.1] - 2026-09-04
 
-Both fixes are shell-lifecycle leaks found by running the crate against live
-Windows hosts — Server 2012 R2 and Server 2025 — rather than by reading it.
-Each one leaks a server-side shell per occurrence, and they accumulate
-silently against `MaxShellsPerUser` (30 by default). Past that ceiling every
-`Create` fails with `InternalError`, which reads like a broken host: the
-symptom appears long after the cause, on an operation that is not at fault.
+Three fixes, all found by running the crate against live Windows hosts —
+Server 2012 R2 and Server 2025 — rather than by reading it. Two are
+shell-lifecycle leaks: each one leaks a server-side shell per occurrence, and
+they accumulate silently against `MaxShellsPerUser` (30 by default). Past that
+ceiling every `Create` fails with `InternalError`, which reads like a broken
+host: the symptom appears long after the cause, on an operation that is not at
+fault. The third is the bug that kept CredSSP from ever completing.
 
 ### Fixed
 
@@ -38,6 +39,32 @@ symptom appears long after the cause, on an operation that is not at fault.
   attempt. The shell is now deleted before the original error is surfaced.
   (`src/shell.rs`)
 
+- **CredSSP: `pubKeyAuth` was sealed at the wrong RC4 keystream position, so
+  every handshake died at step 6 with a bare 401.** Windows SPNEGO computes
+  the NTLM `mechListMIC` with GSS_GetMIC — 8 bytes of keystream, one sequence
+  number — and then re-initialises the RC4 sealing handle, keeping only the
+  sequence number; pyspnego mirrors this (`_reset_ntlm_crypto_state`). Our
+  `NtlmSession` kept the keystream running, so `pubKeyAuth` went out at
+  offset 8 with seq 1: the server decrypted garbage, dropped the context and
+  answered `401` with a token-less `WWW-Authenticate: CredSSP`. Found with a
+  byte-for-byte differential against pyspnego 0.12.1 on identical inputs
+  (fixed client challenge, session key and nonce): Type 1/2/3, mechListMIC,
+  SubjectPublicKey and the client hash all matched; only the sealed
+  `pubKeyAuth` differed. `NtlmSession::sign_mech_list_mic` now resets the
+  client handle after signing; `verify_mech_list_mic` checks the server's
+  mechListMIC (previously ignored) and resets the server handle, so the
+  `pubKeyAuth` echo unseals at server seq 1. The plain NTLM-over-HTTP sealing
+  path is untouched. `credssp_run_command_whoami` passes against Server 2025
+  and no longer needs `WINRM_TEST_CREDSSP=1`.
+  (`src/ntlm/mod.rs`, `src/asn1.rs`, `src/auth/credssp.rs`)
+
+- **`__internal` builds (fuzz targets, `tests/proptest_wire_format.rs`) did not
+  compile.** The `delete_shell_request` rename above left the `__fuzz` wrapper
+  behind. It now forwards to `delete_shell_request_for`, and the fuzzed
+  ResourceURI is part of `fuzz_soap_envelope`'s injection invariant, since it
+  is caller-supplied from this release on. (`src/__fuzz.rs`,
+  `fuzz/fuzz_targets/fuzz_soap_envelope.rs`)
+
 ### Testing
 
 - The live suite now runs against a Windows Server 2025 bench as well as the
@@ -49,10 +76,9 @@ symptom appears long after the cause, on an operation that is not at fault.
 - Four tests in `tests/integration_real.rs` now skip with an explicit reason
   rather than failing: three HTTPS ones and `run_powershell_unicode` on
   Server 2012 R2 (PowerShell 4.0 ignores `[Console]::OutputEncoding` under
-  `-EncodedCommand`, so non-ASCII returns in the OEM code page), and
-  `credssp_run_command_whoami` unless `WINRM_TEST_CREDSSP=1` — CredSSP is
-  still WIP and currently fails at pubKeyAuth verification against Server
-  2025.
+  `-EncodedCommand`, so non-ASCII returns in the OEM code page).
+- `credssp_run_command_whoami` runs unconditionally against Server 2025 and
+  passes; `fuzz_asn1_spnego` also covers `decode_spnego_mech_list_mic`.
 
 ## [1.2.0] - 2026-09-03
 

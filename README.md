@@ -250,7 +250,7 @@ cargo test --test integration_real -- --ignored
 |---|---|---|
 | *(default)* | stable | NTLMv2, Basic, Certificate auth; no optional deps |
 | `kerberos` | stable | Pulls `cross-krb5`; requires a working `kinit` |
-| `credssp` | **experimental** | Double-hop delegation. End-to-end handshake is not yet fully validated — **do not use in production**. Pulls `openssl` (C dep: `libssl-dev` on Debian). |
+| `credssp` | **experimental** | Double-hop delegation. Validated end-to-end against Windows Server 2025 (live `credssp_run_command_whoami`); not yet exercised on other host generations. Pulls `openssl` (C dep: `libssl-dev` on Debian). |
 
 ## License
 

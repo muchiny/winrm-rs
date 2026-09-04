@@ -918,23 +918,12 @@ async fn basic_over_https_works() {
 #[tokio::test]
 #[ignore]
 async fn credssp_run_command_whoami() {
-    // CredSSP is WIP (see CLAUDE.md), and this is the first server this suite
-    // can even attempt it against — 2012 R2 has no cipher suite rustls will
-    // take, so the HTTPS leg never got that far.
-    //
-    // Against Server 2025 the handshake reaches step 6 and stops: the server
-    // answers the NTLM AUTHENTICATE + pubKeyAuth TSRequest with 401 and a bare
-    // `WWW-Authenticate: CredSSP`, no token — which is how Windows reports a
-    // rejected pubKeyAuth, the shape the CVE-2018-0886 remediation enforces.
-    // Opt in with WINRM_TEST_CREDSSP=1 while working on it; the crate has a
-    // `CREDSSP_DUMP` env hook in debug builds for exactly that.
-    if std::env::var("WINRM_TEST_CREDSSP").is_err() {
-        eprintln!(
-            "SKIP credssp_run_command_whoami: CredSSP is WIP and currently fails at \
-             pubKeyAuth verification. Set WINRM_TEST_CREDSSP=1 to run it anyway."
-        );
-        return;
-    }
+    // Full MS-CSSP handshake against a live host. 2012 R2 is skipped below:
+    // it has no cipher suite rustls will take, so the HTTPS leg never gets
+    // this far. Passes against Server 2025 since the SPNEGO mechListMIC RC4
+    // reset fix (`NtlmSession::sign_mech_list_mic`); before it the server
+    // answered the pubKeyAuth TSRequest with a bare 401. `CREDSSP_DUMP=1`
+    // (debug builds) dumps every intermediate value if it regresses.
     if is_server_2012_r2().await {
         eprintln!(
             "SKIP credssp_run_command_whoami: Server 2012 R2 SCHANNEL pairs GCM only with static-RSA \

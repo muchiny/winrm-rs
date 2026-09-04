@@ -5,7 +5,9 @@
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
-use winrm_rs::__fuzz::{decode_spnego_token, encode_spnego_init, encode_spnego_response};
+use winrm_rs::__fuzz::{
+    decode_spnego_mech_list_mic, decode_spnego_token, encode_spnego_init, encode_spnego_response,
+};
 
 #[derive(Arbitrary, Debug)]
 struct Input<'a> {
@@ -20,6 +22,14 @@ fuzz_target!(|input: Input<'_>| {
         assert!(
             token.len() <= input.wire.len(),
             "extracted token larger than the SPNEGO message"
+        );
+    }
+
+    // Same for the mechListMIC extractor, and whatever it finds must fit.
+    if let Ok(Some(mic)) = decode_spnego_mech_list_mic(input.wire) {
+        assert!(
+            mic.len() <= input.wire.len(),
+            "extracted mechListMIC larger than the SPNEGO message"
         );
     }
 
@@ -38,6 +48,17 @@ fuzz_target!(|input: Input<'_>| {
         input.ntlm_token,
         "NegTokenResp roundtrip"
     );
+
+    // The mechListMIC we put in must come back out unchanged, and be absent
+    // when we sent none. A NegTokenInit is not a NegTokenResp: refuse, not panic.
+    assert_eq!(
+        decode_spnego_mech_list_mic(&resp)
+            .expect("our own NegTokenResp must decode")
+            .as_deref(),
+        input.mech_list_mic,
+        "mechListMIC roundtrip"
+    );
+    assert!(decode_spnego_mech_list_mic(&init).is_err());
 
     // Adding the MIC must not disturb the responseToken.
     let without = encode_spnego_response(input.ntlm_token, None);

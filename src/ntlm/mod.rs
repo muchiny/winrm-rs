@@ -58,8 +58,11 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct NtlmSession {
     client_sign_key: [u8; 16],
-    #[allow(dead_code)] // Used for full checksum verification (future)
     server_sign_key: [u8; 16],
+    /// Sealing keys are kept so the RC4 handles can be re-initialised after
+    /// a SPNEGO mechListMIC — see [`Self::sign_mech_list_mic`].
+    client_seal_key: [u8; 16],
+    server_seal_key: [u8; 16],
     client_seq_num: u32,
     server_seq_num: u32,
     client_seal_handle: Rc4State,
@@ -93,6 +96,8 @@ impl NtlmSession {
         Self {
             client_sign_key,
             server_sign_key,
+            client_seal_key,
+            server_seal_key,
             client_seq_num: 0,
             server_seq_num: 0,
             client_seal_handle: Rc4State::new(&client_seal_key),
@@ -166,6 +171,85 @@ impl NtlmSession {
         sig[12..16].copy_from_slice(&self.client_seq_num.to_le_bytes());
         self.client_seq_num += 1;
         sig
+    }
+
+    /// Sign the SPNEGO mech_type_list for the `mechListMIC` of the final
+    /// NegTokenResp, then re-initialise the client RC4 sealing handle.
+    ///
+    /// Windows SPNEGO computes the mechListMIC with GSS_GetMIC — which
+    /// consumes 8 bytes of RC4 keystream and one sequence number — and then
+    /// resets the NTLM RC4 sealing state while keeping the sequence number.
+    /// pyspnego mirrors this (`NegotiateProxy._step_spnego_mic` →
+    /// `_reset_ntlm_crypto_state`) and notes that SSPI cannot be used for the
+    /// inner NTLM precisely because it does not expose that reset. The next
+    /// [`Self::seal`] therefore runs at keystream offset 0 with seq 1.
+    ///
+    /// CredSSP depends on this: a pubKeyAuth sealed at keystream offset 8
+    /// decrypts to garbage on the server, which drops the context and
+    /// answers a bare 401 without any TSRequest.
+    pub fn sign_mech_list_mic(&mut self, mech_type_list: &[u8]) -> [u8; 16] {
+        let sig = self.sign(mech_type_list);
+        self.client_seal_handle = Rc4State::new(&self.client_seal_key);
+        sig
+    }
+
+    /// Verify the server's SPNEGO `mechListMIC` over `mech_type_list`, then
+    /// re-initialise the server RC4 sealing handle.
+    ///
+    /// Accept-direction twin of [`Self::sign_mech_list_mic`]: the server
+    /// signs with its seq 0 and resets its sealing state, so its next sealed
+    /// message (the CredSSP pubKeyAuth echo) is at seq 1, keystream offset 0.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NtlmError::InvalidMessage`] if the MIC is not 16 bytes, has
+    /// a version other than 1, carries an unexpected sequence number, or its
+    /// checksum does not match. The session must not be used after an error.
+    pub fn verify_mech_list_mic(
+        &mut self,
+        mech_type_list: &[u8],
+        mic: &[u8],
+    ) -> Result<(), NtlmError> {
+        if mic.len() != 16 {
+            return Err(NtlmError::InvalidMessage(
+                "mechListMIC must be 16 bytes".into(),
+            ));
+        }
+        let version = u32::from_le_bytes([mic[0], mic[1], mic[2], mic[3]]);
+        if version != 1 {
+            return Err(NtlmError::InvalidMessage(
+                "mechListMIC bad signature version".into(),
+            ));
+        }
+        let sig_seq = u32::from_le_bytes([mic[12], mic[13], mic[14], mic[15]]);
+        if sig_seq != self.server_seq_num {
+            return Err(NtlmError::InvalidMessage(
+                "mechListMIC sequence number mismatch".into(),
+            ));
+        }
+
+        // Expected checksum: RC4(server handle, HMAC_MD5(server sign key,
+        // seq || data)[0..8]). RC4 is symmetric, so encrypting our expected
+        // value and comparing against the received (encrypted) checksum is
+        // equivalent to decrypting theirs.
+        let mut sig_input = Vec::with_capacity(4 + mech_type_list.len());
+        sig_input.extend_from_slice(&self.server_seq_num.to_le_bytes());
+        sig_input.extend_from_slice(mech_type_list);
+        let checksum = hmac_md5(&self.server_sign_key, &sig_input);
+        let mut expected = [0u8; 8];
+        expected.copy_from_slice(&checksum[..8]);
+        self.server_seal_handle.process(&mut expected);
+
+        use subtle::ConstantTimeEq;
+        if expected.ct_eq(&mic[4..12]).unwrap_u8() == 0 {
+            return Err(NtlmError::InvalidMessage(
+                "mechListMIC checksum mismatch".into(),
+            ));
+        }
+
+        self.server_seq_num += 1;
+        self.server_seal_handle = Rc4State::new(&self.server_seal_key);
+        Ok(())
     }
 
     /// Unseal (decrypt + verify) a message received from the server.
@@ -323,6 +407,93 @@ mod tests {
             sig.to_vec(),
             unhex("0100000002f81117bb3953f700000000"),
             "mechListMIC mismatch"
+        );
+    }
+
+    // Vectors generated with pyspnego 0.12.1 (`_ntlm_raw.security.sign/seal`
+    // + `RC4Handle.reset`), session key 0x10..0x1f, flags 0xe28a8235.
+    //
+    // Windows SPNEGO re-initialises the NTLM RC4 sealing handle right after
+    // the mechListMIC is produced (client side) or verified (server side),
+    // keeping only the sequence-number increment. Without the reset the
+    // CredSSP pubKeyAuth is sealed at keystream offset 8 instead of 0 and the
+    // server answers a bare 401 (no TSRequest, no errorCode).
+    const MECH_LIST_NTLM: &[u8] = &[
+        0x30, 0x0c, 0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a,
+    ];
+    const VECTOR_KEY: [u8; 16] = [
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e,
+        0x1f,
+    ];
+    const SERVER_MIC: &str = "01000000a7a9da7e0ff3680100000000";
+
+    #[test]
+    fn sign_mech_list_mic_then_seal_matches_pyspnego() {
+        let mut s = NtlmSession::from_auth(&VECTOR_KEY);
+        let mic = s.sign_mech_list_mic(MECH_LIST_NTLM);
+        assert_eq!(mic.to_vec(), unhex("0100000002f81117bb3953f700000000"));
+        let client_hash = unhex("f976d979417938eaa4cf8078ddda0e268deed123e5bf944763a0a2202dad3952");
+        let sealed = s.seal(&client_hash);
+        assert_eq!(
+            sealed,
+            unhex(
+                "010000000886090156bfb29c01000000e254cc4a746ca019864ec451e5c0c3509405197402b28218d0de6416555abb0c"
+            ),
+            "pubKeyAuth must be sealed at keystream offset 0, seq 1"
+        );
+    }
+
+    #[test]
+    fn verify_mech_list_mic_then_unseal_matches_pyspnego() {
+        let mut s = NtlmSession::from_auth(&VECTOR_KEY);
+        s.verify_mech_list_mic(MECH_LIST_NTLM, &unhex(SERVER_MIC))
+            .expect("server mechListMIC");
+        let sealed = unhex(
+            "01000000948f7ee5690a514c010000000ebbb2c034dbd4482fbfdaf5b510049cd5abff77739580bae87d74f82794ab93",
+        );
+        let pt = s.unseal(&sealed).expect("unseal seq 1 after reset");
+        assert_eq!(pt, (0u8..32).collect::<Vec<u8>>());
+    }
+
+    #[test]
+    fn unseal_after_verify_rejects_non_reset_peer() {
+        // Same server sealing but WITHOUT the RC4 reset — what a peer that
+        // keeps the keystream running would produce. Must fail the checksum.
+        let mut s = NtlmSession::from_auth(&VECTOR_KEY);
+        s.verify_mech_list_mic(MECH_LIST_NTLM, &unhex(SERVER_MIC))
+            .unwrap();
+        let noreset = unhex(
+            "010000001405fcb64049e5040100000027b7d2fdbd180c94cdb3e76f6b8d98a2e0757cf02f9ca39b0c0d98f2a6c84d05",
+        );
+        assert!(s.unseal(&noreset).is_err());
+    }
+
+    #[test]
+    fn verify_mech_list_mic_rejects_tampered_checksum() {
+        let mut s = NtlmSession::from_auth(&VECTOR_KEY);
+        let mut mic = unhex(SERVER_MIC);
+        mic[5] ^= 0x01;
+        assert!(s.verify_mech_list_mic(MECH_LIST_NTLM, &mic).is_err());
+    }
+
+    #[test]
+    fn verify_mech_list_mic_rejects_wrong_seq() {
+        let mut s = NtlmSession::from_auth(&VECTOR_KEY);
+        let mut mic = unhex(SERVER_MIC);
+        mic[12] = 1; // seq 1, expected 0
+        assert!(s.verify_mech_list_mic(MECH_LIST_NTLM, &mic).is_err());
+    }
+
+    #[test]
+    fn verify_mech_list_mic_rejects_bad_version_and_length() {
+        let mut s = NtlmSession::from_auth(&VECTOR_KEY);
+        let mut mic = unhex(SERVER_MIC);
+        mic[0] = 2;
+        assert!(s.verify_mech_list_mic(MECH_LIST_NTLM, &mic).is_err());
+        let mut s = NtlmSession::from_auth(&VECTOR_KEY);
+        assert!(
+            s.verify_mech_list_mic(MECH_LIST_NTLM, &unhex(SERVER_MIC)[..15])
+                .is_err()
         );
     }
 

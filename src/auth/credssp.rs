@@ -1,10 +1,11 @@
 // CredSSP authentication transport for WinRM (MS-CSSP).
 //
-// **STATUS: EXPERIMENTAL — INCOMPLETE**
+// **STATUS: EXPERIMENTAL — validated end-to-end against Windows Server 2025**
 //
-// Several fields and helpers below are part of a WIP implementation and
-// are not yet on the active path. Silence dead_code at module level
-// rather than scattering attributes.
+// A few helpers below (reqwest-header variants of the token extraction) are
+// kept for the day the flow moves back onto reqwest and are not on the
+// active path. Silence dead_code at module level rather than scattering
+// attributes.
 #![allow(dead_code)]
 //
 // This implements the CredSSP protocol with TLS-in-TLS architecture:
@@ -34,17 +35,26 @@
 // - Type 3 structure exactly matches pywinrm's bytes byte-for-byte
 //
 // **Current status:**
-// Server parses our Type 3 and attempts authentication. Returns
-// STATUS_LOGON_FAILURE (0xC000006D), indicating the NT hash check fails
-// at the server. The structural NTLM message is correct, but a subtle
-// mismatch in either the username/domain combination or the hash input
-// remains. Further debugging would require side-by-side hash comparison
-// with pywinrm using the same credentials.
+// Validated end-to-end against Windows Server 2025 (live test
+// `credssp_run_command_whoami`): TLS-in-TLS, NTLM inside SPNEGO with
+// mechListMIC, v6 pubKeyAuth with client nonce, server pubKeyAuth
+// verification, TSCredentials delegation. A byte-for-byte differential
+// against pyspnego 0.12.1 on identical inputs (fixed client challenge,
+// session key and nonce — see the `CREDSSP_FIXED_*` debug hooks) matches at
+// every step.
 //
-// Use Basic, NTLM (with HTTPS+CBT for EPA), Kerberos, or Certificate
-// authentication for production. CredSSP is provided as a foundation for
-// future development — it implements the full TLS-in-TLS architecture and
-// all CredSSP protocol structures correctly.
+// The last blocker was the SPNEGO mechListMIC RC4 reset: Windows re-keys the
+// NTLM sealing handle right after the MIC is computed/verified (sequence
+// number kept), so pubKeyAuth must be sealed at keystream offset 0 with
+// seq 1. See `NtlmSession::sign_mech_list_mic` / `verify_mech_list_mic`.
+// How the server reports each failure, measured on Server 2025:
+//   - wrong password        → TSRequest errorCode STATUS_LOGON_FAILURE
+//   - bad mechListMIC       → TSRequest errorCode 0x8009030C
+//   - undecryptable pubKeyAuth → 401 with a token-less
+//                              `WWW-Authenticate: CredSSP`, no TSRequest
+//
+// Still experimental: validated on a single host generation, and the inner
+// TLS leg pulls OpenSSL.
 
 #[cfg(feature = "credssp")]
 use std::sync::Arc;
@@ -728,8 +738,10 @@ impl AuthTransport for CredSspAuth {
         // Compute mechListMIC over the SPNEGO mech_type_list. This MUST happen
         // before sealing pubKeyAuth so that the latter uses seq=1 (matches
         // pyspnego/Windows expectations). Without mechListMIC the server
-        // returns STATUS_LOGON_FAILURE.
-        let mech_list_mic = ntlm_session.sign(asn1::MECH_TYPE_LIST_NTLM);
+        // returns STATUS_LOGON_FAILURE. `sign_mech_list_mic` also resets the
+        // RC4 sealing handle afterwards, as Windows SPNEGO does — the
+        // pubKeyAuth below must be sealed at keystream offset 0.
+        let mech_list_mic = ntlm_session.sign_mech_list_mic(asn1::MECH_TYPE_LIST_NTLM);
 
         // Compute pubKeyAuth (v6): SHA256(magic + nonce + SubjectPublicKey).
         //
@@ -779,6 +791,13 @@ impl AuthTransport for CredSspAuth {
                 h(&ts_req3)
             );
             eprintln!("[CREDSSP_DUMP] nonce: {}", h(&nonce));
+            eprintln!("[CREDSSP_DUMP] inner_cert_der: {}", h(inner_cert_der));
+            eprintln!("[CREDSSP_DUMP] type1: {}", h(&type1));
+            eprintln!("[CREDSSP_DUMP] spnego_init: {}", h(&spnego_init));
+            eprintln!("[CREDSSP_DUMP] type2: {}", h(&type2));
+            eprintln!("[CREDSSP_DUMP] type3: {}", h(&type3));
+            eprintln!("[CREDSSP_DUMP] mech_list_mic: {}", h(&mech_list_mic));
+            eprintln!("[CREDSSP_DUMP] spn: {spn}");
             eprintln!(
                 "[CREDSSP_DUMP] subject_public_key: {}",
                 h(&subject_public_key)
@@ -800,9 +819,19 @@ impl AuthTransport for CredSspAuth {
                 "CredSSP: NTLM authenticate: expected 401, got {status}"
             )));
         }
+        #[cfg(debug_assertions)]
+        if std::env::var("CREDSSP_DUMP").is_ok() {
+            eprintln!("[CREDSSP_DUMP] step6 response status={status} headers={headers:?}");
+        }
         let server_token = header_get(&headers, "www-authenticate")
             .and_then(extract_credssp_token_str)
-            .ok_or_else(|| WinrmError::AuthFailed("CredSSP: NTLM auth: no CredSSP token".into()))?;
+            .ok_or_else(|| {
+                WinrmError::AuthFailed(
+                    "CredSSP: server dropped the context after NTLM AUTHENTICATE + pubKeyAuth \
+                     (401 without a CredSSP token is how Windows reports a rejected pubKeyAuth)"
+                        .into(),
+                )
+            })?;
         let server_bytes = B64
             .decode(server_token.trim_ascii())
             .map_err(|e| WinrmError::AuthFailed(format!("CredSSP: bad b64 auth: {e}")))?;
@@ -816,6 +845,18 @@ impl AuthTransport for CredSspAuth {
         let ts_resp = asn1::decode_ts_request(&plaintext).map_err(WinrmError::CredSsp)?;
         if let Some(code) = ts_resp.error_code {
             return Err(WinrmError::CredSsp(CredSspError::ServerError(code)));
+        }
+        // The server's final SPNEGO token carries its mechListMIC. Verify it
+        // (GSS_VerifyMIC at server seq 0); this also re-initialises the server
+        // RC4 handle, so the pubKeyAuth below unseals at seq 1, keystream
+        // offset 0 — the same reset Windows applies on its side.
+        if let Some(nego) = &ts_resp.nego_token
+            && let Some(mic) =
+                asn1::decode_spnego_mech_list_mic(nego).map_err(WinrmError::CredSsp)?
+        {
+            ntlm_session
+                .verify_mech_list_mic(asn1::MECH_TYPE_LIST_NTLM, &mic)
+                .map_err(WinrmError::Ntlm)?;
         }
         let server_pub_key_auth = ts_resp
             .pub_key_auth

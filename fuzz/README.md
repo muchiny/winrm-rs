@@ -66,7 +66,7 @@ drives; "invariant" is what it asserts beyond *must not panic*.
 | Target | Source | Invariant |
 |---|---|---|
 | `fuzz_asn1_ts_request` | `decode_ts_request`, `encode_ts_request`, `encode_ts_credentials` | encode → decode is the identity for every field |
-| `fuzz_asn1_spnego` | `decode_spnego_token`, `encode_spnego_init/response` | both wrappers roundtrip; the `mechListMIC` does not disturb the token |
+| `fuzz_asn1_spnego` | `decode_spnego_token`, `decode_spnego_mech_list_mic`, `encode_spnego_init/response` | both wrappers roundtrip; the `mechListMIC` does not disturb the token and comes back out unchanged; a `NegTokenInit` is refused by the MIC extractor |
 | `fuzz_asn1_cert` | `extract_subject_public_key` | extracted key fits inside the certificate |
 
 ## Layout

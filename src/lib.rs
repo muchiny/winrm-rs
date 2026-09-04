@@ -51,8 +51,8 @@
 //!   double-hop delegation. Pulls in `openssl` as a C dependency
 //!   (required because Microsoft's `CredSSP` server has proven incompatible
 //!   with `rustls` in-memory TLS — see `src/auth/credssp.rs`).
-//!   The handshake is not yet fully validated end-to-end; treat as
-//!   preview-quality and do not use in production.
+//!   Validated end-to-end against Windows Server 2025; not yet exercised
+//!   on other host generations.
 //!
 //! # Re-exports
 //!

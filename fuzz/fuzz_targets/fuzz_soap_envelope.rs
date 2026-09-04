@@ -20,6 +20,7 @@ use winrm_rs::WinrmConfig;
 struct Input<'a> {
     endpoint: &'a str,
     shell_id: &'a str,
+    resource_uri: &'a str,
     command_id: &'a str,
     command: &'a str,
     args: Vec<&'a str>,
@@ -98,8 +99,8 @@ fuzz_target!(|input: Input<'_>| {
         ),
         (
             "delete_shell",
-            delete_shell_request(ep, sid, t, m),
-            delete_shell_request("", "", t, m),
+            delete_shell_request(ep, sid, input.resource_uri, t, m),
+            delete_shell_request("", "", "", t, m),
         ),
         (
             "send_input",

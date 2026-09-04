@@ -235,13 +235,22 @@ pub fn signal_terminate_request(
     )
 }
 
+/// Delete carries the shell's own ResourceURI since 1.2.1 — a caller-supplied
+/// string spliced into the header, so it is part of the injection surface.
 pub fn delete_shell_request(
     endpoint: &str,
     shell_id: &str,
+    resource_uri: &str,
     timeout_secs: u64,
     max_envelope_size: u32,
 ) -> String {
-    crate::soap::envelope::delete_shell_request(endpoint, shell_id, timeout_secs, max_envelope_size)
+    crate::soap::envelope::delete_shell_request_for(
+        endpoint,
+        shell_id,
+        resource_uri,
+        timeout_secs,
+        max_envelope_size,
+    )
 }
 
 pub fn send_input_request(
@@ -348,6 +357,14 @@ pub fn encode_ts_credentials(domain: &str, username: &str, password: &str) -> Ve
 #[cfg(feature = "credssp")]
 pub fn decode_spnego_token(data: &[u8]) -> Result<Vec<u8>, crate::error::CredSspError> {
     crate::asn1::decode_spnego_token(data)
+}
+
+/// Extract the `mechListMIC` from a SPNEGO `NegTokenResp`, if present.
+#[cfg(feature = "credssp")]
+pub fn decode_spnego_mech_list_mic(
+    data: &[u8],
+) -> Result<Option<Vec<u8>>, crate::error::CredSspError> {
+    crate::asn1::decode_spnego_mech_list_mic(data)
 }
 
 /// Wrap an NTLM Type 1 in a SPNEGO `NegTokenInit`.

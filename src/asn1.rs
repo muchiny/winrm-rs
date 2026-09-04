@@ -413,6 +413,26 @@ pub(crate) fn decode_spnego_token(data: &[u8]) -> Result<Vec<u8>, CredSspError> 
     }
 }
 
+/// Extract the `mechListMIC` (`[3] OCTET STRING`) from a SPNEGO NegTokenResp,
+/// if present.
+///
+/// The server's final CredSSP token (in the pubKeyAuth TSRequest) is a
+/// NegTokenResp with negState accept-completed and a mechListMIC but no
+/// responseToken, so [`decode_spnego_token`] cannot be used for it.
+pub(crate) fn decode_spnego_mech_list_mic(data: &[u8]) -> Result<Option<Vec<u8>>, CredSspError> {
+    let (tag, contents, _) = read_tlv(data)?;
+    if tag != 0xA1 {
+        return Err(CredSspError::Asn1Decode(format!(
+            "expected NegTokenResp (0xa1), got tag 0x{tag:02x}"
+        )));
+    }
+    let (_, seq_data, _) = read_tlv(contents)?;
+    match find_context_tag(seq_data, 3) {
+        Some(mic) => Ok(Some(decode_octet_string(mic)?.to_vec())),
+        None => Ok(None),
+    }
+}
+
 /// Extract SubjectPublicKey from a DER-encoded X.509 certificate.
 ///
 /// Navigates: Certificate → TBSCertificate → SubjectPublicKeyInfo → SubjectPublicKey (BIT STRING).
@@ -690,6 +710,42 @@ mod tests {
         let data = [TAG_INTEGER, 0x00];
         let err = decode_integer(&data).unwrap_err();
         assert!(matches!(err, CredSspError::Asn1Decode(_)));
+    }
+
+    #[test]
+    fn decode_spnego_mech_list_mic_from_server_final_token() {
+        // Captured from Server 2025 in the pubKeyAuth TSRequest: NegTokenResp
+        // { negState accept-completed, mechListMIC } — no responseToken.
+        let tok: &[u8] = &[
+            0xa1, 0x1b, 0x30, 0x19, 0xa0, 0x03, 0x0a, 0x01, 0x00, 0xa3, 0x12, 0x04, 0x10, 0x01,
+            0x00, 0x00, 0x00, 0x7c, 0x04, 0x2c, 0xe7, 0x3e, 0x8f, 0x62, 0x15, 0x00, 0x00, 0x00,
+            0x00,
+        ];
+        let mic = decode_spnego_mech_list_mic(tok).unwrap();
+        assert_eq!(
+            mic,
+            Some(vec![
+                0x01, 0x00, 0x00, 0x00, 0x7c, 0x04, 0x2c, 0xe7, 0x3e, 0x8f, 0x62, 0x15, 0x00, 0x00,
+                0x00, 0x00
+            ])
+        );
+    }
+
+    #[test]
+    fn decode_spnego_mech_list_mic_absent_or_present_in_client_shape() {
+        let tok = encode_spnego_response(b"NTLMSSP\0", None);
+        assert_eq!(decode_spnego_mech_list_mic(&tok).unwrap(), None);
+        let tok = encode_spnego_response(b"NTLMSSP\0", Some(&[0xAB; 16]));
+        assert_eq!(
+            decode_spnego_mech_list_mic(&tok).unwrap(),
+            Some(vec![0xAB; 16])
+        );
+    }
+
+    #[test]
+    fn decode_spnego_mech_list_mic_rejects_non_neg_token_resp() {
+        assert!(decode_spnego_mech_list_mic(&[0x60, 0x00]).is_err());
+        assert!(decode_spnego_mech_list_mic(&[]).is_err());
     }
 
     #[test]

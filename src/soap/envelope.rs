@@ -26,12 +26,33 @@ pub(crate) fn xml_escape(s: &str) -> String {
 const NS_DECL_WITH_RSP: &str = r#"xmlns:s="http://www.w3.org/2003/05/soap-envelope"
   xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing"
   xmlns:wsman="http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd"
+  xmlns:wsmv="http://schemas.microsoft.com/wbem/wsman/1/wsman.xsd"
   xmlns:rsp="http://schemas.microsoft.com/wbem/wsman/1/windows/shell""#;
 
 /// XML namespace declarations without the shell namespace (used by Delete).
 const NS_DECL_NO_RSP: &str = r#"xmlns:s="http://www.w3.org/2003/05/soap-envelope"
   xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing"
-  xmlns:wsman="http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd""#;
+  xmlns:wsman="http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd"
+  xmlns:wsmv="http://schemas.microsoft.com/wbem/wsman/1/wsman.xsd""#;
+
+/// Stamp the client's `wsmv:SessionId` header (MS-WSMV 2.2.4.x) into a
+/// built envelope.
+///
+/// Windows binds a shell to the session that created it: a Create without
+/// this header yields a shell that refuses Disconnect/Reconnect ("created by
+/// an older WinRS client"), and once a Create carried it, every later request
+/// on that shell must carry the same value or the server answers 0x8033810F
+/// (`does not contain a valid SessionID element`). The transport therefore
+/// stamps every outgoing envelope with its own id, here, instead of threading
+/// the value through every builder. Envelopes without a `</s:Header>` (raw
+/// caller bodies) are returned unchanged.
+pub(crate) fn with_session_id(envelope: &str, session_id: &str) -> String {
+    let element = format!(
+        "\n    <wsmv:SessionId s:mustUnderstand=\"false\">{}</wsmv:SessionId>\n  </s:Header>",
+        xml_escape(session_id)
+    );
+    envelope.replacen("</s:Header>", &element, 1)
+}
 
 /// Build the common SOAP envelope header.
 ///
@@ -514,16 +535,16 @@ pub(crate) fn disconnect_shell_request(
         timeout_secs,
         max_envelope_size,
     );
-    // The body carries the idle timeout the server should honour while
-    // the shell is disconnected. We reuse `timeout_secs` for both so the
-    // shell stays alive for at least as long as a normal operation.
+    // No IdleTimeOut in the body: the shell keeps the one it was created
+    // with. Recycling the operation timeout here sent 20 s, and Windows
+    // refuses anything under 60 s (`IdleTimeout of 20000 is outside the
+    // allowed range`), which killed every Disconnect. pypsrp sends the bare
+    // element too.
     format!(
         r"<s:Envelope {NS_DECL_WITH_RSP}>
 {header}
   <s:Body>
-    <rsp:Disconnect>
-      <rsp:IdleTimeOut>PT{timeout_secs}S</rsp:IdleTimeOut>
-    </rsp:Disconnect>
+    <rsp:Disconnect/>
   </s:Body>
 </s:Envelope>"
     )
@@ -563,13 +584,12 @@ pub(crate) fn disconnect_shell_request_with_uri(
         timeout_secs,
         max_envelope_size,
     );
+    // Bare element — see `disconnect_shell_request`.
     format!(
         r"<s:Envelope {NS_DECL_WITH_RSP}>
 {header}
   <s:Body>
-    <rsp:Disconnect>
-      <rsp:IdleTimeOut>PT{timeout_secs}S</rsp:IdleTimeOut>
-    </rsp:Disconnect>
+    <rsp:Disconnect/>
   </s:Body>
 </s:Envelope>"
     )
@@ -1312,7 +1332,13 @@ mod tests {
         assert!(xml.contains("SHELL-1"));
         assert!(xml.contains("shell/Disconnect"));
         assert!(xml.contains("Disconnect"));
-        assert!(xml.contains("<rsp:IdleTimeOut>PT60S</rsp:IdleTimeOut>"));
+        // The body carries no IdleTimeOut: the shell keeps the one from its
+        // Create, and Windows rejects anything under 60 s outright — the
+        // operation timeout used to be recycled here and 20 s answered
+        // `IdleTimeout of 20000 is outside the allowed range`.
+        assert!(xml.contains("<rsp:Disconnect/>"), "{xml}");
+        assert!(!xml.contains("IdleTimeOut"), "{xml}");
+        assert!(xml.contains("<wsman:OperationTimeout>PT60S</wsman:OperationTimeout>"));
     }
 
     #[test]
@@ -1336,7 +1362,9 @@ mod tests {
         );
         assert!(xml.contains("SHELL-1"));
         assert!(xml.contains("shell/Disconnect"));
-        assert!(xml.contains("<rsp:IdleTimeOut>PT90S</rsp:IdleTimeOut>"));
+        assert!(xml.contains("<rsp:Disconnect/>"), "{xml}");
+        assert!(!xml.contains("IdleTimeOut"), "{xml}");
+        assert!(xml.contains("<wsman:OperationTimeout>PT90S</wsman:OperationTimeout>"));
         assert!(xml.contains("schemas.microsoft.com/powershell/Custom"));
     }
 
@@ -1395,5 +1423,69 @@ mod tests {
         assert!(xml.contains("schemas.microsoft.com/powershell/Microsoft.PowerShell"));
         // No CommandId on the stream element for PSRP send
         assert!(!xml.contains("CommandId"));
+    }
+
+    // --- wsmv:SessionId (MS-WSMV 2.2.4.x) ---
+    //
+    // Windows only grants Disconnect/Reconnect to a shell whose Create carried
+    // a SessionId header — otherwise the shell is "created by an older WinRS
+    // client". Measured against Server 2025 with pypsrp: strip SessionId from
+    // the Create alone and Disconnect answers exactly that fault; keep it on
+    // the Create and strip it from the follow-ups and every follow-up is
+    // refused with 0x8033810F "does not contain a valid SessionID element".
+    // So the element goes on every request of a session, and it is injected
+    // at the transport chokepoint rather than threaded through 19 builders.
+
+    #[test]
+    fn with_session_id_inserts_element_before_header_end_once() {
+        let env = create_shell_request(
+            "http://h:5985/wsman",
+            &crate::config::WinrmConfig::default(),
+        );
+        let out = with_session_id(&env, "uuid:9A85B009-AB3A-47D9-A357-EFCA4F6174B5");
+        let needle = r#"<wsmv:SessionId s:mustUnderstand="false">uuid:9A85B009-AB3A-47D9-A357-EFCA4F6174B5</wsmv:SessionId>"#;
+        assert_eq!(
+            out.matches(needle).count(),
+            1,
+            "exactly one SessionId: {out}"
+        );
+        let pos_sid = out.find(needle).unwrap();
+        let pos_hdr_end = out.find("</s:Header>").unwrap();
+        assert!(
+            pos_sid < pos_hdr_end,
+            "SessionId must sit inside the header"
+        );
+        // Nothing else moved: body identical, header end still unique.
+        let body = |s: &str| s[s.find("<s:Body>").unwrap()..].to_string();
+        assert_eq!(body(&out), body(&env));
+        assert_eq!(out.matches("</s:Header>").count(), 1);
+    }
+
+    #[test]
+    fn with_session_id_is_a_no_op_without_a_header() {
+        assert_eq!(with_session_id("<s:Envelope/>", "uuid:X"), "<s:Envelope/>");
+    }
+
+    #[test]
+    fn with_session_id_escapes_the_value() {
+        let out = with_session_id("<s:Header></s:Header>", "uuid:<x>&");
+        assert!(out.contains("uuid:&lt;x&gt;&amp;"), "{out}");
+    }
+
+    #[test]
+    fn every_envelope_declares_the_wsmv_prefix() {
+        // The SessionId element uses the `wsmv` prefix, so both namespace
+        // declaration sets must bind it — including the Delete one.
+        for decl in [NS_DECL_WITH_RSP, NS_DECL_NO_RSP] {
+            assert!(
+                decl.contains(
+                    r#"xmlns:wsmv="http://schemas.microsoft.com/wbem/wsman/1/wsman.xsd""#
+                ),
+                "missing wsmv declaration in {decl}"
+            );
+        }
+        let del =
+            delete_shell_request_for("http://h:5985/wsman", "S", RESOURCE_URI_CMD, 60, 153_600);
+        assert!(del.contains("xmlns:wsmv="), "{del}");
     }
 }

@@ -44,6 +44,9 @@ pub(crate) struct HttpTransport {
     /// Cached NTLM session for sealed message exchange.
     /// Uses `tokio::sync::Mutex` because the lock spans an `.await` (HTTP send).
     ntlm_cache: Mutex<Option<NtlmSessionCache>>,
+    /// `wsmv:SessionId` value stamped on every request (`uuid:<UPPERCASE>`),
+    /// one per transport. See [`crate::soap::envelope::with_session_id`].
+    session_id: String,
 }
 
 /// Strip scheme, userinfo, port, and path from a host string.
@@ -183,6 +186,7 @@ impl HttpTransport {
             credentials,
             cert_handle,
             ntlm_cache: Mutex::new(None),
+            session_id: format!("uuid:{}", uuid::Uuid::new_v4().to_string().to_uppercase()),
         })
     }
 
@@ -387,6 +391,7 @@ impl HttpTransport {
         host: &str,
         body: String,
     ) -> Result<String, WinrmError> {
+        let body = crate::soap::envelope::with_session_id(&body, &self.session_id);
         let max = self.config.max_retries;
         for attempt in 0..=max {
             match self.send_soap(host, body.clone()).await {
@@ -405,6 +410,12 @@ impl HttpTransport {
             }
         }
         unreachable!()
+    }
+
+    /// The `wsmv:SessionId` value this transport stamps on every request.
+    #[cfg(test)]
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session_id
     }
 
     /// Send an authenticated SOAP request (used by Shell and other internal callers).
@@ -719,5 +730,60 @@ mod tests {
         // the hostname and the URL is rebuilt with the configured scheme.
         let url = transport.endpoint("http://evil.com/path");
         assert_eq!(url, "http://evil.com:5985/wsman");
+    }
+
+    /// Every request of a session carries the same `wsmv:SessionId`; without
+    /// it on the Create, Windows creates a non-disconnectable shell, and with
+    /// it on the Create but not on the follow-ups, every follow-up is refused
+    /// (0x8033810F). Measured against Server 2025 — see soap/envelope.rs.
+    #[tokio::test]
+    async fn every_request_carries_the_same_session_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<ok/>"))
+            .mount(&server)
+            .await;
+        let transport = basic_transport(server.address().port());
+        let env = r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Header></s:Header><s:Body/></s:Envelope>"#;
+        for _ in 0..2 {
+            transport
+                .send_soap_with_retry(&server.address().ip().to_string(), env.to_string())
+                .await
+                .unwrap();
+        }
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 2);
+        let bodies: Vec<String> = reqs
+            .iter()
+            .map(|r| String::from_utf8(r.body.clone()).unwrap())
+            .collect();
+        let sid = |b: &str| -> String {
+            let start = b.find("<wsmv:SessionId").expect("SessionId present");
+            let open = b[start..].find('>').unwrap() + start + 1;
+            let end = b[open..].find('<').unwrap() + open;
+            b[open..end].to_string()
+        };
+        let first = sid(&bodies[0]);
+        assert_eq!(first, sid(&bodies[1]), "one session id per transport");
+        assert_eq!(
+            first,
+            transport.session_id(),
+            "accessor exposes the same id"
+        );
+        let uuid = first.strip_prefix("uuid:").expect("uuid: prefix");
+        assert_eq!(uuid.len(), 36);
+        assert!(
+            uuid.chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '-'),
+            "{uuid}"
+        );
+        assert!(bodies[0].contains(r#"<wsmv:SessionId s:mustUnderstand="false">"#));
+    }
+
+    #[tokio::test]
+    async fn two_transports_have_distinct_session_ids() {
+        let a = basic_transport(5985);
+        let b = basic_transport(5985);
+        assert_ne!(a.session_id(), b.session_id());
     }
 }

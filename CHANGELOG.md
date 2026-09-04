@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-09-04
+
+CredSSP shipped in 1.2.1; this one makes PSRP shells disconnectable. Found by
+driving `psrp-rs` disconnect/reconnect against a live Server 2025 and diffing
+the WS-Management traffic against pypsrp on the same host.
+
+### Fixed
+
+- **Shells were created without a `wsmv:SessionId`, so Windows refused to
+  disconnect them.** Server 2025 answered every Disconnect with
+  `InternalError: This WinRS shell instance does not support disconnect and
+  reconnect operations because it was created by an older WinRS client`.
+  Windows binds a shell to the session that created it: strip the SessionId
+  from the Create alone (measured against a pypsrp reference on the same host)
+  and Disconnect is refused exactly this way; keep it on the Create but drop
+  it from the follow-ups and every follow-up is refused with 0x8033810F
+  (`does not contain a valid SessionID element`). The transport now stamps one
+  `wsmv:SessionId` per client on **every** request, injected at the send
+  chokepoint rather than threaded through the 19 envelope builders. Verified
+  live: all 51 integration tests still pass with the header on every request.
+  (`src/transport.rs`, `src/soap/envelope.rs`)
+
+- **Disconnect recycled the operation timeout as the shell idle timeout, which
+  Windows rejects.** The body sent `<rsp:IdleTimeOut>PT20S</rsp:IdleTimeOut>`,
+  and the server answered `The requested IdleTimeout of 20000 is outside the
+  allowed range. Specify an IdleTimeout value between 60000 and 2147483647`.
+  The Disconnect body is now the bare `<rsp:Disconnect/>` — the shell keeps the
+  idle timeout it was created with, matching pypsrp. (`src/soap/envelope.rs`)
+
 ## [1.2.1] - 2026-09-04
 
 Three fixes, all found by running the crate against live Windows hosts —

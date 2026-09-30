@@ -337,7 +337,7 @@ impl<'a> Shell<'a> {
             )
         };
         let response = self.client.send_soap_raw(&self.host, envelope).await?;
-        soap::parse_receive_output(&response).map_err(WinrmError::Soap)
+        soap::parse_receive_output(&response, config.decode_clixml_stderr).map_err(WinrmError::Soap)
     }
 
     /// Get the shell ID.

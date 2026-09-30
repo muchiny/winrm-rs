@@ -45,8 +45,15 @@ pub fn parse_command_id(xml: &str) -> Result<String, SoapError> {
 /// `CommandState` for the `Done` URI, and extracts the `ExitCode` if present.
 /// Returns [`SoapError::ParseError`] if a stream contains invalid base64, or
 /// a [`SoapError::Fault`] if the response body contains a SOAP fault.
+///
+/// When `decode_clixml_stderr` is `true`, a stderr chunk starting with
+/// `#< CLIXML` is reduced to its error text (see `parse_clixml`); when
+/// `false`, stderr is returned byte for byte.
 #[allow(unreachable_pub)] // re-exported under the `__internal` feature for fuzz targets
-pub fn parse_receive_output(xml: &str) -> Result<ReceiveOutput, SoapError> {
+pub fn parse_receive_output(
+    xml: &str,
+    decode_clixml_stderr: bool,
+) -> Result<ReceiveOutput, SoapError> {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD as B64;
 
@@ -64,7 +71,7 @@ pub fn parse_receive_output(xml: &str) -> Result<ReceiveOutput, SoapError> {
         match name.as_str() {
             "stdout" => stdout.extend_from_slice(&decoded),
             "stderr" => {
-                if decoded.starts_with(b"#< CLIXML") {
+                if decode_clixml_stderr && decoded.starts_with(b"#< CLIXML") {
                     stderr.extend_from_slice(&parse_clixml(&decoded));
                 } else {
                     stderr.extend_from_slice(&decoded);
@@ -362,7 +369,7 @@ mod tests {
             </rsp:CommandState>
         </rsp:ReceiveResponse></s:Body></s:Envelope>"#;
 
-        let output = parse_receive_output(xml).unwrap();
+        let output = parse_receive_output(xml, true).unwrap();
         assert_eq!(output.stdout, b"hello");
         assert_eq!(output.stderr, b"err");
         assert_eq!(output.exit_code, Some(0));
@@ -376,7 +383,7 @@ mod tests {
             <rsp:CommandState CommandId="C1" State="http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Running"/>
         </rsp:ReceiveResponse></s:Body></s:Envelope>"#;
 
-        let output = parse_receive_output(xml).unwrap();
+        let output = parse_receive_output(xml, true).unwrap();
         assert_eq!(output.stdout, b"test");
         assert!(!output.done);
         assert!(output.exit_code.is_none());
@@ -417,7 +424,7 @@ mod tests {
                 <s:Reason><s:Text>Invalid input</s:Text></s:Reason>
             </s:Fault>
         </s:Body></s:Envelope>";
-        let result = parse_receive_output(xml);
+        let result = parse_receive_output(xml, true);
         assert!(result.is_err());
     }
 
@@ -454,7 +461,7 @@ mod tests {
         let xml = r#"<s:Envelope><s:Body><rsp:ReceiveResponse>
             <rsp:Stream Name="stdout" CommandId="C1">!!!not-base64!!!</rsp:Stream>
         </rsp:ReceiveResponse></s:Body></s:Envelope>"#;
-        let result = parse_receive_output(xml);
+        let result = parse_receive_output(xml, true);
         assert!(result.is_err());
     }
 
@@ -514,7 +521,7 @@ mod tests {
         let xml = r#"<s:Envelope><s:Body><rsp:ReceiveResponse>
             <rsp:CommandState CommandId="C1" State="http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Done"/>
         </rsp:ReceiveResponse></s:Body></s:Envelope>"#;
-        let output = parse_receive_output(xml).unwrap();
+        let output = parse_receive_output(xml, true).unwrap();
         assert!(output.done);
         assert!(output.exit_code.is_none());
         assert!(output.stdout.is_empty());
@@ -544,7 +551,7 @@ mod tests {
                 <rsp:ExitCode>0</rsp:ExitCode>
             </rsp:CommandState>
         </rsp:ReceiveResponse></s:Body></s:Envelope>"#;
-        let output = parse_receive_output(xml).unwrap();
+        let output = parse_receive_output(xml, true).unwrap();
         assert_eq!(output.stdout, b"hello");
     }
 
@@ -559,7 +566,7 @@ mod tests {
                 <rsp:ExitCode>1</rsp:ExitCode>
             </rsp:CommandState>
         </rsp:ReceiveResponse></s:Body></s:Envelope>"#;
-        let output = parse_receive_output(xml).unwrap();
+        let output = parse_receive_output(xml, true).unwrap();
         assert_eq!(output.stdout, b"ABCD");
         assert_eq!(output.stderr, b"err");
         assert_eq!(output.exit_code, Some(1));
@@ -582,7 +589,7 @@ mod tests {
                 <rsp:ExitCode>0</rsp:ExitCode>
             </rsp:CommandState>
         </rsp:ReceiveResponse></s:Body></s:Envelope>"#;
-        let output = parse_receive_output(xml).unwrap();
+        let output = parse_receive_output(xml, true).unwrap();
         assert_eq!(output.stdout, b"AC");
         assert_eq!(output.stderr, b"B");
     }
@@ -600,7 +607,7 @@ mod tests {
                 <rsp:ExitCode>-1</rsp:ExitCode>
             </rsp:CommandState>
         </rsp:ReceiveResponse></s:Body></s:Envelope>"#;
-        let output = parse_receive_output(xml).unwrap();
+        let output = parse_receive_output(xml, true).unwrap();
         assert!(output.done);
         assert_eq!(output.exit_code, Some(-1));
     }
@@ -612,7 +619,7 @@ mod tests {
                 <rsp:ExitCode>notanumber</rsp:ExitCode>
             </rsp:CommandState>
         </rsp:ReceiveResponse></s:Body></s:Envelope>"#;
-        let output = parse_receive_output(xml).unwrap();
+        let output = parse_receive_output(xml, true).unwrap();
         assert!(output.done);
         assert!(output.exit_code.is_none());
     }
@@ -699,7 +706,7 @@ mod tests {
     fn parse_receive_output_stream_at_xml_end() {
         // "Z" = Wg==
         let xml = r#"<s:Envelope><s:Body><rsp:ReceiveResponse><rsp:Stream Name="stdout" CommandId="C1">Wg==</rsp:Stream><rsp:CommandState CommandId="C1" State="http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Done"><rsp:ExitCode>0</rsp:ExitCode></rsp:CommandState></rsp:ReceiveResponse></s:Body></s:Envelope>"#;
-        let output = parse_receive_output(xml).unwrap();
+        let output = parse_receive_output(xml, true).unwrap();
         assert_eq!(output.stdout, b"Z");
         assert_eq!(output.exit_code, Some(0));
         assert!(output.done);
@@ -733,7 +740,7 @@ mod tests {
                 </rsp:CommandState>
             </rsp:ReceiveResponse></s:Body></s:Envelope>"#
         );
-        let output = parse_receive_output(&xml).unwrap();
+        let output = parse_receive_output(&xml, true).unwrap();
         assert_eq!(output.stdout.len(), 30, "should decode 30 bytes of stdout");
         assert_eq!(output.stderr, b"err", "should decode stderr correctly");
         assert_eq!(output.exit_code, Some(0));
@@ -778,12 +785,28 @@ mod tests {
         let xml = format!(
             r#"<rsp:ReceiveResponse><rsp:Stream Name="stderr">{encoded}</rsp:Stream><rsp:CommandState State="http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Done"><rsp:ExitCode>1</rsp:ExitCode></rsp:CommandState></rsp:ReceiveResponse>"#
         );
-        let output = parse_receive_output(&xml).unwrap();
+        let output = parse_receive_output(&xml, true).unwrap();
         assert_eq!(
             String::from_utf8_lossy(&output.stderr),
             "PowerShell error\r\n"
         );
         assert_eq!(output.exit_code, Some(1));
+    }
+
+    #[test]
+    fn parse_receive_output_raw_stderr_keeps_clixml_untouched() {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD as B64;
+
+        // A Write-Host record has no <S S="Error"> fragment, so decoding
+        // would drop it entirely; raw mode must hand back the exact bytes.
+        let clixml = b"#< CLIXML\r\n<Objs><Obj S=\"information\"><Props><S N=\"Message\">dump written</S></Props></Obj></Objs>";
+        let encoded = B64.encode(clixml);
+        let xml = format!(
+            r#"<rsp:ReceiveResponse><rsp:Stream Name="stderr">{encoded}</rsp:Stream></rsp:ReceiveResponse>"#
+        );
+        assert!(parse_receive_output(&xml, true).unwrap().stderr.is_empty());
+        assert_eq!(parse_receive_output(&xml, false).unwrap().stderr, clixml);
     }
 
     // Kills extract_subcode_value returning None

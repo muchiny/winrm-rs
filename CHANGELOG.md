@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`WinrmConfig::decode_clixml_stderr`** (default `true`, unchanged
+  behaviour). Set it to `false` to get stderr exactly as the server sent it.
+  The built-in decoding keeps only `<S S="Error">` text, so `Write-Host`,
+  warning and verbose records vanish, and a `#< CLIXML` marker that arrives
+  in a different Receive response from its `<Objs>` document leaves raw XML
+  behind. Callers that parse CLIXML themselves need the raw bytes.
+
 ## [1.2.2] - 2026-09-04
 
 CredSSP shipped in 1.2.1; this one makes PSRP shells disconnectable. Found by

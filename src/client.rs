@@ -162,7 +162,7 @@ impl WinrmClient {
             config.max_envelope_size,
         );
         let response = self.transport.send_soap_with_retry(host, envelope).await?;
-        soap::parse_receive_output(&response).map_err(WinrmError::Soap)
+        soap::parse_receive_output(&response, config.decode_clixml_stderr).map_err(WinrmError::Soap)
     }
 
     /// Send a terminate signal to a running command.

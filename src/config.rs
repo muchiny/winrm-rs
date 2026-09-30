@@ -89,6 +89,16 @@ pub struct WinrmConfig {
     /// and the shell is best-effort closed. Set to `None` to disable the
     /// cap (pre-1.1 behaviour).
     pub max_output_bytes: Option<usize>,
+    /// Decode PowerShell CLIXML on stderr (default: `true`).
+    ///
+    /// When `true`, a stderr stream chunk that starts with `#< CLIXML` is
+    /// replaced by the text of its `<S S="Error">` records, and all other
+    /// records (warning, verbose, information such as `Write-Host`) are
+    /// dropped. Set to `false` to receive stderr bytes exactly as the server
+    /// sent them, for callers that parse CLIXML themselves (for example to
+    /// keep non-error records, or to reassemble a document split across
+    /// several Receive responses).
+    pub decode_clixml_stderr: bool,
 }
 
 impl Default for WinrmConfig {
@@ -112,6 +122,7 @@ impl Default for WinrmConfig {
             env_vars: Vec::new(),
             idle_timeout_secs: None,
             max_output_bytes: Some(64 * 1024 * 1024),
+            decode_clixml_stderr: true,
         }
     }
 }

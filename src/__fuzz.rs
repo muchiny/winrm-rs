@@ -160,7 +160,7 @@ pub fn parse_command_id(xml: &str) -> Result<String, SoapError> {
 }
 
 pub fn parse_receive_output(xml: &str) -> Result<ReceiveOutput, SoapError> {
-    crate::soap::parser::parse_receive_output(xml)
+    crate::soap::parser::parse_receive_output(xml, true)
 }
 
 pub fn check_soap_fault(xml: &str) -> Result<(), SoapError> {

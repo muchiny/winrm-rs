@@ -82,6 +82,10 @@ pub struct WinrmConfig {
     ///
     /// Controls the `WINRS_CODEPAGE` option in the shell creation envelope.
     /// Common values: 65001 (UTF-8), 437 (US), 850 (Western European).
+    ///
+    /// Stderr inside a PowerShell CLIXML document is decoded as UTF-8, so
+    /// with any other code page its non-ASCII characters come out mangled
+    /// (typically replaced by U+FFFD).
     pub codepage: u32,
     /// Initial working directory for the remote shell (default: `None`).
     ///

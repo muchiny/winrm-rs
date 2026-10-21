@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`StderrDecoder`**, re-exported from the crate root: the stateful
+  PowerShell CLIXML stderr decoder that `run_command`, `run_powershell`,
+  `Shell::run_command` and `Shell::receive_next` use, for callers that poll
+  Receive themselves. Keep one per command, `push` each poll's raw stderr,
+  `finish` after the last one. It implements `Debug` (buffered length only)
+  and `Default`.
+- **`WinrmClient::receive_output_raw`** (was crate-private): `receive_output`
+  with stderr exactly as the server sent it, to feed a `StderrDecoder`.
+  `receive_output` itself still decodes each response on its own, so a
+  CLIXML document split across responses comes back partly raw there.
+
 ### Fixed
 
 - **`AuthMethod::Certificate` never authenticated (always HTTP 401).** Two
@@ -77,9 +90,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   response, then the `<Objs>` document cut mid-tag, even mid-escape, across
   the next ones. Each slice was decoded on its own, so the marker slice
   decoded to nothing and the rest came through as raw XML. `run_command`,
-  `run_powershell`, `Shell::run_command` and `Shell::receive_next` now buffer
-  a document until `</Objs>` before decoding it; `WinrmClient::receive_output`
-  and `parse_receive_output` decode whole responses. Reported in #1.
+  `run_powershell`, `Shell::run_command` and `Shell::receive_next` now keep
+  one decoder per command across polls. It decodes each record (`<S>`
+  element) as soon as it is complete and buffers only the record still
+  arriving, so a document of any size decodes and `Shell::receive_next`
+  returns records while the command runs, although powershell.exe closes its
+  `<Objs>` document only when it exits. powershell.exe buffers its stderr
+  itself (measured on Server 2025: blocks of about 6 KiB, the rest at exit),
+  so a few small errors still arrive only when the command ends. A single record longer than 16 MiB is given
+  up on and released raw. Several documents after one marker, and a marker
+  doubled by nested PowerShell, all decode. `WinrmClient::receive_output`
+  decodes each response on its own; use `receive_output_raw` with a
+  `StderrDecoder` to decode across polls. Reported in #1.
 - **Warning, verbose and debug records were dropped** from CLIXML stderr; only
   error records were kept. They now come through with the console prefixes
   `WARNING: `, `VERBOSE: ` and `DEBUG: `. Progress and information records
@@ -87,6 +109,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **XML entities were left encoded** in decoded stderr (`2&gt;$null`), and
   only four `_xHHHH_` escapes were understood. All entities, numeric
   references and `_xHHHH_` escapes, surrogate pairs included, are decoded.
+  A signed (`&#+65;`) or NUL (`&#0;`) numeric reference stays as written.
 
 ### Changed
 
@@ -108,8 +131,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   CredSSP over HTTP. Such a configuration used to build but could never
   authenticate: without TLS there is no handshake to present the certificate
   in.
+- **Behaviour change: PowerShell warning, verbose and debug records now
+  reach stderr** (prefixed `WARNING: `, `VERBOSE: `, `DEBUG: `; see Fixed),
+  so a command that only warns, which used to return an empty stderr, now
+  returns a non-empty one. Callers that treat any stderr as failure should
+  check the exit code instead, or ignore those prefixes.
+- **Decoded stderr can hold any control character.** Every `_xHHHH_`
+  escape is decoded, so BEL, backspace, NUL and the like written by the
+  remote command come through as is (only CR, LF, tab and ESC used to).
+  Sanitise stderr before writing it to a terminal or a log viewer.
 - **`max_output_bytes` counts stderr bytes as received**, before CLIXML
-  decoding, so it also bounds a document still being buffered. CLIXML is
+  decoding, so it also bounds a record still being buffered. CLIXML is
   several times larger than the text it decodes to, so a cap tuned to
   decoded output trips sooner on PowerShell stderr.
 - **A `#< CLIXML` marker only opens a document at the start of a line and

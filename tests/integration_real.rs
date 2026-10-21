@@ -510,7 +510,7 @@ fn assert_large_clixml_decoded(stderr: &[u8]) {
     assert!(
         stderr.starts_with("WARNING: careful now\r\n"),
         "warning record lost: {}",
-        &stderr[..stderr.len().min(200)]
+        stderr.chars().take(200).collect::<String>()
     );
     // Each error also echoes the script line, which holds `'bulk-'` but
     // never `bulk-x`.
@@ -557,6 +557,62 @@ async fn streaming_large_clixml_stderr_reassembled() {
     }
     shell.close().await.ok();
     assert_large_clixml_decoded(&stderr);
+}
+
+/// powershell.exe keeps one `<Objs>` document open until it exits, and
+/// buffers its stderr: measured on Server 2025, a few errors stay in that
+/// buffer until exit (only the `#< CLIXML` marker comes early), while a
+/// burst past it (~6 KiB) is flushed at once. Records flushed early must
+/// reach a `receive_next` caller right away, not when the document closes:
+/// the burst is written ~10 s before the last error, so its first record must
+/// arrive on a poll that is neither `done` nor already holding the last one.
+#[tokio::test]
+#[ignore]
+async fn streaming_clixml_stderr_yields_records_before_exit() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let shell = client.open_shell(&host).await.expect("open shell");
+    let encoded = winrm_rs::encode_powershell_command(
+        "1..20 | % { Write-Error ('burst-' + ('x' * 100) + $_) }; \
+         Start-Sleep -Seconds 10; Write-Error ('stream-' + 'last')",
+    );
+    let cmd_id = shell
+        .start_command("powershell.exe", &["-EncodedCommand", &encoded])
+        .await
+        .expect("start command");
+    let started = Instant::now();
+    let mut stderr = Vec::new();
+    let mut first_seen: Option<(Duration, bool, bool)> = None;
+    loop {
+        let chunk = shell.receive_next(&cmd_id).await.expect("receive");
+        stderr.extend(chunk.stderr);
+        let text = String::from_utf8_lossy(&stderr);
+        // The error text echoes the script line, which holds `'burst-'` and
+        // `'stream-'` but never `burst-x` or `stream-last`.
+        if first_seen.is_none() && text.contains("burst-x") {
+            first_seen = Some((started.elapsed(), chunk.done, text.contains("stream-last")));
+        }
+        if chunk.done {
+            break;
+        }
+    }
+    let total = started.elapsed();
+    shell.close().await.ok();
+    let text = String::from_utf8_lossy(&stderr);
+    let (at, done, with_last) = first_seen.expect("burst never decoded");
+    eprintln!("first record after {at:?}, command done after {total:?}");
+    assert!(
+        !done && !with_last,
+        "first record only arrived with the command's end ({at:?} of {total:?})"
+    );
+    assert!(
+        total.saturating_sub(at) >= Duration::from_secs(5),
+        "first record arrived {at:?} into a {total:?} run: not ahead of the sleep"
+    );
+    assert_eq!(text.matches("burst-x").count(), 20, "records lost: {text}");
+    assert!(text.contains("stream-last"), "last error lost: {text}");
+    for raw in ["#< CLIXML", "<Objs", "<S S=", "_x000D_"] {
+        assert!(!text.contains(raw), "raw CLIXML leaked: {raw}");
+    }
 }
 
 // === Output cap ===

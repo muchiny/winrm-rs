@@ -2,28 +2,64 @@
 //!
 //! `powershell.exe` run non-interactively writes its error, warning, verbose
 //! and debug streams to stderr as a CLIXML document: `#< CLIXML\r\n` followed
-//! by `<Objs>...</Objs>`. WinRM hands stderr back in arbitrary slices, and on
-//! Server 2025 a large document arrives as the marker alone in one Receive
-//! response, then the `<Objs>` body cut mid-tag (even mid-escape) across the
-//! next ones. Decoding each slice on its own therefore loses text or leaks raw
-//! XML; this decoder buffers a document until `</Objs>` before decoding it.
+//! by `<Objs>...</Objs>`. The `<Objs>` root is opened with the first record
+//! and only closed when the process exits, and WinRM hands stderr back in
+//! arbitrary slices: on Server 2025 a large document arrives as the marker
+//! alone in one Receive response, then the body cut mid-tag (even mid-escape)
+//! across the next ones. Decoding each slice on its own therefore loses text
+//! or leaks raw XML, and waiting for `</Objs>` would hold every record until
+//! the process ends. This decoder decodes each top-level record as soon as it
+//! is complete and buffers only the record still being received.
 //!
 //! A marker only opens a document at the start of the stream or of a line,
-//! and only when `<Objs` follows it; anything else is plain stderr text, so a
-//! native tool printing `#< CLIXML` cannot swallow the rest of its output.
-//! The document ends at the first `</Objs>`: `<Objs>` is only ever the root
-//! of a CLIXML document, nested objects are `<Obj>`.
+//! and only when `<Objs` follows it (after optional whitespace); anything
+//! else is plain stderr text, so a native tool printing `#< CLIXML` cannot
+//! swallow the rest of its output. A marker followed by another marker is
+//! dropped (nested PowerShell writes its own marker into the outer stderr),
+//! and once a document closes, `<Objs` after optional whitespace opens the
+//! next one without a new marker.
+//!
+//! The output depends only on the bytes, never on how they were sliced.
 
-/// Largest unterminated document held while waiting for `</Objs>`. Past this
-/// the buffered bytes are released raw so a server that never closes the
-/// document cannot make the client hold stderr forever.
+/// Largest single record (or root start tag) held while waiting for its end.
+/// A record that runs past this is given up on: its bytes and the rest of
+/// the document are released raw, so a server that never closes a record
+/// cannot make the client hold stderr forever. The limit applies to the
+/// record's own length, not to how much of it has arrived, so the decision is
+/// the same however the stream is sliced.
 const MAX_PENDING: usize = 16 * 1024 * 1024;
 
 const MARKER: &[u8] = b"#< CLIXML";
 const DOCUMENT_START: &[u8] = b"<Objs";
-const DOCUMENT_END: &[u8] = b"</Objs>";
-/// Most whitespace allowed between a marker and its `<Objs`.
+const ROOT: &[u8] = b"Objs";
+/// Most whitespace allowed between a marker and its `<Objs`, or between two
+/// documents.
 const MAX_HEADER: usize = 64;
+
+/// Where the decoder stands in the stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    /// Plain stderr; a marker at a line start may open a document.
+    Text,
+    /// At a document's `<Objs ...>` start tag.
+    Root,
+    /// Inside a document, before the next top-level record.
+    Body,
+    /// Just after `</Objs>`: `<Objs` after optional whitespace opens another
+    /// document.
+    AfterDocument,
+}
+
+/// Where the scan of the incomplete item at the front of the buffer stopped,
+/// so the next push resumes there instead of rescanning a long record.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Scan {
+    /// Offset, from the item start, of the first byte not yet scanned: a `<`
+    /// whose `>` has not arrived, or the end of the buffer.
+    pos: usize,
+    /// Elements named like the item's root that are open at `pos`.
+    depth: usize,
+}
 
 /// Turns a stderr byte stream into readable text, decoding PowerShell CLIXML
 /// documents and passing every other byte through unchanged.
@@ -39,9 +75,9 @@ const MAX_HEADER: usize = 64;
 /// default on a console too.
 pub(crate) struct ClixmlDecoder {
     pending: Vec<u8>,
-    in_document: bool,
-    /// Bytes of `pending` already searched for `</Objs>` without a match.
-    scanned: usize,
+    mode: Mode,
+    /// Progress through the incomplete item at the front of `pending`.
+    scan: Scan,
     /// Whether the next byte of plain text starts a line, i.e. may begin a
     /// marker.
     at_line_start: bool,
@@ -51,8 +87,8 @@ impl ClixmlDecoder {
     pub(crate) fn new() -> Self {
         Self {
             pending: Vec::new(),
-            in_document: false,
-            scanned: 0,
+            mode: Mode::Text,
+            scan: Scan::default(),
             at_line_start: true,
         }
     }
@@ -63,19 +99,23 @@ impl ClixmlDecoder {
         self.drain(false)
     }
 
-    /// Release everything still buffered, decoding an unterminated document
-    /// as far as it goes.
+    /// Release everything still buffered, decoding an unterminated record as
+    /// far as it goes. The decoder is then as new.
     pub(crate) fn finish(&mut self) -> Vec<u8> {
-        self.drain(true)
+        let out = self.drain(true);
+        *self = Self::new();
+        out
     }
 
     fn drain(&mut self, eof: bool) -> Vec<u8> {
-        // Walk `pending` with a cursor and compact it once at the end: removing
-        // each document from the front as it is decoded would shift the rest
-        // of the buffer every time, quadratic in a slice of tiny documents.
+        // Walk `pending` with a cursor and compact it once at the end:
+        // removing each record from the front as it is decoded would shift
+        // the rest of the buffer every time, quadratic in a slice of tiny
+        // records.
         let mut start = 0usize;
         let out = self.drain_from(&mut start, eof);
-        self.pending.drain(..start);
+        let consumed = start.min(self.pending.len());
+        self.pending.drain(..consumed);
         out
     }
 
@@ -83,62 +123,128 @@ impl ClixmlDecoder {
         let mut out = Vec::new();
         loop {
             let view = self.pending.get(*start..).unwrap_or_default();
-            if self.in_document {
-                // Resume the search where the last one stopped, minus the
-                // bytes that could hold the start of a split `</Objs>`.
-                let from = self
-                    .scanned
-                    .saturating_sub(DOCUMENT_END.len().saturating_sub(1));
-                let found = view
-                    .get(from..)
-                    .and_then(|tail| find(tail, DOCUMENT_END))
-                    .and_then(|pos| from.checked_add(pos)?.checked_add(DOCUMENT_END.len()));
-                if let Some(document) = found.and_then(|end| view.get(..end)) {
-                    out.extend(decode_document(document));
-                    *start = start.saturating_add(document.len());
-                    self.leave_document();
-                } else if eof {
-                    out.extend(decode_document(view));
-                    *start = self.pending.len();
-                    self.leave_document();
-                    return out;
-                } else if view.len() > MAX_PENDING {
-                    out.extend_from_slice(MARKER);
-                    out.extend_from_slice(view);
-                    *start = self.pending.len();
-                    self.leave_document();
-                    self.at_line_start = out.last() == Some(&b'\n');
-                    return out;
-                } else {
-                    self.scanned = view.len();
-                    return out;
-                }
-            } else if let Some(pos) = find_line_marker(view, self.at_line_start) {
-                let after = pos.saturating_add(MARKER.len());
-                let header = view.get(after..).unwrap_or_default();
-                match document_follows(header, eof) {
-                    Some(true) => {
-                        self.emit_text(&mut out, start, pos);
-                        *start = start.saturating_add(MARKER.len());
-                        self.in_document = true;
-                        self.scanned = 0;
+            match self.mode {
+                Mode::Text => {
+                    let Some(pos) = find_line_marker(view, self.at_line_start) else {
+                        // Hold back a trailing `#< CL...` that the next slice
+                        // may complete into a marker.
+                        let keep = if eof { 0 } else { partial_marker_len(view) };
+                        let ready = view.len().saturating_sub(keep);
+                        self.emit_text(&mut out, start, ready);
+                        return out;
+                    };
+                    let after = pos.saturating_add(MARKER.len());
+                    let header = view.get(after..).unwrap_or_default();
+                    match classify_header(header, eof, true) {
+                        Header::Document(blank) => {
+                            self.emit_text(&mut out, start, pos);
+                            *start = start.saturating_add(MARKER.len()).saturating_add(blank);
+                            self.enter(Mode::Root);
+                        }
+                        Header::Marker(blank) => {
+                            // Drop this marker; the one after it is read as
+                            // if it stood here, at a line start.
+                            self.emit_text(&mut out, start, pos);
+                            *start = start.saturating_add(MARKER.len()).saturating_add(blank);
+                            self.at_line_start = true;
+                        }
+                        Header::Text => self.emit_text(&mut out, start, after),
+                        Header::Wait => {
+                            // Wait for the bytes that tell what follows.
+                            self.emit_text(&mut out, start, pos);
+                            return out;
+                        }
                     }
-                    Some(false) => self.emit_text(&mut out, start, after),
-                    None => {
-                        // Wait for the bytes that tell whether `<Objs` follows.
-                        self.emit_text(&mut out, start, pos);
+                }
+                Mode::AfterDocument => match classify_header(view, eof, false) {
+                    Header::Document(blank) => {
+                        *start = start.saturating_add(blank);
+                        self.enter(Mode::Root);
+                    }
+                    Header::Wait => return out,
+                    Header::Text | Header::Marker(_) => {
+                        self.enter(Mode::Text);
+                        self.at_line_start = true;
+                    }
+                },
+                Mode::Root => {
+                    let window = view.get(..MAX_PENDING).unwrap_or(view);
+                    if let Some(end) = find_byte_from(window, self.scan.pos, b'>') {
+                        let len = end.saturating_add(1);
+                        let empty = window.get(..len).is_some_and(|tag| tag.ends_with(b"/>"));
+                        *start = start.saturating_add(len);
+                        self.enter(if empty {
+                            Mode::AfterDocument
+                        } else {
+                            Mode::Body
+                        });
+                    } else if view.len() > MAX_PENDING {
+                        self.give_up();
+                    } else if eof {
+                        *start = self.pending.len();
+                        return out;
+                    } else {
+                        self.scan.pos = window.len();
                         return out;
                     }
                 }
-            } else {
-                // Hold back a trailing `#< CL...` that the next slice may
-                // complete into a marker.
-                let keep = if eof { 0 } else { partial_marker_len(view) };
-                let ready = view.len().saturating_sub(keep);
-                self.emit_text(&mut out, start, ready);
-                return out;
+                Mode::Body => {
+                    let body = view.trim_ascii_start();
+                    let blank = view.len().saturating_sub(body.len());
+                    *start = start.saturating_add(blank);
+                    if body.is_empty() {
+                        return out;
+                    }
+                    if body.first() != Some(&b'<') {
+                        // Text between records carries nothing; skip to the
+                        // next tag.
+                        let skip = find_byte_from(body, 0, b'<').unwrap_or(body.len());
+                        *start = start.saturating_add(skip);
+                        continue;
+                    }
+                    let window = body.get(..MAX_PENDING).unwrap_or(body);
+                    match scan_item(window, self.scan) {
+                        Step::Complete {
+                            len,
+                            end_of_document,
+                        } => {
+                            if !end_of_document {
+                                out.extend(decode_record(window.get(..len).unwrap_or_default()));
+                            }
+                            *start = start.saturating_add(len);
+                            self.enter(if end_of_document {
+                                Mode::AfterDocument
+                            } else {
+                                Mode::Body
+                            });
+                        }
+                        Step::Partial(_) if body.len() > MAX_PENDING => self.give_up(),
+                        Step::Partial(_) if eof => {
+                            out.extend(decode_record(body));
+                            *start = self.pending.len();
+                            return out;
+                        }
+                        Step::Partial(scan) => {
+                            self.scan = scan;
+                            return out;
+                        }
+                    }
+                }
             }
         }
+    }
+
+    /// Switch to `mode` with no item partly scanned.
+    fn enter(&mut self, mode: Mode) {
+        self.mode = mode;
+        self.scan = Scan::default();
+    }
+
+    /// Abandon the current document after an oversized record: from here on
+    /// its bytes are plain text.
+    fn give_up(&mut self) {
+        self.enter(Mode::Text);
+        self.at_line_start = false;
     }
 
     /// Copy the `n` bytes of `pending` at `start` to `out` as plain text and
@@ -154,11 +260,43 @@ impl ClixmlDecoder {
         }
         *start = end;
     }
+}
 
-    fn leave_document(&mut self) {
-        self.in_document = false;
-        self.scanned = 0;
-        self.at_line_start = true;
+/// What the bytes after a marker (or after `</Objs>`) announce.
+#[derive(Debug, PartialEq, Eq)]
+enum Header {
+    /// `<Objs` after this many whitespace bytes.
+    Document(usize),
+    /// Another marker after this many whitespace bytes.
+    Marker(usize),
+    /// Anything else: plain text.
+    Text,
+    /// More bytes are needed to tell.
+    Wait,
+}
+
+/// Classify `header`, the bytes after a marker (`markers` set) or after a
+/// closed document (`markers` unset, where only `<Objs` counts).
+///
+/// Only the bytes decide, never how many have arrived: whitespace longer than
+/// [`MAX_HEADER`] rules a document out whatever comes after it, so a stream
+/// decodes the same however it is sliced.
+fn classify_header(header: &[u8], eof: bool, markers: bool) -> Header {
+    // Past MAX_HEADER blank bytes the answer is known; do not scan further.
+    let limit = MAX_HEADER.saturating_add(1).saturating_add(MARKER.len());
+    let header = header.get(..limit).unwrap_or(header);
+    let rest = header.trim_ascii_start();
+    let blank = header.len().saturating_sub(rest.len());
+    if blank > MAX_HEADER {
+        Header::Text
+    } else if rest.starts_with(DOCUMENT_START) {
+        Header::Document(blank)
+    } else if markers && rest.starts_with(MARKER) {
+        Header::Marker(blank)
+    } else if !eof && (DOCUMENT_START.starts_with(rest) || (markers && MARKER.starts_with(rest))) {
+        Header::Wait
+    } else {
+        Header::Text
     }
 }
 
@@ -179,29 +317,14 @@ fn find_line_marker(buf: &[u8], at_line_start: bool) -> Option<usize> {
     }
 }
 
-/// Whether the bytes after a marker open a document: `Some(true)` if `<Objs`
-/// follows (after optional whitespace), `Some(false)` if something else
-/// does, `None` if more bytes are needed to tell.
-///
-/// Only the bytes decide, never how many have arrived: whitespace longer than
-/// [`MAX_HEADER`] rules a document out whatever comes after it, so a stream
-/// decodes the same however it is sliced.
-fn document_follows(header: &[u8], eof: bool) -> Option<bool> {
-    let rest = header.trim_ascii_start();
-    let blank = header.len().saturating_sub(rest.len());
-    if blank > MAX_HEADER {
-        Some(false)
-    } else if rest.starts_with(DOCUMENT_START) {
-        Some(true)
-    } else if !eof && DOCUMENT_START.starts_with(rest) {
-        None
-    } else {
-        Some(false)
-    }
-}
-
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Position of the first `byte` in `buf` at or after `from`.
+fn find_byte_from(buf: &[u8], from: usize, byte: u8) -> Option<usize> {
+    let pos = buf.get(from..)?.iter().position(|&b| b == byte)?;
+    from.checked_add(pos)
 }
 
 /// Length of the longest proper prefix of [`MARKER`] that ends `buf`.
@@ -212,46 +335,130 @@ fn partial_marker_len(buf: &[u8]) -> usize {
         .unwrap_or(0)
 }
 
-/// Render the stream records of one CLIXML document (marker excluded).
-fn decode_document(document: &[u8]) -> Vec<u8> {
-    const OPEN: &str = "<S S=\"";
-    const CLOSE: &str = "</S>";
+/// Result of scanning the top-level item at the front of a document body.
+#[derive(Debug, PartialEq, Eq)]
+enum Step {
+    /// The item is complete and `len` bytes long; `end_of_document` when it
+    /// is the `</Objs>` closing the document.
+    Complete { len: usize, end_of_document: bool },
+    /// The item has not ended yet; resume the scan from here.
+    Partial(Scan),
+}
 
-    let text = String::from_utf8_lossy(document);
-    let mut rest: &str = &text;
-    let mut out = String::new();
-    while let Some((_, after_open)) = rest.split_once(OPEN) {
-        let Some((kind, after_kind)) = after_open.split_once("\">") else {
-            break;
+/// Scan the item starting with `<` at the front of `item`, resuming from
+/// `scan`: an element up to its matching end tag (counting nested elements
+/// of the same name), or a lone tag (`</...>`, `<!...>`, `<?...>`).
+///
+/// Raw `<` and `>` only delimit tags in well-formed CLIXML, where text
+/// escapes them; a malformed stream still scans deterministically.
+fn scan_item(item: &[u8], scan: Scan) -> Step {
+    let partial_at_start = Step::Partial(Scan::default());
+    let Some(name) = item.get(1..).and_then(element_name) else {
+        return partial_at_start;
+    };
+    let lone_tag = matches!(item.get(1), Some(b'/' | b'!' | b'?'));
+    if lone_tag {
+        let from = scan.pos.max(1);
+        return match find_byte_from(item, from, b'>') {
+            Some(end) => Step::Complete {
+                len: end.saturating_add(1),
+                end_of_document: item.get(2..).and_then(element_name) == Some(ROOT)
+                    && item.get(1) == Some(&b'/'),
+            },
+            None => Step::Partial(Scan {
+                pos: item.len(),
+                depth: 0,
+            }),
         };
-        let Some((content, after_close)) = after_kind.split_once(CLOSE) else {
-            break;
+    }
+    let mut pos = scan.pos;
+    let mut depth = scan.depth;
+    loop {
+        let Some(lt) = find_byte_from(item, pos, b'<') else {
+            return Step::Partial(Scan {
+                pos: item.len(),
+                depth,
+            });
         };
-        let prefix = [
-            ("error", ""),
-            ("warning", "WARNING: "),
-            ("verbose", "VERBOSE: "),
-            ("debug", "DEBUG: "),
-        ]
-        .into_iter()
-        .find(|(name, _)| kind.eq_ignore_ascii_case(name))
-        .map(|(_, prefix)| prefix);
-        if let Some(prefix) = prefix {
-            out.push_str(prefix);
-            out.push_str(&decode_escapes(&decode_entities(content)));
-            if !prefix.is_empty() {
-                // Error records carry their own line endings; the other
-                // streams are one message per record.
-                out.push_str("\r\n");
+        let Some(gt) = find_byte_from(item, lt, b'>') else {
+            return Step::Partial(Scan { pos: lt, depth });
+        };
+        let tag = item.get(lt..=gt).unwrap_or_default();
+        let len = gt.saturating_add(1);
+        if let Some(closing) = tag.strip_prefix(b"</") {
+            if element_name(closing) == Some(name) {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Step::Complete {
+                        len,
+                        end_of_document: false,
+                    };
+                }
+            }
+        } else if tag.get(1..).and_then(element_name) == Some(name) {
+            if tag.ends_with(b"/>") {
+                if depth == 0 {
+                    return Step::Complete {
+                        len,
+                        end_of_document: false,
+                    };
+                }
+            } else {
+                depth = depth.saturating_add(1);
             }
         }
-        rest = after_close;
+        pos = len;
+    }
+}
+
+/// The element name at the start of `tag` (the bytes after `<` or `</`), or
+/// `None` while the byte that ends it has not arrived.
+fn element_name(tag: &[u8]) -> Option<&[u8]> {
+    let end = tag
+        .iter()
+        .position(|&b| b.is_ascii_whitespace() || b == b'/' || b == b'>')?;
+    tag.get(..end)
+}
+
+/// Render one top-level record: the text of an `<S S="kind">` stream record,
+/// nothing for anything else. An unterminated record (end of stream) yields
+/// the text it has so far.
+fn decode_record(record: &[u8]) -> Vec<u8> {
+    let Some(after_open) = record.strip_prefix(b"<S S=\"") else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(after_open);
+    let Some((kind, rest)) = text.split_once("\">") else {
+        return Vec::new();
+    };
+    let prefix = [
+        ("error", ""),
+        ("warning", "WARNING: "),
+        ("verbose", "VERBOSE: "),
+        ("debug", "DEBUG: "),
+    ]
+    .into_iter()
+    .find(|(name, _)| kind.eq_ignore_ascii_case(name))
+    .map(|(_, prefix)| prefix);
+    let Some(prefix) = prefix else {
+        return Vec::new();
+    };
+    // Element text escapes `<`, so the first one starts the end tag (or what
+    // has arrived of it).
+    let content = rest.split_once('<').map_or(rest, |(content, _)| content);
+    let mut out = String::from(prefix);
+    out.push_str(&decode_escapes(&decode_entities(content)));
+    if !prefix.is_empty() {
+        // Error records carry their own line endings; the other streams are
+        // one message per record.
+        out.push_str("\r\n");
     }
     out.into_bytes()
 }
 
 /// Undo the XML escaping of element text: the five named entities and
-/// numeric character references.
+/// numeric character references. A reference that is malformed or names
+/// NUL stays as written.
 fn decode_entities(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
@@ -265,11 +472,10 @@ fn decode_entities(s: &str) -> String {
                 "quot" => Some('"'),
                 "apos" => Some('\''),
                 _ => name
-                    .strip_prefix("#x")
-                    .or_else(|| name.strip_prefix("#X"))
-                    .and_then(|hex| u32::from_str_radix(hex, 16).ok())
-                    .or_else(|| name.strip_prefix('#').and_then(|dec| dec.parse().ok()))
-                    .and_then(char::from_u32),
+                    .strip_prefix('#')
+                    .and_then(numeric_reference)
+                    .and_then(char::from_u32)
+                    .filter(|&c| c != '\0'),
             }?;
             Some((c, after))
         });
@@ -286,6 +492,27 @@ fn decode_entities(s: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// The value of a numeric reference body (`x41`, `65`): digits only, no
+/// sign, which `from_str_radix` alone would accept.
+fn numeric_reference(body: &str) -> Option<u32> {
+    let (digits, radix) = match body.strip_prefix(['x', 'X']) {
+        Some(hex) => (hex, 16),
+        None => (body, 10),
+    };
+    let valid = !digits.is_empty()
+        && digits.bytes().all(|b| {
+            if radix == 16 {
+                b.is_ascii_hexdigit()
+            } else {
+                b.is_ascii_digit()
+            }
+        });
+    if !valid {
+        return None;
+    }
+    u32::from_str_radix(digits, radix).ok()
 }
 
 /// Undo PowerShell's `_xHHHH_` escaping, where each escape is one UTF-16
@@ -439,16 +666,31 @@ mod tests {
     fn many_small_documents_in_one_slice_decode_in_linear_time() {
         // Each document used to shift the whole remaining buffer, so one
         // hostile slice of tiny documents cost O(n^2): minutes for 8 MiB.
-        // Linear decoding takes well under a second, even in a debug build.
-        let doc: &[u8] = b"#< CLIXML\n<Objs></Objs>\n";
-        let stream = doc.repeat(8 * 1024 * 1024 / doc.len());
-        let start = std::time::Instant::now();
-        let out = decode(&stream);
-        assert_eq!(out.len(), stream.len() / doc.len());
+        // Compare two sizes rather than a wall-clock bound, so a loaded
+        // machine cannot fail it: 8x the input must cost far less than the
+        // 64x a quadratic decoder pays. Best of three damps scheduler noise.
+        let doc: &[u8] = b"#< CLIXML\n<Objs><S S=\"Error\">e</S></Objs>\n";
+        let time = |n: usize| {
+            let stream = doc.repeat(n);
+            (0..3)
+                .map(|_| {
+                    let start = std::time::Instant::now();
+                    let out = decode(&stream);
+                    let elapsed = start.elapsed();
+                    // "e" + the newline after each document.
+                    assert_eq!(out.len(), 2 * n);
+                    elapsed
+                })
+                .min()
+                .unwrap()
+        };
+        let small = time(16 * 1024);
+        let large = time(8 * 16 * 1024);
         assert!(
-            start.elapsed() < std::time::Duration::from_secs(5),
-            "took {:?}",
-            start.elapsed()
+            large < small * 24,
+            "8x the input took {:?} vs {:?}: not linear",
+            large,
+            small
         );
     }
 
@@ -496,12 +738,131 @@ mod tests {
     }
 
     #[test]
-    fn oversized_unterminated_document_is_flushed_raw() {
+    fn oversized_single_record_is_released_raw_by_the_push_itself() {
         let mut d = ClixmlDecoder::new();
-        let mut out = d.push(b"#< CLIXML\r\n<Objs><S S=\"Error\">");
+        assert!(
+            d.push(b"#< CLIXML\r\n<Objs><S S=\"Error\">a</S><S S=\"Error\">")
+                .starts_with(b"a")
+        );
         let filler = vec![b'x'; MAX_PENDING + 1];
-        out.extend(d.push(&filler));
-        out.extend(d.finish());
+        let out = d.push(&filler);
+        // The push that crosses the bound hands the record back raw, so the
+        // client never holds more than MAX_PENDING bytes of one record.
+        assert!(
+            out.starts_with(b"<S S=\"Error\">xxx"),
+            "{:?}",
+            out.get(..32)
+        );
         assert!(out.len() > MAX_PENDING, "buffer must not be held forever");
+        assert!(d.pending.len() < MAX_PENDING);
+        // What follows is plain text: the document was given up.
+        assert_eq!(d.push(b"</S></Objs>"), b"</S></Objs>");
+    }
+
+    #[test]
+    fn oversized_record_decides_the_same_whole_or_sliced() {
+        let mut stream = b"#< CLIXML\r\n<Objs><S S=\"Error\">".to_vec();
+        stream.extend(std::iter::repeat_n(b'x', MAX_PENDING));
+        stream.extend_from_slice(b"</S><S S=\"Error\">after</S></Objs>");
+        let whole = decode(&stream);
+        let (a, b) = stream.split_at(MAX_PENDING / 2);
+        assert_eq!(decode_chunks(&[a, b]), whole);
+        assert!(whole.starts_with("<S S=\"Error\">xxx"));
+    }
+
+    // Nested PowerShell: the inner powershell.exe writes its own marker and
+    // document into the outer one's stderr, so one marker can be followed by
+    // another marker, and one marker by several documents.
+    const NESTED: &[u8] = b"#< CLIXML\r\n#< CLIXML\r\n<Objs Version=\"1.1.0.1\"><S S=\"Error\">A_x000D__x000A_</S></Objs><Objs Version=\"1.1.0.1\"><S S=\"warning\">B</S></Objs>";
+
+    #[test]
+    fn several_documents_after_one_marker_all_decode() {
+        assert_eq!(decode(NESTED), "A\r\nWARNING: B\r\n");
+        for i in 0..=NESTED.len() {
+            let (a, b) = NESTED.split_at(i);
+            assert_eq!(
+                decode_chunks(&[a, b]),
+                "A\r\nWARNING: B\r\n",
+                "split at byte {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn whitespace_between_documents_is_dropped() {
+        assert_eq!(
+            decode(b"#< CLIXML\r\n<Objs><S S=\"Error\">A</S></Objs>\r\n<Objs><S S=\"Error\">B</S></Objs>"),
+            "AB"
+        );
+    }
+
+    #[test]
+    fn text_after_a_document_is_kept() {
+        assert_eq!(
+            decode(b"#< CLIXML\r\n<Objs><S S=\"Error\">A</S></Objs>\r\nnative\n"),
+            "A\r\nnative\n"
+        );
+    }
+
+    #[test]
+    fn doubled_marker_before_plain_text_drops_the_first_marker() {
+        assert_eq!(
+            decode(b"#< CLIXML\r\n#< CLIXML\r\nnot a document\n"),
+            "#< CLIXML\r\nnot a document\n"
+        );
+    }
+
+    #[test]
+    fn complete_records_are_released_before_the_document_closes() {
+        // powershell.exe keeps one <Objs> root open until it exits, so
+        // waiting for </Objs> would hold every error until the end.
+        let mut d = ClixmlDecoder::new();
+        assert_eq!(
+            d.push(b"#< CLIXML\r\n<Objs Version=\"1.1.0.1\" xmlns=\"x\"><Obj S=\"progress\" RefId=\"0\"><TN RefId=\"0\"><T>a</T></TN><Obj N=\"in\"><S N=\"x\">p</S></Obj></Obj><S S=\"Error\">first_x000D__x000A_</S><S S=\"Er"),
+            b"first\r\n"
+        );
+        assert_eq!(d.push(b"ror\">second</S>"), b"second");
+        assert_eq!(d.push(b"</Objs>"), b"");
+        assert_eq!(d.finish(), b"");
+    }
+
+    #[test]
+    fn document_larger_than_the_record_bound_decodes_fully() {
+        // Only one record is ever buffered, so a document of many records
+        // may exceed MAX_PENDING and still decode.
+        let record = format!("<S S=\"Error\">{}_x000D__x000A_</S>", "y".repeat(1000));
+        let count = MAX_PENDING / record.len() + 100;
+        let mut d = ClixmlDecoder::new();
+        let mut out = d.push(b"#< CLIXML\r\n<Objs>");
+        let body = record.repeat(count);
+        for chunk in body.as_bytes().chunks(1 << 20) {
+            out.extend(d.push(chunk));
+            assert!(d.pending.len() < 2 * record.len(), "{}", d.pending.len());
+        }
+        out.extend(d.push(b"</Objs>"));
+        out.extend(d.finish());
+        let line = format!("{}\r\n", "y".repeat(1000));
+        assert_eq!(out.len(), line.len() * count);
+        assert!(String::from_utf8(out).unwrap() == line.repeat(count));
+    }
+
+    #[test]
+    fn unclosed_trailing_record_keeps_its_text_on_finish() {
+        assert_eq!(
+            decode(b"#< CLIXML\r\n<Objs><S S=\"Error\">a</S><S S=\"Error\">partial &lt;tail"),
+            "apartial <tail"
+        );
+        assert_eq!(
+            decode(b"#< CLIXML\r\n<Objs><S S=\"warning\">cut</"),
+            "WARNING: cut\r\n"
+        );
+    }
+
+    #[test]
+    fn signed_and_nul_numeric_references_stay_literal() {
+        assert_eq!(
+            decode(b"#< CLIXML\r\n<Objs><S S=\"Error\">&#x+41;&#+65;&#0;&#x0;&#65;</S></Objs>"),
+            "&#x+41;&#+65;&#0;&#x0;A"
+        );
     }
 }

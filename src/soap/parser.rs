@@ -47,9 +47,9 @@ pub fn parse_command_id(xml: &str) -> Result<String, SoapError> {
 /// Returns [`SoapError::ParseError`] if a stream contains invalid base64, or
 /// a [`SoapError::Fault`] if the response body contains a SOAP fault.
 ///
-/// PowerShell CLIXML on stderr is decoded within this one response. A
-/// document split across Receive responses is only reassembled by callers
-/// that keep a [`ClixmlDecoder`] per command over
+/// PowerShell CLIXML on stderr is decoded within this one response, with a
+/// decoder finished at its end. A document split across Receive responses is
+/// only reassembled by callers that keep a [`ClixmlDecoder`] per command over
 /// [`parse_receive_output_raw`].
 #[allow(unreachable_pub)] // re-exported under the `__internal` feature for fuzz targets
 pub fn parse_receive_output(xml: &str) -> Result<ReceiveOutput, SoapError> {

@@ -12,7 +12,8 @@
 //! - SOAP parser: never panics on adversarial input
 //! - `parse_challenge`: never panics on adversarial input ≤ 16 KiB
 //! - stderr CLIXML decoder: output does not depend on how the stream is
-//!   sliced into Receive responses, and never panics
+//!   sliced into Receive responses, never panics, and decodes every record
+//!   of a multi-document stream (nested PowerShell) to the exact text
 //!
 //! Run with: `cargo test --features __internal --test proptest_wire_format`
 
@@ -90,6 +91,7 @@ fn clixml_fragment() -> impl Strategy<Value = Vec<u8>> {
         Just(b"#< CLIXML\r\n".to_vec()),
         Just(b"<Objs Version=\"1.1.0.1\">".to_vec()),
         Just(b"</Objs>".to_vec()),
+        Just(b"\r\n<Objs>".to_vec()),
         Just(b"<S S=\"Error\">".to_vec()),
         Just(b"<S S=\"warning\">".to_vec()),
         Just(b"<S S=\"verbose\">".to_vec()),
@@ -124,5 +126,105 @@ proptest! {
         slices.push(&stream[start..]);
 
         prop_assert_eq!(winrm_rs::__fuzz::decode_clixml_stderr(&slices), whole);
+    }
+}
+
+/// Cut `stream` at the given points (any order, any repeats).
+fn slice_at<'a>(stream: &'a [u8], cuts: &[prop::sample::Index]) -> Vec<&'a [u8]> {
+    let mut points: Vec<usize> = cuts.iter().map(|c| c.index(stream.len() + 1)).collect();
+    points.sort_unstable();
+    let mut slices: Vec<&[u8]> = Vec::new();
+    let mut start = 0;
+    for p in points {
+        slices.push(&stream[start..p]);
+        start = p;
+    }
+    slices.push(&stream[start..]);
+    slices
+}
+
+/// One stream record: kind (0 error, 1 warning, 2 verbose, 3 debug, 4 a
+/// progress object that decodes to nothing) and its text.
+fn clixml_record() -> impl Strategy<Value = (u8, String)> {
+    let ch = proptest::sample::select(vec![
+        'a', 'Z', '0', ' ', '<', '>', '&', '"', '\'', '\r', '\n', '\t', 'é', '€', '😀',
+    ]);
+    (
+        0u8..5,
+        proptest::collection::vec(ch, 0..12).prop_map(String::from_iter),
+    )
+}
+
+/// Serialize `text` the way PowerShell does in an `<S>` record: XML entities
+/// for markup, `_xHHHH_` for control characters (one per UTF-16 unit).
+fn clixml_escape(text: &str) -> String {
+    let mut out = String::new();
+    for c in text.chars() {
+        match c {
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            c if c.is_control() => {
+                for unit in c.encode_utf16(&mut [0; 2]) {
+                    out.push_str(&format!("_x{unit:04X}_"));
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+// P-CLIXML-2 — nested PowerShell: a marker (possibly doubled) followed by
+// several documents, records written as PowerShell does. Every record
+// decodes to its exact console text, whatever the slicing.
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+    #[test]
+    fn clixml_multi_document_stream_decodes_exactly(
+        documents in proptest::collection::vec(
+            proptest::collection::vec(clixml_record(), 0..5), 1..4),
+        doubled_marker in any::<bool>(),
+        separator in proptest::sample::select(vec!["", "\r\n", " \n\t"]),
+        cuts in proptest::collection::vec(any::<prop::sample::Index>(), 0..8),
+    ) {
+        let mut stream = String::from("#< CLIXML\r\n");
+        if doubled_marker {
+            stream.push_str("#< CLIXML\r\n");
+        }
+        let mut expected = String::new();
+        for (i, records) in documents.iter().enumerate() {
+            if i > 0 {
+                stream.push_str(separator);
+            }
+            stream.push_str("<Objs Version=\"1.1.0.1\" xmlns=\"http://schemas.microsoft.com/powershell/2004/04\">");
+            for (kind, text) in records {
+                let (tag, prefix) = match kind {
+                    0 => ("Error", ""),
+                    1 => ("warning", "WARNING: "),
+                    2 => ("verbose", "VERBOSE: "),
+                    3 => ("debug", "DEBUG: "),
+                    _ => {
+                        stream.push_str("<Obj S=\"progress\" RefId=\"0\"><TN RefId=\"0\"><T>x</T></TN><MS><Obj N=\"r\"><S N=\"m\">");
+                        stream.push_str(&clixml_escape(text));
+                        stream.push_str("</S></Obj></MS></Obj>");
+                        continue;
+                    }
+                };
+                stream.push_str(&format!("<S S=\"{tag}\">{}</S>", clixml_escape(text)));
+                expected.push_str(prefix);
+                expected.push_str(text);
+                if !prefix.is_empty() {
+                    expected.push_str("\r\n");
+                }
+            }
+            stream.push_str("</Objs>");
+        }
+        let stream = stream.into_bytes();
+        let whole = winrm_rs::__fuzz::decode_clixml_stderr(&[&stream]);
+        prop_assert_eq!(String::from_utf8_lossy(&whole), expected.as_str());
+        let sliced = winrm_rs::__fuzz::decode_clixml_stderr(&slice_at(&stream, &cuts));
+        prop_assert_eq!(String::from_utf8_lossy(&sliced), expected.as_str());
     }
 }

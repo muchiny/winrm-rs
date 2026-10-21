@@ -501,6 +501,110 @@ async fn streaming_large_clixml_stderr_reassembled() {
     assert_large_clixml_decoded(&stderr);
 }
 
+// === Low-level API ===
+
+/// Drive the whole shell/command state machine by hand, one primitive per
+/// step, instead of going through `run_command`.
+#[tokio::test]
+#[ignore]
+async fn low_level_command_lifecycle() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+
+    let shell_id = client.create_shell(&host).await.expect("create shell");
+    let cmd_id = client
+        .execute_command(
+            &host,
+            &shell_id,
+            "cmd.exe",
+            &["/c", "echo low-level & exit 7"],
+        )
+        .await
+        .expect("execute command");
+
+    let mut stdout = Vec::new();
+    let mut exit_code = None;
+    loop {
+        let chunk = client
+            .receive_output(&host, &shell_id, &cmd_id)
+            .await
+            .expect("receive output");
+        stdout.extend(chunk.stdout);
+        exit_code = chunk.exit_code.or(exit_code);
+        if chunk.done {
+            break;
+        }
+    }
+
+    client
+        .signal_terminate(&host, &shell_id, &cmd_id)
+        .await
+        .expect("signal terminate");
+    client
+        .delete_shell(&host, &shell_id)
+        .await
+        .expect("delete shell");
+
+    let stdout = String::from_utf8_lossy(&stdout);
+    assert!(
+        stdout.contains("low-level"),
+        "expected 'low-level' in stdout, got: {stdout:?}"
+    );
+    assert_eq!(exit_code, Some(7));
+}
+
+/// `signal_terminate` on a still-running command must make it reach `done`.
+#[tokio::test]
+#[ignore]
+async fn signal_terminate_stops_running_command() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+
+    let shell_id = client.create_shell(&host).await.expect("create shell");
+    let cmd_id = client
+        .execute_command(
+            &host,
+            &shell_id,
+            "powershell.exe",
+            &["-Command", "Start-Sleep 60"],
+        )
+        .await
+        .expect("execute command");
+
+    // One poll to confirm the command is up and still running.
+    let first = client
+        .receive_output(&host, &shell_id, &cmd_id)
+        .await
+        .expect("first receive");
+    assert!(!first.done, "Start-Sleep 60 must not be done yet");
+
+    client
+        .signal_terminate(&host, &shell_id, &cmd_id)
+        .await
+        .expect("signal terminate");
+
+    let drained = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let chunk = client
+                .receive_output(&host, &shell_id, &cmd_id)
+                .await
+                .expect("receive after terminate");
+            if chunk.done {
+                break;
+            }
+        }
+    })
+    .await;
+
+    // Clean up before asserting so a failure does not leak the shell.
+    client
+        .delete_shell(&host, &shell_id)
+        .await
+        .expect("delete shell");
+    assert!(
+        drained.is_ok(),
+        "command should be done within 20s after signal_terminate"
+    );
+}
+
 // === Working directory ===
 
 #[tokio::test]

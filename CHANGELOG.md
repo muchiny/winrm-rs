@@ -20,9 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   loop carries on; the fault is matched on its local part, whatever namespace
   prefix the server uses. Any other fault is still an error, and so is a
   `TimedOut` fault on a request other than Receive. `Shell::run_command` still
-  ends in `WinrmError::Timeout(2 * operation_timeout_secs)` for a command that
-  never produces output. Callers that already treated the fault as "poll
-  again" (psrp-rs) keep working.
+  ends in `WinrmError::Timeout(2 * operation_timeout_secs)` once its total
+  deadline is reached, whether or not the command was chatty. Callers that
+  already treated the fault as "poll again" (psrp-rs) keep working.
 - **PowerShell stderr lost text or leaked raw CLIXML.** Measured on Server
   2025: a large stderr arrives as the `#< CLIXML` marker alone in one Receive
   response, then the `<Objs>` document cut mid-tag, even mid-escape, across

@@ -865,6 +865,7 @@ mod tests {
         assert!(items.is_empty(), "no <Items> tag should yield empty");
         assert!(context.is_none());
     }
+
     fn fault(code: &str) -> SoapError {
         SoapError::Fault {
             code: code.into(),

@@ -3133,7 +3133,8 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, WinrmError::Cancelled), "got: {err}");
     }
-    // --- TimedOut fault on Receive is an empty poll (D1) ---
+
+    // --- TimedOut fault on Receive is an empty poll ---
 
     /// The fault a Windows host sends when a Receive finds no output within
     /// `OperationTimeout`; `prefix` is the namespace prefix the server picked.

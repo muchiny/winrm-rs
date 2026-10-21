@@ -1285,7 +1285,7 @@ mod tests {
         assert!(matches!(err, WinrmError::Cancelled), "got: {err}");
     }
 
-    // --- TimedOut fault on Receive is an empty poll (D1) ---
+    // --- TimedOut fault on Receive is an empty poll ---
 
     const TIMED_OUT_FAULT: &str = r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><s:Fault>
         <s:Code><s:Value>s:Receiver</s:Value><s:Subcode><s:Value>w:TimedOut</s:Value></s:Subcode></s:Code>
@@ -1391,5 +1391,78 @@ mod tests {
         let second = shell.receive_next("TC").await.unwrap();
         assert_eq!(second.stdout, b"ok");
         assert!(second.done);
+    }
+
+    /// Mount Create, Execute, then three Receives: a `#< CLIXML` marker with the
+    /// start of a document cut mid-escape, a `TimedOut` fault, and the rest of
+    /// the document with `Done`; then a catch-all for Signal/Delete.
+    async fn mount_clixml_split_by_timed_out_fault(server: &MockServer) {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        mount_open_shell_and_command(server).await;
+        let part = |bytes: &[u8], state: &str| {
+            format!(
+                r#"<s:Envelope><s:Body><rsp:ReceiveResponse><rsp:Stream Name="stderr" CommandId="TC">{}</rsp:Stream>{state}</rsp:ReceiveResponse></s:Body></s:Envelope>"#,
+                b64.encode(bytes)
+            )
+        };
+        let running = r#"<rsp:CommandState CommandId="TC" State="http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Running"/>"#;
+        let done = r#"<rsp:CommandState CommandId="TC" State="http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Done"><rsp:ExitCode>1</rsp:ExitCode></rsp:CommandState>"#;
+        let first = part(
+            b"#< CLIXML\r\n<Objs><S S=\"Error\">denied_x000D__x000A",
+            running,
+        );
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(first))
+            .up_to_n_times(1)
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(TIMED_OUT_FAULT))
+            .up_to_n_times(1)
+            .mount(server)
+            .await;
+        let last = part(b"_</S></Objs>", done);
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(last))
+            .up_to_n_times(1)
+            .mount(server)
+            .await;
+        mount_ok(server, "<s:Envelope><s:Body/></s:Envelope>", u64::MAX).await;
+    }
+
+    #[tokio::test]
+    async fn shell_run_command_decodes_clixml_split_by_a_timed_out_poll() {
+        let server = MockServer::start().await;
+        mount_clixml_split_by_timed_out_fault(&server).await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        let shell = client.open_shell("127.0.0.1").await.unwrap();
+
+        let out = shell.run_command("powershell.exe", &[]).await.unwrap();
+        // Decoded exactly once, no raw XML, and the empty poll lost nothing.
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "denied\r\n");
+        assert_eq!(out.exit_code, 1);
+    }
+
+    #[tokio::test]
+    async fn receive_next_decodes_clixml_split_by_a_timed_out_poll() {
+        let server = MockServer::start().await;
+        mount_clixml_split_by_timed_out_fault(&server).await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        let shell = client.open_shell("127.0.0.1").await.unwrap();
+
+        let cmd_id = shell.start_command("powershell.exe", &[]).await.unwrap();
+        let mut stderr = Vec::new();
+        let mut polls = 0;
+        loop {
+            let chunk = shell.receive_next(&cmd_id).await.unwrap();
+            polls += 1;
+            stderr.extend(chunk.stderr);
+            if chunk.done {
+                break;
+            }
+        }
+        assert_eq!(polls, 3, "partial document, empty poll, then the rest");
+        assert_eq!(String::from_utf8_lossy(&stderr), "denied\r\n");
     }
 }

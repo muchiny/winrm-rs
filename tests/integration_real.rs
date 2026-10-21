@@ -18,6 +18,12 @@
 //! export WINRM_TEST_PASS=vagrant
 //! cargo test --test integration_real -- --ignored
 //! ```
+//!
+//! A few tests run with a short `operation_timeout_secs` (5 to 15 s) to
+//! exercise the Receive timeout path. Under a busy bench, a request sent with
+//! such a window (for instance shell creation while dozens of other tests hit
+//! the same host) can exceed it and fail with a `TimedOut` fault. They need a
+//! quiet bench and are most reliable with `-- --ignored --test-threads=1`.
 
 use std::time::{Duration, Instant};
 use winrm_rs::{
@@ -667,16 +673,19 @@ async fn low_level_command_lifecycle() {
 /// `signal_terminate` on a still-running command must make it reach `done`.
 ///
 /// The command is silent for far longer than `operation_timeout_secs`, so the
-/// first Receive comes back as an empty, not-done poll after about 5 s: the
-/// command is provably still running when the terminate signal goes out.
+/// first Receive comes back as an empty, not-done poll after about 15 s: the
+/// command is provably still running when the terminate signal goes out. The
+/// shell is created and the command started with a default-timeout client, so
+/// slow setup requests on a busy bench stay out of the short window.
 #[tokio::test]
 #[ignore]
 async fn signal_terminate_stops_running_command() {
-    let (client, host) = test_client_with(|c| c.operation_timeout_secs = 5)
+    let (setup, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let (client, _) = test_client_with(|c| c.operation_timeout_secs = 15)
         .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
 
-    let shell_id = client.create_shell(&host).await.expect("create shell");
-    let cmd_id = client
+    let shell_id = setup.create_shell(&host).await.expect("create shell");
+    let cmd_id = setup
         .execute_command(
             &host,
             &shell_id,
@@ -712,7 +721,7 @@ async fn signal_terminate_stops_running_command() {
     .await;
 
     // Clean up before asserting so a failure does not leak the shell.
-    client
+    setup
         .delete_shell(&host, &shell_id)
         .await
         .expect("delete shell");
@@ -950,12 +959,14 @@ async fn shell_run_command_times_out() {
 #[tokio::test]
 #[ignore]
 async fn silent_command_longer_than_operation_timeout_completes() {
-    let (client, host) = test_client_with(|c| c.operation_timeout_secs = 5)
+    // 15 s leaves room for shell creation on a busy bench; the 20 s sleep still
+    // outlasts one full silent Receive window.
+    let (client, host) = test_client_with(|c| c.operation_timeout_secs = 15)
         .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
 
     let start = Instant::now();
     let out = client
-        .run_powershell(&host, "Start-Sleep 12; 'quiet-done'")
+        .run_powershell(&host, "Start-Sleep 20; 'quiet-done'")
         .await
         .expect("a silent command must survive TimedOut polls");
 
@@ -966,7 +977,7 @@ async fn silent_command_longer_than_operation_timeout_completes() {
     );
     assert_eq!(out.exit_code, 0);
     assert!(
-        start.elapsed() > Duration::from_secs(10),
+        start.elapsed() > Duration::from_secs(18),
         "returned after {:?}, before the command could have finished",
         start.elapsed()
     );

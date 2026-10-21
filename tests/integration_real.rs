@@ -1637,6 +1637,13 @@ async fn ntlm_sealed_large_output_500k_envelope() {
 #[tokio::test]
 #[ignore]
 async fn ntlm_encryption_always_over_https() {
+    if is_server_2012_r2().await {
+        eprintln!(
+            "SKIP ntlm_encryption_always_over_https: no TLS cipher suite shared with \
+             Server 2012 R2 (see ntlm_over_https_with_cbt)"
+        );
+        return;
+    }
     let (client, host) = test_client_with(|c| {
         c.auth_method = AuthMethod::Ntlm;
         c.use_tls = true;

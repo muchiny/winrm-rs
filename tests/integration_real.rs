@@ -19,7 +19,7 @@
 //! cargo test --test integration_real -- --ignored
 //! ```
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use winrm_rs::{
     AuthMethod, CancellationToken, EncryptionMode, WinrmClient, WinrmConfig, WinrmCredentials,
     WinrmError,
@@ -873,6 +873,73 @@ async fn cancel_long_running_command() {
     assert!(
         err.contains("cancelled"),
         "expected Cancelled error, got: {err}"
+    );
+}
+
+// === Timeouts ===
+
+/// `connect_timeout_secs` bounds the TCP connect to an unreachable host.
+///
+/// `10.255.255.1` is non-routable, so the SYN goes unanswered. Needs no
+/// WinRM server and no credentials, but is `#[ignore]` because it touches the
+/// network. If the local network answers with an immediate ICMP unreachable,
+/// the call fails fast and the assertion still holds.
+#[tokio::test]
+#[ignore]
+async fn connect_timeout_is_honoured() {
+    let config = WinrmConfig {
+        auth_method: AuthMethod::Basic,
+        connect_timeout_secs: 2,
+        max_retries: 0,
+        ..Default::default()
+    };
+    let client = WinrmClient::new(config, WinrmCredentials::new("u", "p", "")).unwrap();
+
+    let start = Instant::now();
+    let err = client
+        .run_command("10.255.255.1", "cmd.exe", &["/c", "ver"])
+        .await
+        .unwrap_err();
+    assert!(
+        start.elapsed() < Duration::from_secs(6),
+        "took {:?}: {err}",
+        start.elapsed()
+    );
+}
+
+/// A command that outlives `operation_timeout_secs` must surface
+/// `WinrmError::Timeout(10)` (twice the operation timeout), within 20 s.
+///
+/// CURRENTLY FAILS because of crate bug D1: once a Receive stays silent for
+/// `operation_timeout_secs`, the server answers with a `w:TimedOut` fault, and
+/// the crate returns it as `Err(WinrmError::Soap(..))` instead of treating it
+/// as an empty poll. The test only reaches `Timeout(10)` by a race, when the
+/// `-EncodedCommand` start-up output delays that first fault. Kept as written
+/// (and `#[ignore]`) so it goes green once D1 is fixed; see the
+/// `.superpowers` live-validation notes.
+#[tokio::test]
+#[ignore]
+async fn shell_run_command_times_out() {
+    let (client, host) = test_client_with(|c| c.operation_timeout_secs = 5)
+        .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let shell = client.open_shell(&host).await.expect("open shell");
+
+    let start = Instant::now();
+    let result = shell
+        .run_command("powershell.exe", &["-Command", "Start-Sleep 60"])
+        .await;
+    let elapsed = start.elapsed();
+
+    // Close regardless of the outcome, so a failing run leaves no shell behind.
+    let _ = shell.close().await;
+
+    assert!(
+        matches!(&result, Err(WinrmError::Timeout(10))),
+        "expected Err(Timeout(10)), got {result:?} after {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "timeout took {elapsed:?}"
     );
 }
 

@@ -1488,7 +1488,7 @@ mod tests {
             client_key_pem: Some(key_path.to_string_lossy().into()),
             ..Default::default()
         };
-        // Should fail at Identity::from_pem with invalid PEM
+        // Should fail while loading the PEM files (no certificate section)
         let result = WinrmClient::new(config, test_creds());
         assert!(result.is_err());
 

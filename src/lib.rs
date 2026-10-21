@@ -92,6 +92,8 @@ mod error;
 mod ntlm;
 mod shell;
 mod soap;
+#[cfg(test)]
+mod test_pki;
 mod tls;
 mod transfer;
 mod transport;

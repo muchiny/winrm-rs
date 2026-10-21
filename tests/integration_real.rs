@@ -2108,8 +2108,10 @@ fn cert_auth_ca_path() -> Option<std::path::PathBuf> {
 
 /// Build a Certificate-auth client from the PEM paths held in two variables.
 ///
-/// `None` when the bench host or either variable is missing. The credentials
-/// are unused by the Certificate method but required by the constructor.
+/// `None` when the bench host or either variable is missing; panics if the
+/// client cannot be built (a bad PEM file must not pass for a missing bench).
+/// The credentials are unused by the Certificate method but required by the
+/// constructor.
 fn cert_client_from_env(cert_var: &str, key_var: &str) -> Option<(WinrmClient, String)> {
     let host = std::env::var("WINRM_TEST_HOST").ok()?;
     let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
@@ -2125,7 +2127,10 @@ fn cert_client_from_env(cert_var: &str, key_var: &str) -> Option<(WinrmClient, S
         client_key_pem: Some(key),
         ..Default::default()
     };
-    let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).ok()?;
+    let client = match WinrmClient::new(config, WinrmCredentials::new(user, pass, "")) {
+        Ok(client) => client,
+        Err(e) => panic!("Certificate-auth client from {cert_var}/{key_var}: {e}"),
+    };
     Some((client, host))
 }
 
@@ -2259,17 +2264,10 @@ if ($Matches[1] -ne 'Enabled') { exit 3 }
 
 /// A mapped client certificate authenticates a command as `vagrant`.
 ///
-/// CURRENTLY FAILS (HTTP 401) although the bench is correctly prepared: the
-/// crate has two defects on this path, found by comparing with `curl` and an
-/// `openssl s_server`:
-/// 1. `transport.rs` builds the rustls config with `.with_no_client_auth()` and
-///    installs it through `tls_backend_preconfigured`, which discards the
-///    `reqwest::Identity`, so no client certificate is ever presented
-///    (`s_server -Verify 1`: "peer did not return a certificate").
-/// 2. `auth/certificate.rs` sends no `Authorization` header; WinRM expects
-///    `Authorization: http://schemas.dmtf.org/wbem/wsman/1/wsman/secprofile/https/mutual`
-///    (curl with that header and the same certificate gets past 401).
-/// Kept as written (and `#[ignore]`) so it goes green once both are fixed.
+/// Needs both halves of Certificate auth: the certificate presented in the
+/// TLS handshake, and the `Authorization:
+/// http://schemas.dmtf.org/wbem/wsman/1/wsman/secprofile/https/mutual` header
+/// that makes WinRM map it to an account (without either, HTTP 401).
 #[tokio::test]
 #[ignore]
 async fn certificate_auth_whoami() {
@@ -2289,18 +2287,28 @@ async fn certificate_auth_whoami() {
     );
 }
 
-/// A certificate signed by a CA the server does not trust is rejected with an
-/// explicit error, promptly: not a success, and not a hang (HTTP.sys may ask
-/// for the certificate by TLS renegotiation, which rustls does not support).
+/// A certificate signed by a CA the server does not trust is rejected by the
+/// server, promptly: an authentication failure (HTTP 401) or a TLS-level
+/// rejection, not a success, not a local configuration error, and not a hang
+/// (HTTP.sys may ask for the certificate by TLS renegotiation, which rustls
+/// does not support).
 ///
-/// NOTE: while `certificate_auth_whoami` fails (see its doc), this test passes
-/// for the wrong reason: every request gets a 401, whatever the certificate.
-/// It only becomes discriminating once the valid certificate authenticates.
+/// Positive control in the same test: the mapped certificate, sent through
+/// the same code path to the same host, authenticates. Without it, a client
+/// that never presents any certificate would pass the rejection check too.
 #[tokio::test]
 #[ignore]
 async fn certificate_auth_unmapped_cert_is_rejected() {
-    let (client, host) = test_client_rogue_cert()
-        .expect("set WINRM_TEST_HOST, WINRM_TEST_PASS and eval tests/scripts/make-client-cert.sh");
+    const BENCH: &str =
+        "set WINRM_TEST_HOST, WINRM_TEST_PASS and eval tests/scripts/make-client-cert.sh";
+    let (mapped, host) = test_client_cert().expect(BENCH);
+    let out = mapped
+        .run_command(&host, "whoami", &[])
+        .await
+        .expect("positive control: the mapped certificate must authenticate");
+    assert_eq!(out.exit_code, 0, "positive control: whoami exit code");
+
+    let (client, host) = test_client_rogue_cert().expect(BENCH);
     let start = Instant::now();
     let result = tokio::time::timeout(
         Duration::from_secs(30),
@@ -2310,9 +2318,16 @@ async fn certificate_auth_unmapped_cert_is_rejected() {
     let elapsed = start.elapsed();
     eprintln!("rogue certificate outcome after {elapsed:?}: {result:?}");
     let result = result.expect("rogue certificate request hung for 30 s");
-    assert!(
-        result.is_err(),
-        "unmapped certificate must not authenticate"
-    );
+    match result {
+        Ok(out) => panic!("unmapped certificate authenticated: {out:?}"),
+        Err(WinrmError::AuthFailed(msg)) => {
+            assert!(msg.contains("HTTP 401"), "expected a 401 rejection: {msg}");
+        }
+        // A server may also refuse the certificate during the handshake.
+        Err(WinrmError::Http(e)) => {
+            assert!(!e.is_builder(), "local client configuration error: {e}");
+        }
+        Err(e) => panic!("expected a 401 or a TLS-level rejection, got: {e}"),
+    }
     assert!(elapsed < Duration::from_secs(30), "took {elapsed:?}");
 }

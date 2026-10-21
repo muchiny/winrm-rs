@@ -1,17 +1,25 @@
 // Certificate-based authentication for WinRM.
 //
 // Uses client TLS certificates for authentication. The certificate
-// must be configured on the WinRM service.
+// must be mapped to a local account on the WinRM service.
 
-use reqwest::header::CONTENT_TYPE;
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 
 use crate::auth::AuthTransport;
 use crate::error::WinrmError;
 
+/// `Authorization` value announcing the HTTPS mutual-authentication security
+/// profile (MS-WSMV). WinRM (HTTP.sys) only maps the TLS client certificate
+/// to an account when a request carries it; without it the answer is 401.
+const MUTUAL_TLS_SECPROFILE: &str =
+    "http://schemas.dmtf.org/wbem/wsman/1/wsman/secprofile/https/mutual";
+
 /// Certificate authentication transport.
 ///
-/// Certificate auth uses TLS client cert -- no Authorization header needed.
-/// The `reqwest::Client` must be configured with the cert at construction time.
+/// The TLS client certificate itself is presented by the `reqwest::Client`,
+/// whose rustls config is built with it at construction time
+/// (`HttpTransport::new`). Each request carries the mutual security profile
+/// in its `Authorization` header so the server uses that certificate.
 pub(crate) struct CertificateAuth;
 
 impl AuthTransport for CertificateAuth {
@@ -24,6 +32,7 @@ impl AuthTransport for CertificateAuth {
         let resp = http
             .post(url)
             .header(CONTENT_TYPE, "application/soap+xml;charset=UTF-8")
+            .header(AUTHORIZATION, MUTUAL_TLS_SECPROFILE)
             .body(body)
             .send()
             .await
@@ -44,13 +53,20 @@ impl AuthTransport for CertificateAuth {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::method;
+    use wiremock::matchers::{header, method};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    /// HTTP.sys only maps the TLS client certificate to an account when the
+    /// request announces the HTTPS mutual security profile (MS-WSMV); without
+    /// this header the server answers 401 even to a mapped certificate.
     #[tokio::test]
-    async fn certificate_auth_sends_without_authorization_header() {
+    async fn certificate_auth_sends_mutual_secprofile_authorization_header() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
+            .and(header(
+                "Authorization",
+                "http://schemas.dmtf.org/wbem/wsman/1/wsman/secprofile/https/mutual",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_string("<ok/>"))
             .mount(&server)
             .await;
@@ -60,8 +76,11 @@ mod tests {
         let result = auth
             .send_authenticated(&http, &server.uri(), "body".into())
             .await;
-        assert!(result.is_ok());
         assert_eq!(result.unwrap(), "<ok/>");
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        let values: Vec<_> = reqs[0].headers.get_all("authorization").iter().collect();
+        assert_eq!(values.len(), 1, "exactly one Authorization header");
     }
 
     #[tokio::test]

@@ -7,8 +7,12 @@
 use std::sync::{Arc, Mutex};
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::pki_types::pem::{self, PemObject};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, Error, SignatureScheme};
+use zeroize::Zeroizing;
+
+use crate::error::WinrmError;
 
 /// A [`ServerCertVerifier`] wrapper that captures the server's end-entity
 /// certificate (DER bytes) during the TLS handshake, then delegates all
@@ -139,6 +143,85 @@ impl ServerCertVerifier for NoVerifier {
         rustls::crypto::ring::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
+    }
+}
+
+/// Client certificate chain and private key for `AuthMethod::Certificate`,
+/// ready for `rustls::ConfigBuilder::with_client_auth_cert`.
+///
+/// Deliberately not `Debug`: the private key must never reach logs.
+pub(crate) struct ClientAuthCert {
+    /// End-entity certificate first, then any intermediates, as in the file.
+    pub(crate) chain: Vec<CertificateDer<'static>>,
+    /// PKCS#8, PKCS#1 (RSA) or SEC1 (EC) private key.
+    pub(crate) key: PrivateKeyDer<'static>,
+}
+
+/// Load the TLS client certificate chain and private key from PEM files.
+///
+/// `cert_path` must hold at least one `CERTIFICATE` section; other sections
+/// are ignored. `key_path` must hold a `PRIVATE KEY` (PKCS#8),
+/// `RSA PRIVATE KEY` (PKCS#1) or `EC PRIVATE KEY` (SEC1) section; the first
+/// one is used. Whether the key matches the certificate is checked later, by
+/// rustls, when the client configuration is built.
+///
+/// Every failure is a [`WinrmError::AuthFailed`] naming the file; the message
+/// never quotes the file contents, so no key material can leak through it.
+pub(crate) fn load_client_auth_cert(
+    cert_path: &str,
+    key_path: &str,
+) -> Result<ClientAuthCert, WinrmError> {
+    let cert_pem = std::fs::read(cert_path).map_err(|e| {
+        WinrmError::AuthFailed(format!("failed to read client cert {cert_path}: {e}"))
+    })?;
+    let key_pem = Zeroizing::new(std::fs::read(key_path).map_err(|e| {
+        WinrmError::AuthFailed(format!("failed to read client key {key_path}: {e}"))
+    })?);
+
+    let chain = CertificateDer::pem_slice_iter(&cert_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| {
+            WinrmError::AuthFailed(format!(
+                "invalid PEM in client cert {cert_path}: {}",
+                describe_pem_error(&e)
+            ))
+        })?;
+    if chain.is_empty() {
+        return Err(WinrmError::AuthFailed(format!(
+            "client cert {cert_path} contains no certificate (expected a CERTIFICATE PEM section)"
+        )));
+    }
+
+    let key = match PrivateKeyDer::from_pem_slice(&key_pem) {
+        Ok(key) => key,
+        Err(pem::Error::NoItemsFound) => {
+            return Err(WinrmError::AuthFailed(format!(
+                "client key {key_path} contains no private key (expected a PRIVATE KEY, \
+                 RSA PRIVATE KEY or EC PRIVATE KEY PEM section)"
+            )));
+        }
+        Err(e) => {
+            return Err(WinrmError::AuthFailed(format!(
+                "invalid PEM in client key {key_path}: {}",
+                describe_pem_error(&e)
+            )));
+        }
+    };
+
+    Ok(ClientAuthCert { chain, key })
+}
+
+/// Describe a PEM parse error without its payload: some variants carry
+/// bytes of the input (a header line, base64 details), which for a key file
+/// could be key material.
+fn describe_pem_error(e: &pem::Error) -> &'static str {
+    match e {
+        pem::Error::MissingSectionEnd { .. } => "a section has no END line",
+        pem::Error::IllegalSectionStart { .. } => "malformed BEGIN line",
+        pem::Error::Base64Decode(_) => "section body is not valid base64",
+        pem::Error::NoItemsFound => "no PEM section found",
+        pem::Error::SectionTooLarge => "PEM section too large",
+        _ => "malformed PEM",
     }
 }
 

@@ -46,9 +46,16 @@ pub struct WinrmConfig {
     /// Only `WinrmError::Http` errors trigger a retry; authentication and
     /// SOAP faults are returned immediately.
     pub max_retries: u32,
-    /// Path to client certificate PEM file (for `AuthMethod::Certificate`).
+    /// Path to the client certificate PEM file (for `AuthMethod::Certificate`).
+    ///
+    /// Holds one or more `CERTIFICATE` sections: the end-entity certificate
+    /// first, then any intermediates. Read when the client is built.
     pub client_cert_pem: Option<String>,
-    /// Path to client private key PEM file (for `AuthMethod::Certificate`).
+    /// Path to the client private key PEM file (for `AuthMethod::Certificate`).
+    ///
+    /// Accepted encodings: `PRIVATE KEY` (PKCS#8), `RSA PRIVATE KEY` (PKCS#1)
+    /// and `EC PRIVATE KEY` (SEC1), unencrypted. It must match the end-entity
+    /// certificate of [`client_cert_pem`](Self::client_cert_pem).
     pub client_key_pem: Option<String>,
     /// HTTP proxy URL (e.g. `"http://proxy:8080"`).
     ///
@@ -149,10 +156,16 @@ pub enum AuthMethod {
     /// Uses SPNEGO Negotiate tokens via the system Kerberos library.
     /// The service principal is derived as `HTTP/<hostname>`.
     Kerberos,
-    /// TLS client certificate authentication.
+    /// TLS client certificate authentication. Requires HTTPS (`use_tls = true`).
     ///
-    /// The `reqwest::Client` is configured with the client cert at construction
-    /// time. No `Authorization` header is sent; the TLS handshake authenticates.
+    /// The certificate chain and key from `client_cert_pem` / `client_key_pem`
+    /// are presented in the TLS handshake, and every request carries
+    /// `Authorization: http://schemas.dmtf.org/wbem/wsman/1/wsman/secprofile/https/mutual`
+    /// (MS-WSMV), which tells WinRM to authenticate with that certificate. The
+    /// server must trust the issuing CA and map the certificate to a local
+    /// account (`WSMan:\localhost\ClientCertificate`). Over plain HTTP no
+    /// certificate can be presented: the client builds, with a warning, but
+    /// cannot authenticate.
     Certificate,
     /// CredSSP authentication for double-hop credential delegation.
     ///

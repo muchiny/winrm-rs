@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`AuthMethod::Certificate` never authenticated (always HTTP 401).** Two
+  defects, both on the path: the transport installed its rustls config with
+  `with_no_client_auth()`, which made `reqwest` drop the client identity, so
+  no certificate was presented in the TLS handshake; and requests carried no
+  `Authorization` header, while WinRM only maps the client certificate when
+  it gets `Authorization:
+  http://schemas.dmtf.org/wbem/wsman/1/wsman/secprofile/https/mutual`
+  (MS-WSMV). Over HTTPS the rustls config is now built with the certificate
+  chain from `client_cert_pem` and the key from `client_key_pem`
+  (`PRIVATE KEY` / PKCS#8, `RSA PRIVATE KEY` / PKCS#1 or `EC PRIVATE KEY` /
+  SEC1), and every Certificate request sends that header. Server-certificate
+  verification and channel binding are unchanged. A file with no certificate,
+  no key, malformed PEM, or a key rustls rejects (unsupported, or not matching
+  the certificate) is now a `WinrmError::AuthFailed` at construction that names
+  the file and never quotes its contents (it used to be a `WinrmError::Http`
+  builder error, or no error at all for a mismatched key). Over plain HTTP
+  the client still builds, now with a warning that no certificate can be
+  presented. Validated live against Server 2025 with a mapped certificate
+  (whoami returns the mapped account) and an untrusted one (401).
 - **A command silent for longer than `operation_timeout_secs` failed with a
   `TimedOut` fault.** The server answers a Receive that finds no output within
   `OperationTimeout` with the WS-Management fault `w:TimedOut`, which means

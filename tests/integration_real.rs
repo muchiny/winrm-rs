@@ -49,16 +49,24 @@ fn test_client_with(tweak: impl FnOnce(&mut WinrmConfig)) -> Option<(WinrmClient
     Some((client, host))
 }
 
-/// Number of shells currently open on the server, as seen by WS-Management.
+/// Number of open shells created with the given `IdleTimeOut`, as seen by
+/// WS-Management.
 ///
-/// The shell that runs this very probe is part of the count, so only compare
-/// two readings taken the same way.
-async fn open_shell_count(client: &WinrmClient, host: &str) -> usize {
+/// A distinctive idle timeout marks the shells a test owns (the server reports
+/// it back as `PT<n>.000S`), so shells opened or reaped concurrently by other
+/// tests do not move the count. Call it with a client that does not carry the
+/// marker, so the probe's own shell is not counted.
+async fn open_shell_count_with_idle_timeout(
+    client: &WinrmClient,
+    host: &str,
+    idle_secs: u64,
+) -> usize {
+    let script = format!(
+        "@(Get-WSManInstance -ResourceURI shell -Enumerate -ErrorAction SilentlyContinue | \
+         Where-Object {{ $_.IdleTimeOut -eq 'PT{idle_secs}.000S' }}).Count"
+    );
     let out = client
-        .run_powershell(
-            host,
-            "@(Get-WSManInstance -ResourceURI shell -Enumerate -ErrorAction SilentlyContinue).Count",
-        )
+        .run_powershell(host, &script)
         .await
         .expect("count open shells");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -529,26 +537,42 @@ async fn streaming_large_clixml_stderr_reassembled() {
 
 // === Output cap ===
 
-/// The two cap tests share the server's shell table: the leak test compares
-/// two shell counts, so the other must not open a shell in between.
-static OUTPUT_CAP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 /// Hitting `max_output_bytes` aborts the call with `Transfer`, and the shell
 /// the call opened must not stay behind on the server.
+///
+/// Only shells carrying this test's own `IdleTimeOut` are counted, so the
+/// strict `after == before == 0` check holds even while other live tests open
+/// and close shells in the same process or the server reaps old ones.
 #[tokio::test]
 #[ignore]
 async fn max_output_bytes_aborts_and_releases_shell() {
-    let _serial = OUTPUT_CAP_LOCK.lock().await;
-    let (client, host) = test_client_with(|c| c.max_output_bytes = Some(64 * 1024))
-        .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    // Unique per process, below the server's 7200 s default ceiling.
+    let marker = 4000 + u64::from(std::process::id() % 3000);
+    let (client, host) = test_client_with(|c| {
+        c.max_output_bytes = Some(64 * 1024);
+        c.idle_timeout_secs = Some(marker);
+    })
+    .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    // Unmarked client for the probes.
+    let (counter, _) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
 
-    let before = open_shell_count(&client, &host).await;
+    // Positive control: a marked shell must be seen, otherwise a failed
+    // enumeration would read as 0 and the test would pass vacuously.
+    let control = client.open_shell(&host).await.expect("open control shell");
+    let seen = open_shell_count_with_idle_timeout(&counter, &host, marker).await;
+    control.close().await.expect("close control shell");
+    assert_eq!(seen, 1, "marker filter did not see the control shell");
+
+    let before = open_shell_count_with_idle_timeout(&counter, &host, marker).await;
+    assert_eq!(before, 0, "marker {marker} already used by a stale shell");
+
     let err = client
         .run_powershell(&host, "'x' * (1024 * 1024)")
         .await
         .unwrap_err();
-    let after = open_shell_count(&client, &host).await;
-    eprintln!("open shells: before={before} after={after}");
+    // `run_powershell` closes its shell before it returns, error or not.
+    let after = open_shell_count_with_idle_timeout(&counter, &host, marker).await;
+    eprintln!("marked open shells: before={before} after={after}");
 
     assert!(
         matches!(&err, WinrmError::Transfer(m) if m.contains("max_output_bytes")),
@@ -557,19 +581,32 @@ async fn max_output_bytes_aborts_and_releases_shell() {
     assert_eq!(after, before, "shell leaked after max_output_bytes abort");
 }
 
-/// The cap counts raw bytes as received: ~80 KB of decoded stderr is far more
-/// than that once wrapped in CLIXML, and must trip a 32 KiB cap.
+/// The cap counts raw bytes as received, before CLIXML is decoded. Tabs are
+/// escaped as `_x0009_` (7 bytes for 1), so this script decodes to ~29 KB of
+/// stderr, under the 64 KiB cap, while the raw CLIXML is ~160 KB, far over it.
+/// Only a cap applied to the raw bytes can trip.
 #[tokio::test]
 #[ignore]
 async fn max_output_bytes_counts_raw_clixml_stderr() {
-    let _serial = OUTPUT_CAP_LOCK.lock().await;
-    let (client, host) = test_client_with(|c| c.max_output_bytes = Some(32 * 1024))
-        .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    const CAP: usize = 64 * 1024;
+    const SCRIPT: &str = "1..40 | % { Write-Error ([string][char]9 * 500) }";
 
-    let err = client
-        .run_powershell(&host, "1..400 | % { Write-Error ('e' * 200) }")
+    // Precondition: uncapped, the decoded stderr fits under the cap.
+    let (uncapped, host) = test_client_with(|c| c.max_output_bytes = None)
+        .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let out = uncapped
+        .run_powershell(&host, SCRIPT)
         .await
-        .unwrap_err();
+        .expect("uncapped run");
+    assert!(
+        out.stderr.len() < CAP / 2,
+        "decoded stderr ({} bytes) must stay well under the {CAP}-byte cap",
+        out.stderr.len()
+    );
+
+    let (client, host) = test_client_with(|c| c.max_output_bytes = Some(CAP))
+        .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let err = client.run_powershell(&host, SCRIPT).await.unwrap_err();
     assert!(
         matches!(&err, WinrmError::Transfer(m) if m.contains("max_output_bytes")),
         "expected Transfer(max_output_bytes), got: {err}"

@@ -22,9 +22,15 @@
 use std::time::Duration;
 use winrm_rs::{
     AuthMethod, CancellationToken, EncryptionMode, WinrmClient, WinrmConfig, WinrmCredentials,
+    WinrmError,
 };
 
 fn test_client() -> Option<(WinrmClient, String)> {
+    test_client_with(|_| {})
+}
+
+/// Same as [`test_client`], with a last-minute tweak applied to the config.
+fn test_client_with(tweak: impl FnOnce(&mut WinrmConfig)) -> Option<(WinrmClient, String)> {
     let host = std::env::var("WINRM_TEST_HOST").ok()?;
     let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
     let pass = std::env::var("WINRM_TEST_PASS").ok()?;
@@ -33,13 +39,33 @@ fn test_client() -> Option<(WinrmClient, String)> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(5985);
 
-    let config = WinrmConfig {
+    let mut config = WinrmConfig {
         auth_method: AuthMethod::Basic,
         port,
         ..Default::default()
     };
+    tweak(&mut config);
     let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).ok()?;
     Some((client, host))
+}
+
+/// Number of shells currently open on the server, as seen by WS-Management.
+///
+/// The shell that runs this very probe is part of the count, so only compare
+/// two readings taken the same way.
+async fn open_shell_count(client: &WinrmClient, host: &str) -> usize {
+    let out = client
+        .run_powershell(
+            host,
+            "@(Get-WSManInstance -ResourceURI shell -Enumerate -ErrorAction SilentlyContinue).Count",
+        )
+        .await
+        .expect("count open shells");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    stdout
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("open_shell_count: cannot parse stdout {stdout:?}"))
 }
 
 /// Windows Server 2012 R2 reports OS version `6.3.x`.
@@ -499,6 +525,55 @@ async fn streaming_large_clixml_stderr_reassembled() {
     }
     shell.close().await.ok();
     assert_large_clixml_decoded(&stderr);
+}
+
+// === Output cap ===
+
+/// The two cap tests share the server's shell table: the leak test compares
+/// two shell counts, so the other must not open a shell in between.
+static OUTPUT_CAP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Hitting `max_output_bytes` aborts the call with `Transfer`, and the shell
+/// the call opened must not stay behind on the server.
+#[tokio::test]
+#[ignore]
+async fn max_output_bytes_aborts_and_releases_shell() {
+    let _serial = OUTPUT_CAP_LOCK.lock().await;
+    let (client, host) = test_client_with(|c| c.max_output_bytes = Some(64 * 1024))
+        .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+
+    let before = open_shell_count(&client, &host).await;
+    let err = client
+        .run_powershell(&host, "'x' * (1024 * 1024)")
+        .await
+        .unwrap_err();
+    let after = open_shell_count(&client, &host).await;
+    eprintln!("open shells: before={before} after={after}");
+
+    assert!(
+        matches!(&err, WinrmError::Transfer(m) if m.contains("max_output_bytes")),
+        "{err}"
+    );
+    assert_eq!(after, before, "shell leaked after max_output_bytes abort");
+}
+
+/// The cap counts raw bytes as received: ~80 KB of decoded stderr is far more
+/// than that once wrapped in CLIXML, and must trip a 32 KiB cap.
+#[tokio::test]
+#[ignore]
+async fn max_output_bytes_counts_raw_clixml_stderr() {
+    let _serial = OUTPUT_CAP_LOCK.lock().await;
+    let (client, host) = test_client_with(|c| c.max_output_bytes = Some(32 * 1024))
+        .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+
+    let err = client
+        .run_powershell(&host, "1..400 | % { Write-Error ('e' * 200) }")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, WinrmError::Transfer(m) if m.contains("max_output_bytes")),
+        "expected Transfer(max_output_bytes), got: {err}"
+    );
 }
 
 // === Low-level API ===

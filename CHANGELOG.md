@@ -82,9 +82,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `Negotiate` requests before (every sealed request rejected), 2 now (one
   handshake), with every later request sealed. The bench allows unencrypted
   traffic (`AllowUnencrypted = true`), which is why the plaintext fallback
-  went unnoticed. The request that completes the NTLM handshake (Type 3) and
-  any re-authentication still go out in plaintext, so
-  `EncryptionMode::Always` does not guarantee encryption.
+  went unnoticed. See also the `### Security` entry: the remaining plaintext
+  paths are gone too.
 - **PowerShell stderr lost text or leaked raw CLIXML.** Measured on Server
   2025: a large stderr arrives as the `#< CLIXML` marker alone in one Receive
   response, then the `<Objs>` document cut mid-tag, even mid-escape, across
@@ -113,6 +112,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Behaviour change: NTLM-sealed requests fail closed** (see `### Security`).
+  A server that answers sealed requests with an error used to get the
+  request again in plaintext after a fresh handshake, which worked when it
+  allowed unencrypted traffic; the call now fails instead. What you see: an
+  HTTP error answer that is not sealed gives
+  `WinrmError::AuthFailed("HTTP <status> to an NTLM-sealed request, answer not
+  sealed (<n> bytes)")`; a sealed answer that does not unseal (framing,
+  signature, sequence) gives `WinrmError::Ntlm(..)` (it was `AuthFailed`);
+  a sealed 4xx/5xx other than a SOAP fault gives `AuthFailed("HTTP <status>:
+  <excerpt>")`. With `max_retries > 0`, a sealed request is retried only on a
+  connection error, before anything was sent. Use HTTPS (sealing is then off
+  under `EncryptionMode::Auto`), or `EncryptionMode::Never` for debugging
+  against a server that does not seal.
+- **NTLM-sealed requests of one client no longer wait for each other.** The
+  sealing session was held under one lock for the whole HTTP exchange, so a
+  Receive long-poll on one shell held up every other request of the same
+  `WinrmClient` (measured on Server 2025: a quick `echo` took 10.3 s during
+  another shell's 10 s Receive, 0.15 s over Basic). Sealed requests now use
+  a pool of authenticated connections (one TCP connection and NTLM session
+  each, at most 8 kept idle, none reused after 60 s idle): concurrent
+  requests run on separate connections, each with its own handshake
+  (measured: 0.19 s for the same `echo`).
+- **Response bodies are capped** at `4 * max(max_envelope_size, 512 KiB)`
+  bytes (2 MiB by default) for every auth method, before unsealing or
+  parsing; a larger body is `WinrmError::Soap(SoapError::ParseError("response
+  body exceeds <n> bytes"))`. `MaxEnvelopeSize` bounds what the server sends;
+  the factor covers UTF-16 encoding and sealing framing, and the floor keeps
+  small `max_envelope_size` settings from rejecting legitimate faults. Error
+  messages quote at most 512 characters of a server body.
 - **Behaviour change: `WinrmClient::run_command` and `run_powershell` have no
   overall time limit any more** (nor `download_file`, which runs through
   `run_powershell`), a consequence of the `TimedOut` fix above.
@@ -151,6 +179,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and `rustls` with `default-features = false`, dropping `aws-lc-rs`,
   `aws-lc-sys`, `cmake` and `quinn` from the dependency tree (no C toolchain
   needed). The `ring` crypto provider is installed in `HttpTransport::new`.
+
+### Security
+
+- **NTLM message sealing no longer falls back to plaintext and never sends a
+  request twice.** With `EncryptionMode::Auto` over HTTP or `Always`: the
+  handshake that sets up sealing ends with an empty Type 3 body (the SOAP
+  body used to ride on it in plaintext); every SOAP request after it is
+  sealed. A sealed request that fails is no longer re-sent in plaintext
+  after a new handshake (an active attacker on plain HTTP could force that
+  with any non-fault error answer, and a request the server had already
+  executed ran twice: a command, a stdin write, an upload chunk). Only a 401
+  on a reused connection, which means the connection lost its session and
+  nothing ran, is re-sent, sealed, on a new connection, once. A body
+  labelled sealed that does not unseal is an error instead of being parsed
+  as a plaintext fault (a forged fault would have been accepted and the RC4
+  keystream desynchronised), and a failed exchange discards its connection
+  and session. `unseal_body` checks the whole MS-WSMV frame (signature
+  length 16, `OriginalContent` `Length` with checked arithmetic, payload of
+  exactly that length followed by the closing boundary, decrypted length)
+  and never quotes the body in its errors. Verified on Server 2025 through a
+  recording relay: no request body crossed unsealed, one handshake per
+  connection; also with psrp-rs and bridge-mcp over NTLM on HTTP. New fuzz
+  target `fuzz_ntlm_unseal_body` and proptests for the framing.
 
 ### Documentation
 

@@ -8,10 +8,10 @@ déduit de la lecture du code.
 
 | Crate | Commit | Ce qui a été exécuté |
 |---|---|---|
-| `winrm-rs` | `f30b7f3` (branche `test/live-coverage`, dernier commit de code ou de test ; le commit de documentation qui le suit ne touche que le `CHANGELOG` et ce document ; les runs ci-dessous ont été faits sur cet arbre) | Suite live complète contre Server 2025 avec `--features credssp,__internal` (78 tests), les deux `eval` du banc faits : **78 passés, 0 échoué** (459 s) avec `--test-threads=1` ; en parallélisme par défaut, **78 passés, 0 échoué** (209 s ; `shell_run_command_times_out` reste sensible à la charge). Server 2012 R2 (VM reconstruite) : les tests NTLM et deux tests Basic seulement, voir « Limites connues ». Runs précédents : à `92341f6`, 78 passés en série comme en parallèle ; à `4f229dc`, 78 passés en série, 77 passés et 1 échoué (`shell_run_command_times_out`) en parallèle ; à `c46f8c6`, 74 passés ; à `4cbebfb`, 66 passés en série, 65 passés et 1 échoué en parallèle. Les tests à timeout court se lisent plus fiablement avec `--test-threads=1` (voir l'en-tête de `tests/integration_real.rs`). |
+| `winrm-rs` | `d69030d` (branche `test/live-coverage`, dernier commit de code ou de test, après `3c6fdbf` qui ajoute les API `*_with_timeout` ; le commit de documentation qui le suit ne touche que le `CHANGELOG` et ce document ; les runs ci-dessous ont été faits sur cet arbre) | Suite live complète contre Server 2025 avec `--features credssp,__internal` (80 tests), les deux `eval` du banc faits : **80 passés, 0 échoué** (463 s) avec `--test-threads=1` ; en parallélisme par défaut, **80 passés, 0 échoué** (207 s ; `shell_run_command_times_out` reste sensible à la charge). Server 2012 R2 (VM reconstruite) : les tests NTLM et deux tests Basic seulement, voir « Limites connues ». Runs précédents : à `f30b7f3` et `92341f6`, 78 passés en série comme en parallèle ; à `4f229dc`, 78 passés en série, 77 passés et 1 échoué (`shell_run_command_times_out`) en parallèle ; à `4cbebfb`, 66 passés en série, 65 passés et 1 échoué en parallèle. Les tests à timeout court se lisent plus fiablement avec `--test-threads=1` (voir l'en-tête de `tests/integration_real.rs`). |
 | `winrm-rs` (Kerberos) | `f8a1272` (code de production identique à `c46f8c6`), plus les tests Kerberos ajoutés par le commit qui suit | Contre le contrôleur de domaine `winrm.test` (banc séparé, `tests/vagrant/dc/README.md`), avec `--features kerberos` et un TGT obtenu par `kinit vagrant@WINRM.TEST` : `cargo test --features kerberos --test integration_real kerberos -- --ignored` → **3 passés, 0 échoué** (22 s). |
-| `psrp-rs` | `4a79189` (`origin/main`) | Suite live (8 tests) contre le `winrm-rs` local (`[patch.crates-io]`, worktree jetable) : **8 passés, 0 échoué** contre `winrm-rs` `4cbebfb` (Basic), puis contre `84f1898` en Basic et en NTLM sur HTTP. Contre `winrm-rs` `4f229dc`, `92341f6` puis `f30b7f3` (scellement qui échoue fermé et sans renvoi, une connexion authentifiée par échange, CBT de la connexion) : **8 passés** avec Basic sur HTTP (réglage par défaut de la suite) et **8 passés** avec `PSRP_INTEGRATION_AUTH=ntlm` (NTLM scellé sur HTTP), à chaque commit. Ce run NTLM, à travers un relais TCP enregistreur qui garde chaque connexion à part : 8 connexions (une par client), 2 requêtes `Negotiate` par connexion, 72 requêtes et 72 réponses `multipart/encrypted`, aucun corps de requête en clair (les Type 1 et Type 3 n'en portent pas), aucun HTTP 400 ni 500. |
-| `bridge-mcp` | `f44a5fa` (v4.0.2, worktree jetable ; `origin/main` est maintenant `ec9310e`) | Smoke en ligne de commande par `winrm` puis par `psrp` (hôtes NTLM sur HTTP) : `hostname` renvoie `winrm-2025`, `Get-Date` renvoie la date du banc (2026-10-21), sur les deux protocoles. Fait contre `winrm-rs` `4cbebfb`, `84f1898`, `4f229dc`, `92341f6`, puis `f30b7f3` (avec `psrp-rs` `4a79189`) : 4 appels sur 4 réussis à chaque fois (1,8 à 3,3 s chacun à `f30b7f3`), à travers le relais enregistreur : 4 connexions, 2 requêtes `Negotiate` par connexion, 26 requêtes scellées, aucun corps de requête en clair, aucun HTTP 400. Journal d'audit redirigé vers un fichier jetable. |
+| `psrp-rs` | `4a79189` (`origin/main`) | Suite live (8 tests) contre le `winrm-rs` local (`[patch.crates-io]`, worktree jetable) : **8 passés, 0 échoué** contre `winrm-rs` `4cbebfb` (Basic), puis contre `84f1898` en Basic et en NTLM sur HTTP. Contre `winrm-rs` `4f229dc`, `92341f6`, `f30b7f3` puis `d69030d` (scellement qui échoue fermé et sans renvoi, une connexion authentifiée par échange, CBT de la connexion) : **8 passés** avec Basic sur HTTP (réglage par défaut de la suite) et **8 passés** avec `PSRP_INTEGRATION_AUTH=ntlm` (NTLM scellé sur HTTP), à chaque commit. Ce run NTLM, à travers un relais TCP enregistreur qui garde chaque connexion à part : 8 connexions (une par client), 2 requêtes `Negotiate` par connexion, 72 requêtes et 72 réponses `multipart/encrypted`, aucun corps de requête en clair (les Type 1 et Type 3 n'en portent pas), aucun HTTP 400 ni 500. |
+| `bridge-mcp` | `f44a5fa` (v4.0.2, worktree jetable ; `origin/main` est maintenant `ec9310e`) | Smoke en ligne de commande par `winrm` puis par `psrp` (hôtes NTLM sur HTTP) : `hostname` renvoie `winrm-2025`, `Get-Date` renvoie la date du banc (2026-10-21), sur les deux protocoles. Fait contre `winrm-rs` `4cbebfb`, `84f1898`, `4f229dc`, `92341f6`, `f30b7f3`, puis `d69030d` (avec `psrp-rs` `4a79189`) : 4 appels sur 4 réussis à chaque fois (1,8 à 2,7 s chacun à `d69030d`), à travers le relais enregistreur : 4 connexions, 2 requêtes `Negotiate` par connexion, 26 requêtes scellées, aucun corps de requête en clair, aucun HTTP 400. Journal d'audit redirigé vers un fichier jetable. |
 
 Banc : une VM Windows Server 2025 (`winrm-2025`) sous Hyper-V, atteinte par
 `tests/scripts/vm-connect.sh` (HTTP `55985`, HTTPS `55986`, compte `vagrant`).
@@ -179,7 +179,7 @@ ouvert.
   `0.0.0.0:5986`.
 
 Historique complet des commits de la campagne :
-`git log --oneline 2fdc39d..f30b7f3`, plus le commit de documentation qui
+`git log --oneline 2fdc39d..d69030d`, plus le commit de documentation qui
 suit. `2fdc39d` est l'instantané de travail de l'utilisateur, hors de cette
 campagne.
 
@@ -293,7 +293,7 @@ ne figurent pas dans la matrice.
   `HTTP/<hôte>` en est dérivé), pas une adresse ; le banc passe par une ligne
   `127.0.0.1 dc.winrm.test` dans `/etc/hosts`.
 - **Server 2012 R2 n'est mesuré qu'en partie.** La VM a été reconstruite ; à
-  `92341f6` puis à `f30b7f3` seuls les tests NTLM (scellés sur HTTP, modes de chiffrement,
+  `92341f6`, `f30b7f3` puis `d69030d` seuls les tests NTLM (scellés sur HTTP, modes de chiffrement,
   proxy) et `create_and_delete_shell` / `run_command_whoami` y ont tourné
   (`vm-connect-2012r2.sh`, ports `56985`/`56986`) : tous passent, le format
   de trame scellée strict compris. La suite complète y reste à passer. Cinq
@@ -361,8 +361,25 @@ ne figurent pas dans la matrice.
   connexion NTLM a vu deux certificats différents, la poignée de main
   échoue (impossible de savoir lequel lier) ; une signature sans hachage
   unique (Ed25519) ou inconnue n'a pas de liaison de canal définie (RFC 5929)
-  et fait échouer NTLM sur HTTPS ; les copies sur la pile de la clé de
-  session faites par le constructeur du message Type 3 ne sont pas effacées.
+  et fait échouer NTLM sur HTTPS (pypsrp, lui, retombe sur SHA-256) ;
+  `unseal_body` est strict (Content-Type exact de la première partie, sans
+  espace final ; `Length=` lu seulement sur la ligne `OriginalContent:`),
+  ce que Server 2025 et 2012 R2 respectent ; les copies sur la pile de la
+  clé de session faites par le constructeur du message Type 3, et la
+  `NtlmSession` (clés, S-box RC4) construite sur la pile avant d'aller dans
+  sa boîte, ne sont pas effacées.
+- **NTLM et proxys.** Proxy HTTP `CONNECT` (HTTPS en tunnel) : la réponse ne
+  porte pas les détails TLS (`reqwest` 0.13.5), le CBT vient du vérificateur
+  du client dédié, restreint au nom du serveur WinRM ; testé en unitaire
+  (`ntlm_cbt_binds_the_certificate_of_its_own_connection`) et en live pour
+  Basic (`http_proxy_connect_carries_https`). Proxy SOCKS5 : même chemin ;
+  live pour NTLM sur HTTP (`socks5_proxy_carries_ntlm`). Proxy `https://` :
+  `reqwest` vérifie le certificat du proxy avec une copie de la même
+  configuration TLS, ce certificat n'est pas compté (`d69030d`) ; testé en
+  unitaire avec un proxy TLS en processus
+  (`ntlm_cbt_through_an_https_proxy_binds_the_target_certificate`), pas en
+  live (pas de proxy `https://` sur le banc). Proxy HTTP qui transfère sans
+  tunnel : voir le point précédent (liaison NTLM à la connexion).
 - **`bridge-mcp` (hors de ce dépôt, observation seulement).** Il n'interpole pas
   `${VAR}` alors que son `config.example.yaml` montre `${WIN_PASSWORD}` (la
   chaîne est envoyée telle quelle) et il convertit toute `AuthFailed` en

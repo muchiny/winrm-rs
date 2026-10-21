@@ -240,7 +240,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and session. `unseal_body` checks the whole MS-WSMV frame (signature
   length 16, `OriginalContent` `Length` with checked arithmetic, payload of
   exactly that length followed by the closing boundary, decrypted length)
-  and never quotes the body in its errors. Verified on Server 2025 through a
+  and never quotes the body in its errors. It is strict on purpose: the
+  first part must carry exactly `Content-Type:
+  application/HTTP-SPNEGO-session-encrypted` (no trailing whitespace) and
+  `Length=` is read only from the `OriginalContent:` line; any other
+  framing is refused (fail closed). Server 2025 and Server 2012 R2 answers
+  pass. Verified on Server 2025 through a
   recording relay: no request body crossed unsealed, one handshake per
   connection; also with psrp-rs and bridge-mcp over NTLM on HTTP, and on
   Server 2012 R2. New fuzz target `fuzz_ntlm_unseal_body` and proptests for
@@ -255,21 +260,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   connection that carried the challenge: the TLS details `reqwest` reports
   on that response, or, through a proxy where it reports none, the
   verifier of a dedicated client that keeps one connection with TLS session
-  resumption off, provided that verifier has seen a single certificate (a
-  background connection presenting another one makes it ambiguous, and the
-  handshake fails). It records a certificate only once the certificate is
-  verified. Without a certain certificate, the handshake fails instead of
-  authenticating unbound. Tested with two TLS servers with different
-  certificates.
+  resumption off, provided that verifier has seen a single certificate for
+  the WinRM host's server name (a background connection presenting another
+  one makes it ambiguous, and the handshake fails; the certificate of an
+  `https://` proxy, which `reqwest` verifies with a copy of the same
+  configuration, does not count). It records a certificate only once the
+  certificate is verified. Without a certain certificate, the handshake
+  fails instead of authenticating unbound. Tested with two TLS servers with
+  different certificates and through an in-process `https://` proxy with a
+  certificate of its own.
 - **NTLM channel binding uses the certificate's own hash (RFC 5929).** The
   token hashed the certificate with SHA-256 whatever its signature
   algorithm, so NTLM over HTTPS failed against a host whose certificate is
   signed with SHA-384 or SHA-512 (P-384 keys, AD CS templates). The hash now
   follows the signature algorithm, as pyspnego and pypsrp do: SHA-224/256/
   384/512, MD5 and SHA-1 upgraded to SHA-256, RSASSA-PSS by its hash
-  parameter. An algorithm without a single hash (Ed25519) or an unknown one
-  has no defined channel binding and fails the handshake. Checked against
-  known answers computed with Python `cryptography` for ten certificates.
+  parameter (absent parameters or an omitted hash: the RFC 4055 default,
+  SHA-1, so SHA-256; malformed parameters fail). An algorithm without a
+  single hash (Ed25519) or an unknown one has no defined channel binding
+  and fails the handshake, where pypsrp falls back to SHA-256. Checked
+  against known answers computed with Python `cryptography` for sixteen
+  certificates.
+- **A sealing handshake whose answer closes the connection is redone.** A
+  Type 3 answered with `Connection: close` ends the connection the session
+  is bound to; the client now authenticates a new connection (once, then
+  reports `WinrmError::Ntlm`) instead of sending the first sealed request
+  on a socket without a session.
 
 ### Documentation
 

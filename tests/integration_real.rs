@@ -2049,3 +2049,234 @@ async fn command_on_deleted_shell_returns_error() {
         "executing command on deleted shell should return an error"
     );
 }
+
+// === Certificate authentication (TLS client certificate) ===
+//
+// Prepare the bench with `tests/scripts/make-client-cert.sh` (eval its output),
+// then run `setup_https_listener` and `setup_certificate_auth` once.
+
+/// Path of the `ca.pem` generated next to the client certificate by
+/// `make-client-cert.sh`.
+fn cert_auth_ca_path() -> Option<std::path::PathBuf> {
+    let cert = std::env::var("WINRM_TEST_CLIENT_CERT").ok()?;
+    Some(std::path::Path::new(&cert).with_file_name("ca.pem"))
+}
+
+/// Build a Certificate-auth client from the PEM paths held in two variables.
+///
+/// `None` when the bench host or either variable is missing. The credentials
+/// are unused by the Certificate method but required by the constructor.
+fn cert_client_from_env(cert_var: &str, key_var: &str) -> Option<(WinrmClient, String)> {
+    let host = std::env::var("WINRM_TEST_HOST").ok()?;
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    let pass = std::env::var("WINRM_TEST_PASS").ok()?;
+    let cert = std::env::var(cert_var).ok()?;
+    let key = std::env::var(key_var).ok()?;
+    let config = WinrmConfig {
+        auth_method: AuthMethod::Certificate,
+        use_tls: true,
+        accept_invalid_certs: true, // self-signed listener certificate
+        port: https_test_port(),
+        client_cert_pem: Some(cert),
+        client_key_pem: Some(key),
+        ..Default::default()
+    };
+    let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).ok()?;
+    Some((client, host))
+}
+
+/// Client presenting the certificate the VM maps to `vagrant`.
+fn test_client_cert() -> Option<(WinrmClient, String)> {
+    cert_client_from_env("WINRM_TEST_CLIENT_CERT", "WINRM_TEST_CLIENT_KEY")
+}
+
+/// Client presenting a certificate signed by a CA the VM does not trust.
+fn test_client_rogue_cert() -> Option<(WinrmClient, String)> {
+    cert_client_from_env("WINRM_TEST_ROGUE_CERT", "WINRM_TEST_ROGUE_KEY")
+}
+
+/// Prepare the VM for TLS client-certificate authentication (idempotent, NTLM
+/// over plain HTTP): trust the test CA, enable the WSMan Certificate method,
+/// map the client certificate to `vagrant`, and make HTTP.sys negotiate the
+/// client certificate during the initial handshake (rustls cannot renegotiate).
+#[tokio::test]
+#[ignore]
+async fn setup_certificate_auth() {
+    use base64::Engine as _;
+    let (client, host) = test_client_ntlm().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let ca_path = cert_auth_ca_path().expect("set WINRM_TEST_CLIENT_CERT (make-client-cert.sh)");
+    let ca_pem = std::fs::read_to_string(&ca_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", ca_path.display()));
+    // PEM body == base64 of the DER certificate.
+    let ca_b64: String = ca_pem.lines().filter(|l| !l.starts_with("-----")).collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(&ca_b64)
+        .expect("ca.pem body is base64");
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    let pass = std::env::var("WINRM_TEST_PASS").expect("WINRM_TEST_PASS");
+    let ps_quote = |s: &str| s.replace('\'', "''");
+
+    // The script travels as -EncodedCommand (UTF-16 + base64), which cmd.exe
+    // caps at ~8 KB: one request per step keeps each under the limit.
+    let thumb_of_ca = "$thumb = (Get-ChildItem Cert:\\LocalMachine\\Root | \
+         Where-Object Subject -eq 'CN=winrm-rs test CA' | Select-Object -First 1).Thumbprint; \
+         if (-not $thumb) { throw 'test CA not in LocalMachine\\Root' }";
+
+    // 1 + 2: trust the CA, enable the Certificate method on the WinRM service.
+    let step_trust = format!(
+        r#"
+$ErrorActionPreference = 'Stop'
+$ca = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 (,[Convert]::FromBase64String('{ca_b64}'))
+$thumb = $ca.Thumbprint
+Write-Output "STEP 0 CA thumbprint: $thumb  subject: $($ca.Subject)"
+foreach ($store in 'Root', 'TrustedPeople') {{
+    $path = "Cert:\LocalMachine\$store\$thumb"
+    if (Test-Path $path) {{ Write-Output "STEP 1 $store : CA already present"; continue }}
+    $s = New-Object System.Security.Cryptography.X509Certificates.X509Store $store, 'LocalMachine'
+    $s.Open('ReadWrite'); $s.Add($ca); $s.Close()
+    Write-Output "STEP 1 $store : CA imported (present now: $(Test-Path $path))"
+}}
+Set-Item WSMan:\localhost\Service\Auth\Certificate -Value $true
+Write-Output "STEP 2 Service\Auth\Certificate = $((Get-Item WSMan:\localhost\Service\Auth\Certificate).Value)"
+"#
+    );
+
+    // 3: map the client certificate (issuer = CA thumbprint, subject = UPN).
+    let step_map = format!(
+        r#"
+$ErrorActionPreference = 'Stop'
+{thumb_of_ca}
+Get-ChildItem WSMan:\localhost\ClientCertificate -ErrorAction SilentlyContinue | ForEach-Object {{
+    $d = Get-ChildItem $_.PSPath
+    if (($d | Where-Object Name -eq Issuer).Value -eq $thumb) {{
+        Remove-Item $_.PSPath -Recurse -Force
+        Write-Output "STEP 3 removed stale mapping $($_.Name)"
+    }}
+}}
+$sec = ConvertTo-SecureString '{pass}' -AsPlainText -Force
+$cred = New-Object System.Management.Automation.PSCredential ('{user}', $sec)
+$m = New-Item -Path WSMan:\localhost\ClientCertificate -Subject 'vagrant@localhost' -URI * -Issuer $thumb -Credential $cred -Force
+Write-Output "STEP 3 mapping created: $($m.Name)"
+Get-ChildItem WSMan:\localhost\ClientCertificate | ForEach-Object {{
+    $d = Get-ChildItem $_.PSPath
+    Write-Output ("STEP 3   {{0}} subject={{1}} issuer={{2}} uri={{3}} enabled={{4}}" -f $_.Name,
+        ($d | Where-Object Name -eq Subject).Value, ($d | Where-Object Name -eq Issuer).Value,
+        ($d | Where-Object Name -eq URI).Value, ($d | Where-Object Name -eq Enabled).Value)
+}}
+"#,
+        pass = ps_quote(&pass),
+        user = ps_quote(&user),
+    );
+
+    // 4: HTTP.sys must request the client certificate in the initial handshake.
+    // Reuse the existing binding's certhash/appid; never guess them.
+    let step_netsh = r#"
+$ipport = '0.0.0.0:5986'
+$show = (netsh http show sslcert ipport=$ipport) -join "`n"
+if ($show -notmatch 'Certificate Hash\s*:\s*([0-9a-fA-F]{40})') {
+    Write-Output "STEP 4 FAIL: no SSL binding on ${ipport}:`n$show"; exit 3
+}
+$hash = $Matches[1]
+if ($show -notmatch 'Application ID\s*:\s*(\{[0-9a-fA-F-]+\})') {
+    Write-Output "STEP 4 FAIL: no Application ID in binding:`n$show"; exit 3
+}
+$appid = $Matches[1]
+Write-Output "STEP 4 current binding: certhash=$hash appid=$appid"
+$out = netsh http update sslcert ipport=$ipport certhash=$hash appid=$appid clientcertnegotiation=enable
+Write-Output "STEP 4 netsh update: $($out -join ' ')"
+$after = (netsh http show sslcert ipport=$ipport) -join "`n"
+if ($after -notmatch 'Negotiate Client Certificate\s*:\s*(\w+)') {
+    Write-Output "STEP 4 FAIL: cannot read back the setting:`n$after"; exit 3
+}
+Write-Output "STEP 4 Negotiate Client Certificate = $($Matches[1])"
+if ($Matches[1] -ne 'Enabled') { exit 3 }
+"#;
+
+    for (name, script) in [
+        ("trust CA + enable Certificate method", step_trust),
+        ("map client certificate", step_map),
+        ("clientcertnegotiation", step_netsh.to_string()),
+    ] {
+        let output = client
+            .run_powershell(&host, &script)
+            .await
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        eprintln!("--- {name} (exit {})", output.exit_code);
+        eprintln!("{}", String::from_utf8_lossy(&output.stdout).trim());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.trim().is_empty() {
+            eprintln!("stderr: {}", stderr.trim());
+        }
+        assert_eq!(output.exit_code, 0, "{name} failed");
+    }
+}
+
+/// A mapped client certificate authenticates a command as `vagrant`.
+///
+/// CURRENTLY FAILS (HTTP 401) although the bench is correctly prepared: the
+/// crate has two defects on this path, found by comparing with `curl` and an
+/// `openssl s_server` (see the task-5 report in `.superpowers`):
+/// 1. `transport.rs` builds the rustls config with `.with_no_client_auth()` and
+///    installs it through `tls_backend_preconfigured`, which discards the
+///    `reqwest::Identity`, so no client certificate is ever presented
+///    (`s_server -Verify 1`: "peer did not return a certificate").
+/// 2. `auth/certificate.rs` sends no `Authorization` header; WinRM expects
+///    `Authorization: http://schemas.dmtf.org/wbem/wsman/1/wsman/secprofile/https/mutual`
+///    (curl with that header and the same certificate gets past 401).
+/// Kept as written (and `#[ignore]`) so it goes green once both are fixed.
+#[tokio::test]
+#[ignore]
+async fn certificate_auth_whoami() {
+    let Some((client, host)) = test_client_cert() else {
+        eprintln!(
+            "SKIP certificate_auth_whoami: set WINRM_TEST_HOST, WINRM_TEST_PASS and \
+             eval tests/scripts/make-client-cert.sh"
+        );
+        return;
+    };
+    let out = client
+        .run_command(&host, "whoami", &[])
+        .await
+        .expect("cert auth");
+    assert_eq!(out.exit_code, 0);
+    assert!(
+        String::from_utf8_lossy(&out.stdout)
+            .to_lowercase()
+            .contains("vagrant"),
+        "stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// A certificate signed by a CA the server does not trust is rejected with an
+/// explicit error, promptly: not a success, and not a hang (HTTP.sys may ask
+/// for the certificate by TLS renegotiation, which rustls does not support).
+///
+/// NOTE: while `certificate_auth_whoami` fails (see its doc), this test passes
+/// for the wrong reason: every request gets a 401, whatever the certificate.
+/// It only becomes discriminating once the valid certificate authenticates.
+#[tokio::test]
+#[ignore]
+async fn certificate_auth_unmapped_cert_is_rejected() {
+    let Some((client, host)) = test_client_rogue_cert() else {
+        eprintln!(
+            "SKIP certificate_auth_unmapped_cert_is_rejected: set WINRM_TEST_HOST, \
+             WINRM_TEST_PASS and eval tests/scripts/make-client-cert.sh"
+        );
+        return;
+    };
+    let start = Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(30),
+        client.run_command(&host, "whoami", &[]),
+    )
+    .await;
+    let elapsed = start.elapsed();
+    eprintln!("rogue certificate outcome after {elapsed:?}: {result:?}");
+    let result = result.expect("rogue certificate request hung for 30 s");
+    assert!(
+        result.is_err(),
+        "unmapped certificate must not authenticate"
+    );
+    assert!(elapsed < Duration::from_secs(30), "took {elapsed:?}");
+}

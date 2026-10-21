@@ -157,13 +157,24 @@ pub(crate) struct ClientAuthCert {
     pub(crate) key: PrivateKeyDer<'static>,
 }
 
+/// Largest PEM file accepted for `client_cert_pem` / `client_key_pem`
+/// (1 MiB): far above any real certificate chain or key, small enough that a
+/// wrong path (a log, a device) cannot make the client read without bound.
+const MAX_PEM_FILE_BYTES: u64 = 1024 * 1024;
+
 /// Load the TLS client certificate chain and private key from PEM files.
 ///
 /// `cert_path` must hold at least one `CERTIFICATE` section; other sections
-/// are ignored. `key_path` must hold a `PRIVATE KEY` (PKCS#8),
-/// `RSA PRIVATE KEY` (PKCS#1) or `EC PRIVATE KEY` (SEC1) section; the first
-/// one is used. Whether the key matches the certificate is checked later, by
-/// rustls, when the client configuration is built.
+/// are ignored, so one file holding both certificate and key may be passed
+/// as both paths. `key_path` must hold an unencrypted `PRIVATE KEY`
+/// (PKCS#8), `RSA PRIVATE KEY` (PKCS#1) or `EC PRIVATE KEY` (SEC1) section;
+/// the first one is used. Encrypted keys are refused. Whether the key
+/// matches the certificate is checked later, by rustls, when the client
+/// configuration is built.
+///
+/// Both paths must be regular files of at most 1 MiB. The PEM text buffers
+/// are wiped on drop ([`Zeroizing`]); the decoded DER returned here, and the
+/// copy rustls keeps, are not.
 ///
 /// Every failure is a [`WinrmError::AuthFailed`] naming the file; the message
 /// never quotes the file contents, so no key material can leak through it.
@@ -171,12 +182,9 @@ pub(crate) fn load_client_auth_cert(
     cert_path: &str,
     key_path: &str,
 ) -> Result<ClientAuthCert, WinrmError> {
-    let cert_pem = std::fs::read(cert_path).map_err(|e| {
-        WinrmError::AuthFailed(format!("failed to read client cert {cert_path}: {e}"))
-    })?;
-    let key_pem = Zeroizing::new(std::fs::read(key_path).map_err(|e| {
-        WinrmError::AuthFailed(format!("failed to read client key {key_path}: {e}"))
-    })?);
+    // A combined cert+key file may be passed as `cert_path`: wipe both.
+    let cert_pem = read_pem_file(cert_path, "client cert")?;
+    let key_pem = read_pem_file(key_path, "client key")?;
 
     let chain = CertificateDer::pem_slice_iter(&cert_pem)
         .collect::<Result<Vec<_>, _>>()
@@ -189,6 +197,13 @@ pub(crate) fn load_client_auth_cert(
     if chain.is_empty() {
         return Err(WinrmError::AuthFailed(format!(
             "client cert {cert_path} contains no certificate (expected a CERTIFICATE PEM section)"
+        )));
+    }
+
+    if is_encrypted_key_pem(&key_pem) {
+        return Err(WinrmError::AuthFailed(format!(
+            "client key {key_path}: encrypted private keys are not supported \
+             (decrypt it, e.g. `openssl pkey -in <key> -out <unencrypted key>`)"
         )));
     }
 
@@ -209,6 +224,49 @@ pub(crate) fn load_client_auth_cert(
     };
 
     Ok(ClientAuthCert { chain, key })
+}
+
+/// Read a PEM file for Certificate auth: regular files only, at most
+/// [`MAX_PEM_FILE_BYTES`], into a buffer wiped on drop. `what` names the file
+/// in errors ("client cert" / "client key"); errors never quote its content.
+fn read_pem_file(path: &str, what: &str) -> Result<Zeroizing<Vec<u8>>, WinrmError> {
+    use std::io::Read;
+
+    let read_err =
+        |e: std::io::Error| WinrmError::AuthFailed(format!("failed to read {what} {path}: {e}"));
+    let not_regular = || WinrmError::AuthFailed(format!("{what} {path} is not a regular file"));
+    // Checked before opening too: opening a FIFO for reading would block.
+    if !std::fs::metadata(path).map_err(read_err)?.is_file() {
+        return Err(not_regular());
+    }
+    let file = std::fs::File::open(path).map_err(read_err)?;
+    let metadata = file.metadata().map_err(read_err)?;
+    if !metadata.is_file() {
+        return Err(not_regular());
+    }
+    // Sized up front so the buffer does not reallocate (which would leave
+    // unwiped copies behind) for a file that does not grow while read.
+    let capacity = metadata.len().min(MAX_PEM_FILE_BYTES).saturating_add(1);
+    let mut buf = Zeroizing::new(Vec::with_capacity(usize::try_from(capacity).unwrap_or(0)));
+    file.take(MAX_PEM_FILE_BYTES.saturating_add(1))
+        .read_to_end(&mut buf)
+        .map_err(read_err)?;
+    if u64::try_from(buf.len()).map_or(true, |n| n > MAX_PEM_FILE_BYTES) {
+        return Err(WinrmError::AuthFailed(format!(
+            "{what} {path} is larger than {MAX_PEM_FILE_BYTES} bytes"
+        )));
+    }
+    Ok(buf)
+}
+
+/// Whether a key PEM file holds an encrypted key: a PKCS#8
+/// `ENCRYPTED PRIVATE KEY` section, or a legacy OpenSSL section with a
+/// `Proc-Type: 4,ENCRYPTED` header. Neither can be used without a passphrase,
+/// and the PEM parser would otherwise report them misleadingly (no key found,
+/// or bad base64).
+fn is_encrypted_key_pem(pem: &[u8]) -> bool {
+    let contains = |needle: &[u8]| pem.windows(needle.len()).any(|w| w == needle);
+    contains(b"-----BEGIN ENCRYPTED PRIVATE KEY-----") || contains(b"Proc-Type: 4,ENCRYPTED")
 }
 
 /// Describe a PEM parse error without its payload: some variants carry

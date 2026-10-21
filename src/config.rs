@@ -60,6 +60,14 @@ pub struct WinrmConfig {
     /// HTTP proxy URL (e.g. `"http://proxy:8080"`).
     ///
     /// When set, all WinRM HTTP(S) requests are routed through this proxy.
+    ///
+    /// Limitation with [`AuthMethod::Certificate`]: with an `https://` proxy,
+    /// `reqwest` uses the same TLS client configuration for the connection
+    /// to the proxy, so the client certificate may be presented to the proxy
+    /// if it requests one. `http://` (CONNECT) and SOCKS5 proxies only relay
+    /// bytes: TLS, and the certificate, stay end-to-end with the WinRM host.
+    /// The same applies to a proxy taken from the `HTTPS_PROXY` / `ALL_PROXY`
+    /// environment variables, which `reqwest` uses when this field is `None`.
     pub proxy: Option<String>,
     /// Console output code page (default: 65001 = UTF-8).
     ///
@@ -163,9 +171,16 @@ pub enum AuthMethod {
     /// `Authorization: http://schemas.dmtf.org/wbem/wsman/1/wsman/secprofile/https/mutual`
     /// (MS-WSMV), which tells WinRM to authenticate with that certificate. The
     /// server must trust the issuing CA and map the certificate to a local
-    /// account (`WSMan:\localhost\ClientCertificate`). Over plain HTTP no
-    /// certificate can be presented: the client builds, with a warning, but
-    /// cannot authenticate.
+    /// account (`WSMan:\localhost\ClientCertificate`). Building the client
+    /// fails with [`WinrmError::AuthFailed`](crate::WinrmError::AuthFailed)
+    /// when `use_tls` is `false` (no TLS handshake to present the certificate
+    /// in), and when a file is missing, not a regular file, over 1 MiB, holds
+    /// no certificate or no key, holds an encrypted key (unencrypted keys
+    /// only), or holds a key that does not match the certificate.
+    ///
+    /// Like credentials, the certificate belongs to the client: the same one
+    /// is presented to every host passed to the client's methods. See
+    /// [`WinrmConfig::proxy`] for `https://` proxies.
     Certificate,
     /// CredSSP authentication for double-hop credential delegation.
     ///

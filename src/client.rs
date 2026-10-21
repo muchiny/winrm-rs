@@ -1444,6 +1444,7 @@ mod tests {
     fn certificate_auth_requires_cert_pem() {
         let config = WinrmConfig {
             auth_method: AuthMethod::Certificate,
+            use_tls: true,
             // No client_cert_pem set
             ..Default::default()
         };
@@ -1462,6 +1463,7 @@ mod tests {
             auth_method: AuthMethod::Certificate,
             client_cert_pem: Some("/tmp/nonexistent-cert.pem".into()),
             client_key_pem: None,
+            use_tls: true,
             ..Default::default()
         };
         let result = WinrmClient::new(config, test_creds());
@@ -1486,6 +1488,7 @@ mod tests {
             auth_method: AuthMethod::Certificate,
             client_cert_pem: Some(cert_path.to_string_lossy().into()),
             client_key_pem: Some(key_path.to_string_lossy().into()),
+            use_tls: true,
             ..Default::default()
         };
         // Should fail while loading the PEM files (no certificate section)
@@ -1893,43 +1896,6 @@ mod tests {
             err.contains("failed to read") || err.contains("key"),
             "error should mention key read failure: {err}"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test]
-    async fn certificate_auth_dispatch_in_send_soap() {
-        let server = MockServer::start().await;
-        let port = server.address().port();
-
-        Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(
-                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>CERT-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
-            ))
-            .mount(&server)
-            .await;
-
-        let dir = std::env::temp_dir().join("winrm-rs-test-cert-dispatch");
-        std::fs::create_dir_all(&dir).unwrap();
-        let cert_path = dir.join("cert.pem");
-        let key_path = dir.join("key.pem");
-        std::fs::write(&cert_path, TEST_CERT_PEM).unwrap();
-        std::fs::write(&key_path, TEST_KEY_PEM).unwrap();
-
-        let config = WinrmConfig {
-            port,
-            auth_method: AuthMethod::Certificate,
-            client_cert_pem: Some(cert_path.to_string_lossy().into()),
-            client_key_pem: Some(key_path.to_string_lossy().into()),
-            connect_timeout_secs: 5,
-            operation_timeout_secs: 10,
-            ..Default::default()
-        };
-
-        let client = WinrmClient::new(config, test_creds()).unwrap();
-        let result = client.create_shell("127.0.0.1").await;
-        assert!(result.is_ok(), "cert auth dispatch failed: {result:?}");
-        assert_eq!(result.unwrap(), "CERT-SHELL");
 
         std::fs::remove_dir_all(&dir).ok();
     }

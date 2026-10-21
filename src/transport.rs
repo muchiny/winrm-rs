@@ -117,23 +117,24 @@ impl HttpTransport {
                     .unwrap_or(concat!("winrm-rs/", env!("CARGO_PKG_VERSION"))),
             );
 
-        // Load the client certificate for Certificate auth here, whatever the
-        // scheme, so a bad path or PEM fails at construction. It is presented
-        // through the rustls config built below (`reqwest::Identity` would be
-        // discarded by `tls_backend_preconfigured`).
+        // Load the client certificate for Certificate auth here, so a bad path
+        // or PEM fails at construction. It is presented through the rustls
+        // config built below (`reqwest::Identity` would be discarded by
+        // `tls_backend_preconfigured`).
         let client_auth = if matches!(config.auth_method, AuthMethod::Certificate) {
+            // Checked before any file is read: over plain HTTP there is no
+            // handshake to present the certificate in.
+            if !config.use_tls {
+                return Err(WinrmError::AuthFailed(
+                    "Certificate auth requires HTTPS (set use_tls = true)".into(),
+                ));
+            }
             let cert_path = config.client_cert_pem.as_deref().ok_or_else(|| {
                 WinrmError::AuthFailed("Certificate auth requires client_cert_pem".into())
             })?;
             let key_path = config.client_key_pem.as_deref().ok_or_else(|| {
                 WinrmError::AuthFailed("Certificate auth requires client_key_pem".into())
             })?;
-            if !config.use_tls {
-                tracing::warn!(
-                    "Certificate auth over HTTP cannot present the client certificate — \
-                     set use_tls = true"
-                );
-            }
             Some(crate::tls::load_client_auth_cert(cert_path, key_path)?)
         } else {
             None
@@ -531,6 +532,7 @@ mod tests {
         let config = WinrmConfig {
             auth_method: AuthMethod::Certificate,
             client_cert_pem: None,
+            use_tls: true,
             ..Default::default()
         };
         let creds = WinrmCredentials::new("admin", "pass", "");
@@ -547,6 +549,7 @@ mod tests {
             auth_method: AuthMethod::Certificate,
             client_cert_pem: Some("/tmp/cert.pem".into()),
             client_key_pem: None,
+            use_tls: true,
             ..Default::default()
         };
         let creds = WinrmCredentials::new("admin", "pass", "");
@@ -563,6 +566,7 @@ mod tests {
             auth_method: AuthMethod::Certificate,
             client_cert_pem: Some("/nonexistent/cert.pem".into()),
             client_key_pem: Some("/nonexistent/key.pem".into()),
+            use_tls: true,
             ..Default::default()
         };
         let creds = WinrmCredentials::new("admin", "pass", "");
@@ -586,11 +590,31 @@ mod tests {
         }
     }
 
-    /// Write `cert` and `key` to fresh files unique to `tag`.
+    /// Create a fresh, unpredictable temp directory: pid, clock nanos and a
+    /// counter in the name, and `create_dir` (not `create_dir_all`) so an
+    /// existing path is never reused; retried on collision.
+    fn unique_temp_dir(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        for _ in 0..100 {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.subsec_nanos());
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "winrm-rs-transport-{tag}-{}-{nanos}-{n}",
+                std::process::id()
+            ));
+            if std::fs::create_dir(&dir).is_ok() {
+                return dir;
+            }
+        }
+        panic!("could not create a unique temp dir for {tag}");
+    }
+
+    /// Write `cert` and `key` to files in a fresh temp directory.
     fn pem_files(tag: &str, cert: &str, key: &str) -> PemFiles {
-        let dir =
-            std::env::temp_dir().join(format!("winrm-rs-transport-{tag}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = unique_temp_dir(tag);
         let cert_path = dir.join("cert.pem");
         let key_path = dir.join("key.pem");
         std::fs::write(&cert_path, cert).unwrap();
@@ -693,6 +717,119 @@ mod tests {
         assert!(msg.contains("rejected"), "{msg}");
     }
 
+    #[test]
+    fn certificate_auth_over_http_is_rejected_before_reading_pem() {
+        let config = WinrmConfig {
+            auth_method: AuthMethod::Certificate,
+            use_tls: false,
+            client_cert_pem: Some("/nonexistent/cert.pem".into()),
+            client_key_pem: Some("/nonexistent/key.pem".into()),
+            ..Default::default()
+        };
+        let msg = cert_auth_failed(config);
+        assert_eq!(msg, "Certificate auth requires HTTPS (set use_tls = true)");
+    }
+
+    #[test]
+    fn certificate_auth_cert_path_that_is_a_directory_is_rejected() {
+        let files = pem_files(
+            "dircert",
+            crate::test_pki::EC_CERT_PEM,
+            crate::test_pki::EC_KEY_PKCS8_PEM,
+        );
+        let config = WinrmConfig {
+            client_cert_pem: Some(files.dir.to_string_lossy().into()),
+            ..cert_tls_config(&files)
+        };
+        let msg = cert_auth_failed(config);
+        assert!(msg.contains("not a regular file"), "{msg}");
+    }
+
+    /// `pem` padded in front with comment lines to exactly `len` bytes; text
+    /// outside PEM sections is ignored by the parser.
+    fn padded_pem(pem: &str, len: usize) -> String {
+        let mut out = String::with_capacity(len);
+        while out.len() + 64 <= len - pem.len() {
+            out.push_str(&"#".repeat(63));
+            out.push('\n');
+        }
+        out.push_str(&" ".repeat(len - pem.len() - out.len()));
+        out.push_str(pem);
+        assert_eq!(out.len(), len);
+        out
+    }
+
+    #[test]
+    fn certificate_auth_key_file_at_the_size_limit_is_read() {
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
+        let key = padded_pem(&format!("\n{EC_KEY_PKCS8_PEM}"), 1024 * 1024);
+        let files = pem_files("keylimit", EC_CERT_PEM, &key);
+        let transport =
+            HttpTransport::new(cert_tls_config(&files), WinrmCredentials::new("u", "p", ""));
+        assert!(transport.is_ok(), "{:?}", transport.err());
+    }
+
+    #[test]
+    fn certificate_auth_key_file_over_the_size_limit_is_rejected() {
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
+        let key = padded_pem(&format!("\n{EC_KEY_PKCS8_PEM}"), 1024 * 1024 + 1);
+        let files = pem_files("keyhuge", EC_CERT_PEM, &key);
+        let msg = cert_auth_failed(cert_tls_config(&files));
+        assert!(msg.contains("larger than"), "{msg}");
+        assert!(msg.contains(&files.key), "names the file: {msg}");
+        assert!(!msg.contains("MIG"), "key material echoed: {msg}");
+    }
+
+    #[test]
+    fn certificate_auth_cert_file_over_the_size_limit_is_rejected() {
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
+        let cert = padded_pem(&format!("\n{EC_CERT_PEM}"), 1024 * 1024 + 1);
+        let files = pem_files("certhuge", &cert, EC_KEY_PKCS8_PEM);
+        let msg = cert_auth_failed(cert_tls_config(&files));
+        assert!(msg.contains("larger than"), "{msg}");
+        assert!(msg.contains(&files.cert), "names the file: {msg}");
+    }
+
+    #[test]
+    fn certificate_auth_encrypted_pkcs8_key_is_rejected_as_encrypted() {
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_ENCRYPTED_PEM};
+        let files = pem_files("encpkcs8", EC_CERT_PEM, EC_KEY_PKCS8_ENCRYPTED_PEM);
+        let msg = cert_auth_failed(cert_tls_config(&files));
+        assert!(
+            msg.contains("encrypted private keys are not supported"),
+            "{msg}"
+        );
+        assert!(!msg.contains("MIH0"), "key material echoed: {msg}");
+    }
+
+    #[test]
+    fn certificate_auth_legacy_encrypted_key_is_rejected_as_encrypted() {
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_SEC1_LEGACY_ENCRYPTED_PEM};
+        let files = pem_files("enclegacy", EC_CERT_PEM, EC_KEY_SEC1_LEGACY_ENCRYPTED_PEM);
+        let msg = cert_auth_failed(cert_tls_config(&files));
+        assert!(
+            msg.contains("encrypted private keys are not supported"),
+            "{msg}"
+        );
+        assert!(!msg.contains("DEK-Info"), "file content echoed: {msg}");
+    }
+
+    /// One file holding both the certificate and the key, passed as both
+    /// paths, keeps working (the earlier code concatenated the two files).
+    #[test]
+    fn certificate_auth_accepts_one_file_holding_cert_and_key() {
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
+        let combined = format!("{EC_CERT_PEM}{EC_KEY_PKCS8_PEM}");
+        let files = pem_files("combined", &combined, &combined);
+        assert_eq!(
+            std::fs::read(&files.cert).unwrap(),
+            std::fs::read(&files.key).unwrap()
+        );
+        let transport =
+            HttpTransport::new(cert_tls_config(&files), WinrmCredentials::new("u", "p", ""));
+        assert!(transport.is_ok(), "{:?}", transport.err());
+    }
+
     /// Server-side verifier for the in-process mutual-TLS test: requires a
     /// client certificate, checks the handshake signature (proof that the
     /// client holds the key) and accepts any chain.
@@ -746,12 +883,66 @@ mod tests {
         }
     }
 
-    /// What the in-process TLS server saw: the client's certificates and the
-    /// request head, or the handshake/IO error.
-    type SeenByServer = Result<(Vec<Vec<u8>>, String), String>;
+    /// What the in-process TLS server saw: the proxy `CONNECT` line, the
+    /// client's certificates and the request head, or the error.
+    type SeenByServer = Result<(String, Vec<Vec<u8>>, String), String>;
 
-    /// One-shot HTTPS server requiring a client certificate. Answers the
-    /// first request with `<ok/>` and reports what it saw.
+    /// Deadline for every blocking step of the in-process TLS server, so a
+    /// client that never connects (or stalls) fails the test instead of
+    /// hanging it.
+    const MTLS_SERVER_DEADLINE: Duration = Duration::from_secs(10);
+
+    /// Accept one connection, polling a non-blocking listener until
+    /// [`MTLS_SERVER_DEADLINE`].
+    fn accept_with_deadline(
+        listener: &std::net::TcpListener,
+    ) -> Result<std::net::TcpStream, String> {
+        listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+        let start = std::time::Instant::now();
+        loop {
+            match listener.accept() {
+                Ok((tcp, _)) => {
+                    tcp.set_nonblocking(false).map_err(|e| e.to_string())?;
+                    tcp.set_read_timeout(Some(MTLS_SERVER_DEADLINE))
+                        .map_err(|e| e.to_string())?;
+                    tcp.set_write_timeout(Some(MTLS_SERVER_DEADLINE))
+                        .map_err(|e| e.to_string())?;
+                    return Ok(tcp);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if start.elapsed() > MTLS_SERVER_DEADLINE {
+                        return Err("no client connected".into());
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+    }
+
+    /// Read from `rd` until a blank line ends an HTTP head; returns the head
+    /// and any bytes read past it.
+    fn read_http_head(rd: &mut impl std::io::Read) -> Result<(String, Vec<u8>), String> {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = rd.read(&mut chunk).map_err(|e| e.to_string())?;
+            if n == 0 {
+                return Err("connection closed before the end of an HTTP head".into());
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let rest = buf.split_off(i + 4);
+                return Ok((String::from_utf8_lossy(&buf).to_string(), rest));
+            }
+        }
+    }
+
+    /// One-shot HTTPS server requiring a client certificate, reached through
+    /// itself as an `http://` CONNECT proxy: it answers the `CONNECT`, then
+    /// runs the TLS server inside the tunnel (TLS stays end-to-end between
+    /// the client and this "target"), answers the first request with
+    /// `<ok/>` and reports what it saw.
     fn spawn_mtls_server() -> (u16, std::thread::JoinHandle<SeenByServer>) {
         use rustls::pki_types::pem::PemObject;
         use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -770,24 +961,19 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let handle = std::thread::spawn(move || -> SeenByServer {
-            let (tcp, _) = listener.accept().map_err(|e| e.to_string())?;
-            tcp.set_read_timeout(Some(Duration::from_secs(10))).ok();
+            let mut tcp = accept_with_deadline(&listener)?;
+            // Proxy leg: the client waits for the 200 before its ClientHello.
+            let (connect, early) = read_http_head(&mut tcp)?;
+            if !early.is_empty() {
+                return Err("client sent data before the CONNECT reply".into());
+            }
+            tcp.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .map_err(|e| e.to_string())?;
+
             let conn = rustls::ServerConnection::new(Arc::new(server_config))
                 .map_err(|e| e.to_string())?;
             let mut tls = rustls::StreamOwned::new(conn, tcp);
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 4096];
-            let head_end = loop {
-                let n = tls.read(&mut chunk).map_err(|e| e.to_string())?;
-                if n == 0 {
-                    return Err("connection closed before request head".into());
-                }
-                buf.extend_from_slice(&chunk[..n]);
-                if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                    break i + 4;
-                }
-            };
-            let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+            let (head, mut body) = read_http_head(&mut tls)?;
             let content_length = head
                 .lines()
                 .find_map(|l| {
@@ -796,12 +982,13 @@ mod tests {
                         .then(|| value.trim().parse::<usize>().ok())?
                 })
                 .unwrap_or(0);
-            while buf.len() < head_end + content_length {
+            let mut chunk = [0u8; 4096];
+            while body.len() < content_length {
                 let n = tls.read(&mut chunk).map_err(|e| e.to_string())?;
                 if n == 0 {
                     break;
                 }
-                buf.extend_from_slice(&chunk[..n]);
+                body.extend_from_slice(&chunk[..n]);
             }
             let peer: Vec<Vec<u8>> = tls
                 .conn
@@ -810,24 +997,31 @@ mod tests {
                 .iter()
                 .map(|c| c.to_vec())
                 .collect();
-            let body = "<ok/>";
+            let reply = "<ok/>";
             write!(
                 tls,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/soap+xml;charset=UTF-8\r\n\
-                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
             )
             .map_err(|e| e.to_string())?;
             tls.conn.send_close_notify();
             tls.flush().map_err(|e| e.to_string())?;
-            Ok((peer, head))
+            Ok((connect, peer, head))
         });
         (port, handle)
     }
 
     /// Strongest proof of the fix: a real TLS server that demands a client
     /// certificate receives the configured one (and the mutual secprofile
-    /// `Authorization` header) from a Certificate-auth transport.
+    /// `Authorization` header) from a Certificate-auth transport, through
+    /// the whole `send_soap` dispatch.
+    ///
+    /// The transport is pointed at the server through an explicit `http://`
+    /// proxy (the server itself answers the `CONNECT`): with an explicit
+    /// proxy reqwest ignores `HTTP(S)_PROXY` / `ALL_PROXY`, so an
+    /// environment proxy cannot divert the connection, and every server
+    /// step has a deadline, so a failure ends the test instead of hanging it.
     #[tokio::test]
     async fn certificate_auth_presents_client_certificate_in_tls_handshake() {
         use crate::test_pki::{RSA_CERT_PEM, RSA_KEY_PKCS1_PEM};
@@ -838,17 +1032,30 @@ mod tests {
         let files = pem_files("mtls", RSA_CERT_PEM, RSA_KEY_PKCS1_PEM);
         let config = WinrmConfig {
             port,
+            proxy: Some(format!("http://127.0.0.1:{port}")),
+            connect_timeout_secs: 5,
+            operation_timeout_secs: 5,
             ..cert_tls_config(&files)
         };
         let transport = HttpTransport::new(config, WinrmCredentials::new("u", "p", "")).unwrap();
-        let client_result = transport.send_soap_raw("127.0.0.1", "<soap/>".into()).await;
-        let seen = tokio::task::spawn_blocking(move || server.join().unwrap())
-            .await
-            .unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(30), async {
+            let client_result = transport.send_soap_raw("127.0.0.1", "<soap/>".into()).await;
+            let seen = tokio::task::spawn_blocking(move || server.join())
+                .await
+                .unwrap()
+                .unwrap();
+            (client_result, seen)
+        })
+        .await;
+        let (client_result, seen) = outcome.expect("mutual-TLS exchange did not finish in 30 s");
 
-        let (peer, head) = seen
+        let (connect, peer, head) = seen
             .unwrap_or_else(|e| panic!("server side failed: {e}; client side: {client_result:?}"));
         assert_eq!(client_result.unwrap(), "<ok/>");
+        assert!(
+            connect.starts_with(&format!("CONNECT 127.0.0.1:{port} ")),
+            "went through the explicit proxy: {connect}"
+        );
         let expected = CertificateDer::from_pem_slice(RSA_CERT_PEM.as_bytes()).unwrap();
         assert_eq!(
             peer,

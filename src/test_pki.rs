@@ -11,6 +11,9 @@
 //   openssl genrsa -traditional -out rsa-pkcs1.key 2048
 //   openssl req -x509 -new -key rsa-pkcs1.key -subj "/CN=winrm-rs throwaway RSA test" \
 //       -days 36500 -addext "extendedKeyUsage=clientAuth" -out rsa.pem
+//   openssl pkcs8 -topk8 -v2 aes-256-cbc -in ec-sec1.key -passout pass:throwaway \
+//       -out ec-pkcs8-enc.key
+//   openssl ec -in ec-sec1.key -aes128 -passout pass:throwaway -out ec-sec1-enc.key
 //
 // One EC key in two encodings (SEC1, PKCS#8) and one RSA key in PKCS#1 cover
 // the three private-key formats Certificate auth accepts.
@@ -102,4 +105,28 @@ UfBlluuCDIRq6t4zQXhzaPd4bDLQgtuW3NMnGsa8kWUYhMVCH+BpGYKskYrvfxrn
 y+1OqhmsxYpS3Kkly7Rb2+R/N7nPg5g62B6UMFC9NWMnwSIdKBYhABD+N1OGK+zx
 QqWuUTzB57v+yrv97Faoucjjd5yOzBXq4JF10QtmQDeOrVtZNqI=
 -----END RSA PRIVATE KEY-----
+";
+
+/// Key of [`EC_CERT_PEM`], encrypted PKCS#8 (`ENCRYPTED PRIVATE KEY`, passphrase `throwaway`).
+pub(crate) const EC_KEY_PKCS8_ENCRYPTED_PEM: &str = "\
+-----BEGIN ENCRYPTED PRIVATE KEY-----
+MIH0MF8GCSqGSIb3DQEFDTBSMDEGCSqGSIb3DQEFDDAkBBCmSHJuPZv3v+Re654n
+PvuoAgIIADAMBggqhkiG9w0CCQUAMB0GCWCGSAFlAwQBKgQQfmd5MaxzV2RcuawG
+AVM0gASBkECth2CFURk6OnOn7lWU+BdfT/KjHP+cCrk8W3QSws9x0p/VK7tvt69z
+oEOYLCWLT+Wh+78NGHifLtRnzLxlRwlLFOa01sHl5npYLIX47Y2JbmuDYGlTPxgb
+z8LLYZDejJ+5dQnHucOoIZ16a+KEas/i0lif51ITJaDvZideB74GysPxZ3/Yw8Bt
+TZJnQuZboA==
+-----END ENCRYPTED PRIVATE KEY-----
+";
+
+/// Key of [`EC_CERT_PEM`], legacy OpenSSL encryption (`Proc-Type: 4,ENCRYPTED`, passphrase `throwaway`).
+pub(crate) const EC_KEY_SEC1_LEGACY_ENCRYPTED_PEM: &str = "\
+-----BEGIN EC PRIVATE KEY-----
+Proc-Type: 4,ENCRYPTED
+DEK-Info: AES-128-CBC,651758622B52D18F47BBA1E64091940C
+
+fiHa7zwQUccr7SMfenx/jxVmJ2aEI5NXs+4onrvwjnTpQZHHq9ZrCqqDU77VSDvP
+c10yteV0lqpywlvVbVtCXtutGCzeBKjbK5RQXrAbXwJELCgbG201IwrOcAd+VGv7
+ossscMeEp9LLtzWBEfaSSeVuhGBbT9OgD/WW8jQbVOc=
+-----END EC PRIVATE KEY-----
 ";

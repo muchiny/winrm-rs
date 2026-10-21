@@ -19,15 +19,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (MS-WSMV). Over HTTPS the rustls config is now built with the certificate
   chain from `client_cert_pem` and the key from `client_key_pem`
   (`PRIVATE KEY` / PKCS#8, `RSA PRIVATE KEY` / PKCS#1 or `EC PRIVATE KEY` /
-  SEC1), and every Certificate request sends that header. Server-certificate
-  verification and channel binding are unchanged. A file with no certificate,
-  no key, malformed PEM, or a key rustls rejects (unsupported, or not matching
-  the certificate) is now a `WinrmError::AuthFailed` at construction that names
-  the file and never quotes its contents (it used to be a `WinrmError::Http`
-  builder error, or no error at all for a mismatched key). Over plain HTTP
-  the client still builds, now with a warning that no certificate can be
-  presented. Validated live against Server 2025 with a mapped certificate
+  SEC1; unencrypted keys only), and every Certificate request sends that
+  header. Server-certificate verification and channel binding are unchanged.
+  A path that is not a regular file or is over 1 MiB, a file with no
+  certificate or no key, an encrypted key, malformed PEM, or a key rustls
+  rejects (unsupported, or not matching the certificate) is now a
+  `WinrmError::AuthFailed` at construction that names the file and never
+  quotes its contents (it used to be a `WinrmError::Http` builder error, or
+  no error at all for a mismatched key). The PEM text buffers are wiped after
+  parsing. Validated live against Server 2025 with a mapped certificate
   (whoami returns the mapped account) and an untrusted one (401).
+- **Behaviour change: `AuthMethod::Certificate` with `use_tls = false` now
+  fails at construction** with `WinrmError::AuthFailed("Certificate auth
+  requires HTTPS (set use_tls = true)")`, before any file is read, like
+  CredSSP over HTTP. Such a configuration used to build but could never
+  authenticate: without TLS there is no handshake to present the certificate
+  in.
 - **A command silent for longer than `operation_timeout_secs` failed with a
   `TimedOut` fault.** The server answers a Receive that finds no output within
   `OperationTimeout` with the WS-Management fault `w:TimedOut`, which means

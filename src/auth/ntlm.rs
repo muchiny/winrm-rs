@@ -47,7 +47,9 @@ pub(crate) fn seal_body(session: &mut ntlm::NtlmSession, body: &str) -> (String,
 
     let mut mime_body = header_part.into_bytes();
     mime_body.extend_from_slice(&payload);
-    mime_body.extend_from_slice(format!("\r\n{ENCRYPTED_BOUNDARY}--\r\n").as_bytes());
+    // The closing boundary follows the sealed payload directly, as Windows
+    // frames it; a CRLF in between makes HTTP.sys reject the request (400).
+    mime_body.extend_from_slice(format!("{ENCRYPTED_BOUNDARY}--\r\n").as_bytes());
 
     (ENCRYPTED_CONTENT_TYPE.to_string(), mime_body)
 }
@@ -80,11 +82,13 @@ pub(crate) fn unseal_body(
 
     let sealed_start = encrypted_start + 4;
 
-    // Find the end boundary
-    let end_marker = format!("\r\n{ENCRYPTED_BOUNDARY}--").into_bytes();
+    // The payload runs up to the closing boundary, which Windows puts right
+    // after it (no CRLF). Take the last occurrence: ciphertext bytes cannot
+    // follow the trailer.
+    let end_marker = format!("{ENCRYPTED_BOUNDARY}--").into_bytes();
     let sealed_end = data[sealed_start..]
         .windows(end_marker.len())
-        .position(|w| w == end_marker.as_slice())
+        .rposition(|w| w == end_marker.as_slice())
         .map_or(data.len(), |p| sealed_start + p);
 
     let sealed_data = &data[sealed_start..sealed_end];
@@ -336,6 +340,65 @@ mod tests {
         let (_, mime_body) = seal_body(&mut session, "x");
         let body_str = String::from_utf8_lossy(&mime_body);
         assert!(body_str.trim_end().ends_with("--Encrypted Boundary--"));
+    }
+
+    /// MS-WSMV framing as Windows sends and expects it (pypsrp builds it the
+    /// same way): the closing boundary follows the sealed payload directly.
+    /// A CRLF between them makes HTTP.sys answer 400 to every sealed request.
+    #[test]
+    fn seal_body_puts_the_closing_boundary_right_after_the_payload() {
+        let mut session = NtlmSession::from_auth(&[0xEF; 16]);
+        let body = "<soap>hello</soap>";
+        let (_, mime_body) = seal_body(&mut session, body);
+        let marker = b"application/octet-stream\r\n";
+        let pos = mime_body
+            .windows(marker.len())
+            .position(|w| w == marker)
+            .expect("octet-stream marker present");
+        // marker, 4-byte signature length, 16-byte signature, ciphertext.
+        let payload_end = pos + marker.len() + 4 + 16 + body.len();
+        assert_eq!(
+            &mime_body[payload_end..],
+            b"--Encrypted Boundary--\r\n",
+            "trailer after the sealed payload"
+        );
+    }
+
+    /// A response framed the way Windows frames it (closing boundary right
+    /// after the payload) unseals to the server's plaintext.
+    #[test]
+    fn unseal_body_reads_a_windows_framed_response() {
+        let key = [0x37; 16];
+        let mut server = NtlmSession::server_side(&key);
+        let mut client = NtlmSession::from_auth(&key);
+        let plaintext = "<s:Envelope>reply</s:Envelope>";
+        let mut response = format!(
+            "{ENCRYPTED_BOUNDARY}\r\n\
+             \tContent-Type: application/HTTP-SPNEGO-session-encrypted\r\n\
+             \tOriginalContent: type=application/soap+xml;charset=UTF-8;Length={}\r\n\
+             {ENCRYPTED_BOUNDARY}\r\n\
+             \tContent-Type: application/octet-stream\r\n",
+            plaintext.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(&16u32.to_le_bytes());
+        response.extend_from_slice(&server.seal(plaintext.as_bytes()));
+        response.extend_from_slice(format!("{ENCRYPTED_BOUNDARY}--\r\n").as_bytes());
+
+        assert_eq!(unseal_body(&mut client, &response).unwrap(), plaintext);
+    }
+
+    /// What `seal_body` sends, the peer unseals: request and response framing agree.
+    #[test]
+    fn seal_body_output_unseals_on_the_other_side() {
+        let key = [0x21; 16];
+        let mut client = NtlmSession::from_auth(&key);
+        let mut server = NtlmSession::server_side(&key);
+        let (_, mime_body) = seal_body(&mut client, "<soap>ping</soap>");
+        assert_eq!(
+            unseal_body(&mut server, &mime_body).unwrap(),
+            "<soap>ping</soap>"
+        );
     }
 
     // Tests that the sig_len field is correctly parsed from the 4-byte LE prefix.

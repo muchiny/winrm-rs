@@ -105,6 +105,20 @@ impl NtlmSession {
         }
     }
 
+    /// The server's view of the session derived from the same key: what it
+    /// seals, a client [`Self::from_auth`] session unseals, and back.
+    ///
+    /// Test-only: lets unit tests build the sealed bodies a WinRM server sends.
+    #[cfg(test)]
+    pub(crate) fn server_side(exported_session_key: &[u8; 16]) -> Self {
+        let mut session = Self::from_auth(exported_session_key);
+        std::mem::swap(&mut session.client_sign_key, &mut session.server_sign_key);
+        std::mem::swap(&mut session.client_seal_key, &mut session.server_seal_key);
+        session.client_seal_handle = Rc4State::new(&session.client_seal_key);
+        session.server_seal_handle = Rc4State::new(&session.server_seal_key);
+        session
+    }
+
     fn derive_key(session_key: &[u8; 16], magic: &[u8]) -> [u8; 16] {
         use md5::Digest;
         let mut hasher = md5::Md5::new();
@@ -317,6 +331,19 @@ impl NtlmSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_side_session_mirrors_the_client_session() {
+        let key = [0x42; 16];
+        let mut client = NtlmSession::from_auth(&key);
+        let mut server = NtlmSession::server_side(&key);
+        for i in 0..2u8 {
+            let to_server = client.seal(&[b'c', i]);
+            assert_eq!(server.unseal(&to_server).unwrap(), [b'c', i]);
+            let to_client = server.seal(&[b's', i]);
+            assert_eq!(client.unseal(&to_client).unwrap(), [b's', i]);
+        }
+    }
 
     fn unhex(s: &str) -> Vec<u8> {
         (0..s.len())

@@ -53,14 +53,11 @@ impl AuthTransport for BasicAuth {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            if status.as_u16() == 500
-                && let Err(soap_err) = crate::soap::parser::check_soap_fault(&body)
-            {
-                return Err(WinrmError::Soap(soap_err));
-            }
-            return Err(WinrmError::AuthFailed(format!(
-                "HTTP {status} from WinRM: {body}"
-            )));
+            return Err(crate::auth::error_for_status(
+                status.as_u16(),
+                &body,
+                || format!("HTTP {status} from WinRM: {body}"),
+            ));
         }
 
         resp.text().await.map_err(WinrmError::Http)

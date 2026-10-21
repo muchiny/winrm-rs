@@ -890,10 +890,10 @@ impl AuthTransport for CredSspAuth {
             ));
         }
         if !(200..300).contains(&status) {
-            let body_text = String::from_utf8_lossy(&resp_body).into_owned();
-            return Err(WinrmError::AuthFailed(format!(
-                "CredSSP HTTP {status}: {body_text}"
-            )));
+            let body_text = String::from_utf8_lossy(&resp_body);
+            return Err(crate::auth::error_for_status(status, &body_text, || {
+                format!("CredSSP HTTP {status}: {body_text}")
+            }));
         }
         Ok(String::from_utf8_lossy(&resp_body).into_owned())
     }

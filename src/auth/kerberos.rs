@@ -76,7 +76,11 @@ impl AuthTransport for KerberosAuth {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(WinrmError::AuthFailed(format!("HTTP {status}: {body}")));
+            return Err(crate::auth::error_for_status(
+                status.as_u16(),
+                &body,
+                || format!("HTTP {status}: {body}"),
+            ));
         }
 
         resp.text().await.map_err(WinrmError::Http)

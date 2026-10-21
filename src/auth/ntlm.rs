@@ -262,12 +262,11 @@ impl NtlmAuth {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            if status.as_u16() == 500
-                && let Err(soap_err) = crate::soap::parser::check_soap_fault(&text)
-            {
-                return Err(WinrmError::Soap(soap_err));
-            }
-            return Err(WinrmError::AuthFailed(format!("HTTP {status}: {text}")));
+            return Err(crate::auth::error_for_status(
+                status.as_u16(),
+                &text,
+                || format!("HTTP {status}: {text}"),
+            ));
         }
 
         let response_text = resp.text().await.map_err(WinrmError::Http)?;

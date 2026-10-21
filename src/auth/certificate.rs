@@ -41,9 +41,11 @@ impl AuthTransport for CertificateAuth {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(WinrmError::AuthFailed(format!(
-                "Certificate auth HTTP {status}: {body}"
-            )));
+            return Err(crate::auth::error_for_status(
+                status.as_u16(),
+                &body,
+                || format!("Certificate auth HTTP {status}: {body}"),
+            ));
         }
 
         resp.text().await.map_err(WinrmError::Http)
@@ -102,5 +104,49 @@ mod tests {
             err.contains("403") || err.contains("Certificate"),
             "error should mention status or auth type: {err}"
         );
+    }
+
+    /// A silent Receive ends in an HTTP 500 `w:TimedOut` fault; it must reach
+    /// the polling loops as a SOAP fault (an empty poll there), not as an
+    /// authentication failure.
+    #[tokio::test]
+    async fn certificate_auth_http_500_fault_is_a_soap_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(crate::auth::TIMED_OUT_FAULT))
+            .mount(&server)
+            .await;
+
+        let http = crate::transport::test_http_client();
+        let err = CertificateAuth
+            .send_authenticated(&http, &server.uri(), "body".into())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, WinrmError::Soap(crate::error::SoapError::Fault { code, .. }) if code == "w:TimedOut"),
+            "expected Soap(Fault w:TimedOut), got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn certificate_auth_http_500_without_fault_keeps_its_message() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("plain failure"))
+            .mount(&server)
+            .await;
+
+        let http = crate::transport::test_http_client();
+        let err = CertificateAuth
+            .send_authenticated(&http, &server.uri(), "body".into())
+            .await
+            .unwrap_err();
+        match err {
+            WinrmError::AuthFailed(msg) => assert_eq!(
+                msg,
+                "Certificate auth HTTP 500 Internal Server Error: plain failure"
+            ),
+            other => panic!("expected AuthFailed, got: {other:?}"),
+        }
     }
 }

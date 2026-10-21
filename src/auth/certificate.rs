@@ -55,7 +55,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let http = reqwest::Client::new();
+        let http = crate::transport::test_http_client();
         let auth = CertificateAuth;
         let result = auth
             .send_authenticated(&http, &server.uri(), "body".into())
@@ -72,7 +72,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let http = reqwest::Client::new();
+        let http = crate::transport::test_http_client();
         let auth = CertificateAuth;
         let result = auth
             .send_authenticated(&http, &server.uri(), "body".into())

@@ -39,7 +39,7 @@ credssp = ["dep:hyper", "dep:hyper-util", "dep:tokio-rustls", "dep:http-body-uti
 __internal = []
 
 [dependencies]
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "socks"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "socks"] }
 cross-krb5 = { version = "0.5", optional = true }
 tokio = { version = "1", features = ["time", "macros"] }
 base64 = "0.23"
@@ -53,7 +53,7 @@ secrecy = { version = "0.10", features = ["serde"] }
 tracing = "0.1"
 zeroize = { version = "1.8", features = ["derive"] }
 tokio-util = { version = "0.7.18", features = ["rt"] }
-rustls = { version = "0.23", features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 sha2 = "0.11"
 subtle = "2.6"
 webpki-roots = "1.0.6"

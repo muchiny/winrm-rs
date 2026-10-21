@@ -97,6 +97,10 @@ impl HttpTransport {
         // server returning a 30x is unexpected and any cross-origin redirect
         // would risk forwarding the Authorization header. Disable redirects
         // entirely.
+        // `reqwest` is built with `rustls-no-provider`, so a provider must be
+        // installed before ANY client is built, plain HTTP included
+        // (idempotent: an already-installed provider is kept).
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let mut builder = reqwest::Client::builder()
             .danger_accept_invalid_certs(config.accept_invalid_certs)
             .redirect(reqwest::redirect::Policy::none())
@@ -154,8 +158,6 @@ impl HttpTransport {
 
         // When using TLS, inject a CertCapturingVerifier to enable Channel Binding Tokens.
         let cert_handle = if config.use_tls {
-            // Ensure a rustls CryptoProvider is installed (idempotent)
-            let _ = rustls::crypto::ring::default_provider().install_default();
             let root_store =
                 rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
             let inner_verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
@@ -426,6 +428,14 @@ impl HttpTransport {
     ) -> Result<String, WinrmError> {
         self.send_soap_with_retry(host, body).await
     }
+}
+
+/// `reqwest::Client` for unit tests that bypass [`HttpTransport::new`]:
+/// `rustls-no-provider` panics at build time unless a provider is installed.
+#[cfg(test)]
+pub(crate) fn test_http_client() -> reqwest::Client {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    reqwest::Client::new()
 }
 
 #[cfg(test)]

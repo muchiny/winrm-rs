@@ -8,10 +8,10 @@ déduit de la lecture du code.
 
 | Crate | Commit | Ce qui a été exécuté |
 |---|---|---|
-| `winrm-rs` | `4f229dc` (branche `test/live-coverage`, dernier commit de code ou de test ; le commit de documentation qui le suit ne touche que le `CHANGELOG` et ce document ; les runs ci-dessous ont été faits sur cet arbre) | Suite live complète contre Server 2025 avec `--features credssp,__internal` (78 tests), les deux `eval` du banc faits : **78 passés, 0 échoué** (465 s) avec `--test-threads=1` ; en parallélisme par défaut, **77 passés, 1 échoué** (220 s ; `shell_run_command_times_out`, `TimedOut` à `open_shell` sous charge, le cas connu ; il passe en série). Runs précédents : à `c46f8c6`, 74 passés en série comme en parallèle ; à `9ceaaba`, 69 passés en série, 68 passés et 1 échoué (`shell_run_command_times_out`) en parallèle ; à `4cbebfb`, 66 passés en série, 65 passés et 1 échoué (le même test) en parallèle. Les tests à timeout court se lisent plus fiablement avec `--test-threads=1` (voir l'en-tête de `tests/integration_real.rs`). |
+| `winrm-rs` | `92341f6` (branche `test/live-coverage`, dernier commit de code ou de test ; le commit de documentation qui le suit ne touche que le `CHANGELOG` et ce document ; les runs ci-dessous ont été faits sur cet arbre) | Suite live complète contre Server 2025 avec `--features credssp,__internal` (78 tests), les deux `eval` du banc faits : **78 passés, 0 échoué** (460 s) avec `--test-threads=1` ; en parallélisme par défaut, **78 passés, 0 échoué** (210 s ; `shell_run_command_times_out` reste sensible à la charge, il a passé cette fois). Server 2012 R2 (VM reconstruite) : les tests NTLM et deux tests Basic seulement, voir « Limites connues ». Runs précédents : à `4f229dc`, 78 passés en série, 77 passés et 1 échoué (`shell_run_command_times_out`) en parallèle ; à `c46f8c6`, 74 passés en série comme en parallèle ; à `4cbebfb`, 66 passés en série, 65 passés et 1 échoué en parallèle. Les tests à timeout court se lisent plus fiablement avec `--test-threads=1` (voir l'en-tête de `tests/integration_real.rs`). |
 | `winrm-rs` (Kerberos) | `f8a1272` (code de production identique à `c46f8c6`), plus les tests Kerberos ajoutés par le commit qui suit | Contre le contrôleur de domaine `winrm.test` (banc séparé, `tests/vagrant/dc/README.md`), avec `--features kerberos` et un TGT obtenu par `kinit vagrant@WINRM.TEST` : `cargo test --features kerberos --test integration_real kerberos -- --ignored` → **3 passés, 0 échoué** (22 s). |
-| `psrp-rs` | `4a79189` (`origin/main`) | Suite live (8 tests) contre le `winrm-rs` local (`[patch.crates-io]`, worktree jetable) : **8 passés, 0 échoué** contre `winrm-rs` `4cbebfb` (Basic), puis contre `84f1898` en Basic et en NTLM sur HTTP. Contre `winrm-rs` `4f229dc` (scellement qui échoue fermé, une connexion authentifiée par échange) : **8 passés** avec Basic sur HTTP (réglage par défaut de la suite) et **8 passés** avec `PSRP_INTEGRATION_AUTH=ntlm` (NTLM scellé sur HTTP). Ce run NTLM, à travers un relais TCP enregistreur qui garde chaque connexion à part : 8 connexions (une par client), 2 requêtes `Negotiate` par connexion, 72 requêtes et 72 réponses `multipart/encrypted`, aucun corps de requête en clair (les Type 1 et Type 3 n'en portent pas), aucun HTTP 400 ni 500. |
-| `bridge-mcp` | `f44a5fa` (v4.0.2, worktree jetable ; `origin/main` est maintenant `ec9310e`) | Smoke en ligne de commande par `winrm` puis par `psrp` (hôtes NTLM sur HTTP) : `hostname` renvoie `winrm-2025`, `Get-Date` renvoie la date du banc (2026-10-21), sur les deux protocoles. Fait contre `winrm-rs` `4cbebfb`, `84f1898`, puis `4f229dc` (avec `psrp-rs` `4a79189`) : 4 appels sur 4 réussis (1,8 à 3,3 s chacun), à travers le relais enregistreur : 4 connexions, 2 requêtes `Negotiate` par connexion, 26 requêtes scellées, aucun corps de requête en clair, aucun HTTP 400. Journal d'audit redirigé vers un fichier jetable. |
+| `psrp-rs` | `4a79189` (`origin/main`) | Suite live (8 tests) contre le `winrm-rs` local (`[patch.crates-io]`, worktree jetable) : **8 passés, 0 échoué** contre `winrm-rs` `4cbebfb` (Basic), puis contre `84f1898` en Basic et en NTLM sur HTTP. Contre `winrm-rs` `4f229dc` puis `92341f6` (scellement qui échoue fermé et sans renvoi, une connexion authentifiée par échange, CBT de la connexion) : **8 passés** avec Basic sur HTTP (réglage par défaut de la suite) et **8 passés** avec `PSRP_INTEGRATION_AUTH=ntlm` (NTLM scellé sur HTTP), aux deux commits. Ce run NTLM, à travers un relais TCP enregistreur qui garde chaque connexion à part : 8 connexions (une par client), 2 requêtes `Negotiate` par connexion, 72 requêtes et 72 réponses `multipart/encrypted`, aucun corps de requête en clair (les Type 1 et Type 3 n'en portent pas), aucun HTTP 400 ni 500. |
+| `bridge-mcp` | `f44a5fa` (v4.0.2, worktree jetable ; `origin/main` est maintenant `ec9310e`) | Smoke en ligne de commande par `winrm` puis par `psrp` (hôtes NTLM sur HTTP) : `hostname` renvoie `winrm-2025`, `Get-Date` renvoie la date du banc (2026-10-21), sur les deux protocoles. Fait contre `winrm-rs` `4cbebfb`, `84f1898`, `4f229dc`, puis `92341f6` (avec `psrp-rs` `4a79189`) : 4 appels sur 4 réussis à chaque fois (2,0 à 2,7 s chacun à `92341f6`), à travers le relais enregistreur : 4 connexions, 2 requêtes `Negotiate` par connexion, 26 requêtes scellées, aucun corps de requête en clair, aucun HTTP 400. Journal d'audit redirigé vers un fichier jetable. |
 
 Banc : une VM Windows Server 2025 (`winrm-2025`) sous Hyper-V, atteinte par
 `tests/scripts/vm-connect.sh` (HTTP `55985`, HTTPS `55986`, compte `vagrant`).
@@ -127,10 +127,12 @@ ouvert.
   correctifs ci-dessus laissaient deux chemins en clair (le corps SOAP porté
   par la requête Type 3, et toute requête scellée en échec rejouée en clair
   après une nouvelle poignée de main, donc exécutable deux fois) et un verrou
-  tenu pendant tout l'échange. Désormais : Type 3 à corps vide ; seul un 401
-  sur une connexion réutilisée (session perdue, rien d'exécuté) est renvoyé,
-  scellé, sur une nouvelle connexion, une fois ; tout autre échec est une
-  erreur et la connexion est jetée ; une réponse annoncée scellée qui ne se
+  tenu pendant tout l'échange. Désormais : Type 3 à corps vide ; aucune
+  requête scellée n'est renvoyée, pas même sur un 401 (`62844d9` : un
+  attaquant peut faire exécuter la requête par le serveur puis répondre 401
+  lui-même, et aucune preuve côté client, comme une nouvelle connexion TCP,
+  ne l'exclut, puisqu'il tient le côté serveur de la connexion
+  authentifiée) ; tout échec est une erreur et la connexion est jetée ; une réponse annoncée scellée qui ne se
   déchiffre pas est une erreur ; `unseal_body` vérifie toute la trame ; une
   connexion authentifiée par échange en cours, au plus 8 au repos. Vérifié
   par les tests `ntlm_sealed_*` et `silent_command_completes_over_ntlm_sealed_http`
@@ -177,7 +179,7 @@ ouvert.
   `0.0.0.0:5986`.
 
 Historique complet des commits de la campagne :
-`git log --oneline 2fdc39d..4f229dc`, plus le commit de documentation qui
+`git log --oneline 2fdc39d..92341f6`, plus le commit de documentation qui
 suit. `2fdc39d` est l'instantané de travail de l'utilisateur, hors de cette
 campagne.
 
@@ -199,7 +201,7 @@ Tests de `tests/integration_real.rs` sauf mention contraire.
 |---|---|---|---|---|
 | `AuthMethod::Certificate` : certificat client présenté en TLS et mappé (après D2) | `setup_certificate_auth`, `certificate_auth_whoami` | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
 | `AuthMethod::Certificate` : certificat d'une CA non approuvée refusé en moins de 30 s | `certificate_auth_unmapped_cert_is_rejected` | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
-| Proxy HTTP réussi (forme absolue, NTLM sur HTTP) ; le trafic passe par le proxy, y compris pour `127.0.0.1` | `http_proxy_carries_ntlm_over_http` | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
+| Proxy HTTP réussi (forme absolue, NTLM sur HTTP) ; le trafic passe par le proxy, y compris pour `127.0.0.1` | `http_proxy_carries_ntlm_over_http` | ✅ 2026-10-21 | ✅ 2026-10-21 (VM reconstruite) | — non applicable |
 | Proxy HTTP `CONNECT` portant du HTTPS | `http_proxy_connect_carries_https` | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
 | Proxy SOCKS5 | `socks5_proxy_carries_ntlm` | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
 | `max_output_bytes` déclenché, erreur `Transfer`, aucun shell laissé ouvert | `max_output_bytes_aborts_and_releases_shell` | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
@@ -207,17 +209,17 @@ Tests de `tests/integration_real.rs` sauf mention contraire.
 | `connect_timeout_secs` respecté | `connect_timeout_is_honoured` | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
 | Délai total de `Shell::run_command` (`operation_timeout_secs * 2`) | `shell_run_command_times_out` (timeout d'opération de 15 s) | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
 | Commande silencieuse plus longue que `operation_timeout_secs` menée à terme (après D1), Basic sur HTTP | `silent_command_longer_than_operation_timeout_completes` (20 s de silence, timeout d'opération de 15 s ; 22 à 25 s mesurées) | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
-| Idem, NTLM sur HTTP avec scellement par défaut (après D1 et D3) | `silent_command_completes_over_ntlm_sealed_http` (relais enregistreur : 1 HTTP 500, 2 requêtes `Negotiate`, 6 requêtes scellées ; 21 à 25 s) | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
+| Idem, NTLM sur HTTP avec scellement par défaut (après D1 et D3) | `silent_command_completes_over_ntlm_sealed_http` (relais enregistreur : 1 HTTP 500, 2 requêtes `Negotiate`, 6 requêtes scellées ; 21 à 25 s) | ✅ 2026-10-21 | ✅ 2026-10-21 (VM reconstruite) | — non applicable |
 | Idem, Certificate sur HTTPS (après D1 complété) | `silent_command_completes_over_certificate_auth` (24 s) | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
 | Idem, CredSSP sur HTTPS (`--features credssp`, après D1 complété) | `silent_command_completes_over_credssp` (22 s) | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite (test sauté sur 2012 R2) | — non applicable |
 | Idem, Kerberos sur HTTP (`--features kerberos`) | `silent_command_completes_over_kerberos` (22 s) | — non applicable (banc hors domaine) | ⏭ non mesuré : VM détruite | ✅ 2026-10-21 |
-| Messages NTLM réellement scellés sur HTTP (après D3) | `silent_command_completes_over_ntlm_sealed_http` (requêtes `multipart/encrypted`, aucune réauthentification) | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
-| Transfert de 200 Ko aller-retour en NTLM scellé sur HTTP, contenu identique | `ntlm_sealed_upload_and_download_large_file` (101 morceaux ; 316 requêtes scellées, une seule poignée de main ; envoi 130 s, soit environ 1,3 s par morceau comme en Basic, réception 2,3 s, réponse la plus grosse 149 Ko) | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
-| Annulation (`run_command_with_cancel`) en NTLM scellé sur HTTP, puis le même client resservi | `ntlm_sealed_cancel_long_running_command` (annulation déclenchée une fois Execute et un premier Receive partis scellés : `Cancelled` ; la connexion de l'échange annulé est jetée, la commande suivante sur le même client ouvre une nouvelle connexion (4 requêtes `Negotiate` au total, 2 par connexion) et part scellée, aucun corps en clair) | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
-| Ctrl+C en NTLM scellé sur HTTP | `ntlm_sealed_shell_signal_ctrl_c` (5 requêtes scellées, une seule poignée de main) | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
-| Shells concurrents sur un même client en NTLM scellé sur HTTP | `ntlm_sealed_concurrent_shells`, référence `concurrent_shells_timings_basic` (tous terminent ; un `echo` lancé pendant le Receive de 10 s de l'autre shell prend 0,19 s en NTLM scellé, contre 10,3 s avant `657570a` et 0,15 à 0,18 s en Basic ; le test exige moins de 3 s ; 2 connexions, une poignée de main chacune) |
-| 1,5 Mo de sortie en NTLM scellé, `MaxEnvelopeSize` par défaut puis 500 Ko | `ntlm_sealed_large_output_default_envelope`, `ntlm_sealed_large_output_500k_envelope` (sortie complète ; plus grosse réponse HTTP 149 Ko puis 155 Ko : Server 2025 plafonne un Receive vers 150 Ko même avec 500 Ko, bien sous le plafond de 2 Mio du client) | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
-| `EncryptionMode::Always` : NTLM scellé à l'intérieur de HTTPS | `ntlm_encryption_always_over_https` | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
+| Messages NTLM réellement scellés sur HTTP (après D3) | `silent_command_completes_over_ntlm_sealed_http` (requêtes `multipart/encrypted`, aucune réauthentification) | ✅ 2026-10-21 | ✅ 2026-10-21 (VM reconstruite) | — non applicable |
+| Transfert de 200 Ko aller-retour en NTLM scellé sur HTTP, contenu identique | `ntlm_sealed_upload_and_download_large_file` (101 morceaux ; 316 requêtes scellées, une seule poignée de main ; envoi 130 s, soit environ 1,3 s par morceau comme en Basic, réception 2,3 s, réponse la plus grosse 149 Ko) | ✅ 2026-10-21 | ✅ 2026-10-21 (VM reconstruite) | — non applicable |
+| Annulation (`run_command_with_cancel`) en NTLM scellé sur HTTP, puis le même client resservi | `ntlm_sealed_cancel_long_running_command` (annulation déclenchée une fois Execute et un premier Receive partis scellés : `Cancelled` ; la connexion de l'échange annulé est jetée, la commande suivante sur le même client ouvre une nouvelle connexion (4 requêtes `Negotiate` au total, 2 par connexion) et part scellée, aucun corps en clair) | ✅ 2026-10-21 | ✅ 2026-10-21 (VM reconstruite) | — non applicable |
+| Ctrl+C en NTLM scellé sur HTTP | `ntlm_sealed_shell_signal_ctrl_c` (5 requêtes scellées, une seule poignée de main) | ✅ 2026-10-21 | ✅ 2026-10-21 (VM reconstruite) | — non applicable |
+| Shells concurrents sur un même client en NTLM scellé sur HTTP | `ntlm_sealed_concurrent_shells`, référence `concurrent_shells_timings_basic` (tous terminent ; un `echo` lancé pendant le Receive de 10 s de l'autre shell prend 0,19 s en NTLM scellé, contre 10,3 s avant `657570a` et 0,15 à 0,18 s en Basic ; le test exige moins de 3 s ; 2 connexions, une poignée de main chacune) | ✅ 2026-10-21 | ✅ 2026-10-21 (VM reconstruite) | — non applicable |
+| 1,5 Mo de sortie en NTLM scellé, `MaxEnvelopeSize` par défaut puis 500 Ko | `ntlm_sealed_large_output_default_envelope`, `ntlm_sealed_large_output_500k_envelope` (sortie complète ; plus grosse réponse HTTP 149 Ko puis 155 Ko : Server 2025 plafonne un Receive vers 150 Ko même avec 500 Ko, bien sous le plafond de 2 Mio du client) | ✅ 2026-10-21 | ✅ 2026-10-21 (VM reconstruite) | — non applicable |
+| `EncryptionMode::Always` : NTLM scellé à l'intérieur de HTTPS | `ntlm_encryption_always_over_https` | ✅ 2026-10-21 | ⏭ sauté : aucune suite TLS commune avec rustls (voir « Limites connues ») | — non applicable |
 | API bas niveau : `create_shell`, `execute_command`, `receive_output`, `signal_terminate`, `delete_shell` | `low_level_command_lifecycle` | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
 | `signal_terminate` arrête une commande en cours | `signal_terminate_stops_running_command` (shell et commande créés avec un client au timeout par défaut ; scrutation, arrêt et vidage avec un timeout d'opération de 15 s) | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
 | `open_psrp_shell` | psrp-rs (`4a79189`) : les 8 tests live, dont `live_smoke_one_plus_one` | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
@@ -247,11 +249,11 @@ n'est compilé qu'avec cette feature : il a été exécuté à part le 2026-10-2
 
 | Fonctionnalité | Tests | Server 2025 | Server 2012 R2 | Domaine (Kerberos) |
 |---|---|---|---|---|
-| Basic sur HTTP | `create_and_delete_shell`, `run_command_whoami`, `run_command_with_args`, `run_command_nonzero_exit` | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
+| Basic sur HTTP | `create_and_delete_shell`, `run_command_whoami`, `run_command_with_args`, `run_command_nonzero_exit` | ✅ 2026-10-21 | ✅ 2026-10-21 (VM reconstruite ; `create_and_delete_shell` et `run_command_whoami` seulement) | — non applicable |
 | Basic sur HTTPS | `basic_over_https_works` | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
-| NTLM sur HTTP | `ntlm_run_command_whoami`, `ntlm_run_powershell`, `ntlm_shell_reuse` | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
+| NTLM sur HTTP | `ntlm_run_command_whoami`, `ntlm_run_powershell`, `ntlm_shell_reuse` | ✅ 2026-10-21 | ✅ 2026-10-21 (VM reconstruite) | — non applicable |
 | NTLM sur HTTPS avec channel binding (CBT) | `ntlm_over_https_with_cbt` | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
-| Les trois `EncryptionMode` (ces tests passaient aussi avant D3 grâce au repli en clair : ils ne prouvent pas le scellement, voir la ligne « Messages NTLM réellement scellés ») | `ntlm_encryption_always`, `ntlm_encryption_never`, `ntlm_encryption_auto_over_http` | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
+| Les trois `EncryptionMode` (ces tests passaient aussi avant D3 grâce au repli en clair : ils ne prouvent pas le scellement, voir la ligne « Messages NTLM réellement scellés ») | `ntlm_encryption_always`, `ntlm_encryption_never`, `ntlm_encryption_auto_over_http` | ✅ 2026-10-21 | ✅ 2026-10-21 (VM reconstruite) | — non applicable |
 | CredSSP (`--features credssp`) | `credssp_run_command_whoami` | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite (test sauté sur 2012 R2 : voir « Limites connues ») | — non applicable |
 | PowerShell, JSON, Unicode | `run_powershell_version`, `run_powershell_json_output`, `run_powershell_unicode`, `gather_host_facts_json` | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
 | Réutilisation d'un shell, démarrage et lecture manuels | `shell_reuse_multiple_commands`, `shell_start_command_and_receive` | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
@@ -290,11 +292,15 @@ ne figurent pas dans la matrice.
   contrôleur de domaine). L'hôte doit être le nom du serveur (le SPN
   `HTTP/<hôte>` en est dérivé), pas une adresse ; le banc passe par une ligne
   `127.0.0.1 dc.winrm.test` dans `/etc/hosts`.
-- **Server 2012 R2 n'a pas été mesuré.** La VM a été détruite (disque et dossier
-  supprimés) et l'utilisateur a choisi de ne pas la reconstruire. La date du
-  dernier passage complet est inconnue. Quatre tests y sont sautés
-  volontairement : trois tests HTTPS (`basic_over_https_works`,
-  `ntlm_over_https_with_cbt`, `credssp_run_command_whoami`), parce que le SCHANNEL
+- **Server 2012 R2 n'est mesuré qu'en partie.** La VM a été reconstruite ; à
+  `92341f6` seuls les tests NTLM (scellés sur HTTP, modes de chiffrement,
+  proxy) et `create_and_delete_shell` / `run_command_whoami` y ont tourné
+  (`vm-connect-2012r2.sh`, ports `56985`/`56986`) : tous passent, le format
+  de trame scellée strict compris. La suite complète y reste à passer. Cinq
+  tests y sont sautés
+  volontairement : quatre tests HTTPS (`basic_over_https_works`,
+  `ntlm_over_https_with_cbt`, `ntlm_encryption_always_over_https`,
+  `credssp_run_command_whoami`), parce que le SCHANNEL
   de 2012 R2 n'associe GCM qu'à l'échange de clés RSA statique alors que
   `rustls` ne gère ni le RSA statique ni CBC, de sorte qu'aucune suite n'est
   commune et que la poignée de main se termine en EOF ; et
@@ -329,19 +335,25 @@ ne figurent pas dans la matrice.
   que le serveur récupère après son idle timeout. `Shell::run_command` garde
   son délai total de `2 * operation_timeout_secs`. `run_wql` ne scrute pas
   Receive et n'est pas concerné.
-- **Scellement NTLM : ce qui reste.** Les suites relevées par l'audit sont
-  traitées par `657570a` et `d95fe1c` (repli en clair, Type 3 à corps vide,
-  double exécution, corps annoncé scellé non déchiffrable, session laissée en
-  cache, contrôles de `unseal_body`, taille des réponses, cible de fuzz
-  `fuzz_ntlm_unseal_body`, verrou global). Restent : `EncryptionMode::Never`
-  envoie tout en clair sur HTTP (réservé au débogage) ; le comportement face à
-  un serveur qui refuse le trafic non chiffré (`AllowUnencrypted = false`,
-  réglage par défaut de Windows) n'a pas été mesuré, le banc l'autorise (avec
-  le scellement plus aucun corps ne part en clair, ce qui est le cas que ce
-  réglage exige) ; la cible de fuzz est compilée mais n'a pas tourné, et le
-  `fuzz/Cargo.lock` est à rafraîchir ; avec `max_retries > 0`, les autres
-  méthodes (Basic, Kerberos, Certificate, CredSSP, NTLM non scellé) rejouent
-  toujours une requête sur toute erreur HTTP, même après l'envoi.
+- **Scellement NTLM et NTLM sur TLS : ce qui reste.** Les suites relevées
+  par les audits sont traitées par `657570a`, `d95fe1c` et `62844d9` (repli
+  en clair, Type 3 à corps vide, aucun renvoi d'une requête scellée, corps
+  annoncé scellé non déchiffrable, session laissée en cache, contrôles de
+  `unseal_body`, taille des réponses, cible de fuzz `fuzz_ntlm_unseal_body`,
+  verrou global, jeton de liaison de canal (CBT) calculé sur le certificat
+  de la connexion qui porte le défi, nouvelles tentatives limitées aux
+  erreurs de connexion pour toutes les méthodes, au plus 32 échanges NTLM
+  simultanés par client). Restent : `EncryptionMode::Never` envoie tout en
+  clair sur HTTP (réservé au débogage) ; le comportement face à un serveur
+  qui refuse le trafic non chiffré (`AllowUnencrypted = false`, réglage par
+  défaut de Windows) n'a pas été mesuré, le banc l'autorise ; la cible de
+  fuzz est compilée mais n'a pas tourné, et le `fuzz/Cargo.lock` est à
+  rafraîchir ; un proxy HTTP qui transfère les requêtes (sans tunnel) sans
+  garder une connexion serveur par connexion cliente casse la liaison NTLM à
+  la connexion : les requêtes scellées échouent alors, sans partir en clair ;
+  un 401 sur une connexion inactive que le serveur a fermée fait échouer la
+  requête au lieu de la renvoyer (les connexions inactives depuis plus de
+  60 s ne sont pas réutilisées, sous le délai de 120 s de HTTP.sys).
 - **`bridge-mcp` (hors de ce dépôt, observation seulement).** Il n'interpole pas
   `${VAR}` alors que son `config.example.yaml` montre `${WIN_PASSWORD}` (la
   chaîne est envoyée telle quelle) et il convertit toute `AuthFailed` en

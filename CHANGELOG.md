@@ -116,15 +116,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   A server that answers sealed requests with an error used to get the
   request again in plaintext after a fresh handshake, which worked when it
   allowed unencrypted traffic; the call now fails instead. What you see: an
-  HTTP error answer that is not sealed gives
-  `WinrmError::AuthFailed("HTTP <status> to an NTLM-sealed request, answer not
-  sealed (<n> bytes)")`; a sealed answer that does not unseal (framing,
-  signature, sequence) gives `WinrmError::Ntlm(..)` (it was `AuthFailed`);
-  a sealed 4xx/5xx other than a SOAP fault gives `AuthFailed("HTTP <status>:
-  <excerpt>")`. With `max_retries > 0`, a sealed request is retried only on a
-  connection error, before anything was sent. Use HTTPS (sealing is then off
-  under `EncryptionMode::Auto`), or `EncryptionMode::Never` for debugging
-  against a server that does not seal.
+  HTTP error answer that is not sealed gives `WinrmError::Ntlm(..)` ("server
+  answered an NTLM-sealed request without sealing: HTTP <status> (<n>
+  bytes)"); a sealed answer that does not unseal (framing, signature,
+  sequence) gives `WinrmError::Ntlm(..)` (it was `AuthFailed`); a sealed
+  4xx/5xx other than a SOAP fault gives `AuthFailed("HTTP <status>:
+  <excerpt>")`; an HTTP 401 on a sealed request gives `AuthFailed("HTTP 401
+  to an NTLM-sealed request: ... not resent ...")`, also when the server
+  merely closed an idle connection (the next request authenticates again).
+  Use HTTPS (sealing is then off under `EncryptionMode::Auto`), or
+  `EncryptionMode::Never` for debugging against a server that does not seal.
+- **Behaviour change: `max_retries` retries only connection errors**, for
+  every auth method: a `WinrmError::Http` raised before anything was sent.
+  A timeout, a reset or a dropped connection after the request went out is
+  returned, since the request may have run on the server (a command, a
+  stdin write, an upload chunk would run twice). The default,
+  `max_retries = 0`, is unaffected.
+- **NTLM over HTTPS uses dedicated connections.** Each NTLM exchange over
+  TLS (sealed with `EncryptionMode::Always`, or unsealed) runs on a pooled
+  client that keeps one connection, so its channel binding token is tied to
+  that connection (see `### Security`). At most 32 NTLM exchanges run at
+  once on such connections per client; a further request waits for a free
+  one, at most `operation_timeout_secs + 10` s (then
+  `WinrmError::Timeout`), and a cancelled wait takes nothing.
 - **NTLM-sealed requests of one client no longer wait for each other.** The
   sealing session was held under one lock for the whole HTTP exchange, so a
   Receive long-poll on one shell held up every other request of the same
@@ -133,14 +147,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   a pool of authenticated connections (one TCP connection and NTLM session
   each, at most 8 kept idle, none reused after 60 s idle): concurrent
   requests run on separate connections, each with its own handshake
-  (measured: 0.19 s for the same `echo`).
+  (measured: 0.16 to 0.19 s for the same `echo`).
 - **Response bodies are capped** at `4 * max(max_envelope_size, 512 KiB)`
   bytes (2 MiB by default) for every auth method, before unsealing or
   parsing; a larger body is `WinrmError::Soap(SoapError::ParseError("response
   body exceeds <n> bytes"))`. `MaxEnvelopeSize` bounds what the server sends;
   the factor covers UTF-16 encoding and sealing framing, and the floor keeps
   small `max_envelope_size` settings from rejecting legitimate faults. Error
-  messages quote at most 512 characters of a server body.
+  messages quote at most 512 characters of a server body, and a SOAP fault's
+  code and reason are kept to 256 and 2048 characters.
 - **Behaviour change: `WinrmClient::run_command` and `run_powershell` have no
   overall time limit any more** (nor `download_file`, which runs through
   `run_powershell`), a consequence of the `TimedOut` fix above.
@@ -182,16 +197,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Security
 
-- **NTLM message sealing no longer falls back to plaintext and never sends a
-  request twice.** With `EncryptionMode::Auto` over HTTP or `Always`: the
-  handshake that sets up sealing ends with an empty Type 3 body (the SOAP
-  body used to ride on it in plaintext); every SOAP request after it is
-  sealed. A sealed request that fails is no longer re-sent in plaintext
-  after a new handshake (an active attacker on plain HTTP could force that
-  with any non-fault error answer, and a request the server had already
-  executed ran twice: a command, a stdin write, an upload chunk). Only a 401
-  on a reused connection, which means the connection lost its session and
-  nothing ran, is re-sent, sealed, on a new connection, once. A body
+- **NTLM message sealing no longer falls back to plaintext, and the client
+  sends each sealed request once.** With `EncryptionMode::Auto` over HTTP or
+  `Always`: the handshake that sets up sealing ends with an empty Type 3
+  body (the SOAP body used to ride on it in plaintext); every SOAP request
+  after it is sealed. A sealed request that fails is no longer re-sent in
+  plaintext after a new handshake (an active attacker on plain HTTP could
+  force that with any non-fault error answer, and a request the server had
+  already executed ran twice: a command, a stdin write, an upload chunk). It
+  is not re-sent at all, an HTTP 401 included: an attacker can forward the
+  sealed request to the server, let it run, and answer 401 itself, and no
+  client-side check (such as seeing that a new TCP connection was used)
+  rules that out, since the attacker holds the server side of the
+  authenticated connection. A body
   labelled sealed that does not unseal is an error instead of being parsed
   as a plaintext fault (a forged fault would have been accepted and the RC4
   keystream desynchronised), and a failed exchange discards its connection
@@ -200,8 +218,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   exactly that length followed by the closing boundary, decrypted length)
   and never quotes the body in its errors. Verified on Server 2025 through a
   recording relay: no request body crossed unsealed, one handshake per
-  connection; also with psrp-rs and bridge-mcp over NTLM on HTTP. New fuzz
-  target `fuzz_ntlm_unseal_body` and proptests for the framing.
+  connection; also with psrp-rs and bridge-mcp over NTLM on HTTP, and on
+  Server 2012 R2. New fuzz target `fuzz_ntlm_unseal_body` and proptests for
+  the framing.
+- **NTLM channel binding is computed from the right certificate.** The
+  channel binding token (CBT) of an NTLM handshake over TLS was computed
+  from the last certificate any connection of the client had verified; a
+  reused or resumed TLS connection is not verified again, so with two hosts
+  (or another connection's certificate accepted under
+  `accept_invalid_certs`) the token could bind the wrong certificate, which
+  weakens the relay protection CBT exists for. It now comes from the
+  connection that carried the challenge: the TLS details `reqwest` reports
+  on that response, or, through a proxy where it reports none, the
+  verifier of a dedicated client that keeps one connection with TLS session
+  resumption off. Without either, the handshake fails instead of
+  authenticating unbound. Tested with two TLS servers with different
+  certificates.
 
 ### Documentation
 

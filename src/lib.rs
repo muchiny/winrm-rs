@@ -28,7 +28,7 @@
 //! | HTTP Basic | [`AuthMethod::Basic`] | Credentials sent base64-encoded per request. Use only over HTTPS. |
 //! | `NTLMv2` | [`AuthMethod::Ntlm`] | Three-step handshake (negotiate / challenge / authenticate). Default. |
 //! | Kerberos | [`AuthMethod::Kerberos`] | SPNEGO Negotiate via system Kerberos. Requires `kerberos` feature + `kinit`. |
-//! | Certificate | [`AuthMethod::Certificate`] | TLS client certificate. Set `client_cert_pem` and `client_key_pem` on config. |
+//! | Certificate | [`AuthMethod::Certificate`] | TLS client certificate; requires `use_tls = true`. Set `client_cert_pem` and `client_key_pem` on config. |
 //!
 //! # Error handling
 //!

@@ -29,12 +29,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   no error at all for a mismatched key). The PEM text buffers are wiped after
   parsing. Validated live against Server 2025 with a mapped certificate
   (whoami returns the mapped account) and an untrusted one (401).
-- **Behaviour change: `AuthMethod::Certificate` with `use_tls = false` now
-  fails at construction** with `WinrmError::AuthFailed("Certificate auth
-  requires HTTPS (set use_tls = true)")`, before any file is read, like
-  CredSSP over HTTP. Such a configuration used to build but could never
-  authenticate: without TLS there is no handshake to present the certificate
-  in.
 - **A command silent for longer than `operation_timeout_secs` failed with a
   `TimedOut` fault.** The server answers a Receive that finds no output within
   `OperationTimeout` with the WS-Management fault `w:TimedOut`, which means
@@ -49,6 +43,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   ends in `WinrmError::Timeout(2 * operation_timeout_secs)` once its total
   deadline is reached, whether or not the command was chatty. Callers that
   already treated the fault as "poll again" (psrp-rs) keep working.
+  Every auth method now hands an HTTP 500 that carries a SOAP fault back as
+  `WinrmError::Soap` (Certificate, Kerberos and CredSSP returned it as
+  `WinrmError::AuthFailed`, so the fault never reached this handling), and
+  the NTLM-sealed path unseals the fault first (see the next entry).
+  Validated live against Server 2025 (`operation_timeout_secs = 15`, a
+  command silent for 20 s completes) over Basic (HTTP), NTLM over HTTP with
+  the default sealing, Certificate (HTTPS) and CredSSP (HTTPS); Kerberos is
+  covered by unit tests of the shared mapping and compile checks only (no
+  KDC on the bench).
+- **NTLM message sealing never worked: with the default
+  `EncryptionMode::Auto` over HTTP, and with `EncryptionMode::Always`, every
+  request after the first went out in plaintext.** `seal_body` put a CRLF
+  between the sealed payload and the closing `--Encrypted Boundary--`;
+  Server 2025 answers such a request with HTTP 400, which the transport took
+  for an expired session: it re-authenticated on a new connection and
+  replayed the request unsealed. The framing now follows what Windows sends
+  and pypsrp builds (closing boundary right after the payload), and
+  `unseal_body` reads it the same way (it expected a CRLF Windows does not
+  send). Windows also seals the HTTP 500 fault of a sealed request; the
+  transport now unseals it before looking for the fault, so a `TimedOut`
+  fault is an empty poll on the same sealed session instead of a
+  re-authentication and a plaintext replay of the Receive. Measured on
+  Server 2025 through a recording forwarder: a silent 20 s command made 14
+  `Negotiate` requests before (every sealed request rejected), 2 now (one
+  handshake), with every later request sealed. The bench allows unencrypted
+  traffic (`AllowUnencrypted = true`), which is why the plaintext fallback
+  went unnoticed.
 - **PowerShell stderr lost text or leaked raw CLIXML.** Measured on Server
   2025: a large stderr arrives as the `#< CLIXML` marker alone in one Receive
   response, then the `<Objs>` document cut mid-tag, even mid-escape, across
@@ -67,6 +88,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Behaviour change: `WinrmClient::run_command` and `run_powershell` have no
+  overall time limit any more** (nor `download_file`, which runs through
+  `run_powershell`), a consequence of the `TimedOut` fix above.
+  `operation_timeout_secs` bounds each Receive poll, not the command: a
+  command that hangs silently (`Read-Host`, `pause`, a blocked process) used
+  to fail with the `TimedOut` fault after about `operation_timeout_secs` and
+  now blocks the call until it ends. Bound it with
+  `run_command_with_cancel` / `run_powershell_with_cancel` or
+  `tokio::time::timeout`; either way the dropped call leaves the remote
+  shell to the server's idle timeout. `Shell::run_command` keeps its total
+  deadline of `2 * operation_timeout_secs`. `run_wql` does not poll Receive
+  and is unchanged.
+- **Behaviour change: `AuthMethod::Certificate` with `use_tls = false` now
+  fails at construction** with `WinrmError::AuthFailed("Certificate auth
+  requires HTTPS (set use_tls = true)")`, before any file is read, like
+  CredSSP over HTTP. Such a configuration used to build but could never
+  authenticate: without TLS there is no handshake to present the certificate
+  in.
 - **`max_output_bytes` counts stderr bytes as received**, before CLIXML
   decoding, so it also bounds a document still being buffered. CLIXML is
   several times larger than the text it decodes to, so a cap tuned to
@@ -91,9 +130,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   measured in the latest round.
 - **Added the live validation matrix**, `docs/validation/live-matrix.md`: one
   row per feature with the test that proves it, the commits tested
-  (`winrm-rs`, `psrp-rs`, `bridge-mcp`), the two defects the live tests found
-  (a `TimedOut` fault on Receive, `AuthMethod::Certificate`) and the known
-  limits.
+  (`winrm-rs`, `psrp-rs`, `bridge-mcp`), the three defects the live tests
+  found (a `TimedOut` fault on Receive, `AuthMethod::Certificate`, NTLM
+  sealing) and the known limits.
 
 ## [1.2.2] - 2026-09-04
 

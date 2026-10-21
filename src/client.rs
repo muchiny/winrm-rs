@@ -248,6 +248,20 @@ impl WinrmClient {
     /// This is the primary entry point for command execution. It handles the
     /// full shell lifecycle: create -> execute -> poll -> signal -> delete.
     /// The shell is always cleaned up, even if the command fails.
+    ///
+    /// # No overall time limit
+    ///
+    /// The call returns when the command ends, however long that takes.
+    /// [`operation_timeout_secs`](crate::WinrmConfig::operation_timeout_secs)
+    /// bounds each Receive poll, not the command: a poll that finds no output
+    /// within it is an empty poll and polling goes on. A command that hangs
+    /// silently (`Read-Host`, `pause`, a blocked process) therefore blocks
+    /// this call until it ends. To bound it, use
+    /// [`run_command_with_cancel`](Self::run_command_with_cancel) or wrap the
+    /// call in `tokio::time::timeout`; the dropped call does not delete the
+    /// shell, which the server then reaps after its idle timeout.
+    /// [`Shell::run_command`] has a total deadline of
+    /// `2 * operation_timeout_secs`.
     #[tracing::instrument(level = "debug", skip(self))]
     pub async fn run_command(
         &self,
@@ -335,6 +349,11 @@ impl WinrmClient {
     /// The script is encoded as UTF-16LE base64 and executed via
     /// `powershell.exe -EncodedCommand`, which avoids quoting and escaping
     /// issues. Internally delegates to [`run_command`](Self::run_command).
+    ///
+    /// Like [`run_command`](Self::run_command), it has no overall time limit:
+    /// a script that hangs silently blocks the call until it ends. Bound it
+    /// with [`run_powershell_with_cancel`](Self::run_powershell_with_cancel)
+    /// or `tokio::time::timeout`.
     #[tracing::instrument(level = "debug", skip(self, script))]
     pub async fn run_powershell(
         &self,

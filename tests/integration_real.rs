@@ -19,10 +19,23 @@
 //! cargo test --test integration_real -- --ignored
 //! ```
 //!
-//! A few tests run with a short `operation_timeout_secs` (5 to 15 s) to
-//! exercise the Receive timeout path. Under a busy bench, a request sent with
-//! such a window (for instance shell creation while dozens of other tests hit
-//! the same host) can exceed it and fail with a `TimedOut` fault. They need a
+//! The certificate tests (`certificate_auth_*`,
+//! `silent_command_completes_over_certificate_auth`) also need
+//! `eval "$(tests/scripts/make-client-cert.sh)"`; without it they panic by
+//! design instead of passing vacuously. A full run therefore needs both
+//! `eval "$(tests/scripts/vm-connect.sh 2>/dev/null | tr -d '\r')"` (bench
+//! variables) and that one, and `--features credssp,__internal` adds the
+//! CredSSP tests.
+//!
+//! BENCH ONLY: the `setup_*` and `enable_*` tests change the host's
+//! configuration (HTTPS listener, CredSSP, CBT hardening, a trusted root CA
+//! and a certificate mapping) and do not undo it. Never point
+//! `WINRM_TEST_HOST` at a real machine.
+//!
+//! A few tests run with a short `operation_timeout_secs` (15 s) to exercise
+//! the Receive timeout path. Under a busy bench, a request sent with such a
+//! window (for instance shell creation while dozens of other tests hit the
+//! same host) can exceed it and fail with a `TimedOut` fault. They need a
 //! quiet bench and are most reliable with `-- --ignored --test-threads=1`.
 
 use std::time::{Duration, Instant};

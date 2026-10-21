@@ -29,9 +29,18 @@ pub struct WinrmConfig {
     pub accept_invalid_certs: bool,
     /// TCP connect timeout in seconds (default: 30).
     pub connect_timeout_secs: u64,
-    /// WS-Management `OperationTimeout` in seconds (default: 60). The HTTP
-    /// client timeout is set to this value plus 10 seconds to allow the server
-    /// to respond before the transport gives up.
+    /// WS-Management `OperationTimeout` in seconds (default: 60): how long the
+    /// server may hold one request. The HTTP client timeout is set to this
+    /// value plus 10 seconds to allow the server to respond before the
+    /// transport gives up.
+    ///
+    /// It bounds each Receive poll, not the command. A Receive that finds no
+    /// output within it comes back as an empty poll and polling goes on, so
+    /// `WinrmClient::run_command` and `run_powershell` wait for the command
+    /// however long it stays silent (no overall limit; use the
+    /// `*_with_cancel` variants or `tokio::time::timeout` to bound them).
+    /// `Shell::run_command` additionally gives up after
+    /// `2 * operation_timeout_secs` in total.
     pub operation_timeout_secs: u64,
     /// Authentication method to use for all requests (default: [`AuthMethod::Ntlm`]).
     pub auth_method: AuthMethod,

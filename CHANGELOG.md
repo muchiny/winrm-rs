@@ -121,9 +121,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   bytes)"); a sealed answer that does not unseal (framing, signature,
   sequence) gives `WinrmError::Ntlm(..)` (it was `AuthFailed`); a sealed
   4xx/5xx other than a SOAP fault gives `AuthFailed("HTTP <status>:
-  <excerpt>")`; an HTTP 401 on a sealed request gives `AuthFailed("HTTP 401
-  to an NTLM-sealed request: ... not resent ...")`, also when the server
-  merely closed an idle connection (the next request authenticates again).
+  <excerpt>")`; an HTTP 401 on a sealed request gives `WinrmError::Ntlm(..)`
+  ("... session is no longer valid (usually the server closed an idle
+  connection); the request was NOT resent ... retry the call if it is safe
+  to run again"), not `AuthFailed`: it is not a credentials error (bad
+  credentials fail the handshake). The next request authenticates a new
+  connection; an answer with `Connection: close` already makes the client
+  drop that connection, so it does not get to the 401.
   Use HTTPS (sealing is then off under `EncryptionMode::Auto`), or
   `EncryptionMode::Never` for debugging against a server that does not seal.
 - **Behaviour change: `max_retries` retries only connection errors**, for
@@ -138,7 +142,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   that connection (see `### Security`). At most 32 NTLM exchanges run at
   once on such connections per client; a further request waits for a free
   one, at most `operation_timeout_secs + 10` s (then
-  `WinrmError::Timeout`), and a cancelled wait takes nothing.
+  `WinrmError::Timeout`), and a cancelled wait takes nothing. Performance:
+  TLS session resumption is off for these clients (direct connections
+  included), and each new connection comes with its own `reqwest::Client`,
+  so every new NTLM-over-HTTPS connection costs a full TLS handshake and a
+  client build; idle connections (up to 8, 60 s) are reused. Unsealed NTLM
+  over HTTPS used to share the transport's connection pool. A failure to
+  bind the channel (no certificate, an ambiguous one, an unsupported
+  signature algorithm) is `WinrmError::Ntlm(..)`.
 - **NTLM-sealed requests of one client no longer wait for each other.** The
   sealing session was held under one lock for the whole HTTP exchange, so a
   Receive long-poll on one shell held up every other request of the same
@@ -231,9 +242,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   connection that carried the challenge: the TLS details `reqwest` reports
   on that response, or, through a proxy where it reports none, the
   verifier of a dedicated client that keeps one connection with TLS session
-  resumption off. Without either, the handshake fails instead of
+  resumption off, provided that verifier has seen a single certificate (a
+  background connection presenting another one makes it ambiguous, and the
+  handshake fails). It records a certificate only once the certificate is
+  verified. Without a certain certificate, the handshake fails instead of
   authenticating unbound. Tested with two TLS servers with different
   certificates.
+- **NTLM channel binding uses the certificate's own hash (RFC 5929).** The
+  token hashed the certificate with SHA-256 whatever its signature
+  algorithm, so NTLM over HTTPS failed against a host whose certificate is
+  signed with SHA-384 or SHA-512 (P-384 keys, AD CS templates). The hash now
+  follows the signature algorithm, as pyspnego and pypsrp do: SHA-224/256/
+  384/512, MD5 and SHA-1 upgraded to SHA-256, RSASSA-PSS by its hash
+  parameter. An algorithm without a single hash (Ed25519) or an unknown one
+  has no defined channel binding and fails the handshake. Checked against
+  known answers computed with Python `cryptography` for ten certificates.
 
 ### Documentation
 

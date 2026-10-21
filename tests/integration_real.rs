@@ -712,6 +712,11 @@ async fn run_powershell_with_timeout_returns_output_of_a_fast_command() {
         .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let (counter, _) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
 
+    // Control: no stale shell carries this marker, so `after == 0` means ours
+    // was released rather than that the count was already off.
+    let before = open_shell_count_with_idle_timeout(&counter, &host, marker).await;
+    assert_eq!(before, 0, "marker {marker} already used by a stale shell");
+
     let out = client
         .run_powershell_with_timeout(
             &host,
@@ -725,6 +730,55 @@ async fn run_powershell_with_timeout_returns_output_of_a_fast_command() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("fast-ok"));
     let after = open_shell_count_with_idle_timeout(&counter, &host, marker).await;
     assert_eq!(after, 0, "shell leaked after a successful bounded call");
+}
+
+/// `run_powershell_with_cancel` on a command that never ends: cancelled after
+/// 3 s it must return `Cancelled` promptly, and the terminate + Delete it sends
+/// must leave no shell behind (before this was fixed the shell survived until
+/// its idle timeout).
+#[tokio::test]
+#[ignore]
+async fn run_powershell_with_cancel_releases_shell() {
+    // Unique per process, below the server's 7200 s default ceiling and
+    // outside the (disjoint) ranges of the other shell-count tests.
+    let marker = 3000 + u64::from(std::process::id() % 1000);
+    let (client, host) = test_client_with(|c| c.idle_timeout_secs = Some(marker))
+        .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let (counter, _) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+
+    let control = client.open_shell(&host).await.expect("open control shell");
+    let seen = open_shell_count_with_idle_timeout(&counter, &host, marker).await;
+    control.close().await.expect("close control shell");
+    assert_eq!(seen, 1, "marker filter did not see the control shell");
+
+    let before = open_shell_count_with_idle_timeout(&counter, &host, marker).await;
+    assert_eq!(before, 0, "marker {marker} already used by a stale shell");
+
+    let cancel = CancellationToken::new();
+    let canceller = {
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            cancel.cancel();
+        })
+    };
+    let started = std::time::Instant::now();
+    let err = client
+        .run_powershell_with_cancel(&host, "Start-Sleep 600", cancel)
+        .await
+        .unwrap_err();
+    let elapsed = started.elapsed();
+    canceller.await.expect("canceller task");
+
+    let after = open_shell_count_with_idle_timeout(&counter, &host, marker).await;
+    eprintln!("cancelled after {elapsed:?}; marked open shells: before={before} after={after}");
+
+    assert!(matches!(err, WinrmError::Cancelled), "got {err:?}");
+    assert!(
+        elapsed >= Duration::from_secs(3) && elapsed < Duration::from_secs(10),
+        "cancelled after {elapsed:?}"
+    );
+    assert_eq!(after, before, "shell leaked after cancellation");
 }
 
 /// The cap counts raw bytes as received, before CLIXML is decoded. Tabs are
@@ -1507,11 +1561,17 @@ async fn ntlm_sealed_cancel_long_running_command() {
         matches!(result, Err(WinrmError::Cancelled)),
         "expected Cancelled, got: {result:?}"
     );
+    // The cancel dropped a sealed exchange in flight, so its connection was
+    // discarded; the terminate + Delete the cancel then sends open a new one
+    // (one more handshake, empty Type 3) and go out sealed.
     let (sealed_before, negotiate_before) = sealed_traffic(&forwarder);
-    assert_eq!(negotiate_before, 2, "one NTLM handshake before the cancel");
+    assert_eq!(
+        negotiate_before, 4,
+        "one new connection for the clean-up after the dropped exchange"
+    );
     assert!(
-        sealed_before >= 2,
-        "Execute and Receive should go out sealed"
+        sealed_before >= 4,
+        "Execute, Receive, terminate and Delete should go out sealed"
     );
 
     let out = client
@@ -1519,10 +1579,9 @@ async fn ntlm_sealed_cancel_long_running_command() {
         .await
         .expect("the client must still work after a cancelled sealed exchange");
     assert!(String::from_utf8_lossy(&out.stdout).contains("after-cancel"));
-    // The cancelled exchange's connection was discarded: the next request
-    // opened a new one (one more handshake, empty Type 3) and went sealed.
+    // The clean-up's connection is reused: no further handshake.
     let (sealed_after, negotiate_after) = sealed_traffic(&forwarder);
-    assert_eq!(negotiate_after, 4, "one new connection after the cancel");
+    assert_eq!(negotiate_after, 4, "the clean-up connection is reused");
     assert!(
         sealed_after >= sealed_before + 4,
         "Create, Execute, Receive and Delete after the cancel should go out sealed"

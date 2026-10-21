@@ -147,8 +147,12 @@ impl<'a> Shell<'a> {
     /// Execute a command with cancellation support.
     ///
     /// Like [`run_command`](Self::run_command), but can be cancelled via a
-    /// [`CancellationToken`](crate::CancellationToken). When cancelled, a Ctrl+C signal is sent to the
-    /// running command and [`WinrmError::Cancelled`] is returned.
+    /// [`CancellationToken`](crate::CancellationToken). When cancelled the
+    /// call in flight is dropped and [`WinrmError::Cancelled`] is returned; no
+    /// signal is sent, so the command keeps running until
+    /// [`signal_ctrl_c`](Self::signal_ctrl_c) (via
+    /// [`start_command`](Self::start_command)) or the shell's deletion stops
+    /// it.
     pub async fn run_command_with_cancel(
         &self,
         command: &str,

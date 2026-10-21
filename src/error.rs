@@ -21,7 +21,10 @@ pub enum WinrmError {
     /// SOAP-level fault or XML parsing error returned by the WinRM service.
     #[error("WinRM SOAP error: {0}")]
     Soap(SoapError),
-    /// The operation exceeded the configured timeout.
+    /// The operation exceeded its total deadline, which the payload gives in
+    /// seconds. The value depends on the API: `Shell::run_command` reports
+    /// `2 * operation_timeout_secs`; the `WinrmClient::*_with_timeout` methods
+    /// report the caller's `timeout` rounded up to whole seconds (at least 1).
     #[error("WinRM operation timed out after {0}s")]
     Timeout(u64),
     /// File transfer error (upload or download failure).

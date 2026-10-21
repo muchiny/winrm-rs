@@ -3,6 +3,9 @@
 // Communicates with the WinRM service (WS-Management) over HTTP(S).
 // Supports NTLM, Basic, Kerberos, and Certificate authentication.
 
+use std::future::Future;
+use std::pin::pin;
+use std::task::Poll;
 use std::time::Duration;
 
 use tokio::time::Instant;
@@ -274,12 +277,12 @@ impl WinrmClient {
     /// within it is an empty poll and polling goes on. A command that hangs
     /// silently (`Read-Host`, `pause`, a blocked process) therefore blocks
     /// this call until it ends. To bound it, use
-    /// [`run_command_with_timeout`](Self::run_command_with_timeout), which
-    /// stops the command and deletes the shell when the time is up, or
-    /// [`run_command_with_cancel`](Self::run_command_with_cancel) to stop it
-    /// from elsewhere. Dropping this future (a `tokio::time::timeout`, a
-    /// `select!` arm that loses) does not delete the shell, which the server
-    /// then reaps after its idle timeout.
+    /// [`run_command_with_timeout`](Self::run_command_with_timeout) or stop it
+    /// from elsewhere with
+    /// [`run_command_with_cancel`](Self::run_command_with_cancel); both
+    /// terminate the command and delete the shell. Dropping this future (a
+    /// `tokio::time::timeout`, a `select!` arm that loses) cannot delete the
+    /// shell, which the server then reaps after its idle timeout.
     /// [`Shell::run_command`] has a total deadline of
     /// `2 * operation_timeout_secs`.
     #[tracing::instrument(level = "debug", skip(self))]
@@ -289,7 +292,8 @@ impl WinrmClient {
         command: &str,
         args: &[&str],
     ) -> Result<CommandOutput, WinrmError> {
-        self.run_command_until(host, command, args, None).await
+        self.run_command_until(host, command, args, std::future::pending(), false)
+            .await
     }
 
     /// Run a command with a total time limit.
@@ -300,21 +304,32 @@ impl WinrmClient {
     /// shell is deleted (best effort), and the call returns
     /// [`WinrmError::Timeout`] carrying `timeout` rounded **up** to whole
     /// seconds, at least 1: `1500 ms` and `2 s` both give `Timeout(2)`, and
-    /// `Duration::ZERO` gives `Timeout(1)` without waiting.
+    /// `Duration::ZERO` gives `Timeout(1)` without sending anything.
     ///
     /// The limit counts wall-clock time of the command itself: empty polls
     /// (the `w:TimedOut` fault a silent command provokes every
     /// [`operation_timeout_secs`](crate::WinrmConfig::operation_timeout_secs))
-    /// do not extend it. The clean-up that follows an expiry is bounded
-    /// separately, each of the two requests by `operation_timeout_secs`
-    /// capped at 10 s, so the call can overrun `timeout` by up to 20 s on a
-    /// host that stops answering. A `timeout` too large to add to the current
-    /// time never expires.
+    /// do not extend it. A `timeout` too large to add to the current time
+    /// never expires.
     ///
-    /// The shell is released on success, on error and on expiry. Dropping the
-    /// returned future before it completes cannot delete it (that needs an
-    /// `async` drop), exactly like [`run_command`](Self::run_command); the
-    /// server reaps it after its idle timeout.
+    /// # Clean-up
+    ///
+    /// The shell is deleted on success, on error and on expiry, with two
+    /// exceptions that leave it to the server's idle timeout: the host does
+    /// not answer the Create request within the clean-up budget after the
+    /// deadline (the shell's id is then unknown), or the future is dropped
+    /// before it completes (deleting needs an `async` drop), exactly like
+    /// [`run_command`](Self::run_command).
+    ///
+    /// When the deadline passes during shell creation, Create is not aborted:
+    /// the call waits for its answer, then deletes the shell it returned.
+    /// Every clean-up request (terminate, delete) is bounded by
+    /// `operation_timeout_secs` capped at 10 s, so after expiry the call can
+    /// overrun `timeout` by up to about 30 s on a host that stops answering
+    /// (Create wait plus two requests). The same bound applies to the
+    /// requests that follow a command that finished in time; a deadline that
+    /// passes after the command has finished is ignored and its output is
+    /// returned.
     ///
     /// # Example
     /// ```rust,no_run
@@ -340,64 +355,107 @@ impl WinrmClient {
         args: &[&str],
         timeout: Duration,
     ) -> Result<CommandOutput, WinrmError> {
-        self.run_command_until(host, command, args, Some(timeout))
+        self.run_command_until(host, command, args, deadline_stop(timeout), true)
             .await
     }
 
-    /// Shell lifecycle shared by [`run_command`](Self::run_command) (no
-    /// limit) and [`run_command_with_timeout`](Self::run_command_with_timeout).
+    /// Shell lifecycle shared by [`run_command`](Self::run_command),
+    /// [`run_command_with_timeout`](Self::run_command_with_timeout) and
+    /// [`run_command_with_cancel`](Self::run_command_with_cancel).
+    ///
+    /// `stop` resolves to the error to return when the caller wants the call
+    /// to end early (deadline, cancellation); it is never polled again once
+    /// it has resolved. `stoppable` says whether `stop` can ever resolve,
+    /// which makes the clean-up requests bounded by
+    /// [`cleanup_budget`](Self::cleanup_budget) instead of by the HTTP
+    /// timeout alone.
+    ///
+    /// A stop that resolves while the command is being created, started or
+    /// polled terminates the command (if it started) and deletes the shell,
+    /// then returns the stop's error. A stop that resolves after the command
+    /// has finished is ignored: its output is returned.
     async fn run_command_until(
         &self,
         host: &str,
         command: &str,
         args: &[&str],
-        limit: Option<Duration>,
+        stop: impl Future<Output = WinrmError>,
+        stoppable: bool,
     ) -> Result<CommandOutput, WinrmError> {
-        // `None` when the limit is absent or too large to represent: no expiry.
-        let deadline = limit.and_then(|l| Instant::now().checked_add(l));
-        let expired = || WinrmError::Timeout(limit.map_or(0, timeout_secs));
+        let budget = stoppable.then(|| self.cleanup_budget());
+        let mut stop = pin!(stop);
 
-        let shell_id = match until(deadline, self.create_shell(host)).await {
-            Ok(created) => created?,
-            // A Create that outlives the deadline may still have made a
-            // shell; its id is unknown, so the server's idle timeout reaps it.
-            Err(Expired) => return Err(expired()),
+        // A stop that is already due must not put a Create on the wire.
+        if let Poll::Ready(reason) =
+            std::future::poll_fn(|cx| Poll::Ready(stop.as_mut().poll(cx))).await
+        {
+            return Err(reason);
+        }
+
+        let mut create = pin!(self.create_shell(host));
+        let shell_id = tokio::select! {
+            biased;
+            reason = &mut stop => {
+                // Create is on the wire and the shell may already exist:
+                // let it answer (bounded) so that the shell can be deleted.
+                let waited = bounded(self.cleanup_budget(), &mut create).await;
+                if let Ok(shell_id) = waited {
+                    self.release_shell(host, &shell_id, None, Some(self.cleanup_budget())).await;
+                }
+                return Err(reason);
+            }
+            created = &mut create => created?,
         };
         debug!(shell_id = %shell_id, "WinRM shell created");
 
         let mut command_id = None;
-        let polled = until(
-            deadline,
-            self.run_in_shell(host, &shell_id, command, args, &mut command_id),
-        )
-        .await;
-        let timed_out = polled.is_err();
-        let result = polled.unwrap_or_else(|Expired| Err(expired()));
-
-        if timed_out {
-            if let Some(command_id) = &command_id {
-                bounded(
-                    self.cleanup_budget(),
-                    self.signal_terminate(host, &shell_id, command_id),
-                )
-                .await
-                .inspect_err(|e| debug!(error = %e, "failed to terminate timed-out command"))
-                .ok();
+        let polled = {
+            let run = self.run_in_shell(host, &shell_id, command, args, &mut command_id);
+            tokio::select! {
+                biased;
+                result = run => Ok(result),
+                reason = &mut stop => Err(reason),
             }
-            bounded(self.cleanup_budget(), self.delete_shell(host, &shell_id))
-                .await
-                .inspect_err(|e| debug!(error = %e, "failed to delete WinRM shell (best-effort)"))
-                .ok();
-            return result;
-        }
+        };
 
-        // Always clean up the shell
-        self.delete_shell(host, &shell_id)
+        match polled {
+            Ok(result) => {
+                // The command ended on its own: the clean-up runs outside
+                // the stop, so a late deadline cannot discard its output.
+                // Only a command that completed is signalled (a failed
+                // Receive leaves it to the shell Delete).
+                let finished = result.is_ok().then_some(command_id.as_deref()).flatten();
+                self.release_shell(host, &shell_id, finished, budget).await;
+                result
+            }
+            Err(reason) => {
+                let budget = Some(self.cleanup_budget());
+                self.release_shell(host, &shell_id, command_id.as_deref(), budget)
+                    .await;
+                Err(reason)
+            }
+        }
+    }
+
+    /// Best effort: terminate `command_id` (if any), then delete the shell.
+    /// Each request is bounded by `budget` when there is one.
+    async fn release_shell(
+        &self,
+        host: &str,
+        shell_id: &str,
+        command_id: Option<&str>,
+        budget: Option<Duration>,
+    ) {
+        if let Some(command_id) = command_id {
+            best_effort(budget, self.signal_terminate(host, shell_id, command_id))
+                .await
+                .inspect_err(|e| debug!(error = %e, "failed to terminate command (best-effort)"))
+                .ok();
+        }
+        best_effort(budget, self.delete_shell(host, shell_id))
             .await
             .inspect_err(|e| debug!(error = %e, "failed to delete WinRM shell (best-effort)"))
             .ok();
-
-        result
     }
 
     /// Longest an expiry clean-up request may take: `operation_timeout_secs`,
@@ -410,6 +468,7 @@ impl WinrmClient {
     ///
     /// `started` receives the command id as soon as the command is running,
     /// so a caller that drops this future (a deadline) can still signal it.
+    /// Signalling the finished command is the caller's job.
     async fn run_in_shell(
         &self,
         host: &str,
@@ -457,9 +516,6 @@ impl WinrmClient {
             }
         }
         stderr.extend(stderr_decoder.finish());
-
-        // Best-effort signal terminate
-        self.signal_terminate(host, shell_id, command_id).await.ok();
 
         Ok(CommandOutput {
             stdout,
@@ -532,11 +588,20 @@ impl WinrmClient {
     /// Execute a command with cancellation support.
     ///
     /// Like [`run_command`](Self::run_command), but can be cancelled via a
-    /// [`CancellationToken`](tokio_util::sync::CancellationToken). Cancelling
-    /// drops the call in flight: the command is not signalled and the shell is
-    /// not deleted (the server reaps it after its idle timeout). To bound the
-    /// time instead, and have the shell deleted, use
-    /// [`run_command_with_timeout`](Self::run_command_with_timeout).
+    /// [`CancellationToken`](tokio_util::sync::CancellationToken). On
+    /// cancellation the command is told to terminate (best effort), the
+    /// remote shell is deleted (best effort), and
+    /// [`WinrmError::Cancelled`] is returned. A token that is already
+    /// cancelled returns at once without sending anything.
+    ///
+    /// Clean-up works as for
+    /// [`run_command_with_timeout`](Self::run_command_with_timeout): a
+    /// cancellation during shell creation waits for Create's answer and
+    /// deletes that shell, every clean-up request is bounded by
+    /// `operation_timeout_secs` capped at 10 s, and a cancellation that
+    /// arrives after the command has finished is ignored (its output is
+    /// returned). Dropping this future cannot delete the shell (that needs an
+    /// `async` drop); the server reaps it after its idle timeout.
     pub async fn run_command_with_cancel(
         &self,
         host: &str,
@@ -544,24 +609,22 @@ impl WinrmClient {
         args: &[&str],
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<CommandOutput, WinrmError> {
-        // Honour a pre-cancelled token deterministically. Without this
-        // short-circuit `tokio::select!` polls the two arms in
-        // pseudo-random order, so on macOS the inner `run_command` future
-        // can start an HTTP request and surface a transport error
-        // *before* the cancel-arm is polled.
+        // Honour a pre-cancelled token deterministically: nothing is sent.
         if cancel.is_cancelled() {
             return Err(WinrmError::Cancelled);
         }
-        tokio::select! {
-            result = self.run_command(host, command, args) => result,
-            () = cancel.cancelled() => Err(WinrmError::Cancelled),
-        }
+        self.run_command_until(host, command, args, cancelled(cancel), true)
+            .await
     }
 
     /// Execute a PowerShell script with cancellation support.
     ///
     /// Like [`run_powershell`](Self::run_powershell), but can be cancelled via a
-    /// [`CancellationToken`](tokio_util::sync::CancellationToken).
+    /// [`CancellationToken`](tokio_util::sync::CancellationToken). Cancelling
+    /// terminates the script, deletes the remote shell and returns
+    /// [`WinrmError::Cancelled`]; see
+    /// [`run_command_with_cancel`](Self::run_command_with_cancel) for the
+    /// details.
     pub async fn run_powershell_with_cancel(
         &self,
         host: &str,
@@ -715,17 +778,39 @@ impl WinrmClient {
     }
 }
 
-/// A deadline passed before the awaited future completed.
-struct Expired;
+/// The stop of a `*_with_timeout` call: resolves to [`WinrmError::Timeout`]
+/// once `timeout` has elapsed, counted from the moment this is called. A
+/// `timeout` too large to add to the current time never elapses.
+fn deadline_stop(timeout: Duration) -> impl Future<Output = WinrmError> {
+    let deadline = Instant::now().checked_add(timeout);
+    let secs = timeout_secs(timeout);
+    async move {
+        match deadline {
+            // A sleep whose deadline is already past is not ready on its
+            // first poll (the timer wheel has to tick), so check first.
+            Some(at) if Instant::now() >= at => {}
+            Some(at) => tokio::time::sleep_until(at).await,
+            None => std::future::pending().await,
+        }
+        WinrmError::Timeout(secs)
+    }
+}
 
-/// Await `fut` until `deadline`; `None` waits as long as it takes.
-async fn until<F: std::future::Future>(
-    deadline: Option<Instant>,
-    fut: F,
-) -> Result<F::Output, Expired> {
-    match deadline {
-        Some(at) => tokio::time::timeout_at(at, fut).await.map_err(|_| Expired),
-        None => Ok(fut.await),
+/// The stop of a `*_with_cancel` call: resolves to [`WinrmError::Cancelled`]
+/// once `cancel` is cancelled.
+async fn cancelled(cancel: tokio_util::sync::CancellationToken) -> WinrmError {
+    cancel.cancelled().await;
+    WinrmError::Cancelled
+}
+
+/// [`bounded`] when there is a `budget`, plain `fut` otherwise.
+async fn best_effort<T>(
+    budget: Option<Duration>,
+    fut: impl Future<Output = Result<T, WinrmError>>,
+) -> Result<T, WinrmError> {
+    match budget {
+        Some(budget) => bounded(budget, fut).await,
+        None => fut.await,
     }
 }
 
@@ -3750,7 +3835,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_command_with_timeout_zero_expires_at_once() {
+    async fn run_command_with_timeout_zero_expires_before_anything_is_sent() {
         use std::time::Duration;
         let server = MockServer::start().await;
         let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
@@ -3761,16 +3846,249 @@ mod tests {
             .await
             .unwrap_err();
 
+        // Asserts: Timeout(1), and the deadline is checked before Create goes
+        // on the wire, so there is no shell to leak. It does not assert any
+        // timing (the call is not slept on).
         assert!(matches!(err, WinrmError::Timeout(1)), "got {err:?}");
+        assert!(
+            received_bodies(&server).await.is_empty(),
+            "an already-expired deadline must not send Create"
+        );
     }
 
+    #[tokio::test]
+    async fn run_command_with_timeout_expiring_during_create_deletes_the_created_shell() {
+        use std::time::{Duration, Instant};
+        let server = MockServer::start().await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        // Create answers after the deadline: the shell exists, id unknown
+        // until the answer comes.
+        Mock::given(method("POST"))
+            .and(body_string_contains("transfer/Create"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(SHELL_S1)
+                    .set_delay(Duration::from_millis(1500)),
+            )
+            .mount(&server)
+            .await;
+        mount_ok(&server, EMPTY_BODY, u64::MAX).await;
+
+        let started = Instant::now();
+        let err = client
+            .run_command_with_timeout("127.0.0.1", "x", &[], Duration::from_secs(1))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, WinrmError::Timeout(1)), "got {err:?}");
+        assert!(
+            started.elapsed() >= Duration::from_millis(1400),
+            "Create was aborted"
+        );
+        let bodies = received_bodies(&server).await;
+        let deletes: Vec<_> = bodies
+            .iter()
+            .filter(|b| b.contains("transfer/Delete"))
+            .collect();
+        assert_eq!(deletes.len(), 1, "{bodies:?}");
+        assert!(
+            deletes[0].contains("S1"),
+            "the created shell must be deleted"
+        );
+        assert_eq!(count_containing(&bodies, "windows/shell/Command"), 0);
+    }
+
+    #[tokio::test]
+    async fn run_command_with_timeout_does_not_discard_output_when_the_deadline_hits_the_final_terminate()
+     {
+        use std::time::Duration;
+        let server = MockServer::start().await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        mount_ok(&server, SHELL_S1, 1).await;
+        mount_ok(&server, COMMAND_C1, 1).await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("windows/shell/Receive"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(DONE_HELLO))
+            .mount(&server)
+            .await;
+        // The post-Done terminate is slow and straddles the 1 s deadline.
+        Mock::given(method("POST"))
+            .and(body_string_contains("signal/terminate"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(EMPTY_BODY)
+                    .set_delay(Duration::from_millis(1500)),
+            )
+            .mount(&server)
+            .await;
+        mount_ok(&server, EMPTY_BODY, u64::MAX).await;
+
+        let out = client
+            .run_command_with_timeout("127.0.0.1", "x", &[], Duration::from_secs(1))
+            .await
+            .expect("a finished command's output must survive a late deadline");
+
+        assert_eq!(out.stdout, b"hello");
+        let bodies = received_bodies(&server).await;
+        assert_eq!(
+            count_containing(&bodies, "transfer/Delete"),
+            1,
+            "{bodies:?}"
+        );
+    }
+
+    // --- Cancellation: run_command_with_cancel / run_powershell_with_cancel ---
+
+    /// Cancel `token` after `after`, from a task.
+    fn cancel_after(
+        token: &tokio_util::sync::CancellationToken,
+        after: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let token = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(after).await;
+            token.cancel();
+        })
+    }
+
+    #[tokio::test]
+    async fn run_command_with_cancel_terminates_and_deletes_the_shell() {
+        use std::time::Duration;
+        let server = MockServer::start().await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        mount_hanging_command(&server, silent_poll()).await;
+        let token = tokio_util::sync::CancellationToken::new();
+        let canceller = cancel_after(&token, Duration::from_millis(600));
+
+        let err = client
+            .run_command_with_cancel("127.0.0.1", "hang", &[], token)
+            .await
+            .unwrap_err();
+        canceller.await.unwrap();
+
+        assert!(matches!(err, WinrmError::Cancelled), "got {err:?}");
+        let bodies = received_bodies(&server).await;
+        assert_eq!(
+            count_containing(&bodies, "signal/terminate"),
+            1,
+            "{bodies:?}"
+        );
+        assert_eq!(
+            count_containing(&bodies, "transfer/Delete"),
+            1,
+            "{bodies:?}"
+        );
+        let signal_at = bodies.iter().position(|b| b.contains("signal/terminate"));
+        let delete_at = bodies.iter().position(|b| b.contains("transfer/Delete"));
+        assert!(signal_at < delete_at, "terminate must precede delete");
+    }
+
+    #[tokio::test]
+    async fn run_powershell_with_cancel_terminates_and_deletes_the_shell() {
+        use std::time::Duration;
+        let server = MockServer::start().await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        mount_hanging_command(&server, silent_poll()).await;
+        let token = tokio_util::sync::CancellationToken::new();
+        let canceller = cancel_after(&token, Duration::from_millis(600));
+
+        let err = client
+            .run_powershell_with_cancel("127.0.0.1", "Read-Host", token)
+            .await
+            .unwrap_err();
+        canceller.await.unwrap();
+
+        assert!(matches!(err, WinrmError::Cancelled), "got {err:?}");
+        let bodies = received_bodies(&server).await;
+        assert_eq!(
+            count_containing(&bodies, "signal/terminate"),
+            1,
+            "{bodies:?}"
+        );
+        assert_eq!(
+            count_containing(&bodies, "transfer/Delete"),
+            1,
+            "{bodies:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_command_with_cancel_during_create_deletes_the_created_shell() {
+        use std::time::Duration;
+        let server = MockServer::start().await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        Mock::given(method("POST"))
+            .and(body_string_contains("transfer/Create"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(SHELL_S1)
+                    .set_delay(Duration::from_millis(1200)),
+            )
+            .mount(&server)
+            .await;
+        mount_ok(&server, EMPTY_BODY, u64::MAX).await;
+        let token = tokio_util::sync::CancellationToken::new();
+        let canceller = cancel_after(&token, Duration::from_millis(300));
+
+        let err = client
+            .run_command_with_cancel("127.0.0.1", "x", &[], token)
+            .await
+            .unwrap_err();
+        canceller.await.unwrap();
+
+        assert!(matches!(err, WinrmError::Cancelled), "got {err:?}");
+        let bodies = received_bodies(&server).await;
+        assert_eq!(
+            count_containing(&bodies, "transfer/Delete"),
+            1,
+            "{bodies:?}"
+        );
+        assert_eq!(count_containing(&bodies, "windows/shell/Command"), 0);
+    }
+
+    #[tokio::test]
+    async fn run_command_with_cancel_that_never_fires_behaves_like_run_command() {
+        let server = MockServer::start().await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        mount_ok(&server, SHELL_S1, 1).await;
+        mount_ok(&server, COMMAND_C1, 1).await;
+        mount_ok(&server, DONE_HELLO, 1).await;
+        mount_ok(&server, EMPTY_BODY, u64::MAX).await;
+
+        let out = client
+            .run_command_with_cancel(
+                "127.0.0.1",
+                "x",
+                &[],
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(out.stdout, b"hello");
+        let bodies = received_bodies(&server).await;
+        assert_eq!(
+            count_containing(&bodies, "signal/terminate"),
+            1,
+            "{bodies:?}"
+        );
+        assert_eq!(
+            count_containing(&bodies, "transfer/Delete"),
+            1,
+            "{bodies:?}"
+        );
+    }
     #[tokio::test]
     async fn download_file_with_timeout_expires_on_a_silent_host() {
         use std::time::Duration;
         let server = MockServer::start().await;
         let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
         mount_hanging_command(&server, silent_poll()).await;
-        let local = std::env::temp_dir().join("winrm-rs-test-dl-timeout.bin");
+        let local = std::env::temp_dir().join(format!(
+            "winrm-rs-test-dl-timeout-{}-{}.bin",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
 
         let err = client
             .download_file_with_timeout("127.0.0.1", "C:\\f.bin", &local, Duration::from_secs(1))

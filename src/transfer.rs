@@ -141,9 +141,29 @@ impl WinrmClient {
     /// [`run_powershell_with_timeout`](Self::run_powershell_with_timeout):
     /// on expiry the shell is deleted and [`WinrmError::Timeout`] is returned
     /// with `timeout` rounded up to whole seconds. The limit covers the
-    /// transfer from the host, not the local write that follows it.
+    /// transfer from the host, not the local write that follows it. No local
+    /// file is created or modified on timeout.
     ///
     /// Returns the number of bytes downloaded.
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// # use std::{path::Path, time::Duration};
+    /// # use winrm_rs::{WinrmClient, WinrmConfig, WinrmCredentials, WinrmError};
+    /// # async fn example() -> Result<(), WinrmError> {
+    /// # let client = WinrmClient::new(WinrmConfig::default(), WinrmCredentials::new("u","p",""))?;
+    /// let bytes = client
+    ///     .download_file_with_timeout(
+    ///         "server",
+    ///         r"C:\logs\app.log",
+    ///         Path::new("app.log"),
+    ///         Duration::from_secs(60),
+    ///     )
+    ///     .await?;
+    /// println!("{bytes} bytes");
+    /// # Ok(()) }
+    /// ```
+    #[tracing::instrument(level = "debug", skip(self))]
     pub async fn download_file_with_timeout(
         &self,
         host: &str,

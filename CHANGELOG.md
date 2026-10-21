@@ -24,15 +24,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `WinrmClient::run_command_with_timeout`, `run_powershell_with_timeout` and
   `download_file_with_timeout`, each taking a `timeout: Duration`. When it
   elapses (shell creation and polling included; empty `TimedOut` polls do not
-  extend it) the command gets a terminate signal, the remote shell is
-  deleted, both best effort and bounded to `operation_timeout_secs` (at most
-  10 s) per request, and the call returns `WinrmError::Timeout(secs)` with
-  `timeout` rounded up to whole seconds (at least 1). The shell is released
-  on success, error and expiry; dropping the future cannot delete it, as for
-  `run_command`. Additive: no `WinrmConfig` field was added.
+  extend it) the command gets a terminate signal and the remote shell is
+  deleted, both best effort, and the call returns `WinrmError::Timeout(secs)`
+  with `timeout` rounded up to whole seconds (at least 1; `Duration::ZERO`
+  returns at once and sends nothing). A deadline that passes while the shell
+  is being created waits for Create's answer and deletes that shell. Every
+  clean-up request is bounded to `operation_timeout_secs` (at most 10 s). A
+  deadline that passes after the command has finished is ignored and its
+  output returned. The shell is released on success, error and expiry;
+  dropping the future cannot delete it, as for `run_command`. Additive: no
+  `WinrmConfig` field was added.
 
 ### Fixed
 
+- **`WinrmClient::run_command_with_cancel` / `run_powershell_with_cancel`
+  leaked the remote shell on cancellation.** They only dropped the call in
+  flight, so the command kept running and the shell stayed on the host until
+  its idle timeout (7200 s by default). They now share the lifecycle of the
+  `*_with_timeout` calls: on cancellation the command is told to terminate,
+  the shell is deleted (both best effort, bounded to `operation_timeout_secs`,
+  at most 10 s each) and `WinrmError::Cancelled` is returned, as before. A
+  cancellation during shell creation waits for Create's answer and deletes
+  that shell; one that arrives after the command has finished is ignored and
+  the output is returned. Dropping the future still cannot delete the shell.
+  Validated live against Server 2025 (`Start-Sleep 600` cancelled after 3 s
+  leaves no shell).
 - **`AuthMethod::Certificate` never authenticated (always HTTP 401).** Two
   defects, both on the path: the transport installed its rustls config with
   `with_no_client_auth()`, which made `reqwest` drop the client identity, so
@@ -186,10 +202,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   to fail with the `TimedOut` fault after about `operation_timeout_secs` and
   now blocks the call until it ends. Bound it with the new
   `run_command_with_timeout` / `run_powershell_with_timeout` /
-  `download_file_with_timeout`, which delete the shell on expiry, or stop it
-  from elsewhere with `run_command_with_cancel` / `run_powershell_with_cancel`
-  or `tokio::time::timeout`; those two drop the call and leave the remote
-  shell to the server's idle timeout. `Shell::run_command` keeps its total
+  `download_file_with_timeout`, or stop it from elsewhere with
+  `run_command_with_cancel` / `run_powershell_with_cancel`; all of them
+  terminate the command and delete the shell. A plain `tokio::time::timeout`
+  drops the call and leaves the remote shell to the server's idle timeout.
+  `Shell::run_command` keeps its total
   deadline of `2 * operation_timeout_secs`. `run_wql` does not poll Receive
   and is unchanged.
 - **Behaviour change: `AuthMethod::Certificate` with `use_tls = false` now

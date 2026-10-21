@@ -83,6 +83,8 @@ pub(crate) enum Event {
 
 #[derive(Default)]
 struct State {
+    /// Type 3 answers still to send with `Connection: close`.
+    close_after_auth: usize,
     sessions: Vec<NtlmSession>,
     replies: VecDeque<Reply>,
     log: Vec<Event>,
@@ -111,6 +113,11 @@ impl FakeNtlmServer {
     /// queued reply, a sealed request gets `Reply::ok("<ok/>")`.
     pub(crate) fn push(&self, reply: Reply) {
         self.lock().replies.push_back(reply);
+    }
+
+    /// Answer the next `n` Type 3 messages with `Connection: close`.
+    pub(crate) fn close_after_auth(&self, n: usize) {
+        self.lock().close_after_auth = n;
     }
 
     /// Everything seen so far.
@@ -212,7 +219,10 @@ impl Respond for FakeNtlmServer {
                     state.log.push(Event::Authenticate {
                         body_len: request.body.len(),
                     });
-                    if request.body.is_empty() {
+                    if state.close_after_auth > 0 {
+                        state.close_after_auth -= 1;
+                        ResponseTemplate::new(200).insert_header("connection", "close")
+                    } else if request.body.is_empty() {
                         ResponseTemplate::new(200)
                     } else {
                         // The pre-fix flow: the SOAP request rode on the Type 3.

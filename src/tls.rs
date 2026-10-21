@@ -17,16 +17,21 @@ use zeroize::Zeroizing;
 use crate::error::WinrmError;
 
 /// A [`ServerCertVerifier`] wrapper that records every distinct end-entity
-/// certificate (DER bytes) the inner verifier accepted.
+/// certificate (DER bytes) the inner verifier accepted for one target host.
 ///
 /// It records after a successful verification only, so a rejected
-/// certificate leaves nothing. A client may open more than one connection
+/// certificate leaves nothing, and only for handshakes with `target` (the
+/// server name of the WinRM host): `reqwest` verifies an `https://` proxy
+/// with a copy of the same TLS configuration, and the proxy's certificate
+/// must not count. A client may open more than one connection to the target
 /// (a background connect racing an idle one), so the handle reports one
-/// certificate only when all the connections it verified presented the same
-/// one; otherwise the certificate of a given connection cannot be told.
+/// certificate only when all the target connections it verified presented
+/// the same one; otherwise the certificate of a given connection cannot be
+/// told.
 #[derive(Debug)]
 pub(crate) struct CertCapturingVerifier {
     inner: Arc<dyn ServerCertVerifier>,
+    target: Option<ServerName<'static>>,
     captured: Arc<Mutex<Captured>>,
 }
 
@@ -43,10 +48,15 @@ pub(crate) enum Captured {
 }
 
 impl CertCapturingVerifier {
-    /// Wrap an existing verifier, recording the server certificates it accepts.
-    pub(crate) fn new(inner: Arc<dyn ServerCertVerifier>) -> Self {
+    /// Wrap an existing verifier, recording the certificates it accepts for
+    /// `target` (nothing when `target` is `None`).
+    pub(crate) fn new(
+        inner: Arc<dyn ServerCertVerifier>,
+        target: Option<ServerName<'static>>,
+    ) -> Self {
         Self {
             inner,
+            target,
             captured: Arc::new(Mutex::new(Captured::None)),
         }
     }
@@ -75,9 +85,14 @@ impl ServerCertVerifier for CertCapturingVerifier {
             ocsp_response,
             now,
         )?;
-        // A poisoned lock (a panic while recording) is unrecoverable state
-        // for channel binding: mark it as ambiguous, which makes NTLM refuse
-        // to authenticate rather than bind a wrong certificate.
+        if self.target.as_ref() != Some(server_name) {
+            return Ok(verified);
+        }
+        // A panic while the lock was held would leave it poisoned. The writer
+        // takes the guard back (`PoisonError::into_inner`) and applies the
+        // normal transition, since the state itself is always consistent;
+        // the reader (`CertHandle::captured`) treats a poisoned lock as
+        // `Several`, so channel binding then fails closed.
         let mut captured = self
             .captured
             .lock()
@@ -372,10 +387,53 @@ mod tests {
         }
     }
 
+    fn target(name: &str) -> ServerName<'static> {
+        ServerName::try_from(name.to_string()).unwrap()
+    }
+
+    /// Certificates verified for another server name (an `https://` proxy)
+    /// are not recorded.
+    #[test]
+    fn records_only_certificates_of_the_target() {
+        let verifier =
+            CertCapturingVerifier::new(Arc::new(AcceptAllVerifier), Some(target("winrm.host")));
+        let handle = verifier.cert_handle();
+        let proxy_cert = CertificateDer::from(vec![1, 1]);
+        let target_cert = CertificateDer::from(vec![2, 2]);
+        let _ = verifier.verify_server_cert(
+            &proxy_cert,
+            &[],
+            &target("proxy.host"),
+            &[],
+            UnixTime::now(),
+        );
+        assert_eq!(handle.captured(), Captured::None);
+        let _ = verifier.verify_server_cert(
+            &target_cert,
+            &[],
+            &target("WINRM.host"),
+            &[],
+            UnixTime::now(),
+        );
+        assert_eq!(
+            handle.captured(),
+            Captured::One(vec![2, 2]),
+            "names compare case-insensitively"
+        );
+        let _ = verifier.verify_server_cert(
+            &proxy_cert,
+            &[],
+            &target("proxy.host"),
+            &[],
+            UnixTime::now(),
+        );
+        assert_eq!(handle.captured(), Captured::One(vec![2, 2]));
+    }
+
     #[test]
     fn captures_server_certificate() {
         let inner = Arc::new(AcceptAllVerifier);
-        let verifier = CertCapturingVerifier::new(inner);
+        let verifier = CertCapturingVerifier::new(inner, Some(target("example.com")));
         let handle = verifier.cert_handle();
 
         // No cert captured yet
@@ -444,7 +502,7 @@ mod tests {
                 vec![SignatureScheme::RSA_PKCS1_SHA256]
             }
         }
-        let verifier = CertCapturingVerifier::new(Arc::new(RejectAll));
+        let verifier = CertCapturingVerifier::new(Arc::new(RejectAll), Some(target("example.com")));
         let handle = verifier.cert_handle();
         let cert = CertificateDer::from(vec![9, 9, 9]);
         let name = ServerName::try_from("example.com").unwrap();
@@ -459,7 +517,7 @@ mod tests {
     #[test]
     fn handle_is_cloneable() {
         let inner = Arc::new(AcceptAllVerifier);
-        let verifier = CertCapturingVerifier::new(inner);
+        let verifier = CertCapturingVerifier::new(inner, Some(target("test.local")));
         let handle1 = verifier.cert_handle();
         let handle2 = handle1.clone();
 
@@ -491,7 +549,7 @@ mod tests {
     #[test]
     fn cert_handle_returns_none_when_nothing_captured() {
         let inner = Arc::new(AcceptAllVerifier);
-        let verifier = CertCapturingVerifier::new(inner);
+        let verifier = CertCapturingVerifier::new(inner, None);
         let handle = verifier.cert_handle();
         assert_eq!(handle.captured(), Captured::None);
     }
@@ -499,7 +557,7 @@ mod tests {
     #[test]
     fn capturing_verifier_delegates_supported_schemes() {
         let inner = Arc::new(AcceptAllVerifier);
-        let verifier = CertCapturingVerifier::new(inner);
+        let verifier = CertCapturingVerifier::new(inner, None);
         assert_eq!(
             verifier.supported_verify_schemes(),
             vec![SignatureScheme::RSA_PKCS1_SHA256]
@@ -509,7 +567,7 @@ mod tests {
     #[test]
     fn capturing_verifier_delegates_tls12_signature() {
         let inner = Arc::new(AcceptAllVerifier);
-        let verifier = CertCapturingVerifier::new(inner);
+        let verifier = CertCapturingVerifier::new(inner, None);
         let cert = CertificateDer::from(vec![0xAA; 32]);
         let dss = make_dss();
         let result = verifier.verify_tls12_signature(b"hello", &cert, &dss);
@@ -519,7 +577,7 @@ mod tests {
     #[test]
     fn capturing_verifier_delegates_tls13_signature() {
         let inner = Arc::new(AcceptAllVerifier);
-        let verifier = CertCapturingVerifier::new(inner);
+        let verifier = CertCapturingVerifier::new(inner, None);
         let cert = CertificateDer::from(vec![0xBB; 32]);
         let dss = make_dss();
         let result = verifier.verify_tls13_signature(b"hello", &cert, &dss);

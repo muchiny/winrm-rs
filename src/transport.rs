@@ -120,6 +120,18 @@ pub(crate) fn max_response_bytes(config: &WinrmConfig) -> usize {
         .saturating_mul(4)
 }
 
+/// The TLS server name of a WinRM host, as `reqwest` sends it for the
+/// endpoint URL (the sanitized host, without IPv6 brackets).
+fn target_name(host: &str) -> Option<rustls::pki_types::ServerName<'static>> {
+    let host = sanitize_host(host);
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(&host)
+        .to_string();
+    rustls::pki_types::ServerName::try_from(host).ok()
+}
+
 /// Strip scheme, userinfo, port, and path from a host string.
 ///
 /// Defensive: callers are supposed to pass `"hostname"` or `"10.0.0.1"`,
@@ -469,7 +481,8 @@ impl HttpTransport {
     fn new_ntlm_conn(&self, host: &str) -> Result<Box<NtlmConn>, WinrmError> {
         let (tls, cert) = match &self.tls_config {
             Some((base, verifier)) => {
-                let capturing = crate::tls::CertCapturingVerifier::new(Arc::clone(verifier));
+                let capturing =
+                    crate::tls::CertCapturingVerifier::new(Arc::clone(verifier), target_name(host));
                 let handle = capturing.cert_handle();
                 let mut config = base.clone();
                 config
@@ -492,14 +505,34 @@ impl HttpTransport {
 
     /// Open a sealed connection to `host`: a new dedicated connection and an
     /// NTLM handshake on it whose Type 3 carries no body.
+    ///
+    /// A Type 3 answered with `Connection: close` ends the connection the
+    /// session is bound to before any sealed request: that connection is
+    /// dropped and a new one authenticated, once; a server that closes again
+    /// cannot carry sealed messages and gets an error.
     async fn open_sealed_conn(&self, host: &str, url: &str) -> Result<Box<NtlmConn>, WinrmError> {
-        let mut conn = self.new_ntlm_conn(host)?;
-        let session_key = self
-            .ntlm_auth()
-            .authenticate(&conn.http, conn.cert.as_ref(), url)
-            .await?;
-        conn.session = Some(NtlmSession::from_auth(&session_key));
-        Ok(conn)
+        for _ in 0..2 {
+            let mut conn = self.new_ntlm_conn(host)?;
+            let (session_key, closing) = self
+                .ntlm_auth()
+                .authenticate(&conn.http, conn.cert.as_ref(), url)
+                .await?;
+            if closing {
+                debug!(
+                    "server closed the connection after NTLM authentication; authenticating a new one"
+                );
+                continue;
+            }
+            // The session (keys, RC4 S-boxes) is built on the stack and then
+            // moved into the boxed connection: that stack copy is not wiped.
+            conn.session = Some(NtlmSession::from_auth(&session_key));
+            return Ok(conn);
+        }
+        Err(WinrmError::Ntlm(crate::error::NtlmError::InvalidMessage(
+            "the server closes the connection right after NTLM authentication, so no sealed \
+             message can use the session bound to it"
+                .into(),
+        )))
     }
 
     /// Send a request NTLM-sealed, failing closed: no request body is ever
@@ -573,12 +606,7 @@ impl HttpTransport {
         if status.as_u16() == 401 {
             return Err(SealedFailure::Unauthorized);
         }
-        conn.closing = resp
-            .headers()
-            .get_all(reqwest::header::CONNECTION)
-            .iter()
-            .filter_map(|v| v.to_str().ok())
-            .any(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("close")));
+        conn.closing = crate::auth::announces_close(resp.headers());
         let labelled_sealed = resp
             .headers()
             .get(CONTENT_TYPE)
@@ -2155,8 +2183,13 @@ mod tests {
         let (port_b, seen_b) = spawn_ntlm_tls_server(RSA_CERT_PEM, RSA_KEY_PKCS1_PEM);
         let proxy = spawn_connect_proxy();
         let transport = ntlm_tls_transport(port_a, proxy);
-        for (host, port) in [("a", port_a), ("b", port_b), ("a", port_a)] {
-            let url = format!("https://127.0.0.1:{port}/wsman");
+        // Two host names, so the two servers are two hosts for the client.
+        for (host, port) in [
+            ("127.0.0.1", port_a),
+            ("localhost", port_b),
+            ("127.0.0.1", port_a),
+        ] {
+            let url = format!("https://{host}:{port}/wsman");
             let reply = tokio::time::timeout(
                 Duration::from_secs(20),
                 transport.send_ntlm_over_tls(host, &url, "<soap/>"),
@@ -2387,7 +2420,9 @@ mod tests {
         let (port_a, seen_a) = spawn_ntlm_tls_server(EC_CERT_PEM, EC_KEY_PKCS8_PEM);
         let (port_b, seen_b) = spawn_ntlm_tls_server(RSA_CERT_PEM, RSA_KEY_PKCS1_PEM);
         let transport = ntlm_tls_transport(port_a, spawn_connect_proxy());
-        let conn = transport.new_ntlm_conn("shared").unwrap();
+        // Both servers are "127.0.0.1" (different ports): the same target
+        // name for the client's certificate record.
+        let conn = transport.new_ntlm_conn("127.0.0.1").unwrap();
         let auth = transport.ntlm_auth();
         let send = |port: u16| {
             let url = format!("https://127.0.0.1:{port}/wsman");
@@ -2508,5 +2543,162 @@ mod tests {
             "<second/>"
         );
         assert_eq!(fake.handshakes(), 2, "log: {:?}", fake.log());
+    }
+
+    /// An `https://` CONNECT proxy on loopback presenting `cert_pem`: TLS
+    /// with the client, `CONNECT` inside it, then bytes relayed between the
+    /// TLS stream and the target (one thread per connection, short read
+    /// timeouts to alternate directions).
+    fn spawn_https_connect_proxy(cert_pem: &'static str, key_pem: &'static str) -> u16 {
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        use std::io::{ErrorKind, Read, Write};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let chain = vec![CertificateDer::from_pem_slice(cert_pem.as_bytes()).unwrap()];
+        let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).unwrap();
+        let config = Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(chain, key)
+                .unwrap(),
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            while let Ok(tcp) = accept_with_deadline(&listener) {
+                let config = Arc::clone(&config);
+                std::thread::spawn(move || -> Result<(), String> {
+                    let conn = rustls::ServerConnection::new(config).map_err(|e| e.to_string())?;
+                    let mut tls = rustls::StreamOwned::new(conn, tcp);
+                    let (head, _) = read_http_head(&mut tls)?;
+                    let target = head
+                        .split_whitespace()
+                        .nth(1)
+                        .ok_or("no CONNECT target")?
+                        .to_string();
+                    let mut upstream =
+                        std::net::TcpStream::connect(&target).map_err(|e| e.to_string())?;
+                    tls.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                        .map_err(|e| e.to_string())?;
+                    tls.flush().map_err(|e| e.to_string())?;
+                    let short = Some(Duration::from_millis(10));
+                    tls.sock
+                        .set_read_timeout(short)
+                        .map_err(|e| e.to_string())?;
+                    upstream
+                        .set_read_timeout(short)
+                        .map_err(|e| e.to_string())?;
+                    let deadline = std::time::Instant::now() + MTLS_SERVER_DEADLINE;
+                    let mut buf = [0u8; 16 * 1024];
+                    let idle = |e: &std::io::Error| {
+                        matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
+                    };
+                    while std::time::Instant::now() < deadline {
+                        match tls.read(&mut buf) {
+                            Ok(0) => return Ok(()),
+                            Ok(n) => upstream.write_all(&buf[..n]).map_err(|e| e.to_string())?,
+                            Err(e) if idle(&e) => {}
+                            Err(e) => return Err(e.to_string()),
+                        }
+                        match upstream.read(&mut buf) {
+                            Ok(0) => return Ok(()),
+                            Ok(n) => {
+                                tls.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+                                tls.flush().map_err(|e| e.to_string())?;
+                            }
+                            Err(e) if idle(&e) => {}
+                            Err(e) => return Err(e.to_string()),
+                        }
+                    }
+                    Ok(())
+                });
+            }
+        });
+        port
+    }
+
+    /// Through an `https://` proxy, reqwest verifies the proxy's certificate
+    /// with a copy of the client's TLS configuration, so the capturing
+    /// verifier also sees the proxy's certificate. Only certificates of the
+    /// target count: the handshake succeeds and binds the target's.
+    #[tokio::test]
+    async fn ntlm_cbt_through_an_https_proxy_binds_the_target_certificate() {
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM, RSA_CERT_PEM, RSA_KEY_PKCS1_PEM};
+        let (port, seen) = spawn_ntlm_tls_server(EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let proxy = spawn_https_connect_proxy(RSA_CERT_PEM, RSA_KEY_PKCS1_PEM);
+        let config = WinrmConfig {
+            auth_method: AuthMethod::Ntlm,
+            use_tls: true,
+            accept_invalid_certs: true,
+            port,
+            // "localhost" for the proxy, "127.0.0.1" for the target: two names.
+            proxy: Some(format!("https://localhost:{proxy}")),
+            connect_timeout_secs: 5,
+            operation_timeout_secs: 5,
+            ..Default::default()
+        };
+        let transport = HttpTransport::new(config, WinrmCredentials::new(USER, PASS, "")).unwrap();
+        let url = format!("https://127.0.0.1:{port}/wsman");
+        let reply = tokio::time::timeout(
+            Duration::from_secs(20),
+            transport.send_ntlm_over_tls("127.0.0.1", &url, "<soap/>"),
+        )
+        .await
+        .expect("did not finish in 20 s")
+        .unwrap();
+        assert_eq!(reply, "<ok/>");
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(type3_channel_bindings(&seen[0]), Some(cbt_of(EC_CERT_PEM)));
+    }
+
+    /// A Type 3 answered with `Connection: close` ends the connection the
+    /// session is bound to: that connection is dropped before any sealed
+    /// request, and a new one is authenticated.
+    #[tokio::test]
+    async fn sealing_handshake_closed_by_the_server_is_redone() {
+        let (_server, fake, transport, host) = sealed_setup().await;
+        fake.close_after_auth(1);
+        fake.push(Reply::ok("<first/>"));
+        let reply = transport
+            .send_soap_with_retry(&host, "<a/>".into())
+            .await
+            .unwrap();
+        assert_eq!(reply, "<first/>");
+        assert_eq!(fake.handshakes(), 2, "log: {:?}", fake.log());
+        assert_eq!(fake.sealed().len(), 1, "sent once, on the second session");
+    }
+
+    /// A server that closes every authenticated connection cannot carry
+    /// sealed messages: an error, with no sealed request sent.
+    #[tokio::test]
+    async fn sealing_handshake_always_closed_is_an_error() {
+        let (_server, fake, transport, host) = sealed_setup().await;
+        fake.close_after_auth(usize::MAX);
+        let err = transport
+            .send_soap_with_retry(&host, "<a/>".into())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, WinrmError::Ntlm(e) if e.to_string().contains("closes the connection")),
+            "{err:?}"
+        );
+        assert!(fake.sealed().is_empty(), "log: {:?}", fake.log());
+    }
+
+    /// The certificate record targets the server name reqwest uses for the
+    /// endpoint: sanitized host, IPv6 brackets removed.
+    #[test]
+    fn target_name_matches_the_endpoint_host() {
+        use rustls::pki_types::ServerName;
+        let name = |s: &str| ServerName::try_from(s.to_string()).unwrap();
+        assert_eq!(
+            target_name("win-01.corp.local"),
+            Some(name("win-01.corp.local"))
+        );
+        assert_eq!(target_name("10.0.0.5"), Some(name("10.0.0.5")));
+        assert_eq!(target_name("[::1]"), Some(name("::1")));
+        assert_eq!(target_name("http://win-01/wsman"), Some(name("win-01")));
+        assert_eq!(target_name(""), None);
     }
 }

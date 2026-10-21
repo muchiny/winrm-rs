@@ -56,6 +56,16 @@ pub(crate) fn excerpt(body: &str) -> String {
     crate::error::excerpt_chars(body, EXCERPT_CHARS)
 }
 
+/// Whether a response announces it closes its connection
+/// (`Connection: close`).
+pub(crate) fn announces_close(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get_all(reqwest::header::CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .any(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("close")))
+}
+
 /// Error for a response body larger than `cap` bytes.
 pub(crate) fn body_too_large(cap: usize) -> WinrmError {
     WinrmError::Soap(crate::error::SoapError::ParseError(format!(

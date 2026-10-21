@@ -171,7 +171,9 @@ impl NtlmAuth {
     /// Complete an NTLM handshake for message sealing: the Type 3 request
     /// carries an empty body (as pypsrp does), so no SOAP body ever crosses
     /// unsealed. Returns the exported session key; the connection `http`
-    /// used is the one the server bound the session to.
+    /// used is the one the server bound the session to. The flag is set when
+    /// the server answered the Type 3 with `Connection: close`: that
+    /// connection, and the session with it, is then gone.
     ///
     /// `cert` is the certificate handle of `http`'s own verifier, used for
     /// channel binding over TLS when the response does not report its TLS
@@ -181,9 +183,9 @@ impl NtlmAuth {
         http: &reqwest::Client,
         cert: Option<&crate::tls::CertHandle>,
         url: &str,
-    ) -> Result<Box<Zeroizing<[u8; 16]>>, WinrmError> {
-        let (_, session_key) = self.do_handshake(http, cert, url, None).await?;
-        Ok(session_key)
+    ) -> Result<(Box<Zeroizing<[u8; 16]>>, bool), WinrmError> {
+        let (_, session_key, closing) = self.do_handshake(http, cert, url, None).await?;
+        Ok((session_key, closing))
     }
 
     /// Unsealed request whose Type 3 carries `body`, with `cert` as the
@@ -196,7 +198,8 @@ impl NtlmAuth {
         url: &str,
         body: &str,
     ) -> Result<String, WinrmError> {
-        let (response, _session_key) = self.do_handshake(http, cert, url, Some(body)).await?;
+        let (response, _session_key, _closing) =
+            self.do_handshake(http, cert, url, Some(body)).await?;
         Ok(response)
     }
 
@@ -204,7 +207,8 @@ impl NtlmAuth {
     ///
     /// `body` is the SOAP request the Type 3 carries in plaintext (the
     /// unsealed path), or `None` for an empty Type 3 (the sealing path).
-    /// Returns the response body and the exported session key.
+    /// Returns the response body, the exported session key, and whether the
+    /// answer announced `Connection: close`.
     ///
     /// Over TLS the Type 3 carries a channel binding token computed from the
     /// server certificate of the connection that carried the challenge: the
@@ -218,7 +222,7 @@ impl NtlmAuth {
         cert: Option<&crate::tls::CertHandle>,
         url: &str,
         body: Option<&str>,
-    ) -> Result<(String, Box<Zeroizing<[u8; 16]>>), WinrmError> {
+    ) -> Result<(String, Box<Zeroizing<[u8; 16]>>, bool), WinrmError> {
         // Step 1: Send Type 1 (Negotiate) with empty body
         let type1 = ntlm::create_negotiate_message();
         let auth_header = ntlm::encode_authorization(&type1);
@@ -332,13 +336,16 @@ impl NtlmAuth {
                 &target_name,
             )
         };
-        // Move the exported session key to the heap before the awaits below
-        // and wipe the stack copy, so no unboxed copy of it lives in this
+        // Copy the exported session key to the heap before the awaits below
+        // and wipe this copy in place, so no unboxed copy of it lives in this
         // future while it waits on the network, and returning it moves a
-        // pointer. (The message builder's own stack copies are not wiped.)
+        // pointer. Not wiped: the stack copies the message builder made
+        // (`ntlm::messages`), and later the `NtlmSession` built from it on
+        // the stack (keys and RC4 S-boxes) before it moves into its box.
+        let mut session_key = session_key;
         let mut boxed_key = Box::new(Zeroizing::new([0u8; 16]));
         boxed_key.copy_from_slice(&*session_key);
-        drop(session_key);
+        zeroize::Zeroize::zeroize(&mut *session_key);
         let session_key = boxed_key;
         let auth_header = ntlm::encode_authorization(&type3);
 
@@ -358,6 +365,7 @@ impl NtlmAuth {
         }
 
         let status = resp.status();
+        let closing = crate::auth::announces_close(resp.headers());
         let text = crate::auth::read_text_capped(resp, self.max_response_bytes).await?;
         if !status.is_success() {
             return Err(crate::auth::error_for_status(
@@ -366,7 +374,7 @@ impl NtlmAuth {
                 || format!("HTTP {status}: {}", crate::auth::excerpt(&text)),
             ));
         }
-        Ok((text, session_key))
+        Ok((text, session_key, closing))
     }
 }
 
@@ -377,7 +385,8 @@ impl AuthTransport for NtlmAuth {
         url: &str,
         body: String,
     ) -> Result<String, WinrmError> {
-        let (response, _session_key) = self.do_handshake(http, None, url, Some(&body)).await?;
+        let (response, _session_key, _closing) =
+            self.do_handshake(http, None, url, Some(&body)).await?;
         Ok(response)
     }
 }

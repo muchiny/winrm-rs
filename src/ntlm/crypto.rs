@@ -265,16 +265,32 @@ fn cbt_hash(cert_der: &[u8]) -> Option<CbtHash> {
     }
 }
 
-/// Hash of RSASSA-PSS parameters (RFC 8017 A.2.3): `hashAlgorithm` is the
-/// optional `[0]` element, SHA-1 (so SHA-256 here) when absent.
+/// Hash of RSASSA-PSS parameters (RFC 4055, RFC 8017 A.2.3).
+///
+/// `RSASSA-PSS-params ::= SEQUENCE { hashAlgorithm [0] (default SHA-1),
+/// maskGenAlgorithm [1], saltLength [2], trailerField [3] }`, every field
+/// optional. Absent parameters, an empty SEQUENCE, or a SEQUENCE whose first
+/// field is `[1]`..`[3]` all leave the hash at its default, SHA-1, which the
+/// channel binding upgrades to SHA-256. Anything else that is not a
+/// well-formed `[0]` with a known hash fails closed (`None`): parameters that
+/// are not a SEQUENCE, trailing data, a malformed or unknown first field.
 fn pss_hash(params: &[u8]) -> Option<CbtHash> {
-    let (0x30, fields, _) = der_element(params)? else {
+    if params.is_empty() {
+        return Some(CbtHash::Sha256);
+    }
+    let (0x30, fields, []) = der_element(params)? else {
         return None;
     };
-    let Some((0xA0, hash_field, _)) = der_element(fields) else {
+    if fields.is_empty() {
         return Some(CbtHash::Sha256);
-    };
-    let (0x30, hash_algorithm, _) = der_element(hash_field)? else {
+    }
+    let (tag, hash_field, _) = der_element(fields)?;
+    match tag {
+        0xA0 => {}
+        0xA1..=0xA3 => return Some(CbtHash::Sha256),
+        _ => return None,
+    }
+    let (0x30, hash_algorithm, []) = der_element(hash_field)? else {
         return None;
     };
     let (0x06, oid, _) = der_element(hash_algorithm)? else {
@@ -309,21 +325,26 @@ fn pss_hash(params: &[u8]) -> Option<CbtHash> {
 pub(crate) fn compute_channel_bindings(
     cert_der: &[u8],
 ) -> Result<[u8; 16], crate::error::NtlmError> {
+    let hash = cbt_hash(cert_der).ok_or_else(|| {
+        crate::error::NtlmError::InvalidMessage(
+            "server certificate: unreadable, or its signature algorithm defines no channel \
+             binding hash (RFC 5929)"
+                .into(),
+        )
+    })?;
+    Ok(channel_bindings_with(hash, cert_der))
+}
+
+/// The CBT of `cert_der` hashed with `hash` (steps 1 to 4 above).
+fn channel_bindings_with(hash: CbtHash, cert_der: &[u8]) -> [u8; 16] {
     use sha2::{Digest as Sha2Digest, Sha224, Sha256, Sha384, Sha512};
 
     // Step 1: hash of the DER-encoded server certificate
-    let cert_hash: Vec<u8> = match cbt_hash(cert_der) {
-        Some(CbtHash::Sha224) => Sha224::digest(cert_der).to_vec(),
-        Some(CbtHash::Sha256) => Sha256::digest(cert_der).to_vec(),
-        Some(CbtHash::Sha384) => Sha384::digest(cert_der).to_vec(),
-        Some(CbtHash::Sha512) => Sha512::digest(cert_der).to_vec(),
-        None => {
-            return Err(crate::error::NtlmError::InvalidMessage(
-                "server certificate: unreadable, or its signature algorithm defines no \
-                 channel binding hash (RFC 5929)"
-                    .into(),
-            ));
-        }
+    let cert_hash: Vec<u8> = match hash {
+        CbtHash::Sha224 => Sha224::digest(cert_der).to_vec(),
+        CbtHash::Sha256 => Sha256::digest(cert_der).to_vec(),
+        CbtHash::Sha384 => Sha384::digest(cert_der).to_vec(),
+        CbtHash::Sha512 => Sha512::digest(cert_der).to_vec(),
     };
 
     // Step 2: Build channel binding application data per RFC 5929 §4
@@ -348,7 +369,7 @@ pub(crate) fn compute_channel_bindings(
     let md5_result = Md5::digest(&bindings);
     let mut output = [0u8; 16];
     output.copy_from_slice(&md5_result);
-    Ok(output)
+    output
 }
 
 /// RC4 (arcfour) cipher state for NTLM message sealing.
@@ -673,6 +694,36 @@ mod tests {
                 pki::CBT_RSA_MD5_PEM,
                 "ff00a2997e118bd141a54ec4b2b28f26",
             ),
+            (
+                "RSA-SHA224",
+                pki::CBT_RSA_SHA224_PEM,
+                "414e78b8c5f88a2627d804ccfa9332d0",
+            ),
+            (
+                "ECDSA-SHA224",
+                pki::CBT_EC_SHA224_PEM,
+                "baba6260e2f3484efd86958736280cfc",
+            ),
+            (
+                "RSA-PSS-SHA256",
+                pki::CBT_RSA_PSS_SHA256_PEM,
+                "739167377b357db9fd117d08f8f9623c",
+            ),
+            (
+                "RSA-PSS-SHA512",
+                pki::CBT_RSA_PSS_SHA512_PEM,
+                "aa551ba67e2b7202137b1f35f8520adf",
+            ),
+            (
+                "RSA-PSS default parameters (SHA-1) -> SHA-256",
+                pki::CBT_RSA_PSS_DEFAULTS_PEM,
+                "95189c71c3d2a8c647bee27253c5debd",
+            ),
+            (
+                "RSA-PSS parameters absent (defaults) -> SHA-256",
+                pki::CBT_RSA_PSS_ABSENT_PEM,
+                "6a5d42ef169390590c8acf5e8107da5d",
+            ),
         ] {
             assert_eq!(
                 compute_channel_bindings(&der(pem)).ok(),
@@ -716,5 +767,109 @@ mod tests {
             );
         }
         assert!(compute_channel_bindings(&cert).is_ok());
+    }
+
+    /// A minimal certificate-shaped DER: empty tbsCertificate, then a
+    /// signature AlgorithmIdentifier with `algorithm` as its content.
+    fn cert_with_algorithm(algorithm: &[u8]) -> Vec<u8> {
+        let mut alg = vec![0x30, u8::try_from(algorithm.len()).unwrap()];
+        alg.extend_from_slice(algorithm);
+        let mut body = vec![0x30, 0x00];
+        body.extend_from_slice(&alg);
+        body.extend_from_slice(&[0x03, 0x01, 0x00]);
+        let mut cert = vec![0x30, u8::try_from(body.len()).unwrap()];
+        cert.extend_from_slice(&body);
+        cert
+    }
+
+    fn pss_with(params: &[u8]) -> Vec<u8> {
+        let mut alg = vec![0x06, 0x09];
+        alg.extend_from_slice(OID_RSASSA_PSS);
+        alg.extend_from_slice(params);
+        cert_with_algorithm(&alg)
+    }
+
+    /// RSASSA-PSS parameters (RFC 4055, RFC 8017 A.2.3): absent parameters
+    /// and an omitted `hashAlgorithm` both mean SHA-1 (so SHA-256 here);
+    /// malformed parameters fail closed instead of defaulting.
+    #[test]
+    fn pss_parameters_default_or_fail_closed() {
+        let sha256_hash_alg = [
+            0xA0, 0x0D, 0x30, 0x0B, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02,
+            0x01,
+        ];
+        let mut explicit = vec![0x30, u8::try_from(sha256_hash_alg.len()).unwrap()];
+        explicit.extend_from_slice(&sha256_hash_alg);
+        let accepted: [(&str, Vec<u8>, CbtHash); 4] = [
+            ("absent", vec![], CbtHash::Sha256),
+            ("empty SEQUENCE", vec![0x30, 0x00], CbtHash::Sha256),
+            (
+                "saltLength only ([2])",
+                vec![0x30, 0x05, 0xA2, 0x03, 0x02, 0x01, 0x14],
+                CbtHash::Sha256,
+            ),
+            ("explicit SHA-256", explicit, CbtHash::Sha256),
+        ];
+        for (name, params, hash) in accepted {
+            assert_eq!(cbt_hash(&pss_with(&params)), Some(hash), "{name}");
+        }
+        let refused: [(&str, Vec<u8>); 6] = [
+            ("NULL instead of a SEQUENCE", vec![0x05, 0x00]),
+            (
+                "first field not [0]..[3]",
+                vec![0x30, 0x03, 0x04, 0x01, 0x00],
+            ),
+            ("truncated field", vec![0x30, 0x02, 0xA0, 0x05]),
+            (
+                "[0] without an AlgorithmIdentifier",
+                vec![0x30, 0x04, 0xA0, 0x02, 0x05, 0x00],
+            ),
+            (
+                "[0] with an unknown hash OID",
+                vec![0x30, 0x07, 0xA0, 0x05, 0x30, 0x03, 0x06, 0x01, 0x2A],
+            ),
+            ("data after the parameters", vec![0x30, 0x00, 0x05, 0x00]),
+        ];
+        for (name, params) in refused {
+            assert_eq!(cbt_hash(&pss_with(&params)), None, "{name}");
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(512))]
+
+        /// Mutations of a real certificate (a flipped byte, a cut, bytes
+        /// appended) never panic, and the result is an error or the CBT
+        /// under one of the four allowed hashes.
+        #[test]
+        fn mutated_certificates_give_an_error_or_an_allowed_cbt(
+            which in 0usize..4,
+            at in proptest::prelude::any::<proptest::sample::Index>(),
+            byte in proptest::prelude::any::<u8>(),
+            mode in 0u8..3,
+            tail in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64),
+        ) {
+            use crate::test_pki as pki;
+            let pem = [
+                pki::CBT_RSA_PSS_SHA384_PEM,
+                pki::CBT_EC384_SHA384_PEM,
+                pki::CBT_RSA_SHA512_PEM,
+                pki::CBT_RSA_PSS_ABSENT_PEM,
+            ][which];
+            let mut cert = der(pem);
+            match mode {
+                0 => {
+                    let i = at.index(cert.len());
+                    cert[i] ^= byte | 1;
+                }
+                1 => cert.truncate(at.index(cert.len())),
+                _ => cert.extend_from_slice(&tail),
+            }
+            if let Ok(cbt) = compute_channel_bindings(&cert) {
+                let allowed = [CbtHash::Sha224, CbtHash::Sha256, CbtHash::Sha384, CbtHash::Sha512]
+                    .map(|h| channel_bindings_with(h, &cert));
+                proptest::prop_assert!(allowed.contains(&cbt));
+            }
+        }
     }
 }

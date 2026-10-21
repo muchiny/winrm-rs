@@ -322,10 +322,18 @@ impl<'a> Shell<'a> {
     /// Callers should accumulate stdout/stderr and stop when
     /// [`done`](ReceiveOutput::done) is `true`.
     ///
-    /// PowerShell CLIXML on stderr is decoded across polls: a document split
-    /// over several Receive responses is held back until it is complete, so a
-    /// poll may return an empty `stderr` while the command is still writing
-    /// it. Anything still buffered comes out on the `done` poll.
+    /// PowerShell CLIXML on stderr is decoded across polls, as a
+    /// [`StderrDecoder`](crate::StderrDecoder) kept per command would: each
+    /// error, warning, verbose or debug record comes out on the poll that
+    /// delivers its last byte, even though `powershell.exe` only closes its
+    /// `<Objs>` document when it exits. Only a record split across Receive
+    /// responses is held back until its end arrives, so a poll may return an
+    /// empty `stderr` while bytes are buffered; anything left comes out on
+    /// the `done` poll. Note that `powershell.exe` buffers its own stderr:
+    /// measured on Server 2025, it sends stderr in blocks of a few KiB and
+    /// the rest at exit, so a few small errors still reach the client only
+    /// when the command ends. Decoders of commands never polled to `done` are
+    /// dropped, least recently polled first, once more than 32 are tracked.
     ///
     /// A `TimedOut` fault (the command stayed silent for
     /// `operation_timeout_secs`) is not an error: it is returned as an empty,
@@ -431,16 +439,16 @@ impl<'a> Shell<'a> {
 }
 
 /// Commands tracked at once by [`StderrDecoders`]. WinRM caps a shell at 25
-/// concurrent processes (`MaxProcessesPerShell`), so past this the oldest
-/// entry belongs to a command the caller stopped polling.
+/// concurrent processes (`MaxProcessesPerShell`), so past this the least
+/// recently polled entry belongs to a command the caller stopped polling.
 const MAX_STREAMED_COMMANDS: usize = 32;
 
 /// stderr decoders of the commands polled through [`Shell::receive_next`],
-/// keyed by command ID, so a CLIXML document split across polls is
+/// keyed by command ID, so a CLIXML record split across polls is
 /// reassembled.
 #[derive(Default)]
 struct StderrDecoders {
-    /// Command ID to (insertion sequence, decoder).
+    /// Command ID to (sequence number of its last poll, decoder).
     by_command: HashMap<String, (u64, ClixmlDecoder)>,
     next_seq: u64,
 }
@@ -449,33 +457,42 @@ impl StderrDecoders {
     /// Decode one poll's stderr for `command_id`; `done` releases whatever
     /// the command's decoder still buffers and forgets it.
     fn decode(&mut self, command_id: &str, chunk: &[u8], done: bool) -> Vec<u8> {
-        if !self.by_command.contains_key(command_id) {
-            if self.by_command.len() >= MAX_STREAMED_COMMANDS {
-                self.evict_oldest();
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        if let Some((last_poll, decoder)) = self.by_command.get_mut(command_id) {
+            *last_poll = seq;
+            let mut out = decoder.push(chunk);
+            if done {
+                out.extend(decoder.finish());
+                self.by_command.remove(command_id);
             }
-            let seq = self.next_seq;
-            self.next_seq = self.next_seq.wrapping_add(1);
-            self.by_command
-                .insert(command_id.to_string(), (seq, ClixmlDecoder::new()));
+            return out;
         }
-        let Some((_, decoder)) = self.by_command.get_mut(command_id) else {
-            return chunk.to_vec();
-        };
+        if chunk.is_empty() {
+            // Nothing buffered and nothing to buffer: no entry needed.
+            return Vec::new();
+        }
+        let mut decoder = ClixmlDecoder::new();
         let mut out = decoder.push(chunk);
         if done {
             out.extend(decoder.finish());
-            self.by_command.remove(command_id);
+            return out;
         }
+        if self.by_command.len() >= MAX_STREAMED_COMMANDS {
+            self.evict_least_recently_polled();
+        }
+        self.by_command
+            .insert(command_id.to_string(), (seq, decoder));
         out
     }
 
-    fn evict_oldest(&mut self) {
-        let oldest = self
+    fn evict_least_recently_polled(&mut self) {
+        let stale = self
             .by_command
             .iter()
-            .min_by_key(|(_, (seq, _))| *seq)
+            .min_by_key(|(_, (last_poll, _))| *last_poll)
             .map(|(id, _)| id.clone());
-        if let Some(id) = oldest {
+        if let Some(id) = stale {
             debug!(command_id = %id, "dropping stderr decoder of a command never polled to Done");
             self.by_command.remove(&id);
         }
@@ -516,7 +533,46 @@ mod stderr_decoder_tests {
     }
 
     #[test]
-    fn abandoned_commands_are_evicted_oldest_first() {
+    fn in_flight_command_survives_many_abandoned_ones() {
+        // The in-flight command started first but keeps being polled; the
+        // abandoned ones are polled once each. Least-recently-used eviction
+        // must drop those, not the oldest-inserted in-flight decoder.
+        let mut decoders = StderrDecoders::default();
+        assert!(
+            decoders
+                .decode("live", b"#< CLIXML\r\n<Objs><S S=\"Error\">kept", false)
+                .is_empty()
+        );
+        for i in 0..MAX_STREAMED_COMMANDS * 2 {
+            decoders.decode(&format!("gone{i}"), b"#< CLIXML\r\n<Objs>", false);
+            assert!(decoders.decode("live", b"", false).is_empty());
+        }
+        assert_eq!(decoders.len(), MAX_STREAMED_COMMANDS);
+        assert_eq!(
+            decoders.decode("live", b" text</S></Objs>", true),
+            b"kept text"
+        );
+    }
+
+    #[test]
+    fn empty_poll_of_an_unknown_command_tracks_nothing() {
+        let mut decoders = StderrDecoders::default();
+        assert!(decoders.decode("quiet", b"", false).is_empty());
+        assert_eq!(decoders.len(), 0);
+        // A one-shot done poll decodes without taking a slot either.
+        assert_eq!(
+            decoders.decode(
+                "once",
+                b"#< CLIXML\r\n<Objs><S S=\"Error\">x</S></Objs>",
+                true
+            ),
+            b"x"
+        );
+        assert_eq!(decoders.len(), 0);
+    }
+
+    #[test]
+    fn abandoned_commands_are_evicted_least_recently_polled_first() {
         let mut decoders = StderrDecoders::default();
         for i in 0..MAX_STREAMED_COMMANDS + 10 {
             decoders.decode(&format!("c{i}"), b"#< CLIXML\r\n<Objs>", false);

@@ -35,6 +35,19 @@ pub enum WinrmError {
     CredSsp(CredSspError),
 }
 
+/// `text` as quoted in an error message: at most `max_chars` characters (cut
+/// on a character boundary), with the full size noted when it is cut.
+pub(crate) fn excerpt_chars(text: &str, max_chars: usize) -> String {
+    match text.char_indices().nth(max_chars) {
+        None => text.to_string(),
+        Some((cut, _)) => format!(
+            "{}… [{} bytes in total]",
+            text.get(..cut).unwrap_or_default(),
+            text.len()
+        ),
+    }
+}
+
 /// Errors from the CredSSP authentication protocol (MS-CSSP).
 #[derive(Debug, thiserror::Error)]
 pub enum CredSspError {

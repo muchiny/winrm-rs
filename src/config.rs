@@ -49,11 +49,14 @@ pub struct WinrmConfig {
     /// Controls the `MaxEnvelopeSize` header sent in every WS-Management request.
     /// Increase this for hosts that return large responses.
     pub max_envelope_size: u32,
-    /// Maximum number of retries for transient HTTP errors (default: 0 = no retry).
+    /// Maximum number of retries for connection errors (default: 0 = no retry).
     ///
     /// Uses exponential backoff starting at 100 ms (100, 200, 400, ...).
-    /// Only `WinrmError::Http` errors trigger a retry; authentication and
-    /// SOAP faults are returned immediately.
+    /// Only a `WinrmError::Http` raised while connecting, before anything was
+    /// sent, triggers a retry, whatever the auth method: a request that went
+    /// out may have run on the server (a command, a stdin write, an upload
+    /// chunk), so a timeout, a reset or a dropped connection after sending is
+    /// returned, as are authentication errors and SOAP faults.
     pub max_retries: u32,
     /// Path to the client certificate PEM file (for `AuthMethod::Certificate`).
     ///
@@ -157,11 +160,17 @@ impl Default for WinrmConfig {
 /// When sealing applies, it applies to every SOAP body, failing closed: the
 /// NTLM handshake runs with empty request bodies, each request is sealed on
 /// the connection the server bound the session to, and the answer must unseal
-/// (a sealed SOAP fault is reported as such). A request is never sent
-/// unsealed, and a request the server may have executed is never sent again:
-/// only a request rejected with HTTP 401 on a reused connection (which then
-/// lost its session, so nothing ran) is sent once more, sealed, on a new
-/// connection. Any other failure is returned as an error.
+/// (a sealed SOAP fault is reported as such). No request body is ever sent
+/// unsealed, and the client sends each request once: any failure, an HTTP
+/// 401 included, is returned as an error and the connection discarded. (A
+/// 401 on a reused connection usually means the server closed it, but on
+/// plain HTTP an attacker can also forward the sealed request to the server,
+/// let it run, and answer 401 itself, so a resend could run it twice.)
+///
+/// NTLM binds its session to one TCP connection: a forwarding (not
+/// tunnelling) HTTP proxy that does not keep one server connection per client
+/// connection breaks that binding, and sealed requests then fail with errors
+/// rather than going out unsealed.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub enum EncryptionMode {
     /// Seal every SOAP body over HTTP; over HTTPS rely on TLS and send them

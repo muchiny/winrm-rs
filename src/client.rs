@@ -2451,45 +2451,33 @@ mod tests {
         assert_eq!(output.stdout, b"ok");
     }
 
+    /// A connection error (nothing sent) is retried with backoff: the port
+    /// refuses connections until a listener appears on it, then the request
+    /// goes through.
     #[tokio::test]
-    // Flaky on Windows: dropping a raw TCP stream doesn't reliably produce
-    // the "connection reset" error `reqwest` needs to classify the call as
-    // retryable. The same scenario is covered by the wiremock-based retry
-    // tests which run on all platforms.
-    #[cfg_attr(windows, ignore)]
     async fn retry_backoff_on_http_error() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicU32, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let counter = Arc::new(AtomicU32::new(0));
-        let counter_clone = counter.clone();
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        let handle = tokio::spawn(async move {
-            loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    break;
-                };
-                let call = counter_clone.fetch_add(1, Ordering::SeqCst);
-                if call == 0 {
-                    drop(stream);
-                } else {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    // Consume the request first: closing a socket with unread
-                    // data sends RST, which can discard the response in flight.
-                    let mut buf = [0u8; 4096];
-                    let _ = stream.read(&mut buf).await;
-                    let body = r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>RETRY-BACKOFF</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>";
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/xml\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    let _ = stream.write_all(response.as_bytes()).await;
-                }
-            }
+        // Reserve a port, then free it so the first attempts are refused.
+        let port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let server = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+                .await
+                .unwrap();
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            let body = r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>RETRY-BACKOFF</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/xml\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
         });
 
         let config = WinrmConfig {
@@ -2497,23 +2485,17 @@ mod tests {
             auth_method: AuthMethod::Basic,
             connect_timeout_secs: 2,
             operation_timeout_secs: 5,
-            max_retries: 2,
+            max_retries: 3,
             ..Default::default()
         };
         let client = WinrmClient::new(config, test_creds()).unwrap();
         let result = client.create_shell("127.0.0.1").await;
-        assert!(
-            result.is_ok(),
-            "retry should have succeeded: {}",
-            result.err().map(|e| format!("{e}")).unwrap_or_default()
+        assert_eq!(
+            result.map_err(|e| e.to_string()),
+            Ok("RETRY-BACKOFF".to_string()),
+            "retry after refused connections should have succeeded"
         );
-        assert_eq!(result.unwrap(), "RETRY-BACKOFF");
-        assert!(
-            counter.load(Ordering::SeqCst) >= 2,
-            "should have retried at least once"
-        );
-
-        handle.abort();
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -2732,18 +2714,19 @@ mod tests {
         );
     }
 
-    // Group 5: Retry with max_retries=1 makes exactly 2 attempts.
+    /// A request the server received is not sent again, even with retries
+    /// configured: the server accepts each connection and drops it, which
+    /// the client sees after sending (it may have run), so exactly one
+    /// connection is made.
     #[tokio::test]
-    async fn retry_max_one_makes_exactly_two_attempts() {
+    async fn retry_skips_a_request_dropped_after_sending() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicU32, Ordering};
 
         let counter = Arc::new(AtomicU32::new(0));
         let counter_clone = counter.clone();
-
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-
         let handle = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -2764,16 +2747,10 @@ mod tests {
         };
         let client = WinrmClient::new(config, test_creds()).unwrap();
         let result = client.create_shell("127.0.0.1").await;
-        assert!(result.is_err(), "should fail after all retries exhausted");
-
+        assert!(result.is_err(), "the dropped connection is an error");
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
         let attempts = counter.load(Ordering::SeqCst);
-        assert_eq!(
-            attempts, 2,
-            "max_retries=1 should make exactly 2 attempts, got {attempts}"
-        );
-
+        assert_eq!(attempts, 1, "sent once, not resent: {attempts} connections");
         handle.abort();
     }
 
@@ -2983,27 +2960,14 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Retries of refused connections back off exponentially (100 ms, then
+    /// 200 ms) rather than additively.
     #[tokio::test]
     async fn retry_backoff_is_exponential_not_additive() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicU32, Ordering};
-
-        let counter = Arc::new(AtomicU32::new(0));
-        let counter_clone = counter.clone();
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        let handle = tokio::spawn(async move {
-            loop {
-                let Ok((stream, _)) = listener.accept().await else {
-                    break;
-                };
-                counter_clone.fetch_add(1, Ordering::SeqCst);
-                drop(stream);
-            }
-        });
-
+        let port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap().port()
+        };
         let config = WinrmConfig {
             port,
             auth_method: AuthMethod::Basic,
@@ -3012,21 +2976,19 @@ mod tests {
             max_retries: 2,
             ..Default::default()
         };
-
         let client = WinrmClient::new(config, test_creds()).unwrap();
         let start = std::time::Instant::now();
         let result = client.create_shell("127.0.0.1").await;
         let elapsed = start.elapsed();
-
-        assert!(result.is_err());
-
+        assert!(
+            matches!(&result, Err(WinrmError::Http(e)) if e.is_connect()),
+            "{result:?}"
+        );
         assert!(
             elapsed >= std::time::Duration::from_millis(280),
             "exponential backoff should take >= 280ms total, took {}ms (catches + and / mutants)",
             elapsed.as_millis()
         );
-
-        handle.abort();
     }
 
     // Kills client.rs:354 — run_wql returning Ok("") or Ok("xyzzy")

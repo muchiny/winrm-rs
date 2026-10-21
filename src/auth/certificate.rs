@@ -166,4 +166,41 @@ mod tests {
             other => panic!("expected AuthFailed, got: {other:?}"),
         }
     }
+
+    // The transport only builds Certificate auth over HTTPS; the struct reads
+    // the answer the same way whatever the scheme, so these use plain HTTP.
+
+    #[tokio::test]
+    async fn certificate_auth_refuses_a_body_over_the_cap() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("c".repeat(65)))
+            .mount(&server)
+            .await;
+        let http = crate::transport::test_http_client();
+        let err = CertificateAuth {
+            max_response_bytes: 64,
+        }
+        .send_authenticated(&http, &server.uri(), "body".into())
+        .await
+        .unwrap_err();
+        assert!(format!("{err}").contains("exceeds 64 bytes"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn certificate_auth_error_quotes_an_excerpt_of_the_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("e".repeat(2000)))
+            .mount(&server)
+            .await;
+        let http = crate::transport::test_http_client();
+        let err = CertificateAuth::default()
+            .send_authenticated(&http, &server.uri(), "body".into())
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("[2000 bytes in total]"), "{msg}");
+        assert!(!msg.contains(&"e".repeat(513)), "whole body quoted");
+    }
 }

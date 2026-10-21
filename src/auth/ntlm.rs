@@ -23,8 +23,6 @@ pub(crate) struct NtlmAuth {
     pub(crate) username: String,
     pub(crate) password: Zeroizing<String>,
     pub(crate) domain: String,
-    /// TLS server certificate handle for computing Channel Binding Tokens.
-    pub(crate) cert_handle: Option<crate::tls::CertHandle>,
     /// Largest response body read (see `transport::max_response_bytes`).
     pub(crate) max_response_bytes: usize,
 }
@@ -151,13 +149,32 @@ impl NtlmAuth {
     /// carries an empty body (as pypsrp does), so no SOAP body ever crosses
     /// unsealed. Returns the exported session key; the connection `http`
     /// used is the one the server bound the session to.
+    ///
+    /// `cert` is the certificate handle of `http`'s own verifier, used for
+    /// channel binding over TLS when the response does not report its TLS
+    /// details (see [`Self::do_handshake`]).
     pub(crate) async fn authenticate(
         &self,
         http: &reqwest::Client,
+        cert: Option<&crate::tls::CertHandle>,
         url: &str,
     ) -> Result<Zeroizing<[u8; 16]>, WinrmError> {
-        let (_, session_key) = self.do_handshake(http, url, None).await?;
+        let (_, session_key) = self.do_handshake(http, cert, url, None).await?;
         Ok(session_key)
+    }
+
+    /// Unsealed request whose Type 3 carries `body`, with `cert` as the
+    /// channel-binding fallback of [`Self::do_handshake`] (NTLM over TLS on a
+    /// dedicated single-connection client).
+    pub(crate) async fn send_with_binding(
+        &self,
+        http: &reqwest::Client,
+        cert: Option<&crate::tls::CertHandle>,
+        url: &str,
+        body: &str,
+    ) -> Result<String, WinrmError> {
+        let (response, _session_key) = self.do_handshake(http, cert, url, Some(body)).await?;
+        Ok(response)
     }
 
     /// Core NTLM handshake: Type 1 → Type 2 → Type 3.
@@ -165,9 +182,17 @@ impl NtlmAuth {
     /// `body` is the SOAP request the Type 3 carries in plaintext (the
     /// unsealed path), or `None` for an empty Type 3 (the sealing path).
     /// Returns the response body and the exported session key.
+    ///
+    /// Over TLS the Type 3 carries a channel binding token computed from the
+    /// server certificate of the connection that carried the challenge: the
+    /// one the response reports (`reqwest` `tls_info`, direct connections),
+    /// else the one `cert` captured, which is that connection's only when
+    /// `http` keeps a single connection with TLS resumption off. With
+    /// neither, the handshake fails rather than authenticating unbound.
     async fn do_handshake(
         &self,
         http: &reqwest::Client,
+        cert: Option<&crate::tls::CertHandle>,
         url: &str,
         body: Option<&str>,
     ) -> Result<(String, Zeroizing<[u8; 16]>), WinrmError> {
@@ -199,6 +224,17 @@ impl NtlmAuth {
             .ok_or_else(|| WinrmError::AuthFailed("missing WWW-Authenticate header in 401".into()))?
             .to_string();
 
+        // Over TLS, the channel binding token must come from the certificate
+        // of the very connection that carried the challenge (the Type 3 goes
+        // on the same one). Read it now, before the response is consumed.
+        let over_tls = url.starts_with("https://");
+        let peer_certificate = resp
+            .extensions()
+            .get::<reqwest::tls::TlsInfo>()
+            .and_then(|info| info.peer_certificate())
+            .map(<[u8]>::to_vec)
+            .or_else(|| cert.and_then(crate::tls::CertHandle::get));
+
         // Consume the response body to release the connection back to the pool
         let _ = crate::auth::read_body_capped(resp, self.max_response_bytes).await;
 
@@ -228,43 +264,28 @@ impl NtlmAuth {
             .unwrap_or(url);
         let target_name = format!("http/{host_part}");
 
-        // Channel Binding Tokens (CBT) bind the NTLM auth to the TLS channel
-        // and are the primary mitigation against NTLM-over-TLS relay attacks.
-        // We can only compute the CBT when the rustls verifier successfully
-        // captured the server cert (cert_handle is Some AND get() returns
-        // Some). If TLS is active but the capture failed (e.g. mutex poison,
-        // verifier swapped), we fall back to non-CBT NTLM — but log a WARN
-        // so operators can investigate.
-        let (type3, session_key) = match self.cert_handle.as_ref() {
-            Some(handle) => match handle.get() {
-                Some(cert_der) => {
-                    let cbt = crate::ntlm::crypto::compute_channel_bindings(&cert_der);
-                    ntlm::create_authenticate_message_with_cbt_and_key(
-                        &challenge,
-                        &self.username,
-                        &self.password,
-                        &domain,
-                        cbt,
-                    )
-                }
-                None => {
-                    tracing::warn!(
-                        "NTLM-over-TLS: server certificate capture returned None; \
-                         falling back to non-CBT authentication. This weakens \
-                         relay-attack protection — investigate verifier state."
-                    );
-                    ntlm::create_authenticate_message_with_key_and_mic(
-                        &challenge,
-                        &self.username,
-                        &self.password,
-                        &domain,
-                        &type1,
-                        &type2_raw,
-                        &target_name,
-                    )
-                }
-            },
-            None => ntlm::create_authenticate_message_with_key_and_mic(
+        // Channel Binding Tokens (CBT) bind the NTLM authentication to the
+        // TLS channel and are the mitigation against NTLM-over-TLS relay.
+        // Over TLS, a connection that reports no server certificate fails
+        // the handshake instead of authenticating unbound.
+        let (type3, session_key) = if over_tls {
+            let cert_der = peer_certificate.ok_or_else(|| {
+                WinrmError::AuthFailed(
+                    "NTLM over TLS: the connection reported no server certificate to bind \
+                     the authentication to (channel binding)"
+                        .into(),
+                )
+            })?;
+            let cbt = crate::ntlm::crypto::compute_channel_bindings(&cert_der);
+            ntlm::create_authenticate_message_with_cbt_and_key(
+                &challenge,
+                &self.username,
+                &self.password,
+                &domain,
+                cbt,
+            )
+        } else {
+            ntlm::create_authenticate_message_with_key_and_mic(
                 &challenge,
                 &self.username,
                 &self.password,
@@ -272,7 +293,7 @@ impl NtlmAuth {
                 &type1,
                 &type2_raw,
                 &target_name,
-            ),
+            )
         };
         let auth_header = ntlm::encode_authorization(&type3);
 
@@ -311,7 +332,7 @@ impl AuthTransport for NtlmAuth {
         url: &str,
         body: String,
     ) -> Result<String, WinrmError> {
-        let (response, _session_key) = self.do_handshake(http, url, Some(&body)).await?;
+        let (response, _session_key) = self.do_handshake(http, None, url, Some(&body)).await?;
         Ok(response)
     }
 }

@@ -267,6 +267,11 @@ fn extract_attribute(tag: &str, attr_name: &str) -> Option<String> {
     Some(tag[start..end].to_string())
 }
 
+/// Longest fault code kept, in characters (real codes are a few dozen).
+const FAULT_CODE_CHARS: usize = 256;
+/// Longest fault reason kept, in characters.
+const FAULT_REASON_CHARS: usize = 2048;
+
 /// Extract a SOAP fault from the response, if present.
 fn extract_soap_fault(xml: &str) -> Option<SoapError> {
     // Check for Fault element
@@ -287,7 +292,11 @@ fn extract_soap_fault(xml: &str) -> Option<SoapError> {
         .or_else(|| extract_element_text(xml, "faultstring"))
         .unwrap_or_else(|| "SOAP fault".into());
 
-    Some(SoapError::Fault { code, reason })
+    // Both come from the server and end up in error messages: bound them.
+    Some(SoapError::Fault {
+        code: crate::error::excerpt_chars(&code, FAULT_CODE_CHARS),
+        reason: crate::error::excerpt_chars(&reason, FAULT_REASON_CHARS),
+    })
 }
 
 /// Whether a SOAP error is the WS-Management `TimedOut` fault.
@@ -919,5 +928,31 @@ mod tests {
             .err()
             .expect("fault expected");
         assert!(!is_timed_out_fault(&err));
+    }
+
+    /// A server-supplied fault code and reason are bounded before they reach
+    /// an error message.
+    #[test]
+    fn fault_code_and_reason_are_bounded() {
+        let xml = format!(
+            "<s:Envelope><s:Body><s:Fault><s:Code><s:Value>s:Receiver</s:Value>\
+             <s:Subcode><s:Value>w:{}</s:Value></s:Subcode></s:Code>\
+             <s:Reason><s:Text>{}</s:Text></s:Reason></s:Fault></s:Body></s:Envelope>",
+            "C".repeat(1000),
+            "R".repeat(5000)
+        );
+        match check_soap_fault(&xml).unwrap_err() {
+            SoapError::Fault { code, reason } => {
+                assert!(code.chars().count() < 300, "code: {} chars", code.len());
+                assert!(code.ends_with("[1002 bytes in total]"), "{code}");
+                assert!(
+                    reason.chars().count() < 2100,
+                    "reason: {} chars",
+                    reason.len()
+                );
+                assert!(reason.ends_with("[5000 bytes in total]"));
+            }
+            other => panic!("expected a fault, got {other:?}"),
+        }
     }
 }

@@ -77,7 +77,6 @@ use crate::error::WinrmError;
 use crate::ntlm;
 #[cfg(feature = "credssp")]
 use crate::ntlm::NtlmSession;
-use crate::tls::CertHandle;
 
 /// CredSSP protocol version (v6 = modern Windows 10+).
 #[cfg(feature = "credssp")]
@@ -567,7 +566,6 @@ pub(crate) struct CredSspAuth {
     pub(crate) username: String,
     pub(crate) password: Zeroizing<String>,
     pub(crate) domain: String,
-    pub(crate) cert_handle: Option<CertHandle>,
     /// Mirrors `WinrmConfig.accept_invalid_certs`. When true, the outer TLS
     /// channel skips chain validation. Inner TLS authentication relies on
     /// pubKeyAuth regardless (MS-CSSP §3.1.5.1).

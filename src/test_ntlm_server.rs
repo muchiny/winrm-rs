@@ -11,6 +11,11 @@
 // Several sessions can be live at once (one per handshake): a sealed request
 // is matched to the session that unseals it, tried on a copy so a failed try
 // leaves the session untouched.
+//
+// It does not model connection binding: a real server ties each NTLM session
+// to the TCP connection that ran the handshake, while this fake accepts a
+// sealed request on any connection. That binding is covered by the live
+// tests (the recording forwarder counts one handshake per connection).
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -148,7 +153,7 @@ impl FakeNtlmServer {
 }
 
 /// The Type 2 challenge the fake server sends (no target info).
-fn challenge_header() -> String {
+pub(crate) fn challenge_header() -> String {
     let mut type2 = vec![0u8; 48];
     type2[0..8].copy_from_slice(b"NTLMSSP\0");
     type2[8..12].copy_from_slice(&2u32.to_le_bytes());

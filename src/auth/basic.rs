@@ -21,17 +21,16 @@ pub(crate) struct BasicAuth {
 }
 
 impl BasicAuth {
-    /// Create a new `BasicAuth` from username and password.
-    pub(crate) fn new(username: &str, password: &str) -> Self {
+    /// Create a new `BasicAuth` from username and password, reading
+    /// response bodies up to `max_response_bytes`.
+    pub(crate) fn new(username: &str, password: &str, max_response_bytes: usize) -> Self {
         // Build "user:pass" inside a Zeroizing buffer so the cleartext
         // never lingers after we've base64-encoded it.
         let raw = Zeroizing::new(format!("{username}:{password}"));
         let encoded = B64.encode(raw.as_bytes());
         Self {
             credentials_b64: SecretString::from(encoded),
-            max_response_bytes: crate::transport::max_response_bytes(
-                &crate::config::WinrmConfig::default(),
-            ),
+            max_response_bytes,
         }
     }
 }
@@ -76,7 +75,7 @@ mod tests {
 
     #[test]
     fn new_encodes_credentials_base64() {
-        let auth = BasicAuth::new("admin", "p@ss");
+        let auth = BasicAuth::new("admin", "p@ss", 1 << 20);
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(auth.credentials_b64.expose_secret())
             .unwrap();
@@ -93,7 +92,7 @@ mod tests {
             .await;
 
         let http = crate::transport::test_http_client();
-        let auth = BasicAuth::new("admin", "pass");
+        let auth = BasicAuth::new("admin", "pass", 1 << 20);
         let result = auth
             .send_authenticated(&http, &server.uri(), "<soap/>".into())
             .await;
@@ -109,7 +108,7 @@ mod tests {
             .await;
 
         let http = crate::transport::test_http_client();
-        let auth = BasicAuth::new("user", "wrong");
+        let auth = BasicAuth::new("user", "wrong", 1 << 20);
         let err = auth
             .send_authenticated(&http, &server.uri(), "<soap/>".into())
             .await
@@ -132,7 +131,7 @@ mod tests {
             .await;
 
         let http = crate::transport::test_http_client();
-        let auth = BasicAuth::new("user", "pass");
+        let auth = BasicAuth::new("user", "pass", 1 << 20);
         let err = auth
             .send_authenticated(&http, &server.uri(), "<soap/>".into())
             .await
@@ -152,7 +151,7 @@ mod tests {
             .await;
 
         let http = crate::transport::test_http_client();
-        let auth = BasicAuth::new("user", "pass");
+        let auth = BasicAuth::new("user", "pass", 1 << 20);
         let err = auth
             .send_authenticated(&http, &server.uri(), "<soap/>".into())
             .await
@@ -161,5 +160,39 @@ mod tests {
             matches!(err, WinrmError::AuthFailed(_)),
             "expected AuthFailed, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn send_refuses_a_body_over_the_cap() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("b".repeat(65)))
+            .mount(&server)
+            .await;
+        let http = crate::transport::test_http_client();
+        let err = BasicAuth::new("user", "pass", 64)
+            .send_authenticated(&http, &server.uri(), "<soap/>".into())
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("exceeds 64 bytes"), "{err}");
+    }
+
+    /// An error answer is quoted in part: the first 512 characters and the
+    /// size, not the whole body.
+    #[tokio::test]
+    async fn send_error_quotes_an_excerpt_of_the_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("d".repeat(2000)))
+            .mount(&server)
+            .await;
+        let http = crate::transport::test_http_client();
+        let err = BasicAuth::new("user", "pass", 1 << 20)
+            .send_authenticated(&http, &server.uri(), "<soap/>".into())
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("[2000 bytes in total]"), "{msg}");
+        assert!(!msg.contains(&"d".repeat(513)), "whole body quoted");
     }
 }

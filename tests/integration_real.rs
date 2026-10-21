@@ -665,10 +665,15 @@ async fn low_level_command_lifecycle() {
 }
 
 /// `signal_terminate` on a still-running command must make it reach `done`.
+///
+/// The command is silent for far longer than `operation_timeout_secs`, so the
+/// first Receive comes back as an empty, not-done poll after about 5 s: the
+/// command is provably still running when the terminate signal goes out.
 #[tokio::test]
 #[ignore]
 async fn signal_terminate_stops_running_command() {
-    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let (client, host) = test_client_with(|c| c.operation_timeout_secs = 5)
+        .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
 
     let shell_id = client.create_shell(&host).await.expect("create shell");
     let cmd_id = client
@@ -676,17 +681,17 @@ async fn signal_terminate_stops_running_command() {
             &host,
             &shell_id,
             "powershell.exe",
-            &["-Command", "Start-Sleep 60"],
+            &["-Command", "Start-Sleep 600"],
         )
         .await
         .expect("execute command");
 
-    // One poll to confirm the command is up and still running.
+    // Silent for the whole operation timeout: an empty poll, not an error.
     let first = client
         .receive_output(&host, &shell_id, &cmd_id)
         .await
         .expect("first receive");
-    assert!(!first.done, "Start-Sleep 60 must not be done yet");
+    assert!(!first.done, "Start-Sleep 600 must not be done yet");
 
     client
         .signal_terminate(&host, &shell_id, &cmd_id)
@@ -907,16 +912,12 @@ async fn connect_timeout_is_honoured() {
     );
 }
 
-/// A command that outlives `operation_timeout_secs` must surface
+/// A command that stays silent past `operation_timeout_secs` must surface
 /// `WinrmError::Timeout(10)` (twice the operation timeout), within 20 s.
 ///
-/// CURRENTLY FAILS because of crate bug D1: once a Receive stays silent for
-/// `operation_timeout_secs`, the server answers with a `w:TimedOut` fault, and
-/// the crate returns it as `Err(WinrmError::Soap(..))` instead of treating it
-/// as an empty poll. The test only reaches `Timeout(10)` by a race, when the
-/// `-EncodedCommand` start-up output delays that first fault. Kept as written
-/// (and `#[ignore]`) so it goes green once D1 is fixed; see the
-/// `.superpowers` live-validation notes.
+/// The server answers each silent Receive with a `TimedOut` fault after 5 s;
+/// the shell treats those as empty polls and keeps waiting, so it is the
+/// 2 x `operation_timeout_secs` deadline that ends the call.
 #[tokio::test]
 #[ignore]
 async fn shell_run_command_times_out() {
@@ -940,6 +941,34 @@ async fn shell_run_command_times_out() {
     assert!(
         elapsed < Duration::from_secs(20),
         "timeout took {elapsed:?}"
+    );
+}
+
+/// A command silent for longer than `operation_timeout_secs` is not an error:
+/// the server's `TimedOut` fault on Receive is an empty poll and the call goes
+/// on until the command completes.
+#[tokio::test]
+#[ignore]
+async fn silent_command_longer_than_operation_timeout_completes() {
+    let (client, host) = test_client_with(|c| c.operation_timeout_secs = 5)
+        .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+
+    let start = Instant::now();
+    let out = client
+        .run_powershell(&host, "Start-Sleep 12; 'quiet-done'")
+        .await
+        .expect("a silent command must survive TimedOut polls");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("quiet-done"),
+        "expected 'quiet-done' in stdout, got: {stdout:?}"
+    );
+    assert_eq!(out.exit_code, 0);
+    assert!(
+        start.elapsed() > Duration::from_secs(10),
+        "returned after {:?}, before the command could have finished",
+        start.elapsed()
     );
 }
 

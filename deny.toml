@@ -1,5 +1,6 @@
 [advisories]
 version = 2
+yanked = "deny"
 ignore = []
 
 [licenses]
@@ -14,5 +15,16 @@ allow = [
 ]
 
 [bans]
-multiple-versions = "warn"
+multiple-versions = "deny"
 wildcards = "deny"
+skip = [
+    { crate = "getrandom@0.2.17", reason = "doublon transitif, version plus ancienne ; revue avant 2027-01-19" },
+    { crate = "shlex@1.3.0", reason = "doublon transitif (bindgen via cross-krb5), version plus ancienne ; revue avant 2027-01-19" },
+    { crate = "syn@2.0.119", reason = "doublon transitif, version plus ancienne ; revue avant 2027-01-19" },
+    { crate = "windows-sys@0.52.0", reason = "doublon transitif, version plus ancienne ; revue avant 2027-01-19" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

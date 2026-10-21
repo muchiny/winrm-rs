@@ -1,8 +1,10 @@
-// Custom TLS certificate verifier that captures the server certificate.
+// Custom TLS certificate verifier that records the server certificates it
+// accepts.
 //
-// Used for NTLM Channel Binding Tokens (CBT) — the server certificate
-// hash is injected into the NTLM Type 3 message to bind authentication
-// to the TLS channel, preventing relay attacks.
+// Used for NTLM Channel Binding Tokens (CBT) when the HTTP response does not
+// report its connection's certificate (connections through a proxy): the
+// server certificate hash is injected into the NTLM Type 3 message to bind
+// authentication to the TLS channel, preventing relay attacks.
 
 use std::sync::{Arc, Mutex};
 
@@ -14,30 +16,45 @@ use zeroize::Zeroizing;
 
 use crate::error::WinrmError;
 
-/// A [`ServerCertVerifier`] wrapper that captures the server's end-entity
-/// certificate (DER bytes) during the TLS handshake, then delegates all
-/// verification to an inner verifier.
+/// A [`ServerCertVerifier`] wrapper that records every distinct end-entity
+/// certificate (DER bytes) the inner verifier accepted.
 ///
-/// The captured certificate is used to compute NTLM Channel Binding Tokens.
+/// It records after a successful verification only, so a rejected
+/// certificate leaves nothing. A client may open more than one connection
+/// (a background connect racing an idle one), so the handle reports one
+/// certificate only when all the connections it verified presented the same
+/// one; otherwise the certificate of a given connection cannot be told.
 #[derive(Debug)]
 pub(crate) struct CertCapturingVerifier {
     inner: Arc<dyn ServerCertVerifier>,
-    captured_cert: Arc<Mutex<Option<Vec<u8>>>>,
+    captured: Arc<Mutex<Captured>>,
+}
+
+/// Certificates a [`CertCapturingVerifier`] has accepted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) enum Captured {
+    /// None yet.
+    #[default]
+    None,
+    /// One certificate, seen on every verified connection.
+    One(Vec<u8>),
+    /// Two or more different certificates.
+    Several,
 }
 
 impl CertCapturingVerifier {
-    /// Wrap an existing verifier, capturing the server certificate on each handshake.
+    /// Wrap an existing verifier, recording the server certificates it accepts.
     pub(crate) fn new(inner: Arc<dyn ServerCertVerifier>) -> Self {
         Self {
             inner,
-            captured_cert: Arc::new(Mutex::new(None)),
+            captured: Arc::new(Mutex::new(Captured::None)),
         }
     }
 
-    /// Return a clone-able handle to retrieve the captured certificate.
+    /// Return a clone-able handle to read what was recorded.
     pub(crate) fn cert_handle(&self) -> CertHandle {
         CertHandle {
-            captured_cert: Arc::clone(&self.captured_cert),
+            captured: Arc::clone(&self.captured),
         }
     }
 }
@@ -51,21 +68,26 @@ impl ServerCertVerifier for CertCapturingVerifier {
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, Error> {
-        // Capture the end-entity certificate (DER bytes).
-        //
-        // Mutex poisoning is rare but possible if a previous handshake
-        // panicked mid-capture. Log loudly because losing the cert here
-        // means NTLM will fall back to non-CBT silently.
-        match self.captured_cert.lock() {
-            Ok(mut captured) => *captured = Some(end_entity.to_vec()),
-            Err(_) => tracing::error!(
-                "CertCapturingVerifier mutex poisoned — server cert not stored, \
-                 NTLM Channel Binding will be skipped"
-            ),
-        }
-        // Delegate actual verification to the inner verifier
-        self.inner
-            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+        let verified = self.inner.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        )?;
+        // A poisoned lock (a panic while recording) is unrecoverable state
+        // for channel binding: mark it as ambiguous, which makes NTLM refuse
+        // to authenticate rather than bind a wrong certificate.
+        let mut captured = self
+            .captured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *captured = match std::mem::take(&mut *captured) {
+            Captured::None => Captured::One(end_entity.to_vec()),
+            Captured::One(seen) if seen.as_slice() == end_entity.as_ref() => Captured::One(seen),
+            Captured::One(_) | Captured::Several => Captured::Several,
+        };
+        Ok(verified)
     }
 
     fn verify_tls12_signature(
@@ -91,16 +113,26 @@ impl ServerCertVerifier for CertCapturingVerifier {
     }
 }
 
-/// Clone-able handle to retrieve the captured server certificate.
+/// Clone-able handle to read the certificates a verifier recorded.
 #[derive(Clone, Debug)]
 pub(crate) struct CertHandle {
-    captured_cert: Arc<Mutex<Option<Vec<u8>>>>,
+    captured: Arc<Mutex<Captured>>,
 }
 
 impl CertHandle {
-    /// Return the DER-encoded server certificate, if one has been captured.
-    pub(crate) fn get(&self) -> Option<Vec<u8>> {
-        self.captured_cert.lock().ok()?.clone()
+    /// What the verifier recorded so far.
+    pub(crate) fn captured(&self) -> Captured {
+        self.captured
+            .lock()
+            .map_or(Captured::Several, |captured| captured.clone())
+    }
+
+    /// A handle holding `captured`, for tests.
+    #[cfg(test)]
+    pub(crate) fn with(captured: Captured) -> Self {
+        Self {
+            captured: Arc::new(Mutex::new(captured)),
+        }
     }
 }
 
@@ -347,7 +379,7 @@ mod tests {
         let handle = verifier.cert_handle();
 
         // No cert captured yet
-        assert!(handle.get().is_none());
+        assert_eq!(handle.captured(), Captured::None);
 
         // Simulate a handshake
         let fake_cert = CertificateDer::from(vec![0xDE, 0xAD, 0xBE, 0xEF]);
@@ -357,8 +389,71 @@ mod tests {
         assert!(result.is_ok());
 
         // Cert should be captured
-        let captured = handle.get().unwrap();
-        assert_eq!(captured, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(
+            handle.captured(),
+            Captured::One(vec![0xDE, 0xAD, 0xBE, 0xEF])
+        );
+
+        // The same certificate again (another connection to the same host)
+        // keeps one; a different one makes the record ambiguous for good.
+        let _ = verifier.verify_server_cert(&fake_cert, &[], &server_name, &[], UnixTime::now());
+        assert_eq!(
+            handle.captured(),
+            Captured::One(vec![0xDE, 0xAD, 0xBE, 0xEF])
+        );
+        let other = CertificateDer::from(vec![0x01]);
+        let _ = verifier.verify_server_cert(&other, &[], &server_name, &[], UnixTime::now());
+        assert_eq!(handle.captured(), Captured::Several);
+        let _ = verifier.verify_server_cert(&fake_cert, &[], &server_name, &[], UnixTime::now());
+        assert_eq!(handle.captured(), Captured::Several);
+    }
+
+    /// A certificate the inner verifier rejects is not recorded.
+    #[test]
+    fn rejected_certificate_is_not_captured() {
+        #[derive(Debug)]
+        struct RejectAll;
+        impl ServerCertVerifier for RejectAll {
+            fn verify_server_cert(
+                &self,
+                _end_entity: &CertificateDer<'_>,
+                _intermediates: &[CertificateDer<'_>],
+                _server_name: &ServerName<'_>,
+                _ocsp_response: &[u8],
+                _now: UnixTime,
+            ) -> Result<ServerCertVerified, Error> {
+                Err(Error::General("rejected".into()))
+            }
+            fn verify_tls12_signature(
+                &self,
+                _message: &[u8],
+                _cert: &CertificateDer<'_>,
+                _dss: &DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, Error> {
+                Ok(HandshakeSignatureValid::assertion())
+            }
+            fn verify_tls13_signature(
+                &self,
+                _message: &[u8],
+                _cert: &CertificateDer<'_>,
+                _dss: &DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, Error> {
+                Ok(HandshakeSignatureValid::assertion())
+            }
+            fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+                vec![SignatureScheme::RSA_PKCS1_SHA256]
+            }
+        }
+        let verifier = CertCapturingVerifier::new(Arc::new(RejectAll));
+        let handle = verifier.cert_handle();
+        let cert = CertificateDer::from(vec![9, 9, 9]);
+        let name = ServerName::try_from("example.com").unwrap();
+        assert!(
+            verifier
+                .verify_server_cert(&cert, &[], &name, &[], UnixTime::now())
+                .is_err()
+        );
+        assert_eq!(handle.captured(), Captured::None);
     }
 
     #[test]
@@ -372,7 +467,7 @@ mod tests {
         let server_name = ServerName::try_from("test.local").unwrap();
         let _ = verifier.verify_server_cert(&fake_cert, &[], &server_name, &[], UnixTime::now());
 
-        assert_eq!(handle1.get(), handle2.get());
+        assert_eq!(handle1.captured(), handle2.captured());
     }
 
     #[test]
@@ -398,7 +493,7 @@ mod tests {
         let inner = Arc::new(AcceptAllVerifier);
         let verifier = CertCapturingVerifier::new(inner);
         let handle = verifier.cert_handle();
-        assert!(handle.get().is_none());
+        assert_eq!(handle.captured(), Captured::None);
     }
 
     #[test]

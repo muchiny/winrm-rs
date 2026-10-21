@@ -243,7 +243,7 @@ fn build_inner_openssl_tls() -> Result<OpenSslMemTls, WinrmError> {
     // abort with `CredSspError::PublicKeyMismatch`. So an X.509 chain
     // check on this leg would be redundant — and crucially, the
     // outer/transport leg already validates the chain (see
-    // CredSspConnection::connect / transport.rs CertCapturingVerifier).
+    // `CredSspConnection::connect`).
     builder.set_verify(SslVerifyMode::NONE);
     // Force TLS 1.2 to match what Microsoft CredSSP server expects.
     builder

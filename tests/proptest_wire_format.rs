@@ -285,3 +285,24 @@ proptest! {
         }
     }
 }
+
+// P-CBT — channel binding hash selection reads server-supplied DER.
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    /// Arbitrary bytes, or a DER-looking prefix followed by them, never panic.
+    #[test]
+    fn channel_bindings_never_panic(
+        data in proptest::collection::vec(any::<u8>(), 0..2048),
+        prefix in proptest::sample::select(vec![
+            vec![],
+            vec![0x30, 0x82],
+            vec![0x30, 0x84, 0xFF, 0xFF, 0xFF, 0xFF],
+            vec![0x30, 0x10, 0x30, 0x00, 0x30, 0x0B, 0x06, 0x09],
+        ]),
+    ) {
+        let mut input = prefix;
+        input.extend_from_slice(&data);
+        let _ = winrm_rs::__fuzz::compute_channel_bindings(&input);
+    }
+}

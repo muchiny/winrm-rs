@@ -126,9 +126,10 @@ pub fn build_ntlmv2_blob(
     crate::ntlm::crypto::build_ntlmv2_blob(timestamp, client_challenge, target_info)
 }
 
-/// Compute the `tls-server-end-point` channel binding token from a DER cert.
-pub fn compute_channel_bindings(cert_der: &[u8]) -> [u8; 16] {
-    crate::ntlm::crypto::compute_channel_bindings(cert_der)
+/// Compute the `tls-server-end-point` channel binding token from a DER cert
+/// (`None` when its signature algorithm defines no channel binding).
+pub fn compute_channel_bindings(cert_der: &[u8]) -> Option<[u8; 16]> {
+    crate::ntlm::crypto::compute_channel_bindings(cert_der).ok()
 }
 
 pub fn hmac_md5(key: &[u8], data: &[u8]) -> [u8; 16] {

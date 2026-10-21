@@ -130,3 +130,218 @@ c10yteV0lqpywlvVbVtCXtutGCzeBKjbK5RQXrAbXwJELCgbG201IwrOcAd+VGv7
 ossscMeEp9LLtzWBEfaSSeVuhGBbT9OgD/WW8jQbVOc=
 -----END EC PRIVATE KEY-----
 ";
+
+// --- Channel binding (RFC 5929 tls-server-end-point) fixtures ---
+//
+// Self-signed throwaway certificates, one per signature algorithm, for the
+// CBT hash selection. Generated once with OpenSSL 3.5.9 (Fedora; SHA-1
+// signing needs a config with `rh-allow-sha1-signatures = yes`):
+//
+//   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-384 -sha384 -nodes \
+//       -keyout ec384.key -out ec384-sha384.pem -days 36500 -subj /CN=winrm-rs-cbt-ec384
+//   openssl req -x509 -newkey rsa:2048 -sha512 -nodes -keyout rsa.key \
+//       -out rsa-sha512.pem -days 36500 -subj /CN=winrm-rs-cbt-rsa-sha512
+//   openssl req -x509 -key rsa.key -sha384 -out rsa-sha384.pem -days 36500 \
+//       -subj /CN=winrm-rs-cbt-rsa-sha384
+//   openssl req -x509 -key ec384.key -sha512 -out ec384-sha512.pem -days 36500 \
+//       -subj /CN=winrm-rs-cbt-ec-sha512
+//   openssl req -x509 -key rsa.key -sha384 -sigopt rsa_padding_mode:pss \
+//       -sigopt rsa_pss_saltlen:48 -out rsa-pss-sha384.pem -days 36500 \
+//       -subj /CN=winrm-rs-cbt-pss384
+//   OPENSSL_CONF=sha1.cnf openssl req -x509 -key rsa.key -sha1 -out rsa-sha1.pem \
+//       -days 36500 -subj /CN=winrm-rs-cbt-rsa-sha1   (and -key ec384.key -> ec-sha1.pem)
+//   openssl req -x509 -key rsa.key -md5 -out rsa-md5.pem -days 36500 \
+//       -subj /CN=winrm-rs-cbt-rsa-md5
+//   openssl genpkey -algorithm ed25519 -out ed.key
+//   openssl req -x509 -key ed.key -out ed25519.pem -days 36500 -subj /CN=winrm-rs-cbt-ed25519
+//
+// The expected CBT values in the tests were computed independently with
+// Python `cryptography` 48.0 the way pypsrp does (`signature_hash_algorithm`,
+// MD5/SHA-1 upgraded to SHA-256), then the gss_channel_bindings struct and MD5.
+
+/// P-384 key, ecdsa-with-SHA384.
+pub(crate) const CBT_EC384_SHA384_PEM: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIBzjCCAVSgAwIBAgIUXMRXi/j9EAIdPd/T87P08kG4+Z4wCgYIKoZIzj0EAwMw
+HTEbMBkGA1UEAwwSd2lucm0tcnMtY2J0LWVjMzg0MCAXDTI2MTAyMTIxMzU1NVoY
+DzIxMjYwOTI3MjEzNTU1WjAdMRswGQYDVQQDDBJ3aW5ybS1ycy1jYnQtZWMzODQw
+djAQBgcqhkjOPQIBBgUrgQQAIgNiAAQ/vZYdBhHkYsTmvh1iI8vn7F6ITilh3YBI
+qOTDB5Sy1nZA0yh1J1rmF9CJ7ePlF/6xnmKNj9EkgFzMBgVTODM7/h7z9c06DUWI
+BSuN0Vs19jMvQ1kXmrF0LAxVF012co+jUzBRMB0GA1UdDgQWBBQUca820zU3M10z
+o9DIUgAu03ZiPDAfBgNVHSMEGDAWgBQUca820zU3M10zo9DIUgAu03ZiPDAPBgNV
+HRMBAf8EBTADAQH/MAoGCCqGSM49BAMDA2gAMGUCMQDwBHWPkx0tLMSsxzqvYqNj
+3Y9hM6TMACgGj+SrQzkLtjoc8OotnEbmSjX3eR0GnsECMGCrnLmKOVoimqBe2+Fp
+wYRtiL/NQSRcx0/7vOmwbcrntaDkcwFrXVbFdqCvgVOhAw==
+-----END CERTIFICATE-----
+";
+
+/// The P-384 key of the ECDSA fixtures (PKCS#8).
+pub(crate) const CBT_EC384_SHA384_KEY_PEM: &str = "\
+-----BEGIN PRIVATE KEY-----
+MIG2AgEAMBAGByqGSM49AgEGBSuBBAAiBIGeMIGbAgEBBDAdFdISMYjfKd6TRnX3
+Yv0UsLwjDNCo4YacPc3sGRseevTRulKyEQVqa6zZX7MdahuhZANiAAQ/vZYdBhHk
+YsTmvh1iI8vn7F6ITilh3YBIqOTDB5Sy1nZA0yh1J1rmF9CJ7ePlF/6xnmKNj9Ek
+gFzMBgVTODM7/h7z9c06DUWIBSuN0Vs19jMvQ1kXmrF0LAxVF012co8=
+-----END PRIVATE KEY-----
+";
+
+/// P-384 key, ecdsa-with-SHA512.
+pub(crate) const CBT_EC_SHA512_PEM: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIB1zCCAVygAwIBAgIUE4g0sXKxXS4NCM3VqvGInIlPhNEwCgYIKoZIzj0EAwQw
+ITEfMB0GA1UEAwwWd2lucm0tcnMtY2J0LWVjLXNoYTUxMjAgFw0yNjEwMjEyMTM1
+NTVaGA8yMTI2MDkyNzIxMzU1NVowITEfMB0GA1UEAwwWd2lucm0tcnMtY2J0LWVj
+LXNoYTUxMjB2MBAGByqGSM49AgEGBSuBBAAiA2IABD+9lh0GEeRixOa+HWIjy+fs
+XohOKWHdgEio5MMHlLLWdkDTKHUnWuYX0Int4+UX/rGeYo2P0SSAXMwGBVM4Mzv+
+HvP1zToNRYgFK43RWzX2My9DWReasXQsDFUXTXZyj6NTMFEwHQYDVR0OBBYEFBRx
+rzbTNTczXTOj0MhSAC7TdmI8MB8GA1UdIwQYMBaAFBRxrzbTNTczXTOj0MhSAC7T
+dmI8MA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwQDaQAwZgIxAM33Y7tca+Dv
+SlSs23Pd2jxU6VaO7rUq8EmWT0hYuEVy+FquVys+Spe844dPDDJQGwIxAPB4GbHz
+gYjHM9fomSKngvkqwL5t5QCduR6/Iud+zCmJQ6VBC097urghjDZc+DGt7Q==
+-----END CERTIFICATE-----
+";
+
+/// P-384 key, ecdsa-with-SHA1.
+pub(crate) const CBT_EC_SHA1_PEM: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIBnjCCASWgAwIBAgIUWgfFctPlTkVsruFFQ56/6uikwswwCQYHKoZIzj0EATAf
+MR0wGwYDVQQDDBR3aW5ybS1ycy1jYnQtZWMtc2hhMTAgFw0yNjEwMjEyMTM2MTFa
+GA8yMTI2MDkyNzIxMzYxMVowHzEdMBsGA1UEAwwUd2lucm0tcnMtY2J0LWVjLXNo
+YTEwdjAQBgcqhkjOPQIBBgUrgQQAIgNiAAQ/vZYdBhHkYsTmvh1iI8vn7F6ITilh
+3YBIqOTDB5Sy1nZA0yh1J1rmF9CJ7ePlF/6xnmKNj9EkgFzMBgVTODM7/h7z9c06
+DUWIBSuN0Vs19jMvQ1kXmrF0LAxVF012co+jITAfMB0GA1UdDgQWBBQUca820zU3
+M10zo9DIUgAu03ZiPDAJBgcqhkjOPQQBA2gAMGUCMGTOPSqNlLU+wyzQFTWFbelf
+pku8aEFfrYkB7tbjMJaifYsTDtFlHkpXhmz3l6eglAIxAMV3GUGD2kJ9q8JszwiA
+jw9cOUDmRdwnzTUlfied4pAWeG7ryRlgxGG+HN8eGoZhZQ==
+-----END CERTIFICATE-----
+";
+
+/// RSA-2048, sha384WithRSAEncryption.
+pub(crate) const CBT_RSA_SHA384_PEM: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIDJzCCAg+gAwIBAgIUBk+TbFcJFRYeGEPnq/+5HUe14iYwDQYJKoZIhvcNAQEM
+BQAwIjEgMB4GA1UEAwwXd2lucm0tcnMtY2J0LXJzYS1zaGEzODQwIBcNMjYxMDIx
+MjEzNTU1WhgPMjEyNjA5MjcyMTM1NTVaMCIxIDAeBgNVBAMMF3dpbnJtLXJzLWNi
+dC1yc2Etc2hhMzg0MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAq775
+lD7iisGC03+h3gvGCC9Pby1Phdv9766Dc6wAJHZ6zsKRe0s2i6WwCGamaImaHZnU
+VQU7kJBERmhofd0HjaZRhZmCwO/LshSwOVAmAaC/IJvBgO2t+AJXlXrb1YVdqxhk
+8onMfnupGxUWRAeeQzcM/KFLbTl8stYwKlfWpvhgpX5/5W4AO7pe5XUEIXHyZWqP
+u8b3rOnNNDgyaFWb13JcWslulwfWG+dj1nY94eP+bcPAX8jtHojIfHif5//Rgykv
+LvGPGqjqwADdmORNHvCRIyX+M7XVanTfuZAD3WGV+aOp38DzP+BLC6wTbbOU6dcZ
+u0pL75+FBlwdxjSUJQIDAQABo1MwUTAdBgNVHQ4EFgQUai1sfX0ky3ffeOUK8Zt6
+GiS2s1MwHwYDVR0jBBgwFoAUai1sfX0ky3ffeOUK8Zt6GiS2s1MwDwYDVR0TAQH/
+BAUwAwEB/zANBgkqhkiG9w0BAQwFAAOCAQEAMjtJd/OxpIULGlZiE7abzL2pi9s2
+2/VCpOztsFkKtQi4lnlTV7xtHjJkfgKsTMwZ9pTFoF6/Lqb0Wr7sbtdghnnVhhzP
+ICDpGo3PUf8jO3/GxxoAVfL+FJsNNVjcncClN4OoD/JsmB/+D6vISIMpY1vo/bN+
+7Ef/xDKFmOtVOOz+pAg91fEkFj8ityXVyTjFu9Z7IX/TWbTzhuqeaLDyMRHSmfq2
+IiuP3KWdcuKScutVaycZgaibMpjZJO1zg10Yta5E3K8/3rNIbGZDeAjitdNYv+Bb
+TPmv28p+e5M4hPJ+4A+eXRzidWaYoJGiGld1QxCEpuQhJgbO28GdfiTbCA==
+-----END CERTIFICATE-----
+";
+
+/// RSA-2048, sha512WithRSAEncryption.
+pub(crate) const CBT_RSA_SHA512_PEM: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIDJzCCAg+gAwIBAgIUY5KdtjDPK0yATTjDvRxwXPVtOwQwDQYJKoZIhvcNAQEN
+BQAwIjEgMB4GA1UEAwwXd2lucm0tcnMtY2J0LXJzYS1zaGE1MTIwIBcNMjYxMDIx
+MjEzNTU1WhgPMjEyNjA5MjcyMTM1NTVaMCIxIDAeBgNVBAMMF3dpbnJtLXJzLWNi
+dC1yc2Etc2hhNTEyMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAq775
+lD7iisGC03+h3gvGCC9Pby1Phdv9766Dc6wAJHZ6zsKRe0s2i6WwCGamaImaHZnU
+VQU7kJBERmhofd0HjaZRhZmCwO/LshSwOVAmAaC/IJvBgO2t+AJXlXrb1YVdqxhk
+8onMfnupGxUWRAeeQzcM/KFLbTl8stYwKlfWpvhgpX5/5W4AO7pe5XUEIXHyZWqP
+u8b3rOnNNDgyaFWb13JcWslulwfWG+dj1nY94eP+bcPAX8jtHojIfHif5//Rgykv
+LvGPGqjqwADdmORNHvCRIyX+M7XVanTfuZAD3WGV+aOp38DzP+BLC6wTbbOU6dcZ
+u0pL75+FBlwdxjSUJQIDAQABo1MwUTAdBgNVHQ4EFgQUai1sfX0ky3ffeOUK8Zt6
+GiS2s1MwHwYDVR0jBBgwFoAUai1sfX0ky3ffeOUK8Zt6GiS2s1MwDwYDVR0TAQH/
+BAUwAwEB/zANBgkqhkiG9w0BAQ0FAAOCAQEAL1CDRKx4s6XOqZbUCzv3Mk/tCplN
+pPv6CmyROfqzktDkn59UrG2DpFrs7+YVhBCITp49a/HxsaoGqHUb1aSyrlrkmByT
+PbKbNmCZkHwFOuC447gU0Ielh/c6xpGTba4SMJALTNjnG8Guuz21FqZ+AZZF7TsL
+6VrEZuVGNgE5m4QcTgyRcQEfxeCI3n3A2O35f0GBjuV+gxdd1wGb3kG6rXb2dg5S
+QMrxln80pnQelfHuAzuRA+1DDRcAs91/1lJW8nAiN35leuhPKII7CIAUSZPuzjSc
+c3GTo/4wh7uuy/SH2rKWbI/7QIbW1NwPEAcJ4+PbpQQWsIqTErEM1QkVYA==
+-----END CERTIFICATE-----
+";
+
+/// RSA-2048, sha1WithRSAEncryption.
+pub(crate) const CBT_RSA_SHA1_PEM: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIC8TCCAdmgAwIBAgIUG46kftdTvGwHoMBGAF0qVqjtBfAwDQYJKoZIhvcNAQEF
+BQAwIDEeMBwGA1UEAwwVd2lucm0tcnMtY2J0LXJzYS1zaGExMCAXDTI2MTAyMTIx
+MzYwMloYDzIxMjYwOTI3MjEzNjAyWjAgMR4wHAYDVQQDDBV3aW5ybS1ycy1jYnQt
+cnNhLXNoYTEwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQCrvvmUPuKK
+wYLTf6HeC8YIL09vLU+F2/3vroNzrAAkdnrOwpF7SzaLpbAIZqZoiZodmdRVBTuQ
+kERGaGh93QeNplGFmYLA78uyFLA5UCYBoL8gm8GA7a34AleVetvVhV2rGGTyicx+
+e6kbFRZEB55DNwz8oUttOXyy1jAqV9am+GClfn/lbgA7ul7ldQQhcfJlao+7xves
+6c00ODJoVZvXclxayW6XB9Yb52PWdj3h4/5tw8BfyO0eiMh8eJ/n/9GDKS8u8Y8a
+qOrAAN2Y5E0e8JEjJf4ztdVqdN+5kAPdYZX5o6nfwPM/4EsLrBNts5Tp1xm7Skvv
+n4UGXB3GNJQlAgMBAAGjITAfMB0GA1UdDgQWBBRqLWx9fSTLd9945Qrxm3oaJLaz
+UzANBgkqhkiG9w0BAQUFAAOCAQEAXQwgPffZAoaaKt0UKe+Og3tw6HPGvE20Bs+H
+J8pjlqZadskaF9tSLo/n37lUreCEnzcSvqsBk92jxpCZT8V1YL1xMvUGhHWBQOe8
+fq7gM0U1Xiq9TTb8+q8y03o31qV82fCJi2hxFU146VPdmUKfmMWl6B3EHOxaji4T
+XtL+8QLnG6oryb847n7wQ1oI9kme0aZjfoMfZV91SmzXCldWCeysoZkCGLuAuOZO
+jTWEuWocfwUyrnfYmoLlrBdvUjH7iLeMr6plwmCBLUTwHijQiAB+iQBNNKwTtEcX
+TByjA3UVwRRWAmWGvQymfxU/DUiwdRocblYwUWHElt1Kd2QjHg==
+-----END CERTIFICATE-----
+";
+
+/// RSA-2048, md5WithRSAEncryption.
+pub(crate) const CBT_RSA_MD5_PEM: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIDITCCAgmgAwIBAgIUDbNu4F9Xv+FvzGNLXAV9wsVukA8wDQYJKoZIhvcNAQEE
+BQAwHzEdMBsGA1UEAwwUd2lucm0tcnMtY2J0LXJzYS1tZDUwIBcNMjYxMDIxMjEz
+NTU1WhgPMjEyNjA5MjcyMTM1NTVaMB8xHTAbBgNVBAMMFHdpbnJtLXJzLWNidC1y
+c2EtbWQ1MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAq775lD7iisGC
+03+h3gvGCC9Pby1Phdv9766Dc6wAJHZ6zsKRe0s2i6WwCGamaImaHZnUVQU7kJBE
+Rmhofd0HjaZRhZmCwO/LshSwOVAmAaC/IJvBgO2t+AJXlXrb1YVdqxhk8onMfnup
+GxUWRAeeQzcM/KFLbTl8stYwKlfWpvhgpX5/5W4AO7pe5XUEIXHyZWqPu8b3rOnN
+NDgyaFWb13JcWslulwfWG+dj1nY94eP+bcPAX8jtHojIfHif5//RgykvLvGPGqjq
+wADdmORNHvCRIyX+M7XVanTfuZAD3WGV+aOp38DzP+BLC6wTbbOU6dcZu0pL75+F
+BlwdxjSUJQIDAQABo1MwUTAdBgNVHQ4EFgQUai1sfX0ky3ffeOUK8Zt6GiS2s1Mw
+HwYDVR0jBBgwFoAUai1sfX0ky3ffeOUK8Zt6GiS2s1MwDwYDVR0TAQH/BAUwAwEB
+/zANBgkqhkiG9w0BAQQFAAOCAQEALeNDYtWjzDAbPHQUAbWdTFrV2ZqWxLK5g5yp
+9zTXB/mmNjuBU+2DfNWAsmiU6MBOrgthUj4pLX9eFXPlfEB4gRBMCmdHTfiSoDWP
+kfHLGbxXlrdyvNuH4mMDU41vmADHJ2TS78h91YCqPBEssUQClUWcokh9QazqyEqc
+ldgFmN6v8/dswYnrPYR90SV43+MpgrhRxE3tGO8RI3dIQmkpr03lik3BMQAp7oCm
+g67tUX2otjG39s+ZDWWDnQwr2SUPAWH0jExP8YU2n8IyGis+pVsSL/vpZs2qW5JK
+ytVgU7tZG8YMxUnKnAq6rM9428xsf4h0m31drV22iumBmsRg/A==
+-----END CERTIFICATE-----
+";
+
+/// RSA-2048, RSASSA-PSS with SHA-384.
+pub(crate) const CBT_RSA_PSS_SHA384_PEM: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIDhzCCAjugAwIBAgIUM89+362Ttw+NpHeUyfNQFB+5iL8wQQYJKoZIhvcNAQEK
+MDSgDzANBglghkgBZQMEAgIFAKEcMBoGCSqGSIb3DQEBCDANBglghkgBZQMEAgIF
+AKIDAgEwMB4xHDAaBgNVBAMME3dpbnJtLXJzLWNidC1wc3MzODQwIBcNMjYxMDIx
+MjEzNTU1WhgPMjEyNjA5MjcyMTM1NTVaMB4xHDAaBgNVBAMME3dpbnJtLXJzLWNi
+dC1wc3MzODQwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQCrvvmUPuKK
+wYLTf6HeC8YIL09vLU+F2/3vroNzrAAkdnrOwpF7SzaLpbAIZqZoiZodmdRVBTuQ
+kERGaGh93QeNplGFmYLA78uyFLA5UCYBoL8gm8GA7a34AleVetvVhV2rGGTyicx+
+e6kbFRZEB55DNwz8oUttOXyy1jAqV9am+GClfn/lbgA7ul7ldQQhcfJlao+7xves
+6c00ODJoVZvXclxayW6XB9Yb52PWdj3h4/5tw8BfyO0eiMh8eJ/n/9GDKS8u8Y8a
+qOrAAN2Y5E0e8JEjJf4ztdVqdN+5kAPdYZX5o6nfwPM/4EsLrBNts5Tp1xm7Skvv
+n4UGXB3GNJQlAgMBAAGjUzBRMB0GA1UdDgQWBBRqLWx9fSTLd9945Qrxm3oaJLaz
+UzAfBgNVHSMEGDAWgBRqLWx9fSTLd9945Qrxm3oaJLazUzAPBgNVHRMBAf8EBTAD
+AQH/MEEGCSqGSIb3DQEBCjA0oA8wDQYJYIZIAWUDBAICBQChHDAaBgkqhkiG9w0B
+AQgwDQYJYIZIAWUDBAICBQCiAwIBMAOCAQEAXMxmoiAiwKMQOiezARFWt3jqBugG
+iDKxETpqGWatA5GLSviS3FCKeL40m9DZAvd8FobUL2JaCdMyOQmXWaWwNMDWj5Bt
+K1IvOU+OMRLT/SGSceRIEQhhcHYRQpNWkIKOsmJvv8DpQK6ZPagIV2XABzXyq5TO
+f7FU2P/NZwVOrtMaCfaClfDOocns1DS5g5vjh+ELEZ4kZTUUkd6P8nBrz97xD0IJ
+DKdKx7QN3CPatB+qkf5T7HCJRzcqanx8U7r3TPeDQLGL9QlFgHrDeL+B15NSxbfy
+HaRstU89hUpT5gV7BrqokoJCGiWeo+6Q644MhFSz9JPJTGhm18slWx/f0Q==
+-----END CERTIFICATE-----
+";
+
+/// Ed25519 (no hash in the signature algorithm).
+pub(crate) const CBT_ED25519_PEM: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIBVTCCAQegAwIBAgIUESB/B8ObJlWJeU3jyGOoaZlhX7gwBQYDK2VwMB8xHTAb
+BgNVBAMMFHdpbnJtLXJzLWNidC1lZDI1NTE5MCAXDTI2MTAyMTIxMzU1NVoYDzIx
+MjYwOTI3MjEzNTU1WjAfMR0wGwYDVQQDDBR3aW5ybS1ycy1jYnQtZWQyNTUxOTAq
+MAUGAytlcAMhANShMiQcj/eDzxU2xyt3N9a9zb78IjGqU5PqNLdm8yPRo1MwUTAd
+BgNVHQ4EFgQUXu+BPBomwm9IXmjd40TIXS0HsPIwHwYDVR0jBBgwFoAUXu+BPBom
+wm9IXmjd40TIXS0HsPIwDwYDVR0TAQH/BAUwAwEB/zAFBgMrZXADQQC+5xXjDQO1
+fOW5G6VNKpguH3Ur8UiVvTLEXGjMlFMsuG0YBlFmb7O7HKv+32KE1A+544xCK5sM
+vYOXB6YzzhED
+-----END CERTIFICATE-----
+";

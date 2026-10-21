@@ -2451,23 +2451,29 @@ mod tests {
         assert_eq!(output.stdout, b"ok");
     }
 
+    /// A loopback port held by a bound socket that does not listen yet:
+    /// connections are refused, and no other process can take the port.
+    fn refusing_port() -> (tokio::net::TcpSocket, u16) {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let port = socket.local_addr().unwrap().port();
+        (socket, port)
+    }
+
     /// A connection error (nothing sent) is retried with backoff: the port
     /// refuses connections until a listener appears on it, then the request
     /// goes through.
     #[tokio::test]
+    // Windows answers a refused loopback connect only after ~2 s of SYN
+    // retries, which makes this slow and timing-sensitive there.
+    #[cfg_attr(windows, ignore)]
     async fn retry_backoff_on_http_error() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        // Reserve a port, then free it so the first attempts are refused.
-        let port = {
-            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            probe.local_addr().unwrap().port()
-        };
+        let (socket, port) = refusing_port();
         let server = tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-            let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
-                .await
-                .unwrap();
+            let listener = socket.listen(16).unwrap();
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut buf = [0u8; 4096];
             let _ = stream.read(&mut buf).await;
@@ -2963,11 +2969,11 @@ mod tests {
     /// Retries of refused connections back off exponentially (100 ms, then
     /// 200 ms) rather than additively.
     #[tokio::test]
+    // Windows answers a refused loopback connect only after ~2 s of SYN
+    // retries, so three attempts would take seconds there.
+    #[cfg_attr(windows, ignore)]
     async fn retry_backoff_is_exponential_not_additive() {
-        let port = {
-            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            probe.local_addr().unwrap().port()
-        };
+        let (_held, port) = refusing_port();
         let config = WinrmConfig {
             port,
             auth_method: AuthMethod::Basic,

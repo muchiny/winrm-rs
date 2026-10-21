@@ -43,15 +43,20 @@ use rustls::client::danger::ServerCertVerifier;
 struct NtlmConn {
     host: String,
     http: reqwest::Client,
-    /// Certificate captured by this client's verifier (HTTPS). The client
-    /// has one connection at a time and TLS session resumption is off, so
-    /// every connection is verified and this is the current connection's
-    /// certificate. Used for channel binding when the response does not
-    /// report its TLS details (connections through a proxy).
+    /// Certificates this client's verifier accepted (HTTPS). TLS session
+    /// resumption is off, so every new connection of this client is
+    /// verified; the client normally has one connection, but hyper may open
+    /// another while an idle one is checked out, so the record is trusted
+    /// only while it holds a single certificate. Used for channel binding
+    /// when the response does not report its TLS details (connections
+    /// through a proxy).
     cert: Option<CertHandle>,
     /// Sealing session (sealed connections only).
     session: Option<NtlmSession>,
     idle_since: Instant,
+    /// The server announced it closes the connection (`Connection: close`):
+    /// its session ends with it, so it is not reused.
+    closing: bool,
 }
 
 /// Idle NTLM connections a transport keeps for reuse. Each holds one TCP
@@ -142,9 +147,11 @@ pub(crate) fn sanitize_host(input: &str) -> String {
 }
 
 /// Build the `reqwest` client for `config`: timeouts, redirects off, user
-/// agent, proxy and, over HTTPS, the prepared rustls configuration. At most
-/// `max_idle_per_host` idle connections are kept per host (1 for the client
-/// of a sealed connection, so its requests stay on the authenticated one).
+/// agent, proxy, TLS details on responses and, over HTTPS, the prepared
+/// rustls configuration. At most `max_idle_per_host` idle connections are
+/// kept per host: 10 for the transport's shared client, 1 for the client of
+/// a dedicated NTLM connection (sealed, or NTLM over TLS), so its requests
+/// stay on the authenticated connection.
 fn build_http_client(
     config: &WinrmConfig,
     tls_config: Option<rustls::ClientConfig>,
@@ -175,6 +182,11 @@ fn build_http_client(
     if let Some(ref proxy_url) = config.proxy {
         let proxy = reqwest::Proxy::all(proxy_url).map_err(WinrmError::Http)?;
         builder = builder.proxy(proxy);
+    } else if cfg!(test) {
+        // Unit tests talk to loopback servers: keep `HTTP(S)_PROXY` from the
+        // environment out of them. Builds outside tests keep reqwest's
+        // system-proxy behaviour.
+        builder = builder.no_proxy();
     }
     if let Some(tls_config) = tls_config {
         builder = builder.tls_backend_preconfigured(tls_config);
@@ -430,6 +442,9 @@ impl HttpTransport {
     /// Return an NTLM connection after a clean exchange, closing the oldest
     /// idle ones beyond [`MAX_IDLE_NTLM_CONNS`].
     fn return_ntlm_conn(&self, mut conn: Box<NtlmConn>) {
+        if conn.closing {
+            return;
+        }
         conn.idle_since = Instant::now();
         let mut pool = self.ntlm_pool();
         pool.push(conn);
@@ -471,6 +486,7 @@ impl HttpTransport {
             cert,
             session: None,
             idle_since: Instant::now(),
+            closing: false,
         }))
     }
 
@@ -517,12 +533,15 @@ impl HttpTransport {
                 self.return_ntlm_conn(conn);
                 Err(WinrmError::Soap(fault))
             }
-            Err(SealedFailure::Unauthorized) => Err(WinrmError::AuthFailed(
-                "HTTP 401 to an NTLM-sealed request: the connection no longer carries its NTLM \
-                 session (closed by the server or the network, or tampered with); not resent, \
-                 as it may already have run"
-                    .into(),
-            )),
+            Err(SealedFailure::Unauthorized) => {
+                Err(WinrmError::Ntlm(crate::error::NtlmError::InvalidMessage(
+                    "HTTP 401 to an NTLM-sealed request: the connection's NTLM session is no \
+                     longer valid (usually the server closed an idle connection); the request \
+                     was NOT resent, as it may already have run: retry the call if it is safe \
+                     to run again"
+                        .into(),
+                )))
+            }
             Err(SealedFailure::Error(e)) => Err(e),
         }
     }
@@ -554,6 +573,12 @@ impl HttpTransport {
         if status.as_u16() == 401 {
             return Err(SealedFailure::Unauthorized);
         }
+        conn.closing = resp
+            .headers()
+            .get_all(reqwest::header::CONNECTION)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .any(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("close")));
         let labelled_sealed = resp
             .headers()
             .get(CONTENT_TYPE)
@@ -1645,7 +1670,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(&err, WinrmError::AuthFailed(m) if m.contains("not resent")),
+            matches!(&err, WinrmError::Ntlm(e) if e.to_string().contains("NOT resent")),
             "got: {err:?}"
         );
         assert_eq!(
@@ -1675,7 +1700,8 @@ mod tests {
             .send_soap_with_retry(&host, "<a/>".into())
             .await
             .unwrap_err();
-        assert!(matches!(err, WinrmError::AuthFailed(_)), "got: {err:?}");
+        // Not a credentials problem (bad credentials fail the handshake).
+        assert!(matches!(err, WinrmError::Ntlm(_)), "got: {err:?}");
         assert_eq!(fake.sealed().len(), 1, "log: {:?}", fake.log());
         assert_eq!(fake.plaintext_bodies(), 0, "log: {:?}", fake.log());
     }
@@ -1885,9 +1911,10 @@ mod tests {
     async fn requests_are_retried_only_on_connection_errors() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let refused = {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let port = listener.local_addr().unwrap().port();
-            drop(listener);
+            // Bound but not listening: refused, and the port stays ours.
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let port = socket.local_addr().unwrap().port();
             reqwest::Client::builder()
                 .no_proxy()
                 .build()
@@ -1921,32 +1948,44 @@ mod tests {
         )));
     }
 
-    /// End to end with Basic and `max_retries = 2`: a request whose answer
-    /// times out after it was sent reaches the server once.
+    /// End to end with Basic and `max_retries = 2`: a request the server
+    /// read before closing the connection without answering (it may have
+    /// run) reaches the server once.
     #[tokio::test]
-    async fn basic_request_timing_out_after_sending_is_not_resent() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(30)))
-            .mount(&server)
-            .await;
+    async fn basic_request_lost_after_sending_is_not_resent() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let received = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&received);
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                if stream.read(&mut buf).await.unwrap_or(0) > 0 {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+                drop(stream); // no answer
+            }
+        });
         let config = WinrmConfig {
             auth_method: AuthMethod::Basic,
-            port: server.address().port(),
-            operation_timeout_secs: 0, // HTTP timeout = 10 s
+            port,
             max_retries: 2,
             ..Default::default()
         };
         let transport = HttpTransport::new(config, WinrmCredentials::new("u", "p", "")).unwrap();
         let err = transport
-            .send_soap_with_retry(&server.address().ip().to_string(), "<run-once/>".into())
+            .send_soap_with_retry("127.0.0.1", "<run-once/>".into())
             .await
             .unwrap_err();
         assert!(
-            matches!(&err, WinrmError::Http(e) if e.is_timeout()),
+            matches!(&err, WinrmError::Http(e) if !e.is_connect()),
             "{err:?}"
         );
-        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(received.load(Ordering::SeqCst), 1, "sent once, not resent");
+        server.abort();
     }
 
     // --- NTLM over TLS: channel binding comes from the connection itself ---
@@ -2086,7 +2125,7 @@ mod tests {
         use rustls::pki_types::CertificateDer;
         use rustls::pki_types::pem::PemObject;
         let der = CertificateDer::from_pem_slice(cert_pem.as_bytes()).unwrap();
-        crate::ntlm::crypto::compute_channel_bindings(&der)
+        crate::ntlm::crypto::compute_channel_bindings(&der).unwrap()
     }
 
     fn ntlm_tls_transport(port: u16, proxy_port: u16) -> HttpTransport {
@@ -2174,7 +2213,7 @@ mod tests {
         .await
         .expect("did not finish in 20 s");
         assert!(
-            matches!(&result, Err(WinrmError::AuthFailed(m)) if m.contains("certificate")),
+            matches!(&result, Err(WinrmError::Ntlm(e)) if e.to_string().contains("certificate")),
             "got: {result:?}"
         );
         assert!(seen.lock().unwrap().is_empty(), "no Type 3 may be sent");
@@ -2335,5 +2374,139 @@ mod tests {
         assert!(waited.is_err(), "the wait should still be pending");
         drop(held);
         assert_eq!(transport.ntlm_slots.available_permits(), 1);
+    }
+
+    /// Through a proxy (no TLS details on the response), a dedicated NTLM
+    /// client whose verifier has seen two different server certificates
+    /// cannot tell which one its connection uses: the handshake fails
+    /// closed instead of binding a certificate that may not be this
+    /// connection's.
+    #[tokio::test]
+    async fn ntlm_handshake_fails_closed_when_the_client_saw_two_certificates() {
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM, RSA_CERT_PEM, RSA_KEY_PKCS1_PEM};
+        let (port_a, seen_a) = spawn_ntlm_tls_server(EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let (port_b, seen_b) = spawn_ntlm_tls_server(RSA_CERT_PEM, RSA_KEY_PKCS1_PEM);
+        let transport = ntlm_tls_transport(port_a, spawn_connect_proxy());
+        let conn = transport.new_ntlm_conn("shared").unwrap();
+        let auth = transport.ntlm_auth();
+        let send = |port: u16| {
+            let url = format!("https://127.0.0.1:{port}/wsman");
+            let (auth, conn) = (&auth, &conn);
+            async move {
+                tokio::time::timeout(
+                    Duration::from_secs(20),
+                    auth.send_with_binding(&conn.http, conn.cert.as_ref(), &url, "<soap/>"),
+                )
+                .await
+                .expect("did not finish in 20 s")
+            }
+        };
+        assert_eq!(send(port_a).await.unwrap(), "<ok/>");
+        let second = send(port_b).await;
+        assert!(
+            matches!(&second, Err(WinrmError::Ntlm(e)) if e.to_string().contains("several")),
+            "got: {second:?}"
+        );
+        assert_eq!(seen_a.lock().unwrap().len(), 1);
+        assert!(seen_b.lock().unwrap().is_empty(), "no Type 3 may reach B");
+    }
+
+    /// A response that reports its TLS details decides the CBT, even when
+    /// the client's certificate record holds another certificate.
+    #[tokio::test]
+    async fn ntlm_cbt_prefers_the_response_tls_details_over_a_stale_record() {
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM, RSA_CERT_PEM};
+        use rustls::pki_types::CertificateDer;
+        use rustls::pki_types::pem::PemObject;
+        let (port, seen) = spawn_ntlm_tls_server(EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let transport = ntlm_tls_transport(port, spawn_connect_proxy());
+        let tls = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(crate::tls::NoVerifier))
+            .with_no_client_auth();
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .tls_info(true)
+            .tls_backend_preconfigured(tls)
+            .build()
+            .unwrap();
+        let other = CertificateDer::from_pem_slice(RSA_CERT_PEM.as_bytes())
+            .unwrap()
+            .to_vec();
+        let stale = crate::tls::CertHandle::with(crate::tls::Captured::One(other));
+        let url = format!("https://127.0.0.1:{port}/wsman");
+        let reply = tokio::time::timeout(
+            Duration::from_secs(20),
+            transport
+                .ntlm_auth()
+                .send_with_binding(&http, Some(&stale), &url, "<soap/>"),
+        )
+        .await
+        .expect("did not finish in 20 s")
+        .unwrap();
+        assert_eq!(reply, "<ok/>");
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(type3_channel_bindings(&seen[0]), Some(cbt_of(EC_CERT_PEM)));
+    }
+
+    /// End to end through `HttpTransport::new` on a direct connection, with
+    /// a P-384 certificate signed with ECDSA-SHA384: the CBT hashes the
+    /// certificate with SHA-384 (known answer computed with Python
+    /// `cryptography`, see `test_pki.rs`).
+    #[tokio::test]
+    async fn ntlm_cbt_through_the_transport_uses_the_certificate_hash() {
+        use crate::test_pki::{CBT_EC384_SHA384_KEY_PEM, CBT_EC384_SHA384_PEM};
+        let (port, seen) = spawn_ntlm_tls_server(CBT_EC384_SHA384_PEM, CBT_EC384_SHA384_KEY_PEM);
+        let config = WinrmConfig {
+            auth_method: AuthMethod::Ntlm,
+            use_tls: true,
+            accept_invalid_certs: true,
+            port,
+            connect_timeout_secs: 5,
+            operation_timeout_secs: 5,
+            ..Default::default()
+        };
+        let transport = HttpTransport::new(config, WinrmCredentials::new(USER, PASS, "")).unwrap();
+        let reply = tokio::time::timeout(
+            Duration::from_secs(20),
+            transport.send_soap_with_retry("127.0.0.1", "<soap/>".into()),
+        )
+        .await
+        .expect("did not finish in 20 s")
+        .unwrap();
+        assert_eq!(reply, "<ok/>");
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            type3_channel_bindings(&seen[0]),
+            Some([
+                0xa0, 0x3a, 0x8a, 0x5e, 0x83, 0x2a, 0x07, 0x81, 0xaa, 0xdf, 0xd8, 0x52, 0x3e, 0xb9,
+                0xc4, 0x64
+            ])
+        );
+    }
+
+    /// An answer carrying `Connection: close` ends that connection: the
+    /// connection is not kept, so the next request authenticates a new one
+    /// instead of failing with a 401 on a socket without a session.
+    #[tokio::test]
+    async fn sealed_connection_announced_closed_is_not_reused() {
+        let (_server, fake, transport, host) = sealed_setup().await;
+        fake.push(Reply::SealedThenClose("<first/>".into()));
+        fake.push(Reply::ok("<second/>"));
+        assert_eq!(
+            transport
+                .send_soap_with_retry(&host, "<a/>".into())
+                .await
+                .unwrap(),
+            "<first/>"
+        );
+        assert_eq!(
+            transport
+                .send_soap_with_retry(&host, "<b/>".into())
+                .await
+                .unwrap(),
+            "<second/>"
+        );
+        assert_eq!(fake.handshakes(), 2, "log: {:?}", fake.log());
     }
 }

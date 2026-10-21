@@ -45,6 +45,8 @@ pub(crate) enum Reply {
     },
     /// Answer 401, as for a connection that lost its authentication.
     Unauthorized,
+    /// Like [`Reply::ok`], with a `Connection: close` header.
+    SealedThenClose(String),
     /// Answer `status` with `body` and `content_type` as given (not sealed).
     Raw {
         status: u16,
@@ -251,6 +253,13 @@ impl Respond for FakeNtlmServer {
                         .set_delay(delay)
                 }
                 Reply::Unauthorized => ResponseTemplate::new(401),
+                Reply::SealedThenClose(body) => {
+                    let (content_type, sealed) = seal_body(&mut state.sessions[index], &body);
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", content_type.as_str())
+                        .insert_header("connection", "close")
+                        .set_body_bytes(sealed)
+                }
                 Reply::Raw {
                     status,
                     content_type,

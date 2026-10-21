@@ -61,18 +61,36 @@ pub(crate) fn seal_body(session: &mut ntlm::NtlmSession, body: &str) -> (String,
     (ENCRYPTED_CONTENT_TYPE.to_string(), mime_body)
 }
 
-/// The `Length=N` value of a sealed part's `OriginalContent` header line.
+/// Header lines of a sealed body's first part (between the opening boundary
+/// and the octet-stream part), without their leading tab or spaces.
+fn header_lines(header: &[u8]) -> impl Iterator<Item = &[u8]> {
+    header
+        .split(|&b| b == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+        .map(|line| line.trim_ascii_start())
+        .filter(|line| !line.is_empty())
+}
+
+/// Whether the first part declares the SPNEGO-encrypted content type (NTLM
+/// through Negotiate), as pypsrp checks.
+fn declares_spnego_encryption(header: &[u8]) -> bool {
+    header_lines(header).any(|line| {
+        line.eq_ignore_ascii_case(b"Content-Type: application/HTTP-SPNEGO-session-encrypted")
+    })
+}
+
+/// The `Length=N` value of the first part's `OriginalContent:` line.
 fn original_length(header: &[u8]) -> Option<usize> {
+    const NAME: &[u8] = b"originalcontent:";
     const KEY: &[u8] = b"Length=";
-    let at = header.windows(KEY.len()).position(|w| w == KEY)?;
-    let digits = header.get(at + KEY.len()..)?;
-    let end = digits
-        .iter()
-        .position(|b| !b.is_ascii_digit())
-        .unwrap_or(digits.len());
-    let (number, after) = digits.split_at_checked(end)?;
-    // At most 10 digits, and the line must end right after the number.
-    if number.is_empty() || number.len() > 10 || !after.starts_with(b"\r\n") {
+    let line = header_lines(header).find(|line| {
+        line.get(..NAME.len())
+            .is_some_and(|name| name.eq_ignore_ascii_case(NAME))
+    })?;
+    let at = line.windows(KEY.len()).position(|w| w == KEY)?;
+    let number = line.get(at + KEY.len()..)?;
+    // At most 10 digits, and the line ends right after the number.
+    if number.is_empty() || number.len() > 10 || !number.iter().all(u8::is_ascii_digit) {
         return None;
     }
     std::str::from_utf8(number).ok()?.parse().ok()
@@ -112,6 +130,11 @@ pub(crate) fn unseal_body(
     let (header, rest) = rest
         .split_at_checked(part_at)
         .ok_or_else(|| bad("missing octet-stream part"))?;
+    if !declares_spnego_encryption(header) {
+        return Err(bad(
+            "first part is not application/HTTP-SPNEGO-session-encrypted",
+        ));
+    }
     let length =
         original_length(header).ok_or_else(|| bad("missing or invalid OriginalContent Length"))?;
     let payload = rest
@@ -158,7 +181,7 @@ impl NtlmAuth {
         http: &reqwest::Client,
         cert: Option<&crate::tls::CertHandle>,
         url: &str,
-    ) -> Result<Zeroizing<[u8; 16]>, WinrmError> {
+    ) -> Result<Box<Zeroizing<[u8; 16]>>, WinrmError> {
         let (_, session_key) = self.do_handshake(http, cert, url, None).await?;
         Ok(session_key)
     }
@@ -195,7 +218,7 @@ impl NtlmAuth {
         cert: Option<&crate::tls::CertHandle>,
         url: &str,
         body: Option<&str>,
-    ) -> Result<(String, Zeroizing<[u8; 16]>), WinrmError> {
+    ) -> Result<(String, Box<Zeroizing<[u8; 16]>>), WinrmError> {
         // Step 1: Send Type 1 (Negotiate) with empty body
         let type1 = ntlm::create_negotiate_message();
         let auth_header = ntlm::encode_authorization(&type1);
@@ -232,8 +255,21 @@ impl NtlmAuth {
             .extensions()
             .get::<reqwest::tls::TlsInfo>()
             .and_then(|info| info.peer_certificate())
-            .map(<[u8]>::to_vec)
-            .or_else(|| cert.and_then(crate::tls::CertHandle::get));
+            .map(<[u8]>::to_vec);
+        let peer_certificate = match (peer_certificate, cert.map(crate::tls::CertHandle::captured))
+        {
+            (Some(der), _) => Some(der),
+            (None, Some(crate::tls::Captured::One(der))) => Some(der),
+            (None, Some(crate::tls::Captured::Several)) if over_tls => {
+                return Err(WinrmError::Ntlm(NtlmError::InvalidMessage(
+                    "NTLM over TLS: this client has seen several server certificates and cannot \
+                     tell which one its connection uses; refusing to authenticate without a \
+                     certain channel binding"
+                        .into(),
+                )));
+            }
+            (None, _) => None,
+        };
 
         // Consume the response body to release the connection back to the pool
         let _ = crate::auth::read_body_capped(resp, self.max_response_bytes).await;
@@ -270,13 +306,14 @@ impl NtlmAuth {
         // the handshake instead of authenticating unbound.
         let (type3, session_key) = if over_tls {
             let cert_der = peer_certificate.ok_or_else(|| {
-                WinrmError::AuthFailed(
+                WinrmError::Ntlm(NtlmError::InvalidMessage(
                     "NTLM over TLS: the connection reported no server certificate to bind \
                      the authentication to (channel binding)"
                         .into(),
-                )
+                ))
             })?;
-            let cbt = crate::ntlm::crypto::compute_channel_bindings(&cert_der);
+            let cbt = crate::ntlm::crypto::compute_channel_bindings(&cert_der)
+                .map_err(WinrmError::Ntlm)?;
             ntlm::create_authenticate_message_with_cbt_and_key(
                 &challenge,
                 &self.username,
@@ -295,6 +332,14 @@ impl NtlmAuth {
                 &target_name,
             )
         };
+        // Move the exported session key to the heap before the awaits below
+        // and wipe the stack copy, so no unboxed copy of it lives in this
+        // future while it waits on the network, and returning it moves a
+        // pointer. (The message builder's own stack copies are not wiped.)
+        let mut boxed_key = Box::new(Zeroizing::new([0u8; 16]));
+        boxed_key.copy_from_slice(&*session_key);
+        drop(session_key);
+        let session_key = boxed_key;
         let auth_header = ntlm::encode_authorization(&type3);
 
         let request = http.post(url).header(AUTHORIZATION, &auth_header);
@@ -674,5 +719,51 @@ mod tests {
         let secret = "s3cr3t-payload";
         let err = unseal_err(format!("--Encrypted Boundary\r\n{secret}").as_bytes());
         assert!(!err.contains(secret), "{err}");
+    }
+
+    /// A body whose header part is `header` (between the opening boundary and
+    /// the octet-stream part), with a correctly sealed payload.
+    fn with_header(header: &str) -> Vec<u8> {
+        let mut out = format!(
+            "{ENCRYPTED_BOUNDARY}\r\n{header}{ENCRYPTED_BOUNDARY}\r\n\
+             \tContent-Type: application/octet-stream\r\n"
+        )
+        .into_bytes();
+        out.extend_from_slice(&16u32.to_le_bytes());
+        out.extend_from_slice(&server_sealed_reply());
+        out.extend_from_slice(b"--Encrypted Boundary--\r\n");
+        out
+    }
+
+    /// The header part must declare the SPNEGO-encrypted content type, as
+    /// pypsrp checks.
+    #[test]
+    fn unseal_body_requires_the_spnego_encrypted_content_type() {
+        let len = REPLY.len();
+        let missing = with_header(&format!(
+            "\tOriginalContent: type=application/soap+xml;charset=UTF-8;Length={len}\r\n"
+        ));
+        assert!(unseal_err(&missing).contains("SPNEGO"), "missing");
+        let other = with_header(&format!(
+            "\tContent-Type: application/HTTP-Kerberos-session-encrypted\r\n\
+             \tOriginalContent: type=application/soap+xml;charset=UTF-8;Length={len}\r\n"
+        ));
+        assert!(unseal_err(&other).contains("SPNEGO"), "other protocol");
+    }
+
+    /// `Length=` counts only on the `OriginalContent:` line.
+    #[test]
+    fn unseal_body_reads_length_only_from_original_content() {
+        let len = REPLY.len();
+        let elsewhere = with_header(&format!(
+            "\tContent-Type: application/HTTP-SPNEGO-session-encrypted\r\n\
+             \tX-Note: Length={len}\r\n\
+             \tOriginalContent: type=application/soap+xml;charset=UTF-8\r\n"
+        ));
+        assert!(unseal_err(&elsewhere).contains("OriginalContent Length"));
+        let no_line = with_header(&format!(
+            "\tContent-Type: application/HTTP-SPNEGO-session-encrypted\r\n\tX-Other: Length={len}\r\n"
+        ));
+        assert!(unseal_err(&no_line).contains("OriginalContent Length"));
     }
 }

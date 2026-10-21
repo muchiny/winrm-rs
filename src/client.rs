@@ -2245,7 +2245,11 @@ mod tests {
                 if call == 0 {
                     drop(stream);
                 } else {
-                    use tokio::io::AsyncWriteExt;
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    // Consume the request first: closing a socket with unread
+                    // data sends RST, which can discard the response in flight.
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
                     let body = r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>RETRY-BACKOFF</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>";
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/xml\r\n\r\n{}",

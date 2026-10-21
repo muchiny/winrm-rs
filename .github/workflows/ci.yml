@@ -211,6 +211,8 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@1.98.0
       - uses: Swatinem/rust-cache@v2
+      - name: Install libkrb5-dev
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev
       - uses: obi1kenobi/cargo-semver-checks-action@v2
 
   # Gate job — add this to branch protection rules

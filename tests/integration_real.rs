@@ -2099,6 +2099,10 @@ fn test_client_rogue_cert() -> Option<(WinrmClient, String)> {
 /// over plain HTTP): trust the test CA, enable the WSMan Certificate method,
 /// map the client certificate to `vagrant`, and make HTTP.sys negotiate the
 /// client certificate during the initial handshake (rustls cannot renegotiate).
+///
+/// BENCH ONLY: installs a root CA, maps it to an admin account and enables
+/// client-cert negotiation, with no teardown — never point WINRM_TEST_HOST at a
+/// real machine.
 #[tokio::test]
 #[ignore]
 async fn setup_certificate_auth() {
@@ -2118,10 +2122,6 @@ async fn setup_certificate_auth() {
 
     // The script travels as -EncodedCommand (UTF-16 + base64), which cmd.exe
     // caps at ~8 KB: one request per step keeps each under the limit.
-    let thumb_of_ca = "$thumb = (Get-ChildItem Cert:\\LocalMachine\\Root | \
-         Where-Object Subject -eq 'CN=winrm-rs test CA' | Select-Object -First 1).Thumbprint; \
-         if (-not $thumb) { throw 'test CA not in LocalMachine\\Root' }";
-
     // 1 + 2: trust the CA, enable the Certificate method on the WinRM service.
     let step_trust = format!(
         r#"
@@ -2145,7 +2145,9 @@ Write-Output "STEP 2 Service\Auth\Certificate = $((Get-Item WSMan:\localhost\Ser
     let step_map = format!(
         r#"
 $ErrorActionPreference = 'Stop'
-{thumb_of_ca}
+$thumb = (New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 (,[Convert]::FromBase64String('{ca_b64}'))).Thumbprint
+if (-not (Test-Path "Cert:\LocalMachine\Root\$thumb")) {{ throw "test CA $thumb not in LocalMachine\Root" }}
+Write-Output "STEP 3 issuer thumbprint: $thumb"
 Get-ChildItem WSMan:\localhost\ClientCertificate -ErrorAction SilentlyContinue | ForEach-Object {{
     $d = Get-ChildItem $_.PSPath
     if (($d | Where-Object Name -eq Issuer).Value -eq $thumb) {{
@@ -2215,7 +2217,7 @@ if ($Matches[1] -ne 'Enabled') { exit 3 }
 ///
 /// CURRENTLY FAILS (HTTP 401) although the bench is correctly prepared: the
 /// crate has two defects on this path, found by comparing with `curl` and an
-/// `openssl s_server` (see the task-5 report in `.superpowers`):
+/// `openssl s_server`:
 /// 1. `transport.rs` builds the rustls config with `.with_no_client_auth()` and
 ///    installs it through `tls_backend_preconfigured`, which discards the
 ///    `reqwest::Identity`, so no client certificate is ever presented
@@ -2227,13 +2229,8 @@ if ($Matches[1] -ne 'Enabled') { exit 3 }
 #[tokio::test]
 #[ignore]
 async fn certificate_auth_whoami() {
-    let Some((client, host)) = test_client_cert() else {
-        eprintln!(
-            "SKIP certificate_auth_whoami: set WINRM_TEST_HOST, WINRM_TEST_PASS and \
-             eval tests/scripts/make-client-cert.sh"
-        );
-        return;
-    };
+    let (client, host) = test_client_cert()
+        .expect("set WINRM_TEST_HOST, WINRM_TEST_PASS and eval tests/scripts/make-client-cert.sh");
     let out = client
         .run_command(&host, "whoami", &[])
         .await
@@ -2258,13 +2255,8 @@ async fn certificate_auth_whoami() {
 #[tokio::test]
 #[ignore]
 async fn certificate_auth_unmapped_cert_is_rejected() {
-    let Some((client, host)) = test_client_rogue_cert() else {
-        eprintln!(
-            "SKIP certificate_auth_unmapped_cert_is_rejected: set WINRM_TEST_HOST, \
-             WINRM_TEST_PASS and eval tests/scripts/make-client-cert.sh"
-        );
-        return;
-    };
+    let (client, host) = test_client_rogue_cert()
+        .expect("set WINRM_TEST_HOST, WINRM_TEST_PASS and eval tests/scripts/make-client-cert.sh");
     let start = Instant::now();
     let result = tokio::time::timeout(
         Duration::from_secs(30),

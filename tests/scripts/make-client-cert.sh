@@ -76,7 +76,7 @@ make_client rogue rogue-ca
 chmod 600 "$DIR"/*.key
 echo "ca thumbprint: $(openssl x509 -in "$DIR/ca.pem" -noout -fingerprint -sha1 | cut -d= -f2 | tr -d ':')" >&2
 
-echo "export WINRM_TEST_CLIENT_CERT=$DIR/client.pem"
-echo "export WINRM_TEST_CLIENT_KEY=$DIR/client.key"
-echo "export WINRM_TEST_ROGUE_CERT=$DIR/rogue.pem"
-echo "export WINRM_TEST_ROGUE_KEY=$DIR/rogue.key"
+printf 'export WINRM_TEST_CLIENT_CERT=%q\n' "$DIR/client.pem"
+printf 'export WINRM_TEST_CLIENT_KEY=%q\n' "$DIR/client.key"
+printf 'export WINRM_TEST_ROGUE_CERT=%q\n' "$DIR/rogue.pem"
+printf 'export WINRM_TEST_ROGUE_KEY=%q\n' "$DIR/rogue.key"

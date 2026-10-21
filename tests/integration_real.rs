@@ -1074,13 +1074,27 @@ async fn silent_command_longer_than_operation_timeout_completes() {
     assert_silent_command_completes(&client, &host).await;
 }
 
+/// Bytes one direction of one forwarded connection carried.
+type Recording = std::sync::Arc<std::sync::Mutex<Vec<u8>>>;
+
+/// A request as a [`RecordingForwarder`] saw it on the wire.
+struct RecordedRequest {
+    /// It carried an `Authorization` header (an NTLM handshake leg).
+    authorization: bool,
+    /// Its `Content-Type` was `multipart/encrypted` (NTLM-sealed).
+    sealed: bool,
+    /// Its `Content-Length`.
+    body_len: usize,
+}
+
 /// A TCP forwarder to the bench's HTTP port that keeps a copy of the bytes
-/// it carries in each direction, so a test can read the plaintext HTTP
-/// framing (request headers, status lines) around NTLM-sealed bodies.
+/// each connection carries in each direction, so a test can read the
+/// plaintext HTTP framing (request headers, status lines) around
+/// NTLM-sealed bodies.
 struct RecordingForwarder {
     addr: std::net::SocketAddr,
-    to_server: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
-    to_client: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    /// (towards the server, back to the client), one pair per connection.
+    connections: std::sync::Arc<std::sync::Mutex<Vec<(Recording, Recording)>>>,
 }
 
 impl RecordingForwarder {
@@ -1091,32 +1105,32 @@ impl RecordingForwarder {
             .await
             .expect("bind recording forwarder");
         let addr = listener.local_addr().expect("forwarder address");
-        let to_server = Arc::new(Mutex::new(Vec::new()));
-        let to_client = Arc::new(Mutex::new(Vec::new()));
-        let (up_log, down_log) = (Arc::clone(&to_server), Arc::clone(&to_client));
+        let connections = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&connections);
         tokio::spawn(async move {
             while let Ok((client, _)) = listener.accept().await {
                 let Ok(server) = tokio::net::TcpStream::connect(&upstream).await else {
                     continue;
                 };
+                let up: Recording = Arc::default();
+                let down: Recording = Arc::default();
+                if let Ok(mut all) = recorded.lock() {
+                    all.push((Arc::clone(&up), Arc::clone(&down)));
+                }
                 let (client_rd, client_wr) = client.into_split();
                 let (server_rd, server_wr) = server.into_split();
-                tokio::spawn(Self::pump(client_rd, server_wr, Arc::clone(&up_log)));
-                tokio::spawn(Self::pump(server_rd, client_wr, Arc::clone(&down_log)));
+                tokio::spawn(Self::pump(client_rd, server_wr, up));
+                tokio::spawn(Self::pump(server_rd, client_wr, down));
             }
         });
-        Self {
-            addr,
-            to_server,
-            to_client,
-        }
+        Self { addr, connections }
     }
 
     /// Copy `rd` to `wr` until either side closes, recording what passes.
     async fn pump(
         mut rd: tokio::net::tcp::OwnedReadHalf,
         mut wr: tokio::net::tcp::OwnedWriteHalf,
-        log: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        log: Recording,
     ) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut buf = vec![0u8; 16 * 1024];
@@ -1135,42 +1149,105 @@ impl RecordingForwarder {
         }
     }
 
+    /// Copies of each connection's bytes in one direction.
+    fn streams(&self, to_server: bool) -> Vec<Vec<u8>> {
+        self.connections.lock().map_or_else(
+            |_| Vec::new(),
+            |all| {
+                all.iter()
+                    .map(|(up, down)| {
+                        let log = if to_server { up } else { down };
+                        log.lock().map(|b| b.clone()).unwrap_or_default()
+                    })
+                    .collect()
+            },
+        )
+    }
+
+    /// TCP connections the client opened.
+    fn connections(&self) -> usize {
+        self.connections.lock().map_or(0, |all| all.len())
+    }
+
+    /// Every request, parsed from each connection's stream.
+    fn requests(&self) -> Vec<RecordedRequest> {
+        let mut requests = Vec::new();
+        for stream in self.streams(true) {
+            let mut at = 0;
+            while let Some(end) = stream
+                .get(at..)
+                .and_then(|rest| rest.windows(4).position(|w| w == b"\r\n\r\n"))
+            {
+                let head = String::from_utf8_lossy(stream.get(at..at + end).unwrap_or_default())
+                    .to_ascii_lowercase();
+                let header = |name: &str| {
+                    head.lines()
+                        .find_map(|l| l.strip_prefix(name).map(|v| v.trim().to_string()))
+                };
+                let body_len = header("content-length:")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                requests.push(RecordedRequest {
+                    authorization: header("authorization:").is_some(),
+                    sealed: header("content-type:")
+                        .is_some_and(|ct| ct.starts_with("multipart/encrypted")),
+                    body_len,
+                });
+                at += end + 4 + body_len;
+            }
+        }
+        requests
+    }
+
+    /// Requests that carried a body without sealing it.
+    fn plaintext_bodies(&self) -> usize {
+        self.requests()
+            .iter()
+            .filter(|r| r.body_len > 0 && !r.sealed)
+            .count()
+    }
+
     /// Occurrences of `needle` (ASCII, case-insensitive) in the bytes sent
     /// towards the server.
     fn count_to_server(&self, needle: &str) -> usize {
-        Self::count(&self.to_server, needle)
+        Self::count(self.streams(true), needle)
     }
 
     /// Occurrences of `needle` (ASCII, case-insensitive) in the bytes sent
     /// back to the client.
     fn count_to_client(&self, needle: &str) -> usize {
-        Self::count(&self.to_client, needle)
+        Self::count(self.streams(false), needle)
     }
 
     /// Size of the largest HTTP answer body sent back to the client, from
     /// the `Content-Length` headers it carried.
     fn largest_answer_to_client(&self) -> usize {
-        let text = self
-            .to_client
-            .lock()
-            .map(|bytes| String::from_utf8_lossy(&bytes).to_ascii_lowercase())
-            .unwrap_or_default();
-        text.split("content-length:")
-            .skip(1)
-            .filter_map(|rest| rest.split("\r\n").next()?.trim().parse::<usize>().ok())
+        self.streams(false)
+            .iter()
+            .flat_map(|bytes| {
+                String::from_utf8_lossy(bytes)
+                    .to_ascii_lowercase()
+                    .split("content-length:")
+                    .skip(1)
+                    .filter_map(|rest| rest.split("\r\n").next()?.trim().parse::<usize>().ok())
+                    .collect::<Vec<_>>()
+            })
             .max()
             .unwrap_or(0)
     }
 
-    fn count(log: &std::sync::Mutex<Vec<u8>>, needle: &str) -> usize {
+    fn count(streams: Vec<Vec<u8>>, needle: &str) -> usize {
         let needle = needle.to_ascii_lowercase().into_bytes();
-        log.lock().map_or(0, |bytes| {
-            bytes
-                .to_ascii_lowercase()
-                .windows(needle.len())
-                .filter(|w| *w == needle.as_slice())
-                .count()
-        })
+        streams
+            .iter()
+            .map(|bytes| {
+                bytes
+                    .to_ascii_lowercase()
+                    .windows(needle.len())
+                    .filter(|w| *w == needle.as_slice())
+                    .count()
+            })
+            .sum()
     }
 }
 
@@ -1203,11 +1280,34 @@ async fn sealed_ntlm_client(
 }
 
 /// Requests that went out NTLM-sealed, and `Authorization: Negotiate`
-/// requests (two per NTLM handshake: Type 1 and Type 3), as seen by `forwarder`.
+/// requests (two per NTLM handshake: Type 1 and Type 3), as seen by
+/// `forwarder`. Also checks what holds for every sealed client: no request
+/// body ever crossed unsealed (the handshake legs carry none), and each
+/// connection ran exactly one handshake (one per sealed connection, no
+/// re-authentication on a connection).
 fn sealed_traffic(forwarder: &RecordingForwarder) -> (usize, usize) {
-    let sealed = forwarder.count_to_server("Content-Type: multipart/encrypted");
+    let requests = forwarder.requests();
+    let sealed = requests.iter().filter(|r| r.sealed).count();
     let negotiate = forwarder.count_to_server("Authorization: Negotiate");
-    eprintln!("sealed requests: {sealed}, Negotiate requests: {negotiate}");
+    let connections = forwarder.connections();
+    let handshake_bodies: usize = requests
+        .iter()
+        .filter(|r| r.authorization)
+        .map(|r| r.body_len)
+        .sum();
+    eprintln!(
+        "connections: {connections}, requests: {}, sealed: {sealed}, Negotiate: {negotiate}, \
+         plaintext bodies: {}",
+        requests.len(),
+        forwarder.plaintext_bodies()
+    );
+    assert_eq!(
+        forwarder.plaintext_bodies(),
+        0,
+        "a request body crossed unsealed"
+    );
+    assert_eq!(handshake_bodies, 0, "a handshake leg carried a body");
+    assert_eq!(negotiate, 2 * connections, "one handshake per connection");
     (sealed, negotiate)
 }
 
@@ -1230,11 +1330,8 @@ async fn silent_command_completes_over_ntlm_sealed_http() {
     assert_silent_command_completes(&client, SEALED_HOST).await;
 
     let faults = forwarder.count_to_client("HTTP/1.1 500");
-    let negotiate = forwarder.count_to_server("Authorization: Negotiate");
-    let sealed = forwarder.count_to_server("Content-Type: multipart/encrypted");
-    eprintln!(
-        "HTTP 500 answers: {faults}, Negotiate requests: {negotiate}, sealed requests: {sealed}"
-    );
+    eprintln!("HTTP 500 answers: {faults}");
+    let (sealed, negotiate) = sealed_traffic(&forwarder);
     assert!(
         faults >= 1,
         "the silent Receive should have hit at least one TimedOut fault (HTTP 500)"
@@ -1356,7 +1453,14 @@ async fn ntlm_sealed_cancel_long_running_command() {
         .await
         .expect("the client must still work after a cancelled sealed exchange");
     assert!(String::from_utf8_lossy(&out.stdout).contains("after-cancel"));
-    sealed_traffic(&forwarder);
+    // The cancelled exchange's connection was discarded: the next request
+    // opened a new one (one more handshake, empty Type 3) and went sealed.
+    let (sealed_after, negotiate_after) = sealed_traffic(&forwarder);
+    assert_eq!(negotiate_after, 4, "one new connection after the cancel");
+    assert!(
+        sealed_after >= sealed_before + 4,
+        "Create, Execute, Receive and Delete after the cancel should go out sealed"
+    );
 }
 
 /// Ctrl+C over sealed NTLM: same outcome as `shell_signal_ctrl_c`.
@@ -1456,23 +1560,96 @@ async fn concurrent_shells_timings_basic() {
     concurrent_shells_timings(&client, &host).await;
 }
 
-/// Concurrent shells on one client over sealed NTLM: all complete. The
-/// sealed session is shared by the client and its lock is held for a whole
-/// exchange, a Receive long-poll included, so the quick echo may wait for
-/// shell 1's Receive (measured, not asserted; compare with
-/// `concurrent_shells_timings_basic`).
+/// Concurrent shells on one client over sealed NTLM: all complete, and a
+/// quick request does not wait for another shell's long Receive. Each
+/// concurrent request uses its own authenticated connection (one handshake
+/// per connection); compare the timings with
+/// `concurrent_shells_timings_basic`.
 #[tokio::test]
 #[ignore]
 async fn ntlm_sealed_concurrent_shells() {
     // Default operation timeout, as in `concurrent_shells_timings_basic`.
     let (client, forwarder) = sealed_ntlm_client(|_| {}).await;
-    concurrent_shells_timings(&client, SEALED_HOST).await;
-    let (sealed, negotiate) = sealed_traffic(&forwarder);
-    assert_eq!(negotiate, 2, "one NTLM handshake, no re-authentication");
+    let (_, quick) = concurrent_shells_timings(&client, SEALED_HOST).await;
+    let (sealed, _) = sealed_traffic(&forwarder);
+    assert!(
+        quick < Duration::from_secs(3),
+        "the quick echo waited {quick:?} for the other shell's Receive"
+    );
+    assert!(
+        forwarder.connections() >= 2,
+        "concurrent requests need their own connections"
+    );
     assert!(
         sealed >= 10,
         "expected the shell traffic sealed, got {sealed}"
     );
+}
+
+/// Run a script printing 1.5 MB of output over sealed NTLM with the given
+/// `MaxEnvelopeSize` and check it all arrives; returns the largest single
+/// HTTP answer seen.
+async fn sealed_large_output(max_envelope_size: u32) -> usize {
+    const LEN: usize = 1_500_000;
+    let (client, forwarder) = sealed_ntlm_client(|c| c.max_envelope_size = max_envelope_size).await;
+    let out = client
+        .run_powershell(SEALED_HOST, &format!("[Console]::Out.Write('x' * {LEN})"))
+        .await
+        .expect("large output over sealed NTLM");
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(out.stdout.len(), LEN, "stdout length");
+    assert!(out.stdout.iter().all(|b| *b == b'x'));
+    let largest = forwarder.largest_answer_to_client();
+    eprintln!("MaxEnvelopeSize {max_envelope_size}: largest HTTP answer {largest} bytes");
+    sealed_traffic(&forwarder);
+    largest
+}
+
+/// More than 1 MiB of output over sealed NTLM with the default
+/// `MaxEnvelopeSize`: it arrives over several sealed Receive answers, each
+/// under the response cap (`4 * max(MaxEnvelopeSize, 512 KiB)`).
+#[tokio::test]
+#[ignore]
+async fn ntlm_sealed_large_output_default_envelope() {
+    let largest = sealed_large_output(153_600).await;
+    assert!(
+        largest > 100_000,
+        "expected full-size answers, largest {largest}"
+    );
+}
+
+/// Same with a 500 KB `MaxEnvelopeSize` (the Windows default limit). Server
+/// 2025 still answers a Receive with about 150 KB at most (measured 155 KB),
+/// well under the cap.
+#[tokio::test]
+#[ignore]
+async fn ntlm_sealed_large_output_500k_envelope() {
+    let largest = sealed_large_output(512_000).await;
+    assert!(
+        largest > 100_000,
+        "expected full-size answers, largest {largest}"
+    );
+}
+
+/// `EncryptionMode::Always` seals over HTTPS too (inside TLS, so the wire
+/// cannot be checked here; the server accepting the sealed requests is the
+/// evidence).
+#[tokio::test]
+#[ignore]
+async fn ntlm_encryption_always_over_https() {
+    let (client, host) = test_client_with(|c| {
+        c.auth_method = AuthMethod::Ntlm;
+        c.use_tls = true;
+        c.accept_invalid_certs = true; // self-signed listener certificate
+        c.port = https_test_port();
+        c.encryption = EncryptionMode::Always;
+    })
+    .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let out = client
+        .run_command(&host, "cmd.exe", &["/c", "echo", "sealed-in-tls"])
+        .await
+        .expect("NTLM sealed over HTTPS");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("sealed-in-tls"));
 }
 
 /// Same over Certificate authentication (HTTPS).

@@ -379,7 +379,27 @@ impl HttpTransport {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
+            // Windows seals the answer to a sealed request, a SOAP fault (HTTP
+            // 500) included: unseal it before looking for the fault, so the
+            // fault is not mistaken for an expired session (which would
+            // re-authenticate and replay the request in plaintext). Unsealing
+            // also keeps the server sequence number in step.
+            let sealed = resp
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|ct| {
+                    ct.trim_start()
+                        .to_ascii_lowercase()
+                        .starts_with("multipart/encrypted")
+                });
+            let bytes = resp.bytes().await.unwrap_or_default();
+            let text = if sealed {
+                ntlm_auth::unseal_body(session, &bytes)
+                    .unwrap_or_else(|_| String::from_utf8_lossy(&bytes).into_owned())
+            } else {
+                String::from_utf8_lossy(&bytes).into_owned()
+            };
             return Err(crate::auth::error_for_status(
                 status.as_u16(),
                 &text,
@@ -1299,5 +1319,103 @@ mod tests {
         let a = basic_transport(5985);
         let b = basic_transport(5985);
         assert_ne!(a.session_id(), b.session_id());
+    }
+
+    // --- NTLM-sealed path: faults come back sealed ---
+
+    const SEALED_KEY: [u8; 16] = [0x5A; 16];
+
+    /// NTLM transport over HTTP (sealing on, the default) whose session cache
+    /// already holds a session for the wiremock host, as after a first request.
+    async fn sealed_ntlm_transport(server: &MockServer) -> (HttpTransport, String) {
+        let config = WinrmConfig {
+            auth_method: AuthMethod::Ntlm,
+            port: server.address().port(),
+            use_tls: false,
+            ..Default::default()
+        };
+        let transport =
+            HttpTransport::new(config, WinrmCredentials::new("admin", "pass", "")).unwrap();
+        let host = server.address().ip().to_string();
+        *transport.ntlm_cache.lock().await = Some(NtlmSessionCache {
+            host: host.clone(),
+            session: NtlmSession::from_auth(&SEALED_KEY),
+        });
+        (transport, host)
+    }
+
+    /// A response sealed by the server side of the session.
+    fn server_sealed(server_side: &mut NtlmSession, status: u16, body: &str) -> ResponseTemplate {
+        let (content_type, sealed) = ntlm_auth::seal_body(server_side, body);
+        ResponseTemplate::new(status)
+            .insert_header("content-type", content_type.as_str())
+            .set_body_bytes(sealed)
+    }
+
+    /// Windows seals the HTTP 500 fault of a sealed request. It must surface as
+    /// the SOAP fault (an empty poll for a Receive), without a re-handshake and
+    /// without dropping the session.
+    #[tokio::test]
+    async fn sealed_http_500_fault_is_a_soap_error_without_rehandshake() {
+        let server = MockServer::start().await;
+        let mut server_side = NtlmSession::server_side(&SEALED_KEY);
+        Mock::given(method("POST"))
+            .respond_with(server_sealed(
+                &mut server_side,
+                500,
+                crate::auth::TIMED_OUT_FAULT,
+            ))
+            .mount(&server)
+            .await;
+        let (transport, host) = sealed_ntlm_transport(&server).await;
+
+        let err = transport
+            .send_soap_with_retry(&host, "<soap/>".into())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, WinrmError::Soap(crate::error::SoapError::Fault { code, .. }) if code == "w:TimedOut"),
+            "expected Soap(Fault w:TimedOut), got: {err:?}"
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "no re-handshake after a sealed fault");
+        assert!(
+            transport.ntlm_cache.lock().await.is_some(),
+            "the sealed session is kept"
+        );
+    }
+
+    /// After a sealed fault the session stays in step with the server: the
+    /// next sealed answer (next server sequence number) unseals.
+    #[tokio::test]
+    async fn sealed_session_stays_in_sync_after_a_sealed_fault() {
+        let server = MockServer::start().await;
+        let mut server_side = NtlmSession::server_side(&SEALED_KEY);
+        let fault = server_sealed(&mut server_side, 500, crate::auth::TIMED_OUT_FAULT);
+        let reply = server_sealed(&mut server_side, 200, "<s:Envelope>after</s:Envelope>");
+        Mock::given(method("POST"))
+            .respond_with(fault)
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(reply)
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        let (transport, host) = sealed_ntlm_transport(&server).await;
+
+        let first = transport
+            .send_soap_with_retry(&host, "<soap/>".into())
+            .await;
+        assert!(matches!(first, Err(WinrmError::Soap(_))), "got: {first:?}");
+        let second = transport
+            .send_soap_with_retry(&host, "<soap/>".into())
+            .await
+            .unwrap();
+        assert_eq!(second, "<s:Envelope>after</s:Envelope>");
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
     }
 }

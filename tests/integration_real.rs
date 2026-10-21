@@ -1086,6 +1086,21 @@ impl RecordingForwarder {
         Self::count(&self.to_client, needle)
     }
 
+    /// Size of the largest HTTP answer body sent back to the client, from
+    /// the `Content-Length` headers it carried.
+    fn largest_answer_to_client(&self) -> usize {
+        let text = self
+            .to_client
+            .lock()
+            .map(|bytes| String::from_utf8_lossy(&bytes).to_ascii_lowercase())
+            .unwrap_or_default();
+        text.split("content-length:")
+            .skip(1)
+            .filter_map(|rest| rest.split("\r\n").next()?.trim().parse::<usize>().ok())
+            .max()
+            .unwrap_or(0)
+    }
+
     fn count(log: &std::sync::Mutex<Vec<u8>>, needle: &str) -> usize {
         let needle = needle.to_ascii_lowercase().into_bytes();
         log.lock().map_or(0, |bytes| {
@@ -1096,6 +1111,43 @@ impl RecordingForwarder {
                 .count()
         })
     }
+}
+
+/// Host name the client uses to reach the bench through a
+/// [`RecordingForwarder`] (it listens on loopback).
+const SEALED_HOST: &str = "127.0.0.1";
+
+/// NTLM client on plain HTTP with the default `EncryptionMode::Auto` (every
+/// request after the handshake is NTLM-sealed), connected through a
+/// [`RecordingForwarder`] so the test can check the traffic. Reach the bench
+/// with [`SEALED_HOST`].
+async fn sealed_ntlm_client(
+    tweak: impl FnOnce(&mut WinrmConfig),
+) -> (WinrmClient, RecordingForwarder) {
+    // The default mode, which seals over plain HTTP.
+    assert_eq!(WinrmConfig::default().encryption, EncryptionMode::Auto);
+    let (_, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let port: u16 = std::env::var("WINRM_TEST_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(5985);
+    let forwarder = RecordingForwarder::start(format!("{host}:{port}")).await;
+    let (client, _) = test_client_with(|c| {
+        c.auth_method = AuthMethod::Ntlm;
+        c.port = forwarder.addr.port();
+        tweak(c);
+    })
+    .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    (client, forwarder)
+}
+
+/// Requests that went out NTLM-sealed, and `Authorization: Negotiate`
+/// requests (two per NTLM handshake: Type 1 and Type 3), as seen by `forwarder`.
+fn sealed_traffic(forwarder: &RecordingForwarder) -> (usize, usize) {
+    let sealed = forwarder.count_to_server("Content-Type: multipart/encrypted");
+    let negotiate = forwarder.count_to_server("Authorization: Negotiate");
+    eprintln!("sealed requests: {sealed}, Negotiate requests: {negotiate}");
+    (sealed, negotiate)
 }
 
 /// Same over NTLM on plain HTTP with the default `EncryptionMode::Auto`, so
@@ -1111,22 +1163,10 @@ impl RecordingForwarder {
 #[tokio::test]
 #[ignore]
 async fn silent_command_completes_over_ntlm_sealed_http() {
-    // The default mode, which seals over plain HTTP.
-    assert_eq!(WinrmConfig::default().encryption, EncryptionMode::Auto);
-    let (_, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
-    let port: u16 = std::env::var("WINRM_TEST_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(5985);
-    let forwarder = RecordingForwarder::start(format!("{host}:{port}")).await;
-    let (client, _) = test_client_with(|c| {
-        c.auth_method = AuthMethod::Ntlm;
-        c.port = forwarder.addr.port();
-        c.operation_timeout_secs = SILENT_OP_SECS;
-    })
-    .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let (client, forwarder) =
+        sealed_ntlm_client(|c| c.operation_timeout_secs = SILENT_OP_SECS).await;
 
-    assert_silent_command_completes(&client, "127.0.0.1").await;
+    assert_silent_command_completes(&client, SEALED_HOST).await;
 
     let faults = forwarder.count_to_client("HTTP/1.1 500");
     let negotiate = forwarder.count_to_server("Authorization: Negotiate");
@@ -1145,6 +1185,220 @@ async fn silent_command_completes_over_ntlm_sealed_http() {
     assert!(
         sealed >= 3,
         "Execute, Receive and Delete should go out sealed"
+    );
+}
+
+// === Sealed NTLM over HTTP: gates ===
+//
+// The same features as the Basic tests further up, over NTLM on plain HTTP
+// with the default sealing, through a `RecordingForwarder` that confirms the
+// traffic was sealed and that no re-authentication (a plaintext replay)
+// happened.
+
+/// A large upload and download round-trip over sealed NTLM: about a hundred
+/// upload chunks (several sealed requests each) and a download whose base64
+/// response runs to some 270 KB across several sealed Receive answers.
+#[tokio::test]
+#[ignore]
+async fn ntlm_sealed_upload_and_download_large_file() {
+    let (client, forwarder) = sealed_ntlm_client(|_| {}).await;
+
+    // 200 001 bytes: 101 chunks of 2000 bytes; varied bytes so a misplaced
+    // chunk cannot go unnoticed.
+    let content: Vec<u8> = (0u32..200_001)
+        .map(|i| u8::try_from((i.wrapping_mul(2_654_435_761) >> 24) & 0xFF).unwrap_or(0))
+        .collect();
+    let local_upload = std::env::temp_dir().join("winrm_rs_sealed_upload.bin");
+    std::fs::write(&local_upload, &content).expect("write local file");
+    let remote_path = r"C:\Windows\Temp\winrm_rs_sealed_large_test.bin";
+
+    let start = Instant::now();
+    let bytes_up = client
+        .upload_file(SEALED_HOST, &local_upload, remote_path)
+        .await
+        .expect("upload over sealed NTLM");
+    let upload_elapsed = start.elapsed();
+    assert_eq!(bytes_up, content.len() as u64);
+
+    let local_download = std::env::temp_dir().join("winrm_rs_sealed_download.bin");
+    let start = Instant::now();
+    let bytes_down = client
+        .download_file(SEALED_HOST, remote_path, &local_download)
+        .await
+        .expect("download over sealed NTLM");
+    let download_elapsed = start.elapsed();
+    assert_eq!(bytes_down, content.len() as u64);
+    let downloaded = std::fs::read(&local_download).expect("read downloaded file");
+    assert!(downloaded == content, "sealed round-trip mismatch");
+
+    let largest_answer = forwarder.largest_answer_to_client();
+    eprintln!(
+        "upload {upload_elapsed:?}, download {download_elapsed:?}, largest HTTP answer {largest_answer} bytes"
+    );
+    let _ = client
+        .run_powershell(SEALED_HOST, &format!("Remove-Item '{remote_path}' -Force"))
+        .await;
+    let _ = std::fs::remove_file(&local_upload);
+    let _ = std::fs::remove_file(&local_download);
+
+    let (sealed, negotiate) = sealed_traffic(&forwarder);
+    assert_eq!(negotiate, 2, "one NTLM handshake, no re-authentication");
+    assert!(
+        sealed >= 300,
+        "expected hundreds of sealed requests, got {sealed}"
+    );
+}
+
+/// `run_command_with_cancel` over sealed NTLM: same outcome as
+/// `cancel_long_running_command`. Cancelling drops a sealed exchange in
+/// flight, so the same client must still work afterwards.
+#[tokio::test]
+#[ignore]
+async fn ntlm_sealed_cancel_long_running_command() {
+    let (client, forwarder) = sealed_ntlm_client(|_| {}).await;
+    let cancel = CancellationToken::new();
+    let cancel2 = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        cancel2.cancel();
+    });
+
+    let start = Instant::now();
+    let result = client
+        .run_command_with_cancel(SEALED_HOST, "ping", &["-n", "30", "127.0.0.1"], cancel)
+        .await;
+    eprintln!("cancelled after {:?}: {result:?}", start.elapsed());
+    assert!(
+        matches!(result, Err(WinrmError::Cancelled)),
+        "expected Cancelled, got: {result:?}"
+    );
+    let (sealed_before, negotiate_before) = sealed_traffic(&forwarder);
+    assert_eq!(negotiate_before, 2, "one NTLM handshake before the cancel");
+    assert!(
+        sealed_before >= 2,
+        "Execute and Receive should go out sealed"
+    );
+
+    let out = client
+        .run_command(SEALED_HOST, "cmd.exe", &["/c", "echo", "after-cancel"])
+        .await
+        .expect("the client must still work after a cancelled sealed exchange");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("after-cancel"));
+    sealed_traffic(&forwarder);
+}
+
+/// Ctrl+C over sealed NTLM: same outcome as `shell_signal_ctrl_c`.
+#[tokio::test]
+#[ignore]
+async fn ntlm_sealed_shell_signal_ctrl_c() {
+    let (client, forwarder) = sealed_ntlm_client(|_| {}).await;
+    let shell = client.open_shell(SEALED_HOST).await.expect("open shell");
+    let cmd_id = shell
+        .start_command("ping", &["-n", "60", "127.0.0.1"])
+        .await
+        .expect("start long ping");
+    let first = shell.receive_next(&cmd_id).await.expect("first receive");
+    assert!(!first.done, "command should not be done yet");
+
+    shell.signal_ctrl_c(&cmd_id).await.expect("signal ctrl+c");
+    let result = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let chunk = shell
+                .receive_next(&cmd_id)
+                .await
+                .expect("receive after ctrl+c");
+            if chunk.done {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "command should finish within 15s after Ctrl+C"
+    );
+    shell.close().await.expect("close shell");
+
+    let (sealed, negotiate) = sealed_traffic(&forwarder);
+    assert_eq!(negotiate, 2, "one NTLM handshake, no re-authentication");
+    assert!(
+        sealed >= 4,
+        "Execute, Receive, Signal and Delete should go out sealed"
+    );
+}
+
+/// Two shells on one client, run concurrently (mirrors `concurrent_shells`),
+/// then a latency probe: shell 1 waits in a long Receive on a 10 s silent
+/// command while shell 2 runs a quick `echo`. Returns (time for the two
+/// echoes, time for the quick echo during the long Receive).
+async fn concurrent_shells_timings(client: &WinrmClient, host: &str) -> (Duration, Duration) {
+    let shell1 = client.open_shell(host).await.expect("open shell 1");
+    let shell2 = client.open_shell(host).await.expect("open shell 2");
+    assert_ne!(shell1.shell_id(), shell2.shell_id());
+
+    let start = Instant::now();
+    let (out1, out2) = tokio::join!(
+        shell1.run_command("cmd.exe", &["/c", "echo", "from-shell-1"]),
+        shell2.run_command("cmd.exe", &["/c", "echo", "from-shell-2"]),
+    );
+    let both = start.elapsed();
+    let (out1, out2) = (out1.expect("shell1 command"), out2.expect("shell2 command"));
+    assert!(String::from_utf8_lossy(&out1.stdout).contains("from-shell-1"));
+    assert!(String::from_utf8_lossy(&out2.stdout).contains("from-shell-2"));
+
+    // `-Command` (not `-EncodedCommand`) prints nothing before it ends, so
+    // shell 1's first Receive is held by the server for the whole 10 s.
+    let (slow, quick) = tokio::join!(
+        shell1.run_command(
+            "powershell.exe",
+            &["-Command", "Start-Sleep 10; 'slow-done'"]
+        ),
+        async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let start = Instant::now();
+            let out = shell2
+                .run_command("cmd.exe", &["/c", "echo", "quick"])
+                .await;
+            (out, start.elapsed())
+        },
+    );
+    let slow = slow.expect("slow command");
+    assert!(String::from_utf8_lossy(&slow.stdout).contains("slow-done"));
+    let (quick, quick_elapsed) = quick;
+    assert!(String::from_utf8_lossy(&quick.expect("quick command").stdout).contains("quick"));
+
+    shell1.close().await.expect("close shell 1");
+    shell2.close().await.expect("close shell 2");
+    eprintln!("two echoes: {both:?}; quick echo during a long Receive: {quick_elapsed:?}");
+    (both, quick_elapsed)
+}
+
+/// Concurrent shells over Basic: the reference timings for
+/// `ntlm_sealed_concurrent_shells`.
+#[tokio::test]
+#[ignore]
+async fn concurrent_shells_timings_basic() {
+    let (client, host) = test_client_with(|c| c.operation_timeout_secs = SILENT_OP_SECS)
+        .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    concurrent_shells_timings(&client, &host).await;
+}
+
+/// Concurrent shells on one client over sealed NTLM: all complete. The
+/// sealed session is shared by the client and its lock is held for a whole
+/// exchange, a Receive long-poll included, so the quick echo may wait for
+/// shell 1's Receive (measured, not asserted; compare with
+/// `concurrent_shells_timings_basic`).
+#[tokio::test]
+#[ignore]
+async fn ntlm_sealed_concurrent_shells() {
+    let (client, forwarder) =
+        sealed_ntlm_client(|c| c.operation_timeout_secs = SILENT_OP_SECS).await;
+    concurrent_shells_timings(&client, SEALED_HOST).await;
+    let (sealed, negotiate) = sealed_traffic(&forwarder);
+    assert_eq!(negotiate, 2, "one NTLM handshake, no re-authentication");
+    assert!(
+        sealed >= 10,
+        "expected the shell traffic sealed, got {sealed}"
     );
 }
 

@@ -957,22 +957,25 @@ async fn shell_run_command_times_out() {
     );
 }
 
-/// A command silent for longer than `operation_timeout_secs` is not an error:
-/// the server's `TimedOut` fault on Receive is an empty poll and the call goes
-/// on until the command completes.
-#[tokio::test]
-#[ignore]
-async fn silent_command_longer_than_operation_timeout_completes() {
-    // 15 s leaves room for shell creation on a busy bench; the 20 s sleep still
-    // outlasts one full silent Receive window.
-    let (client, host) = test_client_with(|c| c.operation_timeout_secs = 15)
-        .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+/// `operation_timeout_secs` of the silent-command tests: 15 s leaves room for
+/// shell creation on a busy bench, and [`SILENT_SCRIPT`] still outlasts one
+/// full silent Receive window.
+const SILENT_OP_SECS: u64 = 15;
 
+/// Silent for 20 s, then one line of output.
+const SILENT_SCRIPT: &str = "Start-Sleep 20; 'quiet-done'";
+
+/// Run [`SILENT_SCRIPT`] with `client` (built with [`SILENT_OP_SECS`]) and
+/// check that it completes: the server's `TimedOut` fault on the silent
+/// Receive must be an empty poll, whatever the auth method that carried it.
+async fn assert_silent_command_completes(client: &WinrmClient, host: &str) {
     let start = Instant::now();
     let out = client
-        .run_powershell(&host, "Start-Sleep 20; 'quiet-done'")
+        .run_powershell(host, SILENT_SCRIPT)
         .await
         .expect("a silent command must survive TimedOut polls");
+    let elapsed = start.elapsed();
+    eprintln!("silent command completed after {elapsed:?}");
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -981,10 +984,194 @@ async fn silent_command_longer_than_operation_timeout_completes() {
     );
     assert_eq!(out.exit_code, 0);
     assert!(
-        start.elapsed() > Duration::from_secs(18),
-        "returned after {:?}, before the command could have finished",
-        start.elapsed()
+        elapsed > Duration::from_secs(18),
+        "returned after {elapsed:?}, before the command could have finished"
     );
+}
+
+/// A command silent for longer than `operation_timeout_secs` is not an error:
+/// the server's `TimedOut` fault on Receive is an empty poll and the call goes
+/// on until the command completes (Basic over HTTP).
+#[tokio::test]
+#[ignore]
+async fn silent_command_longer_than_operation_timeout_completes() {
+    let (client, host) = test_client_with(|c| c.operation_timeout_secs = SILENT_OP_SECS)
+        .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    assert_silent_command_completes(&client, &host).await;
+}
+
+/// A TCP forwarder to the bench's HTTP port that keeps a copy of the bytes
+/// it carries in each direction, so a test can read the plaintext HTTP
+/// framing (request headers, status lines) around NTLM-sealed bodies.
+struct RecordingForwarder {
+    addr: std::net::SocketAddr,
+    to_server: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    to_client: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+impl RecordingForwarder {
+    async fn start(upstream: String) -> Self {
+        use std::sync::{Arc, Mutex};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind recording forwarder");
+        let addr = listener.local_addr().expect("forwarder address");
+        let to_server = Arc::new(Mutex::new(Vec::new()));
+        let to_client = Arc::new(Mutex::new(Vec::new()));
+        let (up_log, down_log) = (Arc::clone(&to_server), Arc::clone(&to_client));
+        tokio::spawn(async move {
+            while let Ok((client, _)) = listener.accept().await {
+                let Ok(server) = tokio::net::TcpStream::connect(&upstream).await else {
+                    continue;
+                };
+                let (client_rd, client_wr) = client.into_split();
+                let (server_rd, server_wr) = server.into_split();
+                tokio::spawn(Self::pump(client_rd, server_wr, Arc::clone(&up_log)));
+                tokio::spawn(Self::pump(server_rd, client_wr, Arc::clone(&down_log)));
+            }
+        });
+        Self {
+            addr,
+            to_server,
+            to_client,
+        }
+    }
+
+    /// Copy `rd` to `wr` until either side closes, recording what passes.
+    async fn pump(
+        mut rd: tokio::net::tcp::OwnedReadHalf,
+        mut wr: tokio::net::tcp::OwnedWriteHalf,
+        log: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            let n = match rd.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            let chunk = buf.get(..n).unwrap_or_default();
+            if let Ok(mut log) = log.lock() {
+                log.extend_from_slice(chunk);
+            }
+            if wr.write_all(chunk).await.is_err() {
+                break;
+            }
+        }
+    }
+
+    /// Occurrences of `needle` (ASCII, case-insensitive) in the bytes sent
+    /// towards the server.
+    fn count_to_server(&self, needle: &str) -> usize {
+        Self::count(&self.to_server, needle)
+    }
+
+    /// Occurrences of `needle` (ASCII, case-insensitive) in the bytes sent
+    /// back to the client.
+    fn count_to_client(&self, needle: &str) -> usize {
+        Self::count(&self.to_client, needle)
+    }
+
+    fn count(log: &std::sync::Mutex<Vec<u8>>, needle: &str) -> usize {
+        let needle = needle.to_ascii_lowercase().into_bytes();
+        log.lock().map_or(0, |bytes| {
+            bytes
+                .to_ascii_lowercase()
+                .windows(needle.len())
+                .filter(|w| *w == needle.as_slice())
+                .count()
+        })
+    }
+}
+
+/// Same over NTLM on plain HTTP with the default `EncryptionMode::Auto`, so
+/// every request after the first is NTLM-sealed and Windows seals the
+/// `TimedOut` fault (HTTP 500) too. The transport must unseal it and keep the
+/// session: it must not mistake it for an expired session, which would
+/// re-authenticate and replay the Receive in plaintext.
+///
+/// The client goes through a recording forwarder: the HTTP status lines and
+/// request headers stay readable around the sealed bodies, which shows the
+/// fault happened (a `500` status line) and that the NTLM handshake ran once
+/// (two `Authorization: Negotiate` requests, Type 1 and Type 3).
+#[tokio::test]
+#[ignore]
+async fn silent_command_completes_over_ntlm_sealed_http() {
+    // The default mode, which seals over plain HTTP.
+    assert_eq!(WinrmConfig::default().encryption, EncryptionMode::Auto);
+    let (_, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let port: u16 = std::env::var("WINRM_TEST_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(5985);
+    let forwarder = RecordingForwarder::start(format!("{host}:{port}")).await;
+    let (client, _) = test_client_with(|c| {
+        c.auth_method = AuthMethod::Ntlm;
+        c.port = forwarder.addr.port();
+        c.operation_timeout_secs = SILENT_OP_SECS;
+    })
+    .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+
+    assert_silent_command_completes(&client, "127.0.0.1").await;
+
+    let faults = forwarder.count_to_client("HTTP/1.1 500");
+    let negotiate = forwarder.count_to_server("Authorization: Negotiate");
+    let sealed = forwarder.count_to_server("Content-Type: multipart/encrypted");
+    eprintln!(
+        "HTTP 500 answers: {faults}, Negotiate requests: {negotiate}, sealed requests: {sealed}"
+    );
+    assert!(
+        faults >= 1,
+        "the silent Receive should have hit at least one TimedOut fault (HTTP 500)"
+    );
+    assert_eq!(
+        negotiate, 2,
+        "one NTLM handshake (Type 1 + Type 3), no re-authentication"
+    );
+    assert!(
+        sealed >= 3,
+        "Execute, Receive and Delete should go out sealed"
+    );
+}
+
+/// Same over Certificate authentication (HTTPS).
+#[tokio::test]
+#[ignore]
+async fn silent_command_completes_over_certificate_auth() {
+    let (client, host) =
+        cert_client_from_env("WINRM_TEST_CLIENT_CERT", "WINRM_TEST_CLIENT_KEY", |c| {
+            c.operation_timeout_secs = SILENT_OP_SECS
+        })
+        .expect("set WINRM_TEST_HOST, WINRM_TEST_PASS and eval tests/scripts/make-client-cert.sh");
+    assert_silent_command_completes(&client, &host).await;
+}
+
+/// Same over CredSSP (HTTPS).
+#[cfg(feature = "credssp")]
+#[tokio::test]
+#[ignore]
+async fn silent_command_completes_over_credssp() {
+    if is_server_2012_r2().await {
+        eprintln!(
+            "SKIP silent_command_completes_over_credssp: no TLS cipher suite shared \
+             with Server 2012 R2 (see credssp_run_command_whoami)"
+        );
+        return;
+    }
+    let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    let pass = std::env::var("WINRM_TEST_PASS").expect("WINRM_TEST_PASS");
+    let config = WinrmConfig {
+        auth_method: AuthMethod::CredSsp,
+        use_tls: true,
+        accept_invalid_certs: true,
+        port: https_test_port(),
+        operation_timeout_secs: SILENT_OP_SECS,
+        ..Default::default()
+    };
+    let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
+    assert_silent_command_completes(&client, &host).await;
 }
 
 // === Idle timeout ===
@@ -2112,13 +2299,17 @@ fn cert_auth_ca_path() -> Option<std::path::PathBuf> {
 /// client cannot be built (a bad PEM file must not pass for a missing bench).
 /// The credentials are unused by the Certificate method but required by the
 /// constructor.
-fn cert_client_from_env(cert_var: &str, key_var: &str) -> Option<(WinrmClient, String)> {
+fn cert_client_from_env(
+    cert_var: &str,
+    key_var: &str,
+    tweak: impl FnOnce(&mut WinrmConfig),
+) -> Option<(WinrmClient, String)> {
     let host = std::env::var("WINRM_TEST_HOST").ok()?;
     let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
     let pass = std::env::var("WINRM_TEST_PASS").ok()?;
     let cert = std::env::var(cert_var).ok()?;
     let key = std::env::var(key_var).ok()?;
-    let config = WinrmConfig {
+    let mut config = WinrmConfig {
         auth_method: AuthMethod::Certificate,
         use_tls: true,
         accept_invalid_certs: true, // self-signed listener certificate
@@ -2127,6 +2318,7 @@ fn cert_client_from_env(cert_var: &str, key_var: &str) -> Option<(WinrmClient, S
         client_key_pem: Some(key),
         ..Default::default()
     };
+    tweak(&mut config);
     let client = match WinrmClient::new(config, WinrmCredentials::new(user, pass, "")) {
         Ok(client) => client,
         Err(e) => panic!("Certificate-auth client from {cert_var}/{key_var}: {e}"),
@@ -2136,12 +2328,12 @@ fn cert_client_from_env(cert_var: &str, key_var: &str) -> Option<(WinrmClient, S
 
 /// Client presenting the certificate the VM maps to `vagrant`.
 fn test_client_cert() -> Option<(WinrmClient, String)> {
-    cert_client_from_env("WINRM_TEST_CLIENT_CERT", "WINRM_TEST_CLIENT_KEY")
+    cert_client_from_env("WINRM_TEST_CLIENT_CERT", "WINRM_TEST_CLIENT_KEY", |_| {})
 }
 
 /// Client presenting a certificate signed by a CA the VM does not trust.
 fn test_client_rogue_cert() -> Option<(WinrmClient, String)> {
-    cert_client_from_env("WINRM_TEST_ROGUE_CERT", "WINRM_TEST_ROGUE_KEY")
+    cert_client_from_env("WINRM_TEST_ROGUE_CERT", "WINRM_TEST_ROGUE_KEY", |_| {})
 }
 
 /// Prepare the VM for TLS client-certificate authentication (idempotent, NTLM

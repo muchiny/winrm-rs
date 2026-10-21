@@ -56,6 +56,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 /// the sealing/signing key material lives, and its `Drop` ensures it does
 /// not survive the session in the process heap.
 #[derive(Zeroize, ZeroizeOnDrop)]
+#[cfg_attr(test, derive(Clone))]
 pub struct NtlmSession {
     client_sign_key: [u8; 16],
     server_sign_key: [u8; 16],
@@ -108,8 +109,9 @@ impl NtlmSession {
     /// The server's view of the session derived from the same key: what it
     /// seals, a client [`Self::from_auth`] session unseals, and back.
     ///
-    /// Test-only: lets unit tests build the sealed bodies a WinRM server sends.
-    #[cfg(test)]
+    /// For tests and the `__internal` fuzz surface only: builds the sealed
+    /// bodies a WinRM server sends.
+    #[cfg(any(test, feature = "__internal"))]
     pub(crate) fn server_side(exported_session_key: &[u8; 16]) -> Self {
         let mut session = Self::from_auth(exported_session_key);
         std::mem::swap(&mut session.client_sign_key, &mut session.server_sign_key);

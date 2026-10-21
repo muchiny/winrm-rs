@@ -47,6 +47,61 @@ pub(crate) fn error_for_status(
     WinrmError::AuthFailed(describe())
 }
 
+/// Largest part of a server body quoted in an error message, in characters.
+const EXCERPT_CHARS: usize = 512;
+
+/// A server body as quoted in an error message: at most [`EXCERPT_CHARS`]
+/// characters, with the full size noted when it is cut.
+pub(crate) fn excerpt(body: &str) -> String {
+    match body.char_indices().nth(EXCERPT_CHARS) {
+        None => body.to_string(),
+        Some((cut, _)) => format!(
+            "{}… [{} bytes in total]",
+            body.get(..cut).unwrap_or_default(),
+            body.len()
+        ),
+    }
+}
+
+/// Error for a response body larger than `cap` bytes.
+pub(crate) fn body_too_large(cap: usize) -> WinrmError {
+    WinrmError::Soap(crate::error::SoapError::ParseError(format!(
+        "response body exceeds {cap} bytes"
+    )))
+}
+
+/// Read a response body, refusing one larger than `cap` bytes: from its
+/// announced length when there is one, and as it streams in otherwise.
+pub(crate) async fn read_body_capped(
+    mut resp: reqwest::Response,
+    cap: usize,
+) -> Result<Vec<u8>, WinrmError> {
+    if resp
+        .content_length()
+        .is_some_and(|len| len > u64::try_from(cap).unwrap_or(u64::MAX))
+    {
+        return Err(body_too_large(cap));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(WinrmError::Http)? {
+        if body.len().saturating_add(chunk.len()) > cap {
+            return Err(body_too_large(cap));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// [`read_body_capped`], decoded as UTF-8 (invalid sequences replaced, as
+/// `reqwest::Response::text` does).
+pub(crate) async fn read_text_capped(
+    resp: reqwest::Response,
+    cap: usize,
+) -> Result<String, WinrmError> {
+    let body = read_body_capped(resp, cap).await?;
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
 /// Body of the HTTP 500 a Windows host sends when a Receive finds no output
 /// within `OperationTimeout`.
 #[cfg(test)]

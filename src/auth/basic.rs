@@ -16,6 +16,8 @@ use crate::error::WinrmError;
 /// in a [`SecretString`] so the buffer is zeroized on drop.
 pub(crate) struct BasicAuth {
     pub(crate) credentials_b64: SecretString,
+    /// Largest response body read (see `transport::max_response_bytes`).
+    pub(crate) max_response_bytes: usize,
 }
 
 impl BasicAuth {
@@ -27,6 +29,9 @@ impl BasicAuth {
         let encoded = B64.encode(raw.as_bytes());
         Self {
             credentials_b64: SecretString::from(encoded),
+            max_response_bytes: crate::transport::max_response_bytes(
+                &crate::config::WinrmConfig::default(),
+            ),
         }
     }
 }
@@ -50,17 +55,16 @@ impl AuthTransport for BasicAuth {
             .await
             .map_err(WinrmError::Http)?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+        let status = resp.status();
+        let body = crate::auth::read_text_capped(resp, self.max_response_bytes).await?;
+        if !status.is_success() {
             return Err(crate::auth::error_for_status(
                 status.as_u16(),
                 &body,
-                || format!("HTTP {status} from WinRM: {body}"),
+                || format!("HTTP {status} from WinRM: {}", crate::auth::excerpt(&body)),
             ));
         }
-
-        resp.text().await.map_err(WinrmError::Http)
+        Ok(body)
     }
 }
 

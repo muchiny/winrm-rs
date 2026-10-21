@@ -295,6 +295,8 @@ struct CredSspConnection {
     host: String,
     port: u16,
     path: String,
+    /// Largest response body accepted (see `transport::max_response_bytes`).
+    max_response_bytes: usize,
 }
 
 #[cfg(feature = "credssp")]
@@ -310,6 +312,7 @@ impl CredSspConnection {
         port: u16,
         path: &str,
         accept_invalid_certs: bool,
+        max_response_bytes: usize,
     ) -> Result<Self, WinrmError> {
         use tokio::net::TcpStream;
         use tokio_rustls::TlsConnector;
@@ -371,6 +374,7 @@ impl CredSspConnection {
             host: host.to_string(),
             port,
             path: path.to_string(),
+            max_response_bytes,
         })
     }
 
@@ -480,6 +484,9 @@ impl CredSspConnection {
             .get("content-length")
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
+        if content_length > self.max_response_bytes {
+            return Err(crate::auth::body_too_large(self.max_response_bytes));
+        }
         let mut body_bytes: Vec<u8> = buf[head_end..].to_vec();
         while body_bytes.len() < content_length {
             let mut chunk = [0u8; 4096];
@@ -565,6 +572,8 @@ pub(crate) struct CredSspAuth {
     /// channel skips chain validation. Inner TLS authentication relies on
     /// pubKeyAuth regardless (MS-CSSP §3.1.5.1).
     pub(crate) accept_invalid_certs: bool,
+    /// Largest response body read (see `transport::max_response_bytes`).
+    pub(crate) max_response_bytes: usize,
 }
 
 #[cfg(feature = "credssp")]
@@ -580,8 +589,14 @@ impl AuthTransport for CredSspAuth {
         // reqwest entirely and drive raw HTTP/1.1 over a single tokio_rustls
         // TlsStream. See CredSspConnection above.
         let (host, port, path) = parse_url(url)?;
-        let mut conn =
-            CredSspConnection::connect(&host, port, &path, self.accept_invalid_certs).await?;
+        let mut conn = CredSspConnection::connect(
+            &host,
+            port,
+            &path,
+            self.accept_invalid_certs,
+            self.max_response_bytes,
+        )
+        .await?;
 
         // Pywinrm sends the SOAP body in every CredSSP round (which is what
         // Microsoft HTTPAPI on the WSMAN listener expects). The same body is
@@ -892,7 +907,10 @@ impl AuthTransport for CredSspAuth {
         if !(200..300).contains(&status) {
             let body_text = String::from_utf8_lossy(&resp_body);
             return Err(crate::auth::error_for_status(status, &body_text, || {
-                format!("CredSSP HTTP {status}: {body_text}")
+                format!(
+                    "CredSSP HTTP {status}: {}",
+                    crate::auth::excerpt(&body_text)
+                )
             }));
         }
         Ok(String::from_utf8_lossy(&resp_body).into_owned())

@@ -93,6 +93,8 @@ mod ntlm;
 mod shell;
 mod soap;
 #[cfg(test)]
+mod test_ntlm_server;
+#[cfg(test)]
 mod test_pki;
 mod tls;
 mod transfer;

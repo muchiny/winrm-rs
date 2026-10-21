@@ -230,6 +230,7 @@ pub(crate) fn compute_channel_bindings(cert_der: &[u8]) -> [u8; 16] {
 /// drops, even after caller-side spills (compiler-confirmed at -O2 the
 /// previous version retained S-box bytes through callee-saved registers).
 #[derive(Zeroize, ZeroizeOnDrop)]
+#[cfg_attr(test, derive(Clone))]
 pub(crate) struct Rc4State {
     s: [u8; 256],
     i: u8,

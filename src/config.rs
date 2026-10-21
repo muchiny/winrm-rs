@@ -148,32 +148,31 @@ impl Default for WinrmConfig {
 }
 
 /// Controls whether NTLM message encryption (sealing) is applied to SOAP bodies
-/// ([`AuthMethod::Ntlm`] only).
+/// ([`AuthMethod::Ntlm`] only; the other methods ignore it).
 ///
-/// When using HTTP (not HTTPS), NTLM sealing encrypts the SOAP body to prevent
-/// eavesdropping. When using HTTPS, the TLS layer provides encryption, making
-/// sealing redundant.
+/// When using HTTP (not HTTPS), NTLM sealing encrypts and signs each SOAP
+/// message to prevent eavesdropping and tampering. When using HTTPS, the TLS
+/// layer provides that, making sealing redundant.
 ///
-/// Sealing is not guaranteed for every message, whatever the mode. The request
-/// that completes the NTLM handshake (the Type 3 message) carries its SOAP body
-/// in plaintext; later requests are sealed with the session it establishes. If
-/// a sealed request then fails other than with a SOAP fault (an HTTP 400, a
-/// 500 without a fault, or a 401, which is also what a new connection gets
-/// once the one carrying the session is lost), the client re-authenticates and
-/// sends that request again in plaintext. On plain HTTP an active attacker can
-/// therefore force a request into plaintext.
+/// When sealing applies, it applies to every SOAP body, failing closed: the
+/// NTLM handshake runs with empty request bodies, each request is sealed on
+/// the connection the server bound the session to, and the answer must unseal
+/// (a sealed SOAP fault is reported as such). A request is never sent
+/// unsealed, and a request the server may have executed is never sent again:
+/// only a request rejected with HTTP 401 on a reused connection (which then
+/// lost its session, so nothing ran) is sent once more, sealed, on a new
+/// connection. Any other failure is returned as an error.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub enum EncryptionMode {
-    /// Seal when using HTTP, skip when using HTTPS (default). On HTTP, the
-    /// handshake request and any re-authentication go out in plaintext (see
-    /// the type-level documentation).
+    /// Seal every SOAP body over HTTP; over HTTPS rely on TLS and send them
+    /// unsealed (default).
     #[default]
     Auto,
-    /// Seal SOAP bodies even over HTTPS. Does not guarantee encryption: the
-    /// handshake request and any re-authentication still go out in plaintext
-    /// (see the type-level documentation).
+    /// Seal every SOAP body, over HTTPS too (inside TLS).
     Always,
-    /// Never encrypt SOAP bodies. **Use only for debugging.**
+    /// Never seal: over HTTP, SOAP bodies (commands, their output, file
+    /// contents) cross the network in plaintext, and the server must allow
+    /// unencrypted traffic (`AllowUnencrypted`). **Use only for debugging.**
     Never,
 }
 
@@ -183,8 +182,10 @@ pub enum AuthMethod {
     /// HTTP Basic authentication. Credentials are sent as a base64-encoded
     /// `Authorization` header on every request. Only safe over HTTPS.
     Basic,
-    /// NTLMv2 challenge/response authentication (default). Performs a three-step
-    /// handshake (negotiate, challenge, authenticate) per request.
+    /// NTLMv2 challenge/response authentication (default). When requests are
+    /// sealed (see [`EncryptionMode`]), the three-step handshake (negotiate,
+    /// challenge, authenticate) runs once per connection and later requests on
+    /// that connection reuse its session; otherwise it runs for every request.
     Ntlm,
     /// Kerberos authentication (requires `kerberos` feature and prior `kinit`).
     ///

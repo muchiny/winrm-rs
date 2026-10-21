@@ -20,7 +20,20 @@ const MUTUAL_TLS_SECPROFILE: &str =
 /// whose rustls config is built with it at construction time
 /// (`HttpTransport::new`). Each request carries the mutual security profile
 /// in its `Authorization` header so the server uses that certificate.
-pub(crate) struct CertificateAuth;
+pub(crate) struct CertificateAuth {
+    /// Largest response body read (see `transport::max_response_bytes`).
+    pub(crate) max_response_bytes: usize,
+}
+
+impl Default for CertificateAuth {
+    fn default() -> Self {
+        Self {
+            max_response_bytes: crate::transport::max_response_bytes(
+                &crate::config::WinrmConfig::default(),
+            ),
+        }
+    }
+}
 
 impl AuthTransport for CertificateAuth {
     async fn send_authenticated(
@@ -38,17 +51,21 @@ impl AuthTransport for CertificateAuth {
             .await
             .map_err(WinrmError::Http)?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+        let status = resp.status();
+        let body = crate::auth::read_text_capped(resp, self.max_response_bytes).await?;
+        if !status.is_success() {
             return Err(crate::auth::error_for_status(
                 status.as_u16(),
                 &body,
-                || format!("Certificate auth HTTP {status}: {body}"),
+                || {
+                    format!(
+                        "Certificate auth HTTP {status}: {}",
+                        crate::auth::excerpt(&body)
+                    )
+                },
             ));
         }
-
-        resp.text().await.map_err(WinrmError::Http)
+        Ok(body)
     }
 }
 
@@ -74,7 +91,7 @@ mod tests {
             .await;
 
         let http = crate::transport::test_http_client();
-        let auth = CertificateAuth;
+        let auth = CertificateAuth::default();
         let result = auth
             .send_authenticated(&http, &server.uri(), "body".into())
             .await;
@@ -94,7 +111,7 @@ mod tests {
             .await;
 
         let http = crate::transport::test_http_client();
-        let auth = CertificateAuth;
+        let auth = CertificateAuth::default();
         let result = auth
             .send_authenticated(&http, &server.uri(), "body".into())
             .await;
@@ -118,7 +135,7 @@ mod tests {
             .await;
 
         let http = crate::transport::test_http_client();
-        let err = CertificateAuth
+        let err = CertificateAuth::default()
             .send_authenticated(&http, &server.uri(), "body".into())
             .await
             .unwrap_err();
@@ -137,7 +154,7 @@ mod tests {
             .await;
 
         let http = crate::transport::test_http_client();
-        let err = CertificateAuth
+        let err = CertificateAuth::default()
             .send_authenticated(&http, &server.uri(), "body".into())
             .await
             .unwrap_err();

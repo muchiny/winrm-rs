@@ -12,6 +12,9 @@ pub(crate) struct KerberosAuth {
     // Used by the `kerberos` feature impl; the non-feature stub discards it.
     #[cfg_attr(not(feature = "kerberos"), allow(dead_code))]
     pub(crate) service_principal: String, // e.g. "HTTP/win-server.corp.local"
+    /// Largest response body read (see `transport::max_response_bytes`).
+    #[cfg_attr(not(feature = "kerberos"), allow(dead_code))]
+    pub(crate) max_response_bytes: usize,
 }
 
 #[cfg(feature = "kerberos")]
@@ -73,17 +76,16 @@ impl AuthTransport for KerberosAuth {
             ));
         }
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+        let status = resp.status();
+        let body = crate::auth::read_text_capped(resp, self.max_response_bytes).await?;
+        if !status.is_success() {
             return Err(crate::auth::error_for_status(
                 status.as_u16(),
                 &body,
-                || format!("HTTP {status}: {body}"),
+                || format!("HTTP {status}: {}", crate::auth::excerpt(&body)),
             ));
         }
-
-        resp.text().await.map_err(WinrmError::Http)
+        Ok(body)
     }
 }
 
@@ -112,6 +114,7 @@ mod tests {
     async fn stub_returns_auth_failed_error() {
         let auth = KerberosAuth {
             service_principal: "HTTP/test".into(),
+            max_response_bytes: 1024,
         };
         let http = crate::transport::test_http_client();
         let result = auth

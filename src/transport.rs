@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use reqwest::header::CONTENT_TYPE;
 use secrecy::ExposeSecret;
-use tokio::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::Instant;
 use tracing::{debug, trace};
 use zeroize::Zeroizing;
 
@@ -20,15 +21,47 @@ use crate::auth::credssp::CredSspAuth;
 use crate::auth::kerberos::KerberosAuth;
 use crate::auth::ntlm::{self as ntlm_auth, NtlmAuth};
 use crate::config::{AuthMethod, EncryptionMode, WinrmConfig, WinrmCredentials};
-use crate::error::WinrmError;
+use crate::error::{SoapError, WinrmError};
 use crate::ntlm::NtlmSession;
 use crate::soap;
 use crate::tls::{CertHandle, ClientAuthCert};
 
-/// Cached NTLM session state for message sealing on a specific host.
-struct NtlmSessionCache {
+/// An NTLM-authenticated connection for sealed messages: a `reqwest` client
+/// that keeps at most one connection, and the sealing session the server
+/// bound to that connection during the handshake.
+///
+/// NTLM sealing state belongs to one TCP connection and `reqwest` cannot pin
+/// a request to a connection, so each such pair has a client of its own. A
+/// pair is used by one request at a time (checked out of the transport's pool
+/// for the whole exchange) and goes back to the pool only after a clean
+/// exchange; one involved in a failure, or dropped mid-exchange, is discarded.
+struct SealedConn {
     host: String,
+    http: reqwest::Client,
     session: NtlmSession,
+    idle_since: Instant,
+}
+
+/// Idle sealed connections a transport keeps for reuse. Each holds one TCP
+/// connection and one NTLM session on the server: eight covers a client
+/// running several shells in parallel (each concurrent request needs its own
+/// connection) without holding many idle sockets on the host. Extra
+/// connections are opened as needed and the oldest idle ones closed.
+const MAX_IDLE_SEALED_CONNS: usize = 8;
+
+/// A sealed connection idle longer than this is not reused but closed: it
+/// stays below the 90 s idle timeout of the `reqwest` pool and the 120 s of
+/// HTTP.sys, so a reused connection is normally still the authenticated one.
+const SEALED_CONN_MAX_IDLE: Duration = Duration::from_secs(60);
+
+/// How a sealed exchange failed.
+enum SealedFailure {
+    /// HTTP 401: the connection carries no session (not executed).
+    Unauthorized,
+    /// A SOAP fault, sealed by the server: a clean exchange.
+    Fault(SoapError),
+    /// Anything else: the request may have been executed.
+    Error(WinrmError),
 }
 
 /// HTTP transport for WinRM SOAP requests.
@@ -41,12 +74,25 @@ pub(crate) struct HttpTransport {
     /// Handle to retrieve the captured TLS server certificate (for CBT).
     /// `None` when using plain HTTP (no TLS).
     cert_handle: Option<CertHandle>,
-    /// Cached NTLM session for sealed message exchange.
-    /// Uses `tokio::sync::Mutex` because the lock spans an `.await` (HTTP send).
-    ntlm_cache: Mutex<Option<NtlmSessionCache>>,
+    /// rustls configuration of [`Self::http`] (HTTPS only), reused for the
+    /// clients of sealed connections.
+    tls_config: Option<rustls::ClientConfig>,
+    /// Idle NTLM-sealed connections. The lock is only held to check one out
+    /// or back in, never across an HTTP exchange.
+    sealed_pool: Mutex<Vec<SealedConn>>,
     /// `wsmv:SessionId` value stamped on every request (`uuid:<UPPERCASE>`),
     /// one per transport. See [`crate::soap::envelope::with_session_id`].
     session_id: String,
+}
+
+/// Largest response body read from the server: four times the envelope size
+/// the client announces (`MaxEnvelopeSize`), with a floor of 512 KiB.
+pub(crate) fn max_response_bytes(config: &WinrmConfig) -> usize {
+    const FLOOR: usize = 512 * 1024;
+    usize::try_from(config.max_envelope_size)
+        .unwrap_or(usize::MAX)
+        .max(FLOOR)
+        .saturating_mul(4)
 }
 
 /// Strip scheme, userinfo, port, and path from a host string.
@@ -75,6 +121,44 @@ pub(crate) fn sanitize_host(input: &str) -> String {
     s.to_string()
 }
 
+/// Build the `reqwest` client for `config`: timeouts, redirects off, user
+/// agent, proxy and, over HTTPS, the prepared rustls configuration. At most
+/// `max_idle_per_host` idle connections are kept per host (1 for the client
+/// of a sealed connection, so its requests stay on the authenticated one).
+fn build_http_client(
+    config: &WinrmConfig,
+    tls_config: Option<rustls::ClientConfig>,
+    max_idle_per_host: usize,
+) -> Result<reqwest::Client, WinrmError> {
+    // The WinRM endpoint is fixed by the caller (host:port/wsman); a
+    // server returning a 30x is unexpected and any cross-origin redirect
+    // would risk forwarding the Authorization header. Disable redirects
+    // entirely.
+    let mut builder = reqwest::Client::builder()
+        .danger_accept_invalid_certs(config.accept_invalid_certs)
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
+        .timeout(Duration::from_secs(config.operation_timeout_secs + 10))
+        .http1_only()
+        .tcp_keepalive(Duration::from_secs(60))
+        .pool_max_idle_per_host(max_idle_per_host)
+        .pool_idle_timeout(Duration::from_secs(90))
+        .user_agent(
+            config
+                .user_agent
+                .as_deref()
+                .unwrap_or(concat!("winrm-rs/", env!("CARGO_PKG_VERSION"))),
+        );
+    if let Some(ref proxy_url) = config.proxy {
+        let proxy = reqwest::Proxy::all(proxy_url).map_err(WinrmError::Http)?;
+        builder = builder.proxy(proxy);
+    }
+    if let Some(tls_config) = tls_config {
+        builder = builder.tls_backend_preconfigured(tls_config);
+    }
+    builder.build().map_err(WinrmError::Http)
+}
+
 impl HttpTransport {
     /// Create a new HTTP transport from the given configuration and credentials.
     ///
@@ -93,29 +177,10 @@ impl HttpTransport {
             );
         }
 
-        // The WinRM endpoint is fixed by the caller (host:port/wsman); a
-        // server returning a 30x is unexpected and any cross-origin redirect
-        // would risk forwarding the Authorization header. Disable redirects
-        // entirely.
         // `reqwest` is built with `rustls-no-provider`, so a provider must be
         // installed before ANY client is built, plain HTTP included
         // (idempotent: an already-installed provider is kept).
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let mut builder = reqwest::Client::builder()
-            .danger_accept_invalid_certs(config.accept_invalid_certs)
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
-            .timeout(Duration::from_secs(config.operation_timeout_secs + 10))
-            .http1_only()
-            .tcp_keepalive(Duration::from_secs(60))
-            .pool_max_idle_per_host(10)
-            .pool_idle_timeout(Duration::from_secs(90))
-            .user_agent(
-                config
-                    .user_agent
-                    .as_deref()
-                    .unwrap_or(concat!("winrm-rs/", env!("CARGO_PKG_VERSION"))),
-            );
 
         // Load the client certificate for Certificate auth here, so a bad path
         // or PEM fails at construction. It is presented through the rustls
@@ -140,12 +205,6 @@ impl HttpTransport {
             None
         };
 
-        // Configure HTTP proxy
-        if let Some(ref proxy_url) = config.proxy {
-            let proxy = reqwest::Proxy::all(proxy_url).map_err(WinrmError::Http)?;
-            builder = builder.proxy(proxy);
-        }
-
         if matches!(config.auth_method, AuthMethod::Basic) && !config.use_tls {
             tracing::warn!(
                 "Basic auth over HTTP transmits credentials in cleartext — use HTTPS in production"
@@ -159,7 +218,7 @@ impl HttpTransport {
         }
 
         // When using TLS, inject a CertCapturingVerifier to enable Channel Binding Tokens.
-        let cert_handle = if config.use_tls {
+        let (tls_config, cert_handle) = if config.use_tls {
             let root_store =
                 rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
             let inner_verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
@@ -183,20 +242,20 @@ impl HttpTransport {
                 }
                 None => tls_builder.with_no_client_auth(),
             };
-            builder = builder.tls_backend_preconfigured(tls_config);
-            Some(handle)
+            (Some(tls_config), Some(handle))
         } else {
-            None
+            (None, None)
         };
 
-        let http = builder.build().map_err(WinrmError::Http)?;
+        let http = build_http_client(&config, tls_config.clone(), 10)?;
 
         Ok(Self {
             http,
             config,
             credentials,
             cert_handle,
-            ntlm_cache: Mutex::new(None),
+            tls_config,
+            sealed_pool: Mutex::new(Vec::new()),
             session_id: format!("uuid:{}", uuid::Uuid::new_v4().to_string().to_uppercase()),
         })
     }
@@ -226,6 +285,11 @@ impl HttpTransport {
         &self.config
     }
 
+    /// Largest response body this transport reads, sealed or not.
+    pub(crate) fn max_response_bytes(&self) -> usize {
+        max_response_bytes(&self.config)
+    }
+
     /// Send an authenticated SOAP request and return the response body.
     ///
     /// Dispatches to Basic or NTLM transport depending on the configured
@@ -239,41 +303,36 @@ impl HttpTransport {
 
         let response_text: String = match &self.config.auth_method {
             AuthMethod::Basic => {
-                let auth = BasicAuth::new(
-                    &self.credentials.username,
-                    self.credentials.password.expose_secret(),
-                );
+                let auth = BasicAuth {
+                    max_response_bytes: self.max_response_bytes(),
+                    ..BasicAuth::new(
+                        &self.credentials.username,
+                        self.credentials.password.expose_secret(),
+                    )
+                };
                 auth.send_authenticated(&self.http, &url, body).await?
             }
             AuthMethod::Ntlm => {
-                let encrypt = match self.config.encryption {
-                    EncryptionMode::Always => true,
-                    EncryptionMode::Never => false,
-                    EncryptionMode::Auto => !self.config.use_tls,
-                };
-                if encrypt {
-                    self.send_ntlm_sealed(host, &url, body).await?
+                if self.seals_ntlm() {
+                    self.send_ntlm_sealed(host, &url, &body).await?
                 } else {
-                    let auth = NtlmAuth {
-                        username: self.credentials.username.clone(),
-                        password: Zeroizing::new(
-                            self.credentials.password.expose_secret().to_string(),
-                        ),
-                        domain: self.credentials.domain.clone(),
-                        cert_handle: self.cert_handle.clone(),
-                    };
-                    auth.send_authenticated(&self.http, &url, body).await?
+                    self.ntlm_auth()
+                        .send_authenticated(&self.http, &url, body)
+                        .await?
                 }
             }
             AuthMethod::Kerberos => {
                 let host_part = host.split(':').next().unwrap_or(host);
                 let auth = KerberosAuth {
                     service_principal: format!("HTTP/{host_part}"),
+                    max_response_bytes: self.max_response_bytes(),
                 };
                 auth.send_authenticated(&self.http, &url, body).await?
             }
             AuthMethod::Certificate => {
-                let auth = CertificateAuth;
+                let auth = CertificateAuth {
+                    max_response_bytes: self.max_response_bytes(),
+                };
                 auth.send_authenticated(&self.http, &url, body).await?
             }
             #[cfg(feature = "credssp")]
@@ -284,6 +343,7 @@ impl HttpTransport {
                     domain: self.credentials.domain.clone(),
                     cert_handle: self.cert_handle.clone(),
                     accept_invalid_certs: self.config.accept_invalid_certs,
+                    max_response_bytes: self.max_response_bytes(),
                 };
                 auth.send_authenticated(&self.http, &url, body).await?
             }
@@ -300,122 +360,195 @@ impl HttpTransport {
         Ok(response_text)
     }
 
-    /// Send an NTLM-sealed request, reusing the cached session if available.
-    ///
-    /// On the first call (no cached session), does a full NTLM handshake with
-    /// the SOAP body sent as plaintext.  The session key is cached so that
-    /// subsequent calls can send the body sealed (multipart/encrypted) without
-    /// a new handshake, reusing the keep-alive TCP connection.
-    ///
-    /// If the server returns 401 (session expired), the cache is cleared and a
-    /// fresh handshake is attempted.
-    async fn send_ntlm_sealed(
-        &self,
-        host: &str,
-        url: &str,
-        body: String,
-    ) -> Result<String, WinrmError> {
-        // Try sending with cached session first
-        {
-            let mut cache = self.ntlm_cache.lock().await;
-            if let Some(ref mut c) = *cache {
-                if c.host == host {
-                    match self.send_sealed_body(&mut c.session, url, &body).await {
-                        Ok(resp) => return Ok(resp),
-                        Err(WinrmError::AuthFailed(_)) => {
-                            // Session expired — clear cache, fall through to handshake
-                            debug!("NTLM sealed session expired, re-authenticating");
-                            *cache = None;
-                        }
-                        Err(e) => return Err(e),
-                    }
-                } else {
-                    // Different host — clear cache
-                    *cache = None;
-                }
+    /// Whether NTLM requests are sealed: `EncryptionMode::Auto` seals over
+    /// plain HTTP only, `Always` over HTTPS too, `Never` never.
+    fn seals_ntlm(&self) -> bool {
+        matches!(self.config.auth_method, AuthMethod::Ntlm)
+            && match self.config.encryption {
+                EncryptionMode::Always => true,
+                EncryptionMode::Never => false,
+                EncryptionMode::Auto => !self.config.use_tls,
             }
-        }
+    }
 
-        // No cached session: do full handshake with plaintext body
-        let auth = NtlmAuth {
+    /// NTLM authenticator for this transport's credentials.
+    fn ntlm_auth(&self) -> NtlmAuth {
+        NtlmAuth {
             username: self.credentials.username.clone(),
             password: Zeroizing::new(self.credentials.password.expose_secret().to_string()),
             domain: self.credentials.domain.clone(),
             cert_handle: self.cert_handle.clone(),
-        };
-        let (response, session_key) = auth.handshake_and_send(&self.http, url, &body).await?;
-
-        // Cache the session for subsequent sealed requests
-        let session = NtlmSession::from_auth(&session_key);
-        *self.ntlm_cache.lock().await = Some(NtlmSessionCache {
-            host: host.to_string(),
-            session,
-        });
-
-        Ok(response)
+            max_response_bytes: self.max_response_bytes(),
+        }
     }
 
-    /// Send a sealed body on an already-authenticated keep-alive connection.
-    async fn send_sealed_body(
+    fn sealed_pool(&self) -> MutexGuard<'_, Vec<SealedConn>> {
+        // The guard is only held for vector operations, which do not leave
+        // the pool inconsistent if they panic.
+        self.sealed_pool
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Check out the most recently used idle sealed connection to `host`,
+    /// closing those idle for longer than [`SEALED_CONN_MAX_IDLE`].
+    fn take_sealed_conn(&self, host: &str) -> Option<SealedConn> {
+        let mut pool = self.sealed_pool();
+        pool.retain(|c| c.idle_since.elapsed() < SEALED_CONN_MAX_IDLE);
+        let at = pool.iter().rposition(|c| c.host == host)?;
+        Some(pool.remove(at))
+    }
+
+    /// Return a sealed connection after a clean exchange, closing the oldest
+    /// idle ones beyond [`MAX_IDLE_SEALED_CONNS`].
+    fn return_sealed_conn(&self, mut conn: SealedConn) {
+        conn.idle_since = Instant::now();
+        let mut pool = self.sealed_pool();
+        pool.push(conn);
+        let excess = pool.len().saturating_sub(MAX_IDLE_SEALED_CONNS);
+        pool.drain(..excess);
+    }
+
+    /// Open a sealed connection to `host`: a new single-connection client and
+    /// an NTLM handshake on it whose Type 3 carries no body.
+    async fn open_sealed_conn(&self, host: &str, url: &str) -> Result<SealedConn, WinrmError> {
+        let http = build_http_client(&self.config, self.tls_config.clone(), 1)?;
+        let session_key = self.ntlm_auth().authenticate(&http, url).await?;
+        Ok(SealedConn {
+            host: host.to_string(),
+            http,
+            session: NtlmSession::from_auth(&session_key),
+            idle_since: Instant::now(),
+        })
+    }
+
+    /// Send a request NTLM-sealed, failing closed: no request body is ever
+    /// sent unsealed, and a request the server may have executed is never
+    /// sent again.
+    ///
+    /// The request goes out on an idle authenticated connection to `host`, or
+    /// a new one. A 401 on a reused connection means it lost its session
+    /// before executing anything (the server closed the connection while
+    /// idle): the idle connections to `host` are closed and the request is
+    /// sent again, sealed, on a new connection, once. A SOAP fault (sealed by
+    /// the server) is returned as [`WinrmError::Soap`] and the connection
+    /// kept. Any other failure discards the connection and is returned as is.
+    async fn send_ntlm_sealed(
         &self,
-        session: &mut NtlmSession,
+        host: &str,
         url: &str,
         body: &str,
     ) -> Result<String, WinrmError> {
-        let (content_type, sealed) = ntlm_auth::seal_body(session, body);
+        let mut resent = false;
+        loop {
+            let (mut conn, fresh) = match self.take_sealed_conn(host) {
+                Some(conn) => (conn, false),
+                None => (self.open_sealed_conn(host, url).await?, true),
+            };
+            match Self::send_sealed_body(&mut conn, url, body, self.max_response_bytes()).await {
+                Ok(text) => {
+                    self.return_sealed_conn(conn);
+                    return Ok(text);
+                }
+                Err(SealedFailure::Fault(fault)) => {
+                    self.return_sealed_conn(conn);
+                    return Err(WinrmError::Soap(fault));
+                }
+                Err(SealedFailure::Unauthorized) if !fresh && !resent => {
+                    debug!("idle NTLM-sealed connection lost its session; resending on a new one");
+                    resent = true;
+                    self.sealed_pool().retain(|c| c.host != host);
+                }
+                Err(SealedFailure::Unauthorized) => {
+                    return Err(WinrmError::AuthFailed(
+                        "NTLM-sealed request rejected with HTTP 401 on a newly authenticated \
+                         connection"
+                            .into(),
+                    ));
+                }
+                Err(SealedFailure::Error(e)) => return Err(e),
+            }
+        }
+    }
 
-        let resp = self
+    /// One sealed exchange on `conn`. Only the outcome decides what happens
+    /// to the connection (see [`Self::send_ntlm_sealed`]).
+    async fn send_sealed_body(
+        conn: &mut SealedConn,
+        url: &str,
+        body: &str,
+        max_response_bytes: usize,
+    ) -> Result<String, SealedFailure> {
+        let (content_type, sealed) = ntlm_auth::seal_body(&mut conn.session, body);
+        let resp = conn
             .http
             .post(url)
             .header(CONTENT_TYPE, &content_type)
             .body(sealed)
             .send()
             .await
-            .map_err(WinrmError::Http)?;
+            .map_err(|e| SealedFailure::Error(WinrmError::Http(e)))?;
 
-        if resp.status().as_u16() == 401 {
-            return Err(WinrmError::AuthFailed("NTLM session expired".into()));
+        let status = resp.status();
+        if status.as_u16() == 401 {
+            return Err(SealedFailure::Unauthorized);
         }
+        let labelled_sealed = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| {
+                ct.trim_start()
+                    .to_ascii_lowercase()
+                    .starts_with("multipart/encrypted")
+            });
+        let bytes = crate::auth::read_body_capped(resp, max_response_bytes)
+            .await
+            .map_err(SealedFailure::Error)?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            // Windows seals the answer to a sealed request, a SOAP fault (HTTP
-            // 500) included: unseal it before looking for the fault, so the
-            // fault is not mistaken for an expired session (which would
-            // re-authenticate and replay the request in plaintext). Unsealing
-            // also keeps the server sequence number in step.
-            let sealed = resp
-                .headers()
-                .get(CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .is_some_and(|ct| {
-                    ct.trim_start()
-                        .to_ascii_lowercase()
-                        .starts_with("multipart/encrypted")
-                });
-            let bytes = resp.bytes().await.unwrap_or_default();
-            let text = if sealed {
-                ntlm_auth::unseal_body(session, &bytes)
-                    .unwrap_or_else(|_| String::from_utf8_lossy(&bytes).into_owned())
-            } else {
-                String::from_utf8_lossy(&bytes).into_owned()
-            };
-            return Err(crate::auth::error_for_status(
-                status.as_u16(),
-                &text,
-                || format!("HTTP {status}: {text}"),
-            ));
+        if status.is_success() {
+            return ntlm_auth::unseal_body(&mut conn.session, &bytes).map_err(SealedFailure::Error);
         }
+        // Windows seals the answer to a sealed request, a SOAP fault (HTTP
+        // 500) included. An error answer that is not sealed is not trusted:
+        // its body is neither parsed nor quoted.
+        if !labelled_sealed {
+            return Err(SealedFailure::Error(WinrmError::AuthFailed(format!(
+                "HTTP {status} to an NTLM-sealed request, answer not sealed ({} bytes)",
+                bytes.len()
+            ))));
+        }
+        let text =
+            ntlm_auth::unseal_body(&mut conn.session, &bytes).map_err(SealedFailure::Error)?;
+        if status.as_u16() == 500
+            && let Err(fault) = crate::soap::parser::check_soap_fault(&text)
+        {
+            return Err(SealedFailure::Fault(fault));
+        }
+        Err(SealedFailure::Error(WinrmError::AuthFailed(format!(
+            "HTTP {status}: {}",
+            crate::auth::excerpt(&text)
+        ))))
+    }
 
-        let resp_bytes = resp.bytes().await.map_err(WinrmError::Http)?;
-        ntlm_auth::unseal_body(session, &resp_bytes)
+    /// Whether `err` may be retried by [`Self::send_soap_with_retry`]: an
+    /// HTTP error, and for NTLM-sealed requests only one raised while
+    /// connecting, before anything was sent (a sealed request may have been
+    /// executed and is never sent twice).
+    fn is_retryable(&self, err: &WinrmError) -> bool {
+        match err {
+            WinrmError::Http(e) => !self.seals_ntlm() || e.is_connect(),
+            _ => false,
+        }
     }
 
     /// Send an authenticated SOAP request with optional retry on transient HTTP errors.
     ///
     /// Retries up to [`WinrmConfig::max_retries`] times with exponential backoff
     /// (100 ms, 200 ms, 400 ms, ...). Only [`WinrmError::Http`] errors are
-    /// retried; authentication and SOAP faults are returned immediately.
+    /// retried, and for NTLM-sealed requests only connection errors (see
+    /// [`Self::is_retryable`]); authentication and SOAP faults are returned
+    /// immediately.
     pub(crate) async fn send_soap_with_retry(
         &self,
         host: &str,
@@ -426,7 +559,7 @@ impl HttpTransport {
         for attempt in 0..=max {
             match self.send_soap(host, body.clone()).await {
                 Ok(r) => return Ok(r),
-                Err(WinrmError::Http(_)) if attempt < max => {
+                Err(e) if attempt < max && self.is_retryable(&e) => {
                     let delay = std::time::Duration::from_millis(100 * 2u64.pow(attempt));
                     tracing::warn!(
                         attempt = attempt + 1,
@@ -1321,101 +1454,375 @@ mod tests {
         assert_ne!(a.session_id(), b.session_id());
     }
 
-    // --- NTLM-sealed path: faults come back sealed ---
+    // --- NTLM-sealed path, against a fake NTLM endpoint ---
 
-    const SEALED_KEY: [u8; 16] = [0x5A; 16];
+    use crate::test_ntlm_server::{Event, FakeNtlmServer, PASS, Reply, USER};
 
-    /// NTLM transport over HTTP (sealing on, the default) whose session cache
-    /// already holds a session for the wiremock host, as after a first request.
-    async fn sealed_ntlm_transport(server: &MockServer) -> (HttpTransport, String) {
-        let config = WinrmConfig {
+    /// NTLM transport over plain HTTP with the default sealing, pointed at a
+    /// fake NTLM endpoint.
+    async fn sealed_setup() -> (MockServer, FakeNtlmServer, HttpTransport, String) {
+        sealed_setup_with(|_| {}).await
+    }
+
+    async fn sealed_setup_with(
+        tweak: impl FnOnce(&mut WinrmConfig),
+    ) -> (MockServer, FakeNtlmServer, HttpTransport, String) {
+        let server = MockServer::start().await;
+        let fake = FakeNtlmServer::mount(&server).await;
+        let mut config = WinrmConfig {
             auth_method: AuthMethod::Ntlm,
             port: server.address().port(),
             use_tls: false,
+            operation_timeout_secs: 10,
             ..Default::default()
         };
-        let transport =
-            HttpTransport::new(config, WinrmCredentials::new("admin", "pass", "")).unwrap();
+        tweak(&mut config);
+        let transport = HttpTransport::new(config, WinrmCredentials::new(USER, PASS, "")).unwrap();
         let host = server.address().ip().to_string();
-        *transport.ntlm_cache.lock().await = Some(NtlmSessionCache {
-            host: host.clone(),
-            session: NtlmSession::from_auth(&SEALED_KEY),
-        });
-        (transport, host)
+        (server, fake, transport, host)
     }
 
-    /// A response sealed by the server side of the session.
-    fn server_sealed(server_side: &mut NtlmSession, status: u16, body: &str) -> ResponseTemplate {
-        let (content_type, sealed) = ntlm_auth::seal_body(server_side, body);
-        ResponseTemplate::new(status)
-            .insert_header("content-type", content_type.as_str())
-            .set_body_bytes(sealed)
+    fn timed_out_sealed() -> Reply {
+        Reply::Sealed {
+            status: 500,
+            body: crate::auth::TIMED_OUT_FAULT.to_string(),
+            delay: Duration::ZERO,
+        }
     }
 
-    /// Windows seals the HTTP 500 fault of a sealed request. It must surface as
-    /// the SOAP fault (an empty poll for a Receive), without a re-handshake and
-    /// without dropping the session.
-    #[tokio::test]
-    async fn sealed_http_500_fault_is_a_soap_error_without_rehandshake() {
-        let server = MockServer::start().await;
-        let mut server_side = NtlmSession::server_side(&SEALED_KEY);
-        Mock::given(method("POST"))
-            .respond_with(server_sealed(
-                &mut server_side,
-                500,
-                crate::auth::TIMED_OUT_FAULT,
-            ))
-            .mount(&server)
-            .await;
-        let (transport, host) = sealed_ntlm_transport(&server).await;
-
-        let err = transport
-            .send_soap_with_retry(&host, "<soap/>".into())
-            .await
-            .unwrap_err();
-
+    fn assert_timed_out(err: &WinrmError) {
         assert!(
-            matches!(&err, WinrmError::Soap(crate::error::SoapError::Fault { code, .. }) if code == "w:TimedOut"),
+            matches!(err, WinrmError::Soap(crate::error::SoapError::Fault { code, .. }) if code == "w:TimedOut"),
             "expected Soap(Fault w:TimedOut), got: {err:?}"
         );
-        let requests = server.received_requests().await.unwrap();
-        assert_eq!(requests.len(), 1, "no re-handshake after a sealed fault");
+    }
+
+    /// Sanity check of the fake endpoint: two requests go through.
+    #[tokio::test]
+    async fn sealed_requests_reach_the_fake_endpoint() {
+        let (_server, fake, transport, host) = sealed_setup().await;
+        fake.push(Reply::ok("<r1/>"));
+        fake.push(Reply::ok("<r2/>"));
         assert!(
-            transport.ntlm_cache.lock().await.is_some(),
-            "the sealed session is kept"
+            transport
+                .send_soap_with_retry(&host, "<a/>".into())
+                .await
+                .is_ok()
+        );
+        assert!(
+            transport
+                .send_soap_with_retry(&host, "<b/>".into())
+                .await
+                .is_ok()
+        );
+        assert_eq!(fake.handshakes(), 1, "log: {:?}", fake.log());
+    }
+
+    /// The Type 3 that completes the handshake carries no body; the SOAP
+    /// request then goes sealed. No SOAP body ever crosses in plaintext.
+    #[tokio::test]
+    async fn sealed_handshake_carries_an_empty_body() {
+        let (_server, fake, transport, host) = sealed_setup().await;
+        fake.push(Reply::ok("<created/>"));
+        let reply = transport
+            .send_soap_with_retry(&host, "<soap>create</soap>".into())
+            .await
+            .unwrap();
+        assert_eq!(reply, "<created/>");
+        let log = fake.log();
+        assert_eq!(
+            log.get(1),
+            Some(&Event::Authenticate { body_len: 0 }),
+            "log: {log:?}"
+        );
+        assert_eq!(fake.plaintext_bodies(), 0, "log: {log:?}");
+        assert_eq!(fake.sealed().len(), 1, "log: {log:?}");
+        assert!(fake.sealed()[0].contains("<soap>create</soap>"));
+    }
+
+    /// A 401 on a reused session means nothing was executed: the request is
+    /// sent again, sealed, on a fresh session, once.
+    #[tokio::test]
+    async fn expired_session_is_resent_sealed_once() {
+        let (_server, fake, transport, host) = sealed_setup().await;
+        fake.push(Reply::ok("<first/>"));
+        fake.push(Reply::Unauthorized);
+        fake.push(Reply::ok("<second/>"));
+        transport
+            .send_soap_with_retry(&host, "<a/>".into())
+            .await
+            .unwrap();
+        let reply = transport
+            .send_soap_with_retry(&host, "<b/>".into())
+            .await
+            .unwrap();
+        assert_eq!(reply, "<second/>");
+        assert_eq!(fake.handshakes(), 2, "log: {:?}", fake.log());
+        assert_eq!(fake.plaintext_bodies(), 0, "log: {:?}", fake.log());
+        assert_eq!(
+            fake.sealed().iter().filter(|p| p.contains("<b/>")).count(),
+            2,
+            "rejected once, then resent sealed: {:?}",
+            fake.log()
         );
     }
 
-    /// After a sealed fault the session stays in step with the server: the
-    /// next sealed answer (next server sequence number) unseals.
+    /// A 401 right after a fresh handshake is an authentication failure, not
+    /// a reason to loop.
     #[tokio::test]
-    async fn sealed_session_stays_in_sync_after_a_sealed_fault() {
-        let server = MockServer::start().await;
-        let mut server_side = NtlmSession::server_side(&SEALED_KEY);
-        let fault = server_sealed(&mut server_side, 500, crate::auth::TIMED_OUT_FAULT);
-        let reply = server_sealed(&mut server_side, 200, "<s:Envelope>after</s:Envelope>");
-        Mock::given(method("POST"))
-            .respond_with(fault)
-            .up_to_n_times(1)
-            .with_priority(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .respond_with(reply)
-            .with_priority(2)
-            .mount(&server)
-            .await;
-        let (transport, host) = sealed_ntlm_transport(&server).await;
+    async fn unauthorized_on_a_fresh_session_is_not_retried() {
+        let (_server, fake, transport, host) = sealed_setup().await;
+        fake.push(Reply::Unauthorized);
+        fake.push(Reply::Unauthorized);
+        fake.push(Reply::Unauthorized);
+        let err = transport
+            .send_soap_with_retry(&host, "<a/>".into())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WinrmError::AuthFailed(_)), "got: {err:?}");
+        assert_eq!(fake.sealed().len(), 1, "log: {:?}", fake.log());
+        assert_eq!(fake.plaintext_bodies(), 0, "log: {:?}", fake.log());
+    }
 
-        let first = transport
-            .send_soap_with_retry(&host, "<soap/>".into())
-            .await;
-        assert!(matches!(first, Err(WinrmError::Soap(_))), "got: {first:?}");
-        let second = transport
-            .send_soap_with_retry(&host, "<soap/>".into())
+    /// Any other failure of a delivered sealed request may follow its
+    /// execution: it is an error, never resent (sealed or not), and the
+    /// session is dropped.
+    #[tokio::test]
+    async fn failed_sealed_request_is_never_resent() {
+        let failures = [
+            Reply::Sealed {
+                status: 500,
+                body: "not a fault".into(),
+                delay: Duration::ZERO,
+            },
+            Reply::Sealed {
+                status: 400,
+                body: "<bad/>".into(),
+                delay: Duration::ZERO,
+            },
+            Reply::Raw {
+                status: 500,
+                content_type: "application/soap+xml;charset=UTF-8",
+                body: crate::auth::TIMED_OUT_FAULT.as_bytes().to_vec(),
+            },
+            Reply::Raw {
+                status: 200,
+                content_type: "multipart/encrypted;protocol=\"application/HTTP-SPNEGO-session-encrypted\";boundary=\"Encrypted Boundary\"",
+                body: b"--Encrypted Boundary\r\ngarbage".to_vec(),
+            },
+        ];
+        for (i, failure) in failures.into_iter().enumerate() {
+            let (_server, fake, transport, host) = sealed_setup_with(|c| c.max_retries = 2).await;
+            fake.push(Reply::ok("<first/>"));
+            fake.push(failure);
+            transport
+                .send_soap_with_retry(&host, "<a/>".into())
+                .await
+                .unwrap();
+            let err = transport
+                .send_soap_with_retry(&host, "<b/>".into())
+                .await
+                .unwrap_err();
+            assert!(
+                !matches!(err, WinrmError::Soap(_) | WinrmError::Http(_)),
+                "case {i}: got {err:?}"
+            );
+            assert_eq!(
+                fake.sealed().iter().filter(|p| p.contains("<b/>")).count(),
+                1,
+                "case {i}: delivered once: {:?}",
+                fake.log()
+            );
+            assert_eq!(fake.plaintext_bodies(), 0, "case {i}: {:?}", fake.log());
+            assert_eq!(
+                fake.handshakes(),
+                1,
+                "case {i}: no re-handshake: {:?}",
+                fake.log()
+            );
+            // The session was dropped: the next request authenticates again.
+            transport
+                .send_soap_with_retry(&host, "<c/>".into())
+                .await
+                .unwrap();
+            assert_eq!(fake.handshakes(), 2, "case {i}: {:?}", fake.log());
+        }
+    }
+
+    /// A body labelled sealed that does not unseal is an error, even when
+    /// it reads as a plaintext SOAP fault (which would be a forged fault).
+    #[tokio::test]
+    async fn sealed_label_on_a_plaintext_fault_is_an_error() {
+        let (_server, fake, transport, host) = sealed_setup().await;
+        fake.push(Reply::ok("<first/>"));
+        fake.push(Reply::Raw {
+            status: 500,
+            content_type: "multipart/encrypted;protocol=\"application/HTTP-SPNEGO-session-encrypted\";boundary=\"Encrypted Boundary\"",
+            body: crate::auth::TIMED_OUT_FAULT.as_bytes().to_vec(),
+        });
+        transport
+            .send_soap_with_retry(&host, "<a/>".into())
             .await
             .unwrap();
-        assert_eq!(second, "<s:Envelope>after</s:Envelope>");
-        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        let err = transport
+            .send_soap_with_retry(&host, "<b/>".into())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WinrmError::Ntlm(_)), "got: {err:?}");
+    }
+
+    /// Windows seals the HTTP 500 fault of a sealed request: it surfaces as
+    /// the SOAP fault, and the session stays usable (no new handshake).
+    #[tokio::test]
+    async fn sealed_fault_is_a_soap_error_and_keeps_the_session() {
+        let (_server, fake, transport, host) = sealed_setup().await;
+        fake.push(Reply::ok("<first/>"));
+        fake.push(timed_out_sealed());
+        fake.push(Reply::ok("<after/>"));
+        transport
+            .send_soap_with_retry(&host, "<a/>".into())
+            .await
+            .unwrap();
+        let err = transport
+            .send_soap_with_retry(&host, "<b/>".into())
+            .await
+            .unwrap_err();
+        assert_timed_out(&err);
+        let reply = transport
+            .send_soap_with_retry(&host, "<c/>".into())
+            .await
+            .unwrap();
+        assert_eq!(reply, "<after/>");
+        assert_eq!(fake.handshakes(), 1, "log: {:?}", fake.log());
+    }
+
+    /// An answer larger than the response cap is refused before unsealing.
+    #[tokio::test]
+    async fn oversized_sealed_answer_is_an_error() {
+        let (_server, fake, transport, host) = sealed_setup_with(|c| c.max_envelope_size = 1).await;
+        let cap = transport.max_response_bytes();
+        fake.push(Reply::ok(&"x".repeat(cap + 1)));
+        let err = transport
+            .send_soap_with_retry(&host, "<a/>".into())
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("exceeds"), "got: {err:?}");
+    }
+
+    /// Two requests on one client do not wait for each other: a slow sealed
+    /// exchange (a long Receive) does not hold up a quick one.
+    #[tokio::test]
+    async fn slow_sealed_exchange_does_not_block_another_request() {
+        let (_server, fake, transport, host) = sealed_setup().await;
+        transport
+            .send_soap_with_retry(&host, "<warm/>".into())
+            .await
+            .unwrap();
+        fake.push(Reply::Sealed {
+            status: 200,
+            body: "<slow/>".into(),
+            delay: Duration::from_secs(3),
+        });
+        let transport = std::sync::Arc::new(transport);
+        let slow = {
+            let (t, h) = (std::sync::Arc::clone(&transport), host.clone());
+            tokio::spawn(async move { t.send_soap_with_retry(&h, "<slow/>".into()).await })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let start = std::time::Instant::now();
+        let quick = transport
+            .send_soap_with_retry(&host, "<quick/>".into())
+            .await
+            .unwrap();
+        let quick_elapsed = start.elapsed();
+        assert_eq!(quick, "<ok/>");
+        assert!(
+            quick_elapsed < Duration::from_secs(1),
+            "quick request waited {quick_elapsed:?} for the slow one"
+        );
+        assert_eq!(slow.await.unwrap().unwrap(), "<slow/>");
+        assert_eq!(fake.plaintext_bodies(), 0, "log: {:?}", fake.log());
+    }
+
+    /// A request future dropped mid-exchange (cancellation) leaves the client
+    /// usable, and the next request still goes sealed.
+    #[tokio::test]
+    async fn cancelled_sealed_exchange_leaves_the_client_usable() {
+        let (_server, fake, transport, host) = sealed_setup().await;
+        transport
+            .send_soap_with_retry(&host, "<warm/>".into())
+            .await
+            .unwrap();
+        fake.push(Reply::Sealed {
+            status: 200,
+            body: "<never-read/>".into(),
+            delay: Duration::from_secs(5),
+        });
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(300),
+            transport.send_soap_with_retry(&host, "<cancelled/>".into()),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the slow exchange should have been cut");
+        let reply = tokio::time::timeout(
+            Duration::from_secs(2),
+            transport.send_soap_with_retry(&host, "<next/>".into()),
+        )
+        .await
+        .expect("the client must not stay locked")
+        .unwrap();
+        assert_eq!(reply, "<ok/>");
+        assert_eq!(fake.plaintext_bodies(), 0, "log: {:?}", fake.log());
+        assert!(fake.sealed().iter().any(|p| p.contains("<next/>")));
+    }
+
+    /// A sealed request is retried only on a connection error, before
+    /// anything was sent; once sent it may have run, so a later transport
+    /// error (here a timeout) is not retried. Other methods keep retrying
+    /// HTTP errors.
+    #[tokio::test]
+    async fn sealed_requests_are_retried_only_on_connection_errors() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let refused = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            reqwest::Client::new()
+                .post(format!("http://127.0.0.1:{port}/wsman"))
+                .send()
+                .await
+                .unwrap_err()
+        };
+        assert!(refused.is_connect());
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
+            .mount(&server)
+            .await;
+        let timed_out = reqwest::Client::builder()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap()
+            .post(server.uri())
+            .send()
+            .await
+            .unwrap_err();
+        assert!(timed_out.is_timeout() && !timed_out.is_connect());
+
+        let (_s, _fake, sealed, _host) = sealed_setup().await;
+        assert!(sealed.is_retryable(&WinrmError::Http(refused)));
+        assert!(!sealed.is_retryable(&WinrmError::Http(timed_out)));
+
+        let timed_out_again = reqwest::Client::builder()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap()
+            .post(server.uri())
+            .send()
+            .await
+            .unwrap_err();
+        let basic = basic_transport(5985);
+        assert!(basic.is_retryable(&WinrmError::Http(timed_out_again)));
+        assert!(!basic.is_retryable(&WinrmError::AuthFailed("x".into())));
     }
 }

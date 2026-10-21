@@ -49,9 +49,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the NTLM-sealed path unseals the fault first (see the next entry).
   Validated live against Server 2025 (`operation_timeout_secs = 15`, a
   command silent for 20 s completes) over Basic (HTTP), NTLM over HTTP with
-  the default sealing, Certificate (HTTPS) and CredSSP (HTTPS); Kerberos is
-  covered by unit tests of the shared mapping and compile checks only (no
-  KDC on the bench).
+  the default sealing, Certificate (HTTPS) and CredSSP (HTTPS), and Kerberos
+  (HTTP) against a `winrm.test` domain controller
+  (`silent_command_completes_over_kerberos`, 22 s).
 - **NTLM message sealing never worked: with the default
   `EncryptionMode::Auto` over HTTP, and with `EncryptionMode::Always`, every
   request after the first went out in plaintext.** `seal_body` put a CRLF
@@ -135,6 +135,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (`winrm-rs`, `psrp-rs`, `bridge-mcp`), the three defects the live tests
   found (a `TimedOut` fault on Receive, `AuthMethod::Certificate`, NTLM
   sealing) and the known limits.
+- **`AuthMethod::Kerberos` validated live for the first time**, against a
+  Windows Server 2025 domain controller (`winrm.test`, bench described in
+  `tests/vagrant/dc/README.md`): `kerberos_run_command_whoami` (runs as
+  `winrm\vagrant`), `kerberos_two_commands_on_one_client` and
+  `silent_command_completes_over_kerberos` pass over HTTP with a TGT from
+  `kinit`. The server's mutual-authentication token (AP-REP) is read and
+  verified on every request. Kerberos SOAP bodies are not encrypted: over
+  HTTP the server must allow unencrypted traffic (`AllowUnencrypted =
+  true`), otherwise every request ends in `AuthFailed("HTTP 500 Internal
+  Server Error: ")`; `EncryptionMode` has no effect on Kerberos.
 
 ## [1.2.2] - 2026-09-04
 

@@ -27,6 +27,11 @@
 //! variables) and that one, and `--features credssp,__internal` adds the
 //! CredSSP tests.
 //!
+//! The Kerberos tests (`kerberos_*`, `silent_command_completes_over_kerberos`,
+//! `--features kerberos`) target a separate domain controller bench instead
+//! and, like the certificate tests, panic by design without its `eval`: see
+//! the "Kerberos" section at the end of this file.
+//!
 //! BENCH ONLY: the `setup_*` and `enable_*` tests change the host's
 //! configuration (HTTPS listener, CredSSP, CBT hardening, a trusted root CA
 //! and a certificate mapping) and do not undo it. Never point
@@ -2801,4 +2806,90 @@ async fn certificate_auth_unmapped_cert_is_rejected() {
         Err(e) => panic!("expected a 401 or a TLS-level rejection, got: {e}"),
     }
     assert!(elapsed < Duration::from_secs(30), "took {elapsed:?}");
+}
+
+// === Kerberos (domain controller bench) ===
+//
+// These run against the separate `winrm.test` domain controller bench
+// (tests/vagrant/dc/README.md), not the 2025 workgroup bench:
+//
+//   eval "$(tests/scripts/vm-connect-dc.sh)"
+//   kinit vagrant@WINRM.TEST     # TGT in the private KRB5CCNAME
+//   cargo test --features kerberos --test integration_real kerberos -- --ignored
+//
+// The host must be `dc.winrm.test`, not an address: the client derives the
+// service principal `HTTP/<host>` from it.
+
+/// Kerberos client for the DC bench, from the variables `vm-connect-dc.sh`
+/// exports. Credentials come from the ticket cache (`kinit`), not from the
+/// user/password passed here.
+#[cfg(feature = "kerberos")]
+fn kerberos_client_from_env(tweak: impl FnOnce(&mut WinrmConfig)) -> (WinrmClient, String) {
+    const HINT: &str = "eval \"$(tests/scripts/vm-connect-dc.sh)\" and kinit vagrant@WINRM.TEST";
+    let host = std::env::var("WINRM_TEST_KRB_HOST").expect(HINT);
+    let port: u16 = std::env::var("WINRM_TEST_KRB_PORT")
+        .expect(HINT)
+        .parse()
+        .expect("WINRM_TEST_KRB_PORT must be a port number");
+    let user = std::env::var("WINRM_TEST_KRB_USER").expect(HINT);
+    let pass = std::env::var("WINRM_TEST_KRB_PASS").expect(HINT);
+    let mut config = WinrmConfig {
+        auth_method: AuthMethod::Kerberos,
+        port,
+        ..Default::default()
+    };
+    tweak(&mut config);
+    let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, ""))
+        .expect("build Kerberos client");
+    (client, host)
+}
+
+/// `AuthMethod::Kerberos` end to end against a domain controller: the
+/// command runs as the domain user whose TGT is in the cache.
+#[cfg(feature = "kerberos")]
+#[tokio::test]
+#[ignore]
+async fn kerberos_run_command_whoami() {
+    let (client, host) = kerberos_client_from_env(|_| {});
+    let output = client
+        .run_command(&host, "whoami", &[])
+        .await
+        .expect("kerberos whoami");
+    assert_eq!(output.exit_code, 0);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
+    assert!(
+        stdout.contains("winrm\\vagrant"),
+        "expected WINRM\\vagrant, got: {stdout:?}"
+    );
+}
+
+/// The silent-command behaviour over Kerberos: the server's `TimedOut`
+/// fault on a silent Receive is an empty poll, as over the other methods.
+#[cfg(feature = "kerberos")]
+#[tokio::test]
+#[ignore]
+async fn silent_command_completes_over_kerberos() {
+    let (client, host) = kerberos_client_from_env(|c| c.operation_timeout_secs = SILENT_OP_SECS);
+    assert_silent_command_completes(&client, &host).await;
+}
+
+/// Two commands on the same client: each request builds a fresh Kerberos
+/// context from the cached service ticket, and the second must not fail.
+#[cfg(feature = "kerberos")]
+#[tokio::test]
+#[ignore]
+async fn kerberos_two_commands_on_one_client() {
+    let (client, host) = kerberos_client_from_env(|_| {});
+    for round in 1..=2 {
+        let output = client
+            .run_powershell(&host, &format!("'round-{round}'"))
+            .await
+            .unwrap_or_else(|e| panic!("kerberos round {round}: {e}"));
+        assert_eq!(output.exit_code, 0);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(&format!("round-{round}")),
+            "round {round}: got {stdout:?}"
+        );
+    }
 }

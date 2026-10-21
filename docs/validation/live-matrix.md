@@ -9,11 +9,16 @@ déduit de la lecture du code.
 | Crate | Commit | Ce qui a été exécuté |
 |---|---|---|
 | `winrm-rs` | `c46f8c6` (branche `test/live-coverage`, dernier commit de code ou de test ; le code de production n'a pas changé depuis `ca335e5`. Le commit de documentation qui le suit ne touche que des commentaires de doc, dont celui de `EncryptionMode`, le `CHANGELOG` et ce document ; les runs ci-dessous ont été faits sur cet arbre) | Suite live complète contre Server 2025 avec `--features credssp,__internal` (74 tests), les deux `eval` du banc faits : **74 passés, 0 échoué** (414 s) avec `--test-threads=1` ; en parallélisme par défaut, **74 passés, 0 échoué** (198 s ; dans un run parallèle précédent du même jour, avant le commit `c46f8c6`, trois tests avaient échoué sous charge : `shell_run_command_times_out` et `ntlm_sealed_concurrent_shells` par un `TimedOut` à la création du shell dans une fenêtre de 15 s, `ntlm_sealed_cancel_long_running_command` parce que l'annulation à 2 s tombait encore pendant la poignée de main ; `c46f8c6` corrige les deux tests NTLM, `shell_run_command_times_out` reste sensible à la charge). Runs précédents : à `9ceaaba`, 69 passés en série, 68 passés et 1 échoué (`shell_run_command_times_out`) en parallèle ; à `4cbebfb`, 66 passés en série, 65 passés et 1 échoué (le même test) en parallèle. Les tests à timeout court se lisent plus fiablement avec `--test-threads=1` (voir l'en-tête de `tests/integration_real.rs`). |
+| `winrm-rs` (Kerberos) | `f8a1272` (code de production identique à `c46f8c6`), plus les tests Kerberos ajoutés par le commit qui suit | Contre le contrôleur de domaine `winrm.test` (banc séparé, `tests/vagrant/dc/README.md`), avec `--features kerberos` et un TGT obtenu par `kinit vagrant@WINRM.TEST` : `cargo test --features kerberos --test integration_real kerberos -- --ignored` → **3 passés, 0 échoué** (22 s). |
 | `psrp-rs` | `4a79189` (`origin/main`) | Suite live (8 tests) contre le `winrm-rs` local (`[patch.crates-io]`, worktree jetable) : **8 passés, 0 échoué** contre `winrm-rs` `4cbebfb` (Basic). Contre `winrm-rs` `84f1898` (code de production identique à `c46f8c6`) : **8 passés** avec Basic sur HTTP (réglage par défaut de la suite) et **8 passés** avec `PSRP_INTEGRATION_AUTH=ntlm` (NTLM scellé sur HTTP). Ce run NTLM, refait à travers un relais TCP enregistreur : 8 connexions (une par client), 16 requêtes `Negotiate` (une poignée de main par client), 64 requêtes et 64 réponses `multipart/encrypted`, 16 requêtes SOAP en clair (Type 1 et Type 3 de chaque poignée de main), aucun HTTP 400. |
 | `bridge-mcp` | `f44a5fa` (v4.0.2, worktree jetable ; ce n'est plus `origin/main`) | Smoke en ligne de commande par `winrm` puis par `psrp` (hôtes NTLM sur HTTP) : `hostname` renvoie `winrm-2025`, `Get-Date` renvoie la date du banc (2026-10-21), sur les deux protocoles. Fait contre `winrm-rs` `4cbebfb` puis contre `winrm-rs` `84f1898` (code de production identique à `c46f8c6` ; avec `psrp-rs` `4a79189`) : 4 appels sur 4 réussis (1,7 à 2,6 s chacun), à travers le relais enregistreur : 4 connexions, 8 requêtes `Negotiate` (une poignée de main par appel), 22 requêtes scellées, aucun HTTP 400. Journal d'audit redirigé vers un fichier jetable. |
 
 Banc : une VM Windows Server 2025 (`winrm-2025`) sous Hyper-V, atteinte par
 `tests/scripts/vm-connect.sh` (HTTP `55985`, HTTPS `55986`, compte `vagrant`).
+Kerberos : une seconde VM, contrôleur de domaine Windows Server 2025 de la
+forêt `winrm.test` (VM Hyper-V `winrm-rs-dc`, hôte `dc`), atteinte par
+`tests/scripts/vm-connect-dc.sh` (WinRM HTTP `57985`, KDC TCP `57088`, compte
+`WINRM\vagrant`) ; voir `tests/vagrant/dc/README.md`.
 Au départ de la campagne (avant tout ajout de test), les 52 tests live
 existants passaient : 52 passés, 0 échoué, 0 sauté (sans la feature `credssp`).
 
@@ -25,6 +30,10 @@ silencieuse par méthode d'authentification live), puis 5 avec `84f1898`
 (transferts, annulation, Ctrl+C et shells concurrents en NTLM scellé, plus
 la référence Basic des shells concurrents). Les runs complets à `c46f8c6` les
 exécutent tous.
+Trois tests Kerberos, sous `#[cfg(feature = "kerberos")]`, s'y ajoutent
+(`kerberos_run_command_whoami`, `kerberos_two_commands_on_one_client`,
+`silent_command_completes_over_kerberos`) ; ils visent le contrôleur de
+domaine et ne font pas partie des runs complets contre Server 2025.
 
 ## Découvertes
 
@@ -77,8 +86,8 @@ ouvert.
   statut vers erreur, `auth::error_for_status`, pour les six points d'appel).
   Vérifié live : une commande silencieuse 20 s avec un timeout d'opération de
   15 s se termine en Basic, NTLM scellé sur HTTP, Certificate et CredSSP.
-  Kerberos : tests unitaires du mappage partagé et compilation avec
-  `--features kerberos` seulement (pas de KDC).
+  Kerberos, vérifié ensuite contre le contrôleur de domaine `winrm.test` :
+  `silent_command_completes_over_kerberos` passe (22 s).
 
 ### D3 : le scellement NTLM sur HTTP ne fonctionnait pas, tout repartait en clair
 
@@ -185,7 +194,7 @@ Tests de `tests/integration_real.rs` sauf mention contraire.
 | Idem, NTLM sur HTTP avec scellement par défaut (après D1 et D3) | `silent_command_completes_over_ntlm_sealed_http` (relais enregistreur : 1 HTTP 500, 2 requêtes `Negotiate`, 6 requêtes scellées ; 21 à 25 s) | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
 | Idem, Certificate sur HTTPS (après D1 complété) | `silent_command_completes_over_certificate_auth` (24 s) | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
 | Idem, CredSSP sur HTTPS (`--features credssp`, après D1 complété) | `silent_command_completes_over_credssp` (22 s) | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite (test sauté sur 2012 R2) | — non applicable |
-| Idem, Kerberos | aucun test live ; tests unitaires du mappage partagé (`auth::tests`) et `cargo clippy --features kerberos` | ⏭ non validé : pas de KDC | ⏭ non validé : pas de KDC | ⏭ non validé : pas de KDC |
+| Idem, Kerberos sur HTTP (`--features kerberos`) | `silent_command_completes_over_kerberos` (22 s) | ⏭ non validé : pas de KDC | ⏭ non validé : pas de KDC | ✅ 2026-10-21 |
 | Messages NTLM réellement scellés sur HTTP (après D3) | `silent_command_completes_over_ntlm_sealed_http` (requêtes `multipart/encrypted`, aucune réauthentification) | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
 | Transfert de 200 Ko aller-retour en NTLM scellé sur HTTP, contenu identique | `ntlm_sealed_upload_and_download_large_file` (101 morceaux ; 316 requêtes scellées, une seule poignée de main ; envoi 130 s, soit environ 1,3 s par morceau comme en Basic, réception 2,3 s, réponse la plus grosse 149 Ko) | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
 | Annulation (`run_command_with_cancel`) en NTLM scellé sur HTTP, puis le même client resservi | `ntlm_sealed_cancel_long_running_command` (annulation déclenchée une fois Execute et un premier Receive partis scellés : `Cancelled` ; la commande suivante sur le même client réussit, mais après une nouvelle poignée de main : 4 requêtes `Negotiate` au total, voir « Limites connues ») | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
@@ -198,7 +207,7 @@ Tests de `tests/integration_real.rs` sauf mention contraire.
 | `Shell::disconnect` réussi | psrp-rs : `live_disconnect_reconnect_pool` seul (la déconnexion a réellement eu lieu, sans le message « disconnect not supported ») | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
 | `reconnect_shell` | psrp-rs : `live_disconnect_reconnect_pool` seul | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
 | Chaîne complète `bridge-mcp` (`hostname`, `Get-Date`) par `winrm` et par `psrp` | smoke CLI `bridge-mcp` `f44a5fa` | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
-| `AuthMethod::Kerberos` | aucun | — non applicable | ⏭ non validé : pas de KDC | ⏭ non validé : pas de KDC |
+| `AuthMethod::Kerberos` sur HTTP (`--features kerberos`, TGT de `kinit`) : la commande tourne sous le compte du domaine, le jeton de réponse du serveur (AP-REP) est vérifié à chaque requête | `kerberos_run_command_whoami` (`winrm\vagrant`), `kerberos_two_commands_on_one_client` (deux commandes sur le même client) | — non applicable | ⏭ non validé : pas de KDC | ✅ 2026-10-21 |
 | Doc de `AuthMethod::CredSsp` (disait « Not yet implemented ») | relue contre `credssp_run_command_whoami` | doc corrigée le 2026-10-21 (relecture ; le passage live est la ligne CredSSP plus bas) | ⏭ non mesuré : VM détruite | — non applicable |
 
 Couverture des API réservées aux crates aval : `open_psrp_shell` et
@@ -251,9 +260,18 @@ ne figurent pas dans la matrice.
 
 ## Limites connues
 
-- **Kerberos n'a jamais été exercé en live.** Il n'existe aucun banc avec
-  contrôleur de domaine ni KDC ; la phase a été écartée sur décision de
-  l'utilisateur.
+- **Kerberos : validé sur HTTP seulement, et sans chiffrement des messages.**
+  Les trois tests Kerberos passent contre le contrôleur de domaine
+  `winrm.test`, mais le corps SOAP part en clair : le crate n'a pas de
+  chiffrement Kerberos des messages et `EncryptionMode` ne s'applique qu'à
+  NTLM. Le serveur doit donc autoriser le trafic non chiffré
+  (`AllowUnencrypted = true`, posé par le `Vagrantfile` du banc) ; avec
+  `AllowUnencrypted = false`, mesuré le 2026-10-21, chaque requête échoue en
+  `AuthFailed("HTTP 500 Internal Server Error: ")`, un message qui ne dit pas
+  pourquoi. Kerberos sur HTTPS n'a pas été mesuré (pas d'écouteur HTTPS sur le
+  contrôleur de domaine). L'hôte doit être le nom du serveur (le SPN
+  `HTTP/<hôte>` en est dérivé), pas une adresse ; le banc passe par une ligne
+  `127.0.0.1 dc.winrm.test` dans `/etc/hosts`.
 - **Server 2012 R2 n'a pas été mesuré.** La VM a été détruite (disque et dossier
   supprimés) et l'utilisateur a choisi de ne pas la reconstruire. La date du
   dernier passage complet est inconnue. Quatre tests y sont sautés

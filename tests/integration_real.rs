@@ -1256,10 +1256,21 @@ async fn ntlm_sealed_upload_and_download_large_file() {
 #[ignore]
 async fn ntlm_sealed_cancel_long_running_command() {
     let (client, forwarder) = sealed_ntlm_client(|_| {}).await;
+    let forwarder = std::sync::Arc::new(forwarder);
     let cancel = CancellationToken::new();
     let cancel2 = cancel.clone();
+    // Cancel once Execute and a first Receive went out sealed, so the cancel
+    // lands in a sealed exchange whatever the bench load (a fixed delay could
+    // fire during the handshake).
+    let watched = std::sync::Arc::clone(&forwarder);
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while watched.count_to_server("Content-Type: multipart/encrypted") < 2
+            && Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
         cancel2.cancel();
     });
 
@@ -1378,8 +1389,9 @@ async fn concurrent_shells_timings(client: &WinrmClient, host: &str) -> (Duratio
 #[tokio::test]
 #[ignore]
 async fn concurrent_shells_timings_basic() {
-    let (client, host) = test_client_with(|c| c.operation_timeout_secs = SILENT_OP_SECS)
-        .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    // Default operation timeout: the 10 s command ends its Receive anyway, and
+    // shell creation must not race a short window on a busy bench.
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     concurrent_shells_timings(&client, &host).await;
 }
 
@@ -1391,8 +1403,8 @@ async fn concurrent_shells_timings_basic() {
 #[tokio::test]
 #[ignore]
 async fn ntlm_sealed_concurrent_shells() {
-    let (client, forwarder) =
-        sealed_ntlm_client(|c| c.operation_timeout_secs = SILENT_OP_SECS).await;
+    // Default operation timeout, as in `concurrent_shells_timings_basic`.
+    let (client, forwarder) = sealed_ntlm_client(|_| {}).await;
     concurrent_shells_timings(&client, SEALED_HOST).await;
     let (sealed, negotiate) = sealed_traffic(&forwarder);
     assert_eq!(negotiate, 2, "one NTLM handshake, no re-authentication");

@@ -22,3 +22,5 @@ pub(crate) use parser::{
 };
 // Re-export ReceiveOutput as fully public so lib.rs can `pub use` it.
 pub use parser::ReceiveOutput;
+// The public stateful stderr decoder, re-exported from the crate root.
+pub use clixml::StderrDecoder;

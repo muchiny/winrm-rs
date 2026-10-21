@@ -21,6 +21,8 @@
 //!
 //! The output depends only on the bytes, never on how they were sliced.
 
+use std::fmt;
+
 /// Largest single record (or root start tag) held while waiting for its end.
 /// A record that runs past this is given up on: its bytes and the rest of
 /// the document are released raw, so a server that never closes a record
@@ -551,6 +553,105 @@ fn parse_escape(s: &str) -> Option<u16> {
     u16::from_str_radix(hex, 16).ok()
 }
 
+/// Decodes PowerShell stderr polled one Receive response at a time.
+///
+/// `powershell.exe` writes its error, warning, verbose and debug streams to
+/// stderr as CLIXML (`#< CLIXML` followed by an `<Objs>` document), and the
+/// server cuts that stream into Receive responses wherever it likes, even in
+/// the middle of a tag. Keep one `StderrDecoder` per command, feed it the raw
+/// stderr of every poll in order with [`push`](Self::push), and call
+/// [`finish`](Self::finish) after the last one.
+///
+/// [`WinrmClient::run_command`](crate::WinrmClient::run_command),
+/// [`run_powershell`](crate::WinrmClient::run_powershell),
+/// [`Shell::run_command`](crate::Shell::run_command) and
+/// [`Shell::receive_next`](crate::Shell::receive_next) already do this. Use
+/// it with [`WinrmClient::receive_output_raw`](crate::WinrmClient::receive_output_raw),
+/// which returns stderr as the server sent it.
+///
+/// Each record is returned by the push that completes it, without waiting
+/// for the document to close (`powershell.exe` closes it only at exit); only
+/// the record still arriving is buffered (at most 16 MiB: past that it is
+/// released raw). `powershell.exe` buffers its stderr itself and sends it in
+/// blocks of a few KiB, so a record reaches the client when its block does. Error text comes as is,
+/// warning, verbose and debug text with the console prefixes `WARNING: `,
+/// `VERBOSE: ` and `DEBUG: `; progress and information records are dropped.
+/// Bytes outside a CLIXML document pass through unchanged. The output is the
+/// same however the stream is sliced.
+///
+/// Decoded text can hold any character, control characters included (the
+/// `_xHHHH_` escapes can encode them): sanitise it before writing it to a
+/// terminal.
+///
+/// # Example
+///
+/// ```
+/// use winrm_rs::StderrDecoder;
+///
+/// let mut decoder = StderrDecoder::new();
+/// // The marker alone, then a record cut in the middle of an escape.
+/// let mut stderr = decoder.push(b"#< CLIXML\r\n");
+/// stderr.extend(decoder.push(b"<Objs Version=\"1.1.0.1\"><S S=\"Error\">denied_x000D__x00"));
+/// stderr.extend(decoder.push(b"0A_</S><S S=\"warning\">careful</S></Objs>"));
+/// stderr.extend(decoder.finish());
+/// assert_eq!(stderr, b"denied\r\nWARNING: careful\r\n");
+/// ```
+///
+/// Polling a command by hand:
+///
+/// ```no_run
+/// # async fn demo(client: &winrm_rs::WinrmClient) -> Result<(), winrm_rs::WinrmError> {
+/// # let (host, shell_id, command_id) = ("host", "shell", "command");
+/// let mut decoder = winrm_rs::StderrDecoder::new();
+/// let mut stderr = Vec::new();
+/// loop {
+///     let output = client.receive_output_raw(host, shell_id, command_id).await?;
+///     stderr.extend(decoder.push(&output.stderr));
+///     if output.done {
+///         break;
+///     }
+/// }
+/// stderr.extend(decoder.finish());
+/// # Ok(())
+/// # }
+/// ```
+pub struct StderrDecoder(ClixmlDecoder);
+
+impl StderrDecoder {
+    /// A decoder for a new command's stderr.
+    pub fn new() -> Self {
+        Self(ClixmlDecoder::new())
+    }
+
+    /// Feed the next raw stderr slice and return the text that is ready:
+    /// plain bytes and every record this slice completes.
+    pub fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
+        self.0.push(chunk)
+    }
+
+    /// Release what is still buffered once the command is done, decoding an
+    /// unterminated record as far as it goes. The decoder can then be reused
+    /// for another command.
+    pub fn finish(&mut self) -> Vec<u8> {
+        self.0.finish()
+    }
+}
+
+impl Default for StderrDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for StderrDecoder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The buffered bytes are command output: show how many, not what.
+        f.debug_struct("StderrDecoder")
+            .field("buffered", &self.0.pending.len())
+            .finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -856,6 +957,19 @@ mod tests {
             decode(b"#< CLIXML\r\n<Objs><S S=\"warning\">cut</"),
             "WARNING: cut\r\n"
         );
+    }
+
+    #[test]
+    fn public_decoder_debug_shows_the_buffered_length_not_the_text() {
+        let mut d = StderrDecoder::default();
+        assert!(
+            d.push(b"#< CLIXML\r\n<Objs><S S=\"Error\">secret")
+                .is_empty()
+        );
+        let shown = format!("{d:?}");
+        assert!(shown.contains("buffered: 19"), "{shown}");
+        assert!(!shown.contains("secret"), "{shown}");
+        assert_eq!(d.finish(), b"secret");
     }
 
     #[test]

@@ -152,6 +152,15 @@ impl WinrmClient {
     /// is not a failure (the command keeps running), so it is returned as an
     /// empty, not-done output: no stdout, no stderr, no exit code. Keep
     /// polling. Any other fault is an error.
+    ///
+    /// PowerShell CLIXML on stderr is decoded within this one response only,
+    /// with a fresh decoder that is finished at the end of the response. A
+    /// document the server splits across responses (Server 2025 does for
+    /// large stderr) then comes back partly decoded and partly as raw XML.
+    /// To decode stderr across polls, call
+    /// [`receive_output_raw`](Self::receive_output_raw) and feed its stderr
+    /// to one [`StderrDecoder`](crate::StderrDecoder) per command, or use
+    /// [`Shell::receive_next`](crate::Shell::receive_next), which does that.
     #[tracing::instrument(level = "debug", skip(self))]
     pub async fn receive_output(
         &self,
@@ -167,10 +176,15 @@ impl WinrmClient {
         empty_poll_on_timeout(polled)
     }
 
-    /// [`receive_output`](Self::receive_output) with stderr left undecoded,
-    /// for callers that keep a [`ClixmlDecoder`](soap::clixml::ClixmlDecoder)
-    /// across polls. A `TimedOut` fault is an empty poll here too.
-    pub(crate) async fn receive_output_raw(
+    /// [`receive_output`](Self::receive_output) with stderr returned exactly
+    /// as the server sent it, PowerShell CLIXML included.
+    ///
+    /// Feed each poll's stderr, in order, to one
+    /// [`StderrDecoder`](crate::StderrDecoder) per command to decode CLIXML
+    /// that spans several responses; its documentation has an example. A
+    /// `TimedOut` fault is an empty, not-done poll here too.
+    #[tracing::instrument(level = "debug", skip(self))]
+    pub async fn receive_output_raw(
         &self,
         host: &str,
         shell_id: &str,
@@ -1712,6 +1726,74 @@ mod tests {
                 break;
             }
         }
+        assert_eq!(String::from_utf8_lossy(&stderr), "denied\r\n");
+    }
+
+    #[tokio::test]
+    async fn receive_next_streams_each_record_before_the_document_closes() {
+        // powershell.exe closes its <Objs> root only when it exits; every
+        // complete record must still come out on the poll that carries it.
+        let server = MockServer::start().await;
+        let slices: [&[u8]; 3] = [
+            b"#< CLIXML\r\n<Objs Version=\"1.1.0.1\"><S S=\"Error\">first_x000D__x000A_</S>",
+            b"<S S=\"warning\">second</S>",
+            b"</Objs>",
+        ];
+        mount_stderr_receives(&server, &slices).await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        let shell = client.open_shell("127.0.0.1").await.unwrap();
+        let cmd_id = shell.start_command("powershell.exe", &[]).await.unwrap();
+
+        let polls: Vec<(String, bool)> = {
+            let mut polls = Vec::new();
+            loop {
+                let chunk = shell.receive_next(&cmd_id).await.unwrap();
+                polls.push((
+                    String::from_utf8_lossy(&chunk.stderr).into_owned(),
+                    chunk.done,
+                ));
+                if chunk.done {
+                    break polls;
+                }
+            }
+        };
+        assert_eq!(
+            polls,
+            [
+                ("first\r\n".to_string(), false),
+                ("WARNING: second\r\n".to_string(), false),
+                (String::new(), true),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn receive_output_raw_with_stderr_decoder_reassembles_split_clixml() {
+        let server = MockServer::start().await;
+        mount_stderr_receives(&server, &SPLIT_CLIXML).await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        let shell_id = client.create_shell("127.0.0.1").await.unwrap();
+        let cmd_id = client
+            .execute_command("127.0.0.1", &shell_id, "powershell.exe", &[])
+            .await
+            .unwrap();
+
+        let mut decoder = crate::StderrDecoder::new();
+        let mut raw = Vec::new();
+        let mut stderr = Vec::new();
+        loop {
+            let output = client
+                .receive_output_raw("127.0.0.1", &shell_id, &cmd_id)
+                .await
+                .unwrap();
+            raw.extend_from_slice(&output.stderr);
+            stderr.extend(decoder.push(&output.stderr));
+            if output.done {
+                break;
+            }
+        }
+        stderr.extend(decoder.finish());
+        assert_eq!(raw, SPLIT_CLIXML.concat(), "raw stderr must be untouched");
         assert_eq!(String::from_utf8_lossy(&stderr), "denied\r\n");
     }
 

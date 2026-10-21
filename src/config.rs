@@ -182,13 +182,21 @@ pub enum AuthMethod {
     /// is presented to every host passed to the client's methods. See
     /// [`WinrmConfig::proxy`] for `https://` proxies.
     Certificate,
-    /// CredSSP authentication for double-hop credential delegation.
+    /// CredSSP authentication for double-hop credential delegation (MS-CSSP).
     ///
-    /// Wraps NTLM or Kerberos inside a TLS channel, allowing credentials
-    /// to be delegated to the remote host for accessing network resources.
-    /// Requires HTTPS (`use_tls = true`).
+    /// Wraps NTLM inside a TLS channel, allowing credentials to be delegated
+    /// to the remote host for accessing network resources. Requires the
+    /// `credssp` cargo feature and HTTPS (`use_tls = true`): building the
+    /// client with `use_tls = false`, or sending a request without the
+    /// feature, fails with
+    /// [`WinrmError::AuthFailed`](crate::WinrmError::AuthFailed).
     ///
-    /// **Not yet implemented** — will return an error at runtime.
+    /// Validated live against Windows Server 2025 (`credssp_run_command_whoami`
+    /// in `tests/integration_real.rs`). Not validated on Windows Server 2012 R2:
+    /// its SCHANNEL pairs AES-GCM only with static-RSA key exchange, which
+    /// `rustls` does not support, so the HTTPS leg shares no cipher suite with
+    /// a default 2012 R2 listener and the live test skips there (it was not
+    /// measured on 2012 R2 in the latest validation round either).
     CredSsp,
 }
 

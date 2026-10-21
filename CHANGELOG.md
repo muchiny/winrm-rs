@@ -79,6 +79,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `aws-lc-sys`, `cmake` and `quinn` from the dependency tree (no C toolchain
   needed). The `ring` crypto provider is installed in `HttpTransport::new`.
 
+### Documentation
+
+- **`AuthMethod::CredSsp` and the `credssp` feature are documented as
+  validated live.** The `AuthMethod::CredSsp` rustdoc said "Not yet
+  implemented — will return an error at runtime" and the `Cargo.toml`
+  comment on `credssp` said "not yet end-to-end validated", both wrong since
+  `credssp_run_command_whoami` passes against Server 2025. They now state
+  that, and that Server 2012 R2 is skipped (its SCHANNEL pairs GCM only with
+  static-RSA key exchange, which rustls does not support) and was not
+  measured in the latest round.
+- **Added the live validation matrix**, `docs/validation/live-matrix.md`: one
+  row per feature with the test that proves it, the commits tested
+  (`winrm-rs`, `psrp-rs`, `bridge-mcp`), the two defects the live tests found
+  (a `TimedOut` fault on Receive, `AuthMethod::Certificate`) and the known
+  limits.
+
 ## [1.2.2] - 2026-09-04
 
 CredSSP shipped in 1.2.1; this one makes PSRP shells disconnectable. Found by

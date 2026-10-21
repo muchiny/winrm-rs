@@ -140,8 +140,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `tests/vagrant/dc/README.md`): `kerberos_run_command_whoami` (runs as
   `winrm\vagrant`), `kerberos_two_commands_on_one_client` and
   `silent_command_completes_over_kerberos` pass over HTTP with a TGT from
-  `kinit`. The server's mutual-authentication token (AP-REP) is read and
-  verified on every request. Kerberos SOAP bodies are not encrypted: over
+  `kinit`; HTTPS with Kerberos was not measured. The server's
+  mutual-authentication token (AP-REP) was observed being verified with
+  `KRB5_TRACE` (no test asserts it). Kerberos SOAP bodies are not encrypted: over
   HTTP the server must allow unencrypted traffic (`AllowUnencrypted =
   true`), otherwise every request ends in `AuthFailed("HTTP 500 Internal
   Server Error: ")`; `EncryptionMode` has no effect on Kerberos.

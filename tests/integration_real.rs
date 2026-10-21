@@ -2823,6 +2823,9 @@ async fn certificate_auth_unmapped_cert_is_rejected() {
 /// Kerberos client for the DC bench, from the variables `vm-connect-dc.sh`
 /// exports. Credentials come from the ticket cache (`kinit`), not from the
 /// user/password passed here.
+/// `WINRM_TEST_KRB_PASS` is read because the `vm-connect-dc.sh` contract
+/// exports it (it is the password to give `kinit`) and `WinrmCredentials`
+/// needs one, but the Kerberos path never uses it.
 #[cfg(feature = "kerberos")]
 fn kerberos_client_from_env(tweak: impl FnOnce(&mut WinrmConfig)) -> (WinrmClient, String) {
     const HINT: &str = "eval \"$(tests/scripts/vm-connect-dc.sh)\" and kinit vagrant@WINRM.TEST";

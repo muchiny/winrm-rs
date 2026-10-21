@@ -85,16 +85,50 @@ cargo test --features kerberos --test integration_real kerberos -- --ignored --n
 tolerates 5 minutes of clock skew; the DC syncs its clock from the Hyper-V
 host. On `Clock skew too great`, resync the DC (`w32tm /resync`), not WSL.
 
-## Stop / remove
+## Exposure on the host network
+
+`vm-connect-dc.sh` (through `gsudo`) creates, on the Windows host:
+
+- two `netsh` port proxies listening on `0.0.0.0`: `57985` → VM `5985`
+  (WinRM HTTP) and `57088` → VM `88` (KDC, TCP);
+- two inbound firewall rules, `WinRM DC HTTP` and `WinRM DC KDC`, with no
+  `RemoteAddress` restriction.
+
+While the bench is up, any machine that can reach the host on those ports can
+talk to an unencrypted WinRM endpoint (`AllowUnencrypted = true`) and try the
+lab Domain Admin `vagrant` / `vagrant`. This mirrors what the Server 2025
+bench already does. Tear the bench down (below) when you are not testing. If
+you want to narrow it, restrict the two firewall rules to the WSL subnet or to
+localhost (`Set-NetFirewallRule -DisplayName 'WinRM DC HTTP','WinRM DC KDC'
+-RemoteAddress ...`); the scripts do not do this.
+
+## Stop (keeps the VM)
 
 ```bash
 G="/mnt/c/Program Files/gsudo/2.6.1/gsudo.exe"
-"$G" powershell.exe -Command "Stop-VM winrm-rs-dc"                 # stop
+"$G" powershell.exe -Command "Stop-VM winrm-rs-dc"
+```
+
+## Destroy (irreversible)
+
+Warning: this deletes the VM and its disks; the domain is lost and the next
+`vm-up-dc.sh` rebuilds it from scratch.
+
+```bash
+G="/mnt/c/Program Files/gsudo/2.6.1/gsudo.exe"
 "$G" powershell.exe -Command "cd C:\winrm-rs-dc-vagrant; & 'C:\Program Files\Vagrant\bin\vagrant.exe' destroy -f"
+```
+
+## Remove the host and WSL side
+
+```bash
+G="/mnt/c/Program Files/gsudo/2.6.1/gsudo.exe"
 "$G" cmd.exe /c "netsh interface portproxy delete v4tov4 listenaddress=0.0.0.0 listenport=57985 & netsh interface portproxy delete v4tov4 listenaddress=0.0.0.0 listenport=57088"
 "$G" powershell.exe -Command "Remove-NetFirewallRule -DisplayName 'WinRM DC HTTP','WinRM DC KDC'"
 rm -rf target/winrm-krb5
 sudo sed -i '/^127\.0\.0\.1 dc\.winrm\.test$/d' /etc/hosts
 ```
 
-Then delete `C:\winrm-rs-dc-vagrant`.
+Then delete `C:\winrm-rs-dc-vagrant`. Optional leftovers: `sudo dnf remove
+krb5-workstation` (the Kerberos client tools) and the `/etc/hosts` backups
+`/var/tmp/hosts.bak.*` written by `vm-connect-dc.sh`.

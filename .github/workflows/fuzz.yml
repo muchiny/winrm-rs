@@ -44,6 +44,7 @@ jobs:
           - fuzz_ntlm_crypto
           - fuzz_ntlm_seal
           - fuzz_ntlm_session
+          - fuzz_ntlm_unseal_body
           - fuzz_soap_parse
           - fuzz_soap_enumerate
           - fuzz_soap_envelope

@@ -1,6 +1,6 @@
 # Fuzzing `winrm-rs`
 
-19 libFuzzer targets covering everything the crate parses off the network and
+20 libFuzzer targets covering everything the crate parses off the network and
 everything it splices into an outgoing request. Driven through
 [`scripts/fuzz.sh`](../scripts/fuzz.sh).
 
@@ -43,6 +43,7 @@ drives; "invariant" is what it asserts beyond *must not panic*.
 | `fuzz_ntlm_crypto` | NTOWFv1/v2, client blob, CBT, RC4, UTF-16 | blob framing is exact; RC4 self-inverse; UTF-16 roundtrips |
 | `fuzz_ntlm_seal` | `NtlmSession::seal`/`unseal` | seal prepends exactly 16 bytes |
 | `fuzz_ntlm_session` | multi-message seal/sign/unseal | signature version and sequence numbering across a conversation |
+| `fuzz_ntlm_unseal_body` | `auth/ntlm.rs::unseal_body` (MS-WSMV multipart/encrypted framing) | never panics; errors do not echo the body; a server-sealed frame round-trips exactly; a flipped bit is rejected or leaves the plaintext unchanged; any truncation is rejected |
 
 ### SOAP
 

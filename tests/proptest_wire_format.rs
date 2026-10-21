@@ -14,6 +14,9 @@
 //! - stderr CLIXML decoder: output does not depend on how the stream is
 //!   sliced into Receive responses, never panics, and decodes every record
 //!   of a multi-document stream (nested PowerShell) to the exact text
+//! - NTLM-sealed responses (`unseal_body`): a server-sealed frame round-trips,
+//!   a flipped bit never yields other text, a truncated frame is rejected,
+//!   arbitrary bytes never panic
 //!
 //! Run with: `cargo test --features __internal --test proptest_wire_format`
 
@@ -226,5 +229,59 @@ proptest! {
         prop_assert_eq!(String::from_utf8_lossy(&whole), expected.as_str());
         let sliced = winrm_rs::__fuzz::decode_clixml_stderr(&slice_at(&stream, &cuts));
         prop_assert_eq!(String::from_utf8_lossy(&sliced), expected.as_str());
+    }
+}
+
+// P-SEAL — `unseal_body` on NTLM-sealed WinRM responses (MS-WSMV framing).
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// A frame sealed by the server side of the session unseals to exactly
+    /// the sealed plaintext.
+    #[test]
+    fn sealed_frame_round_trips(key in any::<[u8; 16]>(), plaintext in "\\PC{0,2048}") {
+        let frame = winrm_rs::__fuzz::seal_body_as_server(&key, &plaintext);
+        prop_assert_eq!(winrm_rs::__fuzz::unseal_body(&key, &frame).ok(), Some(plaintext));
+    }
+
+    /// A flipped bit anywhere in a sealed frame is rejected, or (in the
+    /// header text) leaves the plaintext unchanged.
+    #[test]
+    fn tampered_frame_never_unseals_to_other_text(
+        key in any::<[u8; 16]>(),
+        plaintext in "\\PC{0,512}",
+        at in any::<proptest::sample::Index>(),
+        bit in 0u8..8,
+    ) {
+        let mut frame = winrm_rs::__fuzz::seal_body_as_server(&key, &plaintext);
+        let i = at.index(frame.len());
+        frame[i] ^= 1 << bit;
+        if let Ok(text) = winrm_rs::__fuzz::unseal_body(&key, &frame) {
+            prop_assert_eq!(text, plaintext);
+        }
+    }
+
+    /// A frame cut short is rejected (the closing boundary is mandatory;
+    /// only its final CRLF may be missing).
+    #[test]
+    fn truncated_frame_is_rejected(
+        key in any::<[u8; 16]>(),
+        plaintext in "\\PC{0,512}",
+        at in any::<proptest::sample::Index>(),
+    ) {
+        let frame = winrm_rs::__fuzz::seal_body_as_server(&key, &plaintext);
+        let cut = at.index(frame.len() - 2);
+        prop_assert!(winrm_rs::__fuzz::unseal_body(&key, &frame[..cut]).is_err());
+    }
+
+    /// Arbitrary bytes never panic, and an error never quotes them.
+    #[test]
+    fn unseal_body_never_panics(
+        key in any::<[u8; 16]>(),
+        data in proptest::collection::vec(any::<u8>(), 0..4096),
+    ) {
+        if let Err(e) = winrm_rs::__fuzz::unseal_body(&key, &data) {
+            prop_assert!(e.to_string().len() < 256);
+        }
     }
 }

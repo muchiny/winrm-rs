@@ -90,6 +90,13 @@ bench = false
 # --- SOAP --------------------------------------------------------------------
 
 [[bin]]
+name = "fuzz_ntlm_unseal_body"
+path = "fuzz_targets/fuzz_ntlm_unseal_body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "fuzz_soap_parse"
 path = "fuzz_targets/fuzz_soap_parse.rs"
 test = false

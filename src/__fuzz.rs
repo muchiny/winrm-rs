@@ -145,6 +145,20 @@ pub fn rc4_process(key: &[u8], data: &mut [u8]) {
     crate::ntlm::crypto::Rc4State::new(key).process(data);
 }
 
+/// Unseal a multipart/encrypted WinRM response with the client session of
+/// `key` (`auth/ntlm.rs::unseal_body`).
+pub fn unseal_body(key: &[u8; 16], data: &[u8]) -> Result<String, WinrmError> {
+    let mut session = crate::ntlm::NtlmSession::from_auth(key);
+    crate::auth::ntlm::unseal_body(&mut session, data)
+}
+
+/// A response sealed by the server side of the session of `key`, framed as
+/// Windows frames it (`auth/ntlm.rs::seal_body` with server keys).
+pub fn seal_body_as_server(key: &[u8; 16], plaintext: &str) -> Vec<u8> {
+    let mut server = crate::ntlm::NtlmSession::server_side(key);
+    crate::auth::ntlm::seal_body(&mut server, plaintext).1
+}
+
 // ---------------------------------------------------------------------------
 // SOAP — response parsing (`src/soap/parser.rs`)
 // ---------------------------------------------------------------------------

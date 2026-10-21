@@ -8,21 +8,23 @@ déduit de la lecture du code.
 
 | Crate | Commit | Ce qui a été exécuté |
 |---|---|---|
-| `winrm-rs` | `9ceaaba` (branche `test/live-coverage`, dernier commit de code ; le commit de documentation qui le suit ne change que des commentaires, le `CHANGELOG` et ce document) | Suite live complète contre Server 2025 avec `--features credssp,__internal` (69 tests), les deux `eval` du banc faits : **69 passés, 0 échoué** avec `--test-threads=1` (274 s) ; en parallélisme par défaut, **68 passés, 1 échoué** (`shell_run_command_times_out`, `TimedOut` à `open_shell` sous charge, comme au run précédent ; il passe seul et en série). Run précédent, à `4cbebfb` : 66 passés en série, 65 passés et 1 échoué (le même test) en parallèle. Les tests à timeout court se lisent plus fiablement avec `--test-threads=1` (voir l'en-tête de `tests/integration_real.rs`). |
-| `psrp-rs` | `4a79189` (`origin/main`) | Suite live (8 tests) contre le `winrm-rs` local (`[patch.crates-io]`) : **8 passés, 0 échoué** contre `winrm-rs` `4cbebfb`. Rejouée contre le code final (`9ceaaba`), même procédure (worktree jetable) : **8 passés** avec Basic sur HTTP (réglage par défaut de la suite) et **8 passés** avec `PSRP_INTEGRATION_AUTH=ntlm` (NTLM scellé sur HTTP, le chemin que D3 a changé). |
-| `bridge-mcp` | `f44a5fa` (`origin/main`, v4.0.2) | Smoke en ligne de commande par `winrm` puis par `psrp`, contre `winrm-rs` `4cbebfb` et `psrp-rs` `4a79189` : `hostname` renvoie `winrm-2025`, `Get-Date` renvoie la date du banc (2026-10-21), sur les deux protocoles. **Non rejoué contre le code final** : entre `4cbebfb` et `9ceaaba`, le code ne change que par `7a9d65a`, `4539374` et `ca335e5` (mappage des faults HTTP 500 dans la couche d'authentification, scellement NTLM sur HTTP ; le reste est tests et documentation) ; le smoke passe par NTLM sur HTTP, donc par le scellement corrigé. À rejouer avant publication. |
+| `winrm-rs` | `c46f8c6` (branche `test/live-coverage`, dernier commit de code ou de test ; le code de production n'a pas changé depuis `ca335e5`. Le commit de documentation qui le suit ne touche que des commentaires de doc, dont celui de `EncryptionMode`, le `CHANGELOG` et ce document ; les runs ci-dessous ont été faits sur cet arbre) | Suite live complète contre Server 2025 avec `--features credssp,__internal` (74 tests), les deux `eval` du banc faits : **74 passés, 0 échoué** (414 s) avec `--test-threads=1` ; en parallélisme par défaut, **74 passés, 0 échoué** (198 s ; dans un run parallèle précédent du même jour, avant le commit `c46f8c6`, trois tests avaient échoué sous charge : `shell_run_command_times_out` et `ntlm_sealed_concurrent_shells` par un `TimedOut` à la création du shell dans une fenêtre de 15 s, `ntlm_sealed_cancel_long_running_command` parce que l'annulation à 2 s tombait encore pendant la poignée de main ; `c46f8c6` corrige les deux tests NTLM, `shell_run_command_times_out` reste sensible à la charge). Runs précédents : à `9ceaaba`, 69 passés en série, 68 passés et 1 échoué (`shell_run_command_times_out`) en parallèle ; à `4cbebfb`, 66 passés en série, 65 passés et 1 échoué (le même test) en parallèle. Les tests à timeout court se lisent plus fiablement avec `--test-threads=1` (voir l'en-tête de `tests/integration_real.rs`). |
+| `psrp-rs` | `4a79189` (`origin/main`) | Suite live (8 tests) contre le `winrm-rs` local (`[patch.crates-io]`, worktree jetable) : **8 passés, 0 échoué** contre `winrm-rs` `4cbebfb` (Basic). Contre `winrm-rs` `84f1898` (code de production identique à `c46f8c6`) : **8 passés** avec Basic sur HTTP (réglage par défaut de la suite) et **8 passés** avec `PSRP_INTEGRATION_AUTH=ntlm` (NTLM scellé sur HTTP). Ce run NTLM, refait à travers un relais TCP enregistreur : 8 connexions (une par client), 16 requêtes `Negotiate` (une poignée de main par client), 64 requêtes et 64 réponses `multipart/encrypted`, 16 requêtes SOAP en clair (Type 1 et Type 3 de chaque poignée de main), aucun HTTP 400. |
+| `bridge-mcp` | `f44a5fa` (v4.0.2, worktree jetable ; ce n'est plus `origin/main`) | Smoke en ligne de commande par `winrm` puis par `psrp` (hôtes NTLM sur HTTP) : `hostname` renvoie `winrm-2025`, `Get-Date` renvoie la date du banc (2026-10-21), sur les deux protocoles. Fait contre `winrm-rs` `4cbebfb` puis contre `winrm-rs` `84f1898` (code de production identique à `c46f8c6` ; avec `psrp-rs` `4a79189`) : 4 appels sur 4 réussis (1,7 à 2,6 s chacun), à travers le relais enregistreur : 4 connexions, 8 requêtes `Negotiate` (une poignée de main par appel), 22 requêtes scellées, aucun HTTP 400. Journal d'audit redirigé vers un fichier jetable. |
 
 Banc : une VM Windows Server 2025 (`winrm-2025`) sous Hyper-V, atteinte par
 `tests/scripts/vm-connect.sh` (HTTP `55985`, HTTPS `55986`, compte `vagrant`).
 Au départ de la campagne (avant tout ajout de test), les 52 tests live
 existants passaient : 52 passés, 0 échoué, 0 sauté (sans la feature `credssp`).
 
-Les tests ajoutés par la campagne portent le total à 67, ou 69 avec la
+Les tests ajoutés par la campagne portent le total à 72, ou 74 avec la
 feature `credssp` (`credssp_run_command_whoami` et
 `silent_command_completes_over_credssp` sont sous `#[cfg(feature =
-"credssp")]`) : 13 jusqu'à `4cbebfb`, puis 3 avec `9ceaaba` (une commande
-silencieuse par méthode d'authentification live). Les runs complets à
-`9ceaaba` les exécutent tous.
+"credssp")]`) : 13 jusqu'à `4cbebfb`, 3 avec `9ceaaba` (une commande
+silencieuse par méthode d'authentification live), puis 5 avec `84f1898`
+(transferts, annulation, Ctrl+C et shells concurrents en NTLM scellé, plus
+la référence Basic des shells concurrents). Les runs complets à `c46f8c6` les
+exécutent tous.
 
 ## Découvertes
 
@@ -105,8 +107,10 @@ ouvert.
 - **Vérifié après correctif.** `silent_command_completes_over_ntlm_sealed_http`
   passe à travers un relais TCP qui enregistre le trafic : 1 réponse HTTP 500
   (le `TimedOut`), 2 requêtes `Negotiate` (une seule poignée de main), 6
-  requêtes `multipart/encrypted`. Les tests `ntlm_*` et la suite live de
-  `psrp-rs` en NTLM sur HTTP passent.
+  requêtes `multipart/encrypted`. Les tests `ntlm_*` passent, ainsi que les
+  tests `ntlm_sealed_*` ajoutés ensuite (transferts, annulation, Ctrl+C,
+  shells concurrents en NTLM scellé), la suite live de `psrp-rs` en NTLM sur
+  HTTP et le smoke `bridge-mcp` (lignes « Commits testés »).
 
 ### D2 : `AuthMethod::Certificate` n'authentifiait jamais
 
@@ -148,7 +152,7 @@ ouvert.
   `0.0.0.0:5986`.
 
 Historique complet des commits de la campagne :
-`git log --oneline 2fdc39d..9ceaaba`, plus le commit de documentation qui
+`git log --oneline 2fdc39d..c46f8c6`, plus le commit de documentation qui
 suit. `2fdc39d` est l'instantané de travail de l'utilisateur, hors de cette
 campagne.
 
@@ -183,6 +187,10 @@ Tests de `tests/integration_real.rs` sauf mention contraire.
 | Idem, CredSSP sur HTTPS (`--features credssp`, après D1 complété) | `silent_command_completes_over_credssp` (22 s) | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite (test sauté sur 2012 R2) | — non applicable |
 | Idem, Kerberos | aucun test live ; tests unitaires du mappage partagé (`auth::tests`) et `cargo clippy --features kerberos` | ⏭ non validé : pas de KDC | ⏭ non validé : pas de KDC | ⏭ non validé : pas de KDC |
 | Messages NTLM réellement scellés sur HTTP (après D3) | `silent_command_completes_over_ntlm_sealed_http` (requêtes `multipart/encrypted`, aucune réauthentification) | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
+| Transfert de 200 Ko aller-retour en NTLM scellé sur HTTP, contenu identique | `ntlm_sealed_upload_and_download_large_file` (101 morceaux ; 316 requêtes scellées, une seule poignée de main ; envoi 130 s, soit environ 1,3 s par morceau comme en Basic, réception 2,3 s, réponse la plus grosse 149 Ko) | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
+| Annulation (`run_command_with_cancel`) en NTLM scellé sur HTTP, puis le même client resservi | `ntlm_sealed_cancel_long_running_command` (annulation déclenchée une fois Execute et un premier Receive partis scellés : `Cancelled` ; la commande suivante sur le même client réussit, mais après une nouvelle poignée de main : 4 requêtes `Negotiate` au total, voir « Limites connues ») | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
+| Ctrl+C en NTLM scellé sur HTTP | `ntlm_sealed_shell_signal_ctrl_c` (5 requêtes scellées, une seule poignée de main) | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
+| Shells concurrents sur un même client en NTLM scellé sur HTTP | `ntlm_sealed_concurrent_shells`, référence `concurrent_shells_timings_basic` (tous terminent ; un `echo` lancé pendant le Receive de 10 s de l'autre shell prend 10,3 s en NTLM scellé contre 0,15 à 0,18 s en Basic : la scrutation est sérialisée, voir « Limites connues ») | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
 | API bas niveau : `create_shell`, `execute_command`, `receive_output`, `signal_terminate`, `delete_shell` | `low_level_command_lifecycle` | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
 | `signal_terminate` arrête une commande en cours | `signal_terminate_stops_running_command` (shell et commande créés avec un client au timeout par défaut ; scrutation, arrêt et vidage avec un timeout d'opération de 15 s) | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
 | `open_psrp_shell` | psrp-rs (`4a79189`) : les 8 tests live, dont `live_smoke_one_plus_one` | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
@@ -204,8 +212,8 @@ shell PSRP ; son seul test de `disconnect` est le refus sur un shell cmd,
 
 Les 52 tests live existants (dont les tests de préparation du banc) passaient au
 départ (2026-10-21, avant tout ajout) et ont passé à nouveau dans le run complet
-à `4cbebfb` (65/65, sans la feature `credssp`), puis à `9ceaaba` (69/69 avec
-`--features credssp,__internal`, en série). `credssp_run_command_whoami`
+à `4cbebfb` (65/65, sans la feature `credssp`), puis à `c46f8c6` (74/74 avec
+`--features credssp,__internal`, en série comme en parallèle). `credssp_run_command_whoami`
 n'est compilé qu'avec cette feature : il a été exécuté à part le 2026-10-21 à
 `4cbebfb` (passé) et dans le run complet à 66 tests. Les noms sont ceux de
 `tests/integration_real.rs`.
@@ -285,15 +293,39 @@ ne figurent pas dans la matrice.
   que le serveur récupère après son idle timeout. `Shell::run_command` garde
   son délai total de `2 * operation_timeout_secs`. `run_wql` ne scrute pas
   Receive et n'est pas concerné.
-- **`EncryptionMode::Always` n'empêche pas le repli en clair.** Si une requête
-  scellée échoue autrement que par un fault SOAP (400, 401, 500 sans fault),
-  le transport se réauthentifie et renvoie la requête en clair, quel que soit
-  le mode. Inchangé par cette campagne : c'est une décision de conception.
-- **La requête qui porte l'authentification NTLM (Type 3) part en clair,
-  corps SOAP compris**, avant que les suivantes soient scellées (pypsrp envoie
-  là un corps vide). Le banc autorise le trafic non chiffré ; le comportement
-  face à un serveur qui le refuse (`AllowUnencrypted = false`, réglage par
-  défaut de Windows) n'a pas été mesuré.
+- **Dégradation connue vers le clair en NTLM sur HTTP, quel que soit
+  `EncryptionMode` (`Auto` ou `Always`).** La requête qui termine la poignée
+  de main NTLM (Type 3) porte son corps SOAP en clair (pypsrp y envoie un corps
+  vide). Ensuite, si une requête scellée échoue autrement que par un fault SOAP
+  (400, 500 sans fault, ou 401, ce que reçoit aussi une nouvelle connexion une
+  fois perdue celle qui porte la session), `send_ntlm_sealed` efface la session
+  et renvoie la requête en clair après une nouvelle poignée de main : un
+  attaquant actif sur HTTP, ou une simple coupure de connexion, peut donc faire
+  partir une requête en clair. Mesuré : après une annulation, la commande
+  suivante sur le même client repasse par ce chemin. Ce n'est pas une décision
+  de conception mais un défaut préexistant, désormais limité à ces événements
+  au lieu de toutes les requêtes. Le comportement face à un serveur qui refuse
+  le trafic non chiffré (`AllowUnencrypted = false`, réglage par défaut de
+  Windows) n'a pas été mesuré ; le banc l'autorise.
+- **Suites ouvertes du scellement NTLM (relevées par l'audit, non traitées
+  ici) :**
+  - repli en clair sous `Auto` / `Always` (échouer fermé ; Type 3 à corps vide) ;
+  - double exécution possible d'une requête non idempotente (commande, stdin,
+    morceau d'envoi) quand une requête scellée déjà livrée échoue par une erreur
+    de classe `AuthFailed` et se trouve rejouée ;
+  - un corps d'erreur annoncé scellé qui ne se déchiffre pas retombe sur
+    l'analyse du fault en clair (fault en clair forgé accepté) et désynchronise
+    le flux RC4 ;
+  - un déchiffrement raté laisse la session en cache ;
+  - `unseal_body` ne vérifie ni `sig_len == 16` ni la longueur
+    `OriginalContent`, et la frontière finale y est facultative ;
+  - les corps de réponse sont lus sans limite de taille ;
+  - aucune cible de fuzz pour `unseal_body` ;
+  - le verrou `ntlm_cache` est tenu pendant tout un échange scellé, Receive
+    compris : sur un même client, les autres requêtes attendent la fin d'une
+    longue scrutation (mesuré : 10,3 s pour un `echo` pendant un Receive de
+    10 s, contre 0,15 à 0,18 s en Basic ; jusqu'à `operation_timeout_secs`,
+    60 s par défaut).
 - **`bridge-mcp` (hors de ce dépôt, observation seulement).** Il n'interpole pas
   `${VAR}` alors que son `config.example.yaml` montre `${WIN_PASSWORD}` (la
   chaîne est envoyée telle quelle) et il convertit toute `AuthFailed` en

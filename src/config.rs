@@ -143,17 +143,31 @@ impl Default for WinrmConfig {
     }
 }
 
-/// Controls whether NTLM message encryption (sealing) is applied to SOAP bodies.
+/// Controls whether NTLM message encryption (sealing) is applied to SOAP bodies
+/// ([`AuthMethod::Ntlm`] only).
 ///
 /// When using HTTP (not HTTPS), NTLM sealing encrypts the SOAP body to prevent
 /// eavesdropping. When using HTTPS, the TLS layer provides encryption, making
 /// sealing redundant.
+///
+/// Sealing is not guaranteed for every message, whatever the mode. The request
+/// that completes the NTLM handshake (the Type 3 message) carries its SOAP body
+/// in plaintext; later requests are sealed with the session it establishes. If
+/// a sealed request then fails other than with a SOAP fault (an HTTP 400, a
+/// 500 without a fault, or a 401, which is also what a new connection gets
+/// once the one carrying the session is lost), the client re-authenticates and
+/// sends that request again in plaintext. On plain HTTP an active attacker can
+/// therefore force a request into plaintext.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub enum EncryptionMode {
-    /// Encrypt when using HTTP, skip when using HTTPS (default).
+    /// Seal when using HTTP, skip when using HTTPS (default). On HTTP, the
+    /// handshake request and any re-authentication go out in plaintext (see
+    /// the type-level documentation).
     #[default]
     Auto,
-    /// Always encrypt SOAP bodies, even over HTTPS.
+    /// Seal SOAP bodies even over HTTPS. Does not guarantee encryption: the
+    /// handshake request and any re-authentication still go out in plaintext
+    /// (see the type-level documentation).
     Always,
     /// Never encrypt SOAP bodies. **Use only for debugging.**
     Never,

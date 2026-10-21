@@ -69,7 +69,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `Negotiate` requests before (every sealed request rejected), 2 now (one
   handshake), with every later request sealed. The bench allows unencrypted
   traffic (`AllowUnencrypted = true`), which is why the plaintext fallback
-  went unnoticed.
+  went unnoticed. The request that completes the NTLM handshake (Type 3) and
+  any re-authentication still go out in plaintext, so
+  `EncryptionMode::Always` does not guarantee encryption.
 - **PowerShell stderr lost text or leaked raw CLIXML.** Measured on Server
   2025: a large stderr arrives as the `#< CLIXML` marker alone in one Receive
   response, then the `<Objs>` document cut mid-tag, even mid-escape, across

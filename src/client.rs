@@ -146,6 +146,12 @@ impl WinrmClient {
     ///
     /// Must be called repeatedly until [`ReceiveOutput::done`](soap::ReceiveOutput::done)
     /// is `true`. Each call may return partial output that should be accumulated.
+    ///
+    /// A command that stays silent for the configured `operation_timeout_secs`
+    /// makes the server answer with a WS-Management `TimedOut` fault. That
+    /// is not a failure (the command keeps running), so it is returned as an
+    /// empty, not-done output: no stdout, no stderr, no exit code. Keep
+    /// polling. Any other fault is an error.
     #[tracing::instrument(level = "debug", skip(self))]
     pub async fn receive_output(
         &self,
@@ -153,21 +159,29 @@ impl WinrmClient {
         shell_id: &str,
         command_id: &str,
     ) -> Result<soap::ReceiveOutput, WinrmError> {
-        let response = self.receive_response(host, shell_id, command_id).await?;
-        soap::parse_receive_output(&response).map_err(WinrmError::Soap)
+        let polled = async {
+            let response = self.receive_response(host, shell_id, command_id).await?;
+            soap::parse_receive_output(&response).map_err(WinrmError::Soap)
+        }
+        .await;
+        empty_poll_on_timeout(polled)
     }
 
     /// [`receive_output`](Self::receive_output) with stderr left undecoded,
     /// for callers that keep a [`ClixmlDecoder`](soap::clixml::ClixmlDecoder)
-    /// across polls.
+    /// across polls. A `TimedOut` fault is an empty poll here too.
     pub(crate) async fn receive_output_raw(
         &self,
         host: &str,
         shell_id: &str,
         command_id: &str,
     ) -> Result<soap::ReceiveOutput, WinrmError> {
-        let response = self.receive_response(host, shell_id, command_id).await?;
-        soap::parse_receive_output_raw(&response).map_err(WinrmError::Soap)
+        let polled = async {
+            let response = self.receive_response(host, shell_id, command_id).await?;
+            soap::parse_receive_output_raw(&response).map_err(WinrmError::Soap)
+        }
+        .await;
+        empty_poll_on_timeout(polled)
     }
 
     /// Send one Receive request and return the response body.
@@ -511,6 +525,29 @@ impl WinrmClient {
             shell_id.to_string(),
             resource_uri.to_string(),
         ))
+    }
+}
+
+/// Turn a `TimedOut` fault on a Receive into an empty, not-done poll.
+///
+/// The server sends that fault when a command stays silent for
+/// `OperationTimeout`; the command is still running and the caller should
+/// poll again. The wait already happened server-side, so a loop over this
+/// does not spin. Every other result passes through untouched.
+pub(crate) fn empty_poll_on_timeout(
+    polled: Result<soap::ReceiveOutput, WinrmError>,
+) -> Result<soap::ReceiveOutput, WinrmError> {
+    match polled {
+        Err(WinrmError::Soap(ref fault)) if soap::is_timed_out_fault(fault) => {
+            debug!("Receive timed out with no output; reporting an empty poll");
+            Ok(soap::ReceiveOutput {
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                exit_code: None,
+                done: false,
+            })
+        }
+        other => other,
     }
 }
 
@@ -3095,5 +3132,189 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, WinrmError::Cancelled), "got: {err}");
+    }
+    // --- TimedOut fault on Receive is an empty poll (D1) ---
+
+    /// The fault a Windows host sends when a Receive finds no output within
+    /// `OperationTimeout`; `prefix` is the namespace prefix the server picked.
+    fn timed_out_fault(prefix: &str) -> String {
+        format!(
+            r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><s:Fault>
+                <s:Code><s:Value>s:Receiver</s:Value><s:Subcode><s:Value>{prefix}:TimedOut</s:Value></s:Subcode></s:Code>
+                <s:Reason><s:Text xml:lang="en-US">The WS-Management service cannot complete the operation within the time specified in OperationTimeout.</s:Text></s:Reason>
+            </s:Fault></s:Body></s:Envelope>"#
+        )
+    }
+
+    /// A Receive response with `hello` on stdout and the command done.
+    const DONE_HELLO: &str = r#"<s:Envelope><s:Body><rsp:ReceiveResponse>
+        <rsp:Stream Name="stdout" CommandId="C1">aGVsbG8=</rsp:Stream>
+        <rsp:CommandState CommandId="C1" State="http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Done">
+            <rsp:ExitCode>7</rsp:ExitCode>
+        </rsp:CommandState>
+    </rsp:ReceiveResponse></s:Body></s:Envelope>"#;
+
+    /// Mount `n` HTTP 500 TimedOut faults, as a real host answers them.
+    async fn mount_timed_out_faults(server: &MockServer, prefix: &str, n: u64) {
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(timed_out_fault(prefix)))
+            .up_to_n_times(n)
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_ok(server: &MockServer, body: &'static str, n: u64) {
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .up_to_n_times(n)
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn receive_output_timed_out_fault_is_an_empty_poll() {
+        let server = MockServer::start().await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        mount_timed_out_faults(&server, "w", 1).await;
+        mount_ok(&server, DONE_HELLO, 1).await;
+
+        let first = client
+            .receive_output("127.0.0.1", "S1", "C1")
+            .await
+            .unwrap();
+        assert!(first.stdout.is_empty() && first.stderr.is_empty());
+        assert!(!first.done, "an empty poll must not end the command");
+        assert_eq!(first.exit_code, None);
+
+        let second = client
+            .receive_output("127.0.0.1", "S1", "C1")
+            .await
+            .unwrap();
+        assert_eq!(second.stdout, b"hello");
+        assert!(second.done);
+        assert_eq!(second.exit_code, Some(7));
+    }
+
+    #[tokio::test]
+    async fn receive_output_raw_timed_out_fault_is_an_empty_poll() {
+        let server = MockServer::start().await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        mount_timed_out_faults(&server, "w", 1).await;
+        mount_ok(&server, DONE_HELLO, 1).await;
+
+        let first = client
+            .receive_output_raw("127.0.0.1", "S1", "C1")
+            .await
+            .unwrap();
+        assert!(first.stdout.is_empty() && first.stderr.is_empty() && !first.done);
+        assert_eq!(first.exit_code, None);
+        let second = client
+            .receive_output_raw("127.0.0.1", "S1", "C1")
+            .await
+            .unwrap();
+        assert_eq!(second.stdout, b"hello");
+    }
+
+    #[tokio::test]
+    async fn receive_output_timed_out_fault_in_http_200_body_is_an_empty_poll() {
+        // Some stacks answer a fault with 200; the transport sees it first.
+        let server = MockServer::start().await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(timed_out_fault("w")))
+            .mount(&server)
+            .await;
+
+        let out = client
+            .receive_output("127.0.0.1", "S1", "C1")
+            .await
+            .unwrap();
+        assert!(out.stdout.is_empty() && out.stderr.is_empty() && !out.done);
+        assert_eq!(out.exit_code, None);
+    }
+
+    #[tokio::test]
+    async fn receive_output_timed_out_is_recognised_under_any_namespace_prefix() {
+        for prefix in ["w", "wsman", "x1"] {
+            let server = MockServer::start().await;
+            let client =
+                WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+            mount_timed_out_faults(&server, prefix, 1).await;
+
+            match client.receive_output("127.0.0.1", "S1", "C1").await {
+                Ok(o) => assert!(!o.done && o.stdout.is_empty(), "{prefix}"),
+                Err(e) => panic!("{prefix}:TimedOut should be an empty poll, got {e:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn receive_output_other_faults_are_still_errors() {
+        for (code, reason) in [
+            ("w:AccessDenied", "Access is denied."),
+            ("w:OperationTimedOut", "not the poll timeout"),
+            ("s:Receiver", "Shell not found"),
+        ] {
+            let server = MockServer::start().await;
+            let client =
+                WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+            let fault = format!(
+                r"<s:Envelope><s:Body><s:Fault><s:Code><s:Value>s:Receiver</s:Value><s:Subcode><s:Value>{code}</s:Value></s:Subcode></s:Code>
+                <s:Reason><s:Text>{reason}</s:Text></s:Reason></s:Fault></s:Body></s:Envelope>"
+            );
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(500).set_body_string(fault))
+                .mount(&server)
+                .await;
+
+            let err = client
+                .receive_output("127.0.0.1", "S1", "C1")
+                .await
+                .err()
+                .expect("a non-TimedOut fault must be an error");
+            assert!(
+                matches!(&err, WinrmError::Soap(crate::error::SoapError::Fault { code: c, .. }) if c == code),
+                "{code} must stay an error, got {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn signal_terminate_timed_out_fault_is_still_an_error() {
+        // Only Receive gets the empty-poll treatment.
+        let server = MockServer::start().await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        mount_timed_out_faults(&server, "w", 1).await;
+
+        let err = client
+            .signal_terminate("127.0.0.1", "S1", "C1")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WinrmError::Soap(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn run_command_keeps_polling_through_timed_out_faults() {
+        let server = MockServer::start().await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        mount_ok(
+            &server,
+            r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>S1</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
+            1,
+        )
+        .await;
+        mount_ok(
+            &server,
+            r"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>C1</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
+            1,
+        )
+        .await;
+        mount_timed_out_faults(&server, "w", 2).await;
+        mount_ok(&server, DONE_HELLO, 1).await;
+        mount_ok(&server, "<s:Envelope><s:Body/></s:Envelope>", u64::MAX).await;
+
+        let out = client.run_command("127.0.0.1", "slow", &[]).await.unwrap();
+        assert_eq!(out.stdout, b"hello");
+        assert_eq!(out.exit_code, 7);
     }
 }

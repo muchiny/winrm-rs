@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use tracing::debug;
 
-use crate::client::WinrmClient;
+use crate::client::{WinrmClient, empty_poll_on_timeout};
 use crate::command::CommandOutput;
 use crate::error::WinrmError;
 use crate::soap::clixml::ClixmlDecoder;
@@ -326,6 +326,10 @@ impl<'a> Shell<'a> {
     /// over several Receive responses is held back until it is complete, so a
     /// poll may return an empty `stderr` while the command is still writing
     /// it. Anything still buffered comes out on the `done` poll.
+    ///
+    /// A `TimedOut` fault (the command stayed silent for
+    /// `operation_timeout_secs`) is not an error: it is returned as an empty,
+    /// not-done poll, and the caller should poll again.
     pub async fn receive_next(&self, command_id: &str) -> Result<ReceiveOutput, WinrmError> {
         let endpoint = self.client.endpoint(&self.host);
         let config = self.client.config();
@@ -355,8 +359,12 @@ impl<'a> Shell<'a> {
                 &self.resource_uri,
             )
         };
-        let response = self.client.send_soap_raw(&self.host, envelope).await?;
-        let mut output = soap::parse_receive_output_raw(&response).map_err(WinrmError::Soap)?;
+        let polled = async {
+            let response = self.client.send_soap_raw(&self.host, envelope).await?;
+            soap::parse_receive_output_raw(&response).map_err(WinrmError::Soap)
+        }
+        .await;
+        let mut output = empty_poll_on_timeout(polled)?;
 
         output.stderr = self
             .stderr_decoders
@@ -1275,5 +1283,113 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, WinrmError::Cancelled), "got: {err}");
+    }
+
+    // --- TimedOut fault on Receive is an empty poll (D1) ---
+
+    const TIMED_OUT_FAULT: &str = r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><s:Fault>
+        <s:Code><s:Value>s:Receiver</s:Value><s:Subcode><s:Value>w:TimedOut</s:Value></s:Subcode></s:Code>
+        <s:Reason><s:Text xml:lang="en-US">The WS-Management service cannot complete the operation within the time specified in OperationTimeout.</s:Text></s:Reason>
+    </s:Fault></s:Body></s:Envelope>"#;
+
+    const DONE_OK: &str = r#"<s:Envelope><s:Body><rsp:ReceiveResponse>
+        <rsp:Stream Name="stdout" CommandId="TC">b2s=</rsp:Stream>
+        <rsp:CommandState CommandId="TC" State="http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Done">
+            <rsp:ExitCode>3</rsp:ExitCode>
+        </rsp:CommandState>
+    </rsp:ReceiveResponse></s:Body></s:Envelope>"#;
+
+    async fn mount_ok(server: &MockServer, body: &'static str, n: u64) {
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .up_to_n_times(n)
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_open_shell_and_command(server: &MockServer) {
+        mount_ok(
+            server,
+            "<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>TS</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
+            1,
+        )
+        .await;
+        mount_ok(
+            server,
+            "<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>TC</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
+            1,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn shell_run_command_keeps_polling_through_timed_out_faults() {
+        let server = MockServer::start().await;
+        mount_open_shell_and_command(&server).await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(TIMED_OUT_FAULT))
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        mount_ok(&server, DONE_OK, 1).await;
+        mount_ok(&server, "<s:Envelope><s:Body/></s:Envelope>", u64::MAX).await;
+
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        let shell = client.open_shell("127.0.0.1").await.unwrap();
+        let out = shell.run_command("slow", &[]).await.unwrap();
+        assert_eq!(out.stdout, b"ok");
+        assert_eq!(out.exit_code, 3);
+    }
+
+    #[tokio::test]
+    async fn shell_run_command_silent_forever_ends_in_the_outer_timeout() {
+        // Each Receive is answered with TimedOut after a short wait, as a real
+        // host does after OperationTimeout; the 2 x operation_timeout deadline
+        // is what ends the call.
+        let server = MockServer::start().await;
+        mount_open_shell_and_command(&server).await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_string(TIMED_OUT_FAULT)
+                    .set_delay(std::time::Duration::from_millis(250)),
+            )
+            .mount(&server)
+            .await;
+
+        let config = WinrmConfig {
+            operation_timeout_secs: 1,
+            ..basic_config(server.address().port())
+        };
+        let client = WinrmClient::new(config, test_creds()).unwrap();
+        let shell = client.open_shell("127.0.0.1").await.unwrap();
+        let err = shell.run_command("slow", &[]).await.unwrap_err();
+        assert!(matches!(err, WinrmError::Timeout(2)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn receive_next_timed_out_fault_is_an_empty_poll() {
+        let server = MockServer::start().await;
+        mount_ok(
+            &server,
+            "<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>TS</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
+            1,
+        )
+        .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(TIMED_OUT_FAULT))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        mount_ok(&server, DONE_OK, 1).await;
+
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        let shell = client.open_shell("127.0.0.1").await.unwrap();
+        let first = shell.receive_next("TC").await.unwrap();
+        assert!(first.stdout.is_empty() && first.stderr.is_empty() && !first.done);
+        assert_eq!(first.exit_code, None);
+        let second = shell.receive_next("TC").await.unwrap();
+        assert_eq!(second.stdout, b"ok");
+        assert!(second.done);
     }
 }

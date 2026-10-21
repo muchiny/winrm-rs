@@ -290,6 +290,20 @@ fn extract_soap_fault(xml: &str) -> Option<SoapError> {
     Some(SoapError::Fault { code, reason })
 }
 
+/// Whether a SOAP error is the WS-Management `TimedOut` fault.
+///
+/// A host answers a Receive with this fault when the command produced no
+/// output within `OperationTimeout`. It means "nothing yet, poll again", not
+/// a failure. Only the local part of the fault code is compared: the server
+/// chooses the namespace prefix (`w:TimedOut`, `wsman:TimedOut`, ...). The
+/// code stored in [`SoapError::Fault`] is the subcode when there is one.
+pub(crate) fn is_timed_out_fault(err: &SoapError) -> bool {
+    match err {
+        SoapError::Fault { code, .. } => code.rsplit([':', '/']).next() == Some("TimedOut"),
+        SoapError::MissingElement(_) | SoapError::ParseError(_) => false,
+    }
+}
+
 /// Extract the `<s:Subcode><s:Value>…</s:Value></s:Subcode>` text,
 /// falling back to the WSManFault `Code` attribute if present.
 fn extract_subcode_value(xml: &str) -> Option<String> {
@@ -850,5 +864,59 @@ mod tests {
         let (items, context) = parse_enumerate_response(xml).unwrap();
         assert!(items.is_empty(), "no <Items> tag should yield empty");
         assert!(context.is_none());
+    }
+    fn fault(code: &str) -> SoapError {
+        SoapError::Fault {
+            code: code.into(),
+            reason: "r".into(),
+        }
+    }
+
+    #[test]
+    fn timed_out_fault_matches_on_the_local_part_whatever_the_prefix() {
+        for code in ["w:TimedOut", "wsman:TimedOut", "x1:TimedOut", "TimedOut"] {
+            assert!(is_timed_out_fault(&fault(code)), "{code}");
+        }
+        assert!(is_timed_out_fault(&fault(
+            "http://schemas.dmtf.org/wbem/wsman/1/wsman/TimedOut"
+        )));
+    }
+
+    #[test]
+    fn timed_out_fault_rejects_other_codes_and_variants() {
+        for code in [
+            "w:AccessDenied",
+            "s:Receiver",
+            "w:OperationTimedOut",
+            "w:TimedOutAgain",
+            "w:timedout",
+            "unknown",
+            "",
+        ] {
+            assert!(!is_timed_out_fault(&fault(code)), "{code}");
+        }
+        assert!(!is_timed_out_fault(&SoapError::MissingElement(
+            "TimedOut".into()
+        )));
+        assert!(!is_timed_out_fault(&SoapError::ParseError(
+            "w:TimedOut".into()
+        )));
+    }
+
+    #[test]
+    fn timed_out_fault_is_found_in_a_parsed_server_fault() {
+        // The subcode (`w:TimedOut`) wins over the top-level `s:Receiver`.
+        let xml = r#"<s:Envelope><s:Body><s:Fault>
+            <s:Code><s:Value>s:Receiver</s:Value><s:Subcode><s:Value>w:TimedOut</s:Value></s:Subcode></s:Code>
+            <s:Reason><s:Text xml:lang="en-US">timed out</s:Text></s:Reason>
+        </s:Fault></s:Body></s:Envelope>"#;
+        let err = parse_receive_output_raw(xml).err().expect("fault expected");
+        assert!(is_timed_out_fault(&err));
+
+        let xml = xml.replace("w:TimedOut", "w:AccessDenied");
+        let err = parse_receive_output_raw(&xml)
+            .err()
+            .expect("fault expected");
+        assert!(!is_timed_out_fault(&err));
     }
 }

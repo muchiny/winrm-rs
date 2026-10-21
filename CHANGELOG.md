@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **A command silent for longer than `operation_timeout_secs` failed with a
+  `TimedOut` fault.** The server answers a Receive that finds no output within
+  `OperationTimeout` with the WS-Management fault `w:TimedOut`, which means
+  "nothing yet, poll again". It was returned as `WinrmError::Soap`, so
+  `run_command`, `run_powershell` and `Shell::run_command` failed on any
+  command quiet for 60 s (the default), such as `Start-Sleep 75`. Measured on
+  Server 2025. `WinrmClient::receive_output` and `Shell::receive_next` now
+  return an empty, not-done `ReceiveOutput` for that fault, and every polling
+  loop carries on; the fault is matched on its local part, whatever namespace
+  prefix the server uses. Any other fault is still an error, and so is a
+  `TimedOut` fault on a request other than Receive. `Shell::run_command` still
+  ends in `WinrmError::Timeout(2 * operation_timeout_secs)` for a command that
+  never produces output. Callers that already treated the fault as "poll
+  again" (psrp-rs) keep working.
 - **PowerShell stderr lost text or leaked raw CLIXML.** Measured on Server
   2025: a large stderr arrives as the `#< CLIXML` marker alone in one Receive
   response, then the `<Objs>` document cut mid-tag, even mid-escape, across

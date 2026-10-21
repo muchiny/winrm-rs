@@ -17,8 +17,8 @@ pub(crate) use parser::parse_enumerate_response;
 // `unreachable_pub` allows there) so `crate::__fuzz` can wrap them; in-crate
 // callers reach them through this crate-visible shim.
 pub(crate) use parser::{
-    check_soap_fault, parse_command_id, parse_receive_output, parse_receive_output_raw,
-    parse_shell_id,
+    check_soap_fault, is_timed_out_fault, parse_command_id, parse_receive_output,
+    parse_receive_output_raw, parse_shell_id,
 };
 // Re-export ReceiveOutput as fully public so lib.rs can `pub use` it.
 pub use parser::ReceiveOutput;

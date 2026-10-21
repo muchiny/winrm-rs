@@ -1021,6 +1021,279 @@ async fn invalid_proxy_returns_http_error() {
     assert!(result.is_err(), "should fail with unreachable proxy");
 }
 
+// === Proxy: test doubles ===
+
+/// A minimal in-process proxy that forwards one client connection to one
+/// upstream connection (which keeps NTLM connection affinity intact) and counts
+/// what it carries.
+///
+/// Built on `tokio` only. Its tasks end with the test's runtime; I/O errors
+/// (a peer closing early, a refused upstream) simply end the connection.
+struct TestProxy {
+    addr: std::net::SocketAddr,
+    connections: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    connect_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Largest request header the HTTP test proxy will buffer.
+const PROXY_MAX_HEADER: usize = 64 * 1024;
+
+impl TestProxy {
+    /// HTTP proxy: handles `CONNECT host:port` and absolute-form requests.
+    async fn http() -> Self {
+        Self::start(false).await
+    }
+
+    /// SOCKS5 proxy (RFC 1928), no authentication, `CONNECT` command only.
+    async fn socks5() -> Self {
+        Self::start(true).await
+    }
+
+    async fn start(socks5: bool) -> Self {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test proxy");
+        let addr = listener.local_addr().expect("test proxy address");
+        let connections = Arc::new(AtomicUsize::new(0));
+        let connect_requests = Arc::new(AtomicUsize::new(0));
+
+        let accepted = Arc::clone(&connections);
+        let connects = Arc::clone(&connect_requests);
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                accepted.fetch_add(1, Ordering::SeqCst);
+                let connects = Arc::clone(&connects);
+                tokio::spawn(async move {
+                    let _ = if socks5 {
+                        serve_socks5(socket).await
+                    } else {
+                        serve_http_proxy(socket, &connects).await
+                    };
+                });
+            }
+        });
+
+        Self {
+            addr,
+            connections,
+            connect_requests,
+        }
+    }
+
+    /// Client connections accepted so far.
+    fn connections(&self) -> usize {
+        self.connections.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// HTTP `CONNECT` requests seen so far (always 0 for the SOCKS5 proxy).
+    fn connect_requests(&self) -> usize {
+        self.connect_requests
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Serve one HTTP proxy client connection.
+async fn serve_http_proxy(
+    mut client: tokio::net::TcpStream,
+    connects: &std::sync::atomic::AtomicUsize,
+) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Read up to the end of the request header. Anything read past it is body
+    // (or the start of the tunnelled stream) and is forwarded as-is.
+    let mut buf = Vec::new();
+    let header_end = loop {
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+        if buf.len() > PROXY_MAX_HEADER {
+            return Err(Error::new(ErrorKind::InvalidData, "header too large"));
+        }
+        let mut chunk = [0u8; 4096];
+        let n = client.read(&mut chunk).await?;
+        if n == 0 {
+            return Err(Error::from(ErrorKind::UnexpectedEof));
+        }
+        buf.extend_from_slice(chunk.get(..n).unwrap_or_default());
+    };
+
+    let head = String::from_utf8_lossy(buf.get(..header_end).unwrap_or_default()).into_owned();
+    let mut request_line = head.lines().next().unwrap_or_default().split(' ');
+    let method = request_line.next().unwrap_or_default();
+    let target = request_line.next().unwrap_or_default();
+
+    if method.eq_ignore_ascii_case("CONNECT") {
+        connects.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut upstream = tokio::net::TcpStream::connect(target).await?;
+        client
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await?;
+        // Bytes the client sent after the header belong to the tunnel.
+        upstream
+            .write_all(buf.get(header_end..).unwrap_or_default())
+            .await?;
+        tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+    } else {
+        // Absolute-form: `POST http://host:port/path HTTP/1.1`.
+        let authority = target
+            .split_once("://")
+            .map_or(target, |(_, rest)| rest)
+            .split('/')
+            .next()
+            .unwrap_or_default();
+        let upstream_addr = if authority.contains(':') {
+            authority.to_owned()
+        } else {
+            format!("{authority}:80")
+        };
+        let mut upstream = tokio::net::TcpStream::connect(upstream_addr).await?;
+        // Replay everything read so far verbatim (HTTP.sys accepts the
+        // absolute form), then relay the rest in both directions.
+        upstream.write_all(&buf).await?;
+        tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+    }
+    Ok(())
+}
+
+/// Serve one SOCKS5 client connection (no authentication, `CONNECT` only).
+async fn serve_socks5(mut client: tokio::net::TcpStream) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Method negotiation: `05 n methods...` -> `05 00` (no authentication).
+    let mut greeting = [0u8; 2];
+    client.read_exact(&mut greeting).await?;
+    if greeting.first() != Some(&5) {
+        return Err(Error::new(ErrorKind::InvalidData, "not SOCKS5"));
+    }
+    let mut methods = vec![0u8; usize::from(greeting.get(1).copied().unwrap_or(0))];
+    client.read_exact(&mut methods).await?;
+    client.write_all(&[5, 0]).await?;
+
+    // Request: `05 01 00 atyp addr port`.
+    let mut head = [0u8; 4];
+    client.read_exact(&mut head).await?;
+    let [ver, cmd, _rsv, atyp] = head;
+    if ver != 5 || cmd != 1 {
+        return Err(Error::new(ErrorKind::InvalidData, "only SOCKS5 CONNECT"));
+    }
+    let host = match atyp {
+        1 => {
+            let mut ip = [0u8; 4];
+            client.read_exact(&mut ip).await?;
+            std::net::Ipv4Addr::from(ip).to_string()
+        }
+        3 => {
+            let mut len = [0u8; 1];
+            client.read_exact(&mut len).await?;
+            let mut name = vec![0u8; usize::from(len[0])];
+            client.read_exact(&mut name).await?;
+            String::from_utf8_lossy(&name).into_owned()
+        }
+        _ => return Err(Error::new(ErrorKind::InvalidData, "unsupported atyp")),
+    };
+    let mut port = [0u8; 2];
+    client.read_exact(&mut port).await?;
+    let port = u16::from_be_bytes(port);
+
+    let mut upstream = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
+    // Success, bound address 0.0.0.0:0.
+    client.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
+    tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+    Ok(())
+}
+
+// === Proxy: successful traffic ===
+//
+// Each test runs the WinRM client through a local proxy that counts what it
+// carries. Asserting on the proxy's counters (not only on the command result)
+// is the point: reqwest could silently bypass a proxy for a loopback target and
+// the command would still succeed.
+
+/// The HTTPS port of the bench (same variable as the other HTTPS tests).
+fn https_test_port() -> u16 {
+    std::env::var("WINRM_TEST_HTTPS_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(55986)
+}
+
+#[tokio::test]
+#[ignore]
+async fn http_proxy_carries_ntlm_over_http() {
+    let proxy = TestProxy::http().await;
+    let proxy_url = format!("http://{}", proxy.addr);
+    let (client, host) = test_client_with(|c| {
+        c.auth_method = AuthMethod::Ntlm;
+        c.proxy = Some(proxy_url);
+    })
+    .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+
+    let out = client
+        .run_command(&host, "cmd.exe", &["/c", "echo via-proxy"])
+        .await
+        .expect("via proxy");
+
+    assert!(String::from_utf8_lossy(&out.stdout).contains("via-proxy"));
+    assert!(proxy.connections() > 0, "request bypassed the proxy");
+    assert_eq!(
+        proxy.connect_requests(),
+        0,
+        "plain HTTP must use absolute-form requests, not CONNECT"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn http_proxy_connect_carries_https() {
+    let proxy = TestProxy::http().await;
+    let proxy_url = format!("http://{}", proxy.addr);
+    let (client, host) = test_client_with(|c| {
+        c.auth_method = AuthMethod::Basic;
+        c.use_tls = true;
+        c.accept_invalid_certs = true; // self-signed cert
+        c.port = https_test_port();
+        c.proxy = Some(proxy_url);
+    })
+    .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+
+    let out = client
+        .run_command(&host, "cmd.exe", &["/c", "echo via-proxy"])
+        .await
+        .expect("via proxy");
+
+    assert!(String::from_utf8_lossy(&out.stdout).contains("via-proxy"));
+    assert!(proxy.connections() > 0, "request bypassed the proxy");
+    assert!(
+        proxy.connect_requests() > 0,
+        "HTTPS through an HTTP proxy must tunnel with CONNECT"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn socks5_proxy_carries_ntlm() {
+    let proxy = TestProxy::socks5().await;
+    let proxy_url = format!("socks5://{}", proxy.addr);
+    let (client, host) = test_client_with(|c| {
+        c.auth_method = AuthMethod::Ntlm;
+        c.proxy = Some(proxy_url);
+    })
+    .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+
+    let out = client
+        .run_command(&host, "cmd.exe", &["/c", "echo via-proxy"])
+        .await
+        .expect("via proxy");
+
+    assert!(String::from_utf8_lossy(&out.stdout).contains("via-proxy"));
+    assert!(proxy.connections() > 0, "request bypassed the proxy");
+}
+
 // === HTTPS setup helper (run once to enable HTTPS tests) ===
 
 #[tokio::test]

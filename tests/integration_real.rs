@@ -921,22 +921,25 @@ async fn connect_timeout_is_honoured() {
     );
 }
 
-/// A command that stays silent past `operation_timeout_secs` must surface
-/// `WinrmError::Timeout(10)` (twice the operation timeout), within 20 s.
+/// `Shell::run_command` ends in `WinrmError::Timeout(2 * operation_timeout_secs)`
+/// once its total deadline is reached, within three operation timeouts.
 ///
-/// The server answers each silent Receive with a `TimedOut` fault after 5 s;
-/// the shell treats those as empty polls and keeps waiting, so it is the
-/// 2 x `operation_timeout_secs` deadline that ends the call.
+/// The command stays silent far beyond that deadline. The server answers each
+/// silent Receive with a `TimedOut` fault after `OP` seconds; the shell treats
+/// those as empty polls and keeps waiting, so it is the 2 x `OP` deadline that
+/// ends the call. `OP` is 15 s so that shell creation, which runs inside the
+/// same window, survives a busy bench.
 #[tokio::test]
 #[ignore]
 async fn shell_run_command_times_out() {
-    let (client, host) = test_client_with(|c| c.operation_timeout_secs = 5)
+    const OP: u64 = 15;
+    let (client, host) = test_client_with(|c| c.operation_timeout_secs = OP)
         .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let shell = client.open_shell(&host).await.expect("open shell");
 
     let start = Instant::now();
     let result = shell
-        .run_command("powershell.exe", &["-Command", "Start-Sleep 60"])
+        .run_command("powershell.exe", &["-Command", "Start-Sleep 600"])
         .await;
     let elapsed = start.elapsed();
 
@@ -944,11 +947,12 @@ async fn shell_run_command_times_out() {
     let _ = shell.close().await;
 
     assert!(
-        matches!(&result, Err(WinrmError::Timeout(10))),
-        "expected Err(Timeout(10)), got {result:?} after {elapsed:?}"
+        matches!(&result, Err(WinrmError::Timeout(secs)) if *secs == 2 * OP),
+        "expected Err(Timeout({})), got {result:?} after {elapsed:?}",
+        2 * OP
     );
     assert!(
-        elapsed < Duration::from_secs(20),
+        elapsed < Duration::from_secs(3 * OP),
         "timeout took {elapsed:?}"
     );
 }

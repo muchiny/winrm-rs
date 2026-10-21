@@ -90,11 +90,13 @@ mod command;
 mod config;
 mod error;
 mod ntlm;
+mod request_hook;
 mod shell;
 mod soap;
 mod tls;
 mod transfer;
 mod transport;
+pub use request_hook::RequestHook;
 
 pub use builder::{NeedsCredentials, Ready, WinrmClientBuilder};
 pub use client::WinrmClient;

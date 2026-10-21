@@ -40,6 +40,13 @@ impl WinrmClient {
         })
     }
 
+    /// Install an admission callback before every NTLM HTTP exchange.
+    /// Unsupported auth methods refuse here, before network contact.
+    pub fn with_request_hook(mut self, hook: crate::RequestHook) -> Result<Self, WinrmError> {
+        self.transport.set_request_hook(hook)?;
+        Ok(self)
+    }
+
     /// Build the WinRM endpoint URL for a given host.
     pub(crate) fn endpoint(&self, host: &str) -> String {
         self.transport.endpoint(host)

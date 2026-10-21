@@ -8,6 +8,9 @@
 /// handshake, NTLM protocol, SOAP-level faults, and operation timeouts.
 #[derive(Debug, thiserror::Error)]
 pub enum WinrmError {
+    /// An application request hook refused a send. This error is never retried.
+    #[error("request refused before send")]
+    RequestRefused,
     /// HTTP transport error from `reqwest` (connection refused, timeout, TLS, etc.).
     #[error("WinRM HTTP error: {0}")]
     Http(reqwest::Error),

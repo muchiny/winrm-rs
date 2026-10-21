@@ -16,6 +16,7 @@ use crate::ntlm;
 /// for each SOAP request. The password is wrapped in [`Zeroizing`] to ensure
 /// it is cleared from memory when dropped.
 pub(crate) struct NtlmAuth {
+    pub(crate) request_hook: Option<crate::RequestHook>,
     pub(crate) username: String,
     pub(crate) password: Zeroizing<String>,
     pub(crate) domain: String,
@@ -130,6 +131,9 @@ impl NtlmAuth {
         let type1 = ntlm::create_negotiate_message();
         let auth_header = ntlm::encode_authorization(&type1);
 
+        if let Some(hook) = &self.request_hook {
+            hook.call()?;
+        }
         let resp = http
             .post(url)
             .header(CONTENT_TYPE, "application/soap+xml;charset=UTF-8")
@@ -244,6 +248,9 @@ impl NtlmAuth {
             )
         };
 
+        if let Some(hook) = &self.request_hook {
+            hook.call()?;
+        }
         let resp = http
             .post(url)
             .header(CONTENT_TYPE, &content_type)

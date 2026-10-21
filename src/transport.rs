@@ -35,6 +35,7 @@ struct NtlmSessionCache {
 ///
 /// Handles authentication dispatch, retry logic, and endpoint construction.
 pub(crate) struct HttpTransport {
+    request_hook: Option<crate::RequestHook>,
     http: reqwest::Client,
     config: WinrmConfig,
     credentials: WinrmCredentials,
@@ -100,6 +101,7 @@ impl HttpTransport {
         let mut builder = reqwest::Client::builder()
             .danger_accept_invalid_certs(config.accept_invalid_certs)
             .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
             .timeout(Duration::from_secs(config.operation_timeout_secs + 10))
             .http1_only()
@@ -181,6 +183,7 @@ impl HttpTransport {
         let http = builder.build().map_err(WinrmError::Http)?;
 
         Ok(Self {
+            request_hook: None,
             http,
             config,
             credentials,
@@ -188,6 +191,14 @@ impl HttpTransport {
             ntlm_cache: Mutex::new(None),
             session_id: format!("uuid:{}", uuid::Uuid::new_v4().to_string().to_uppercase()),
         })
+    }
+
+    pub(crate) fn set_request_hook(&mut self, hook: crate::RequestHook) -> Result<(), WinrmError> {
+        if !matches!(self.config.auth_method, AuthMethod::Ntlm) {
+            return Err(WinrmError::RequestRefused);
+        }
+        self.request_hook = Some(hook);
+        Ok(())
     }
 
     /// Build the WinRM endpoint URL for a given host.
@@ -244,6 +255,7 @@ impl HttpTransport {
                     self.send_ntlm_sealed(host, &url, body).await?
                 } else {
                     let auth = NtlmAuth {
+                        request_hook: self.request_hook.clone(),
                         username: self.credentials.username.clone(),
                         password: Zeroizing::new(
                             self.credentials.password.expose_secret().to_string(),
@@ -327,6 +339,7 @@ impl HttpTransport {
 
         // No cached session: do full handshake with plaintext body
         let auth = NtlmAuth {
+            request_hook: self.request_hook.clone(),
             username: self.credentials.username.clone(),
             password: Zeroizing::new(self.credentials.password.expose_secret().to_string()),
             domain: self.credentials.domain.clone(),
@@ -353,6 +366,9 @@ impl HttpTransport {
     ) -> Result<String, WinrmError> {
         let (content_type, sealed) = ntlm_auth::seal_body(session, body);
 
+        if let Some(hook) = &self.request_hook {
+            hook.call()?;
+        }
         let resp = self
             .http
             .post(url)

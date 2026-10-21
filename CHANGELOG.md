@@ -20,6 +20,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `receive_output` itself still decodes each response on its own, so a
   CLIXML document split across responses comes back partly raw there.
 
+- **Total deadline for the one-shot calls:**
+  `WinrmClient::run_command_with_timeout`, `run_powershell_with_timeout` and
+  `download_file_with_timeout`, each taking a `timeout: Duration`. When it
+  elapses (shell creation and polling included; empty `TimedOut` polls do not
+  extend it) the command gets a terminate signal, the remote shell is
+  deleted, both best effort and bounded to `operation_timeout_secs` (at most
+  10 s) per request, and the call returns `WinrmError::Timeout(secs)` with
+  `timeout` rounded up to whole seconds (at least 1). The shell is released
+  on success, error and expiry; dropping the future cannot delete it, as for
+  `run_command`. Additive: no `WinrmConfig` field was added.
+
 ### Fixed
 
 - **`AuthMethod::Certificate` never authenticated (always HTTP 401).** Two
@@ -173,9 +184,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `operation_timeout_secs` bounds each Receive poll, not the command: a
   command that hangs silently (`Read-Host`, `pause`, a blocked process) used
   to fail with the `TimedOut` fault after about `operation_timeout_secs` and
-  now blocks the call until it ends. Bound it with
-  `run_command_with_cancel` / `run_powershell_with_cancel` or
-  `tokio::time::timeout`; either way the dropped call leaves the remote
+  now blocks the call until it ends. Bound it with the new
+  `run_command_with_timeout` / `run_powershell_with_timeout` /
+  `download_file_with_timeout`, which delete the shell on expiry, or stop it
+  from elsewhere with `run_command_with_cancel` / `run_powershell_with_cancel`
+  or `tokio::time::timeout`; those two drop the call and leave the remote
   shell to the server's idle timeout. `Shell::run_command` keeps its total
   deadline of `2 * operation_timeout_secs`. `run_wql` does not poll Receive
   and is unchanged.

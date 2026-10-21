@@ -8,6 +8,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 
 use crate::client::WinrmClient;
+use crate::command::CommandOutput;
 use crate::error::WinrmError;
 
 /// File transfer chunk size (raw bytes before encoding).
@@ -115,6 +116,10 @@ impl WinrmClient {
     /// Download a file from a remote Windows host.
     ///
     /// Reads the file via PowerShell base64 encoding and decodes locally.
+    /// Built on [`run_powershell`](Self::run_powershell), it has no overall
+    /// time limit; use
+    /// [`download_file_with_timeout`](Self::download_file_with_timeout) to
+    /// bound it.
     ///
     /// Returns the number of bytes downloaded.
     pub async fn download_file(
@@ -124,33 +129,66 @@ impl WinrmClient {
         local_path: &Path,
     ) -> Result<u64, WinrmError> {
         validate_remote_path(remote_path)?;
-
-        let escaped = escape_ps_single_quoted(remote_path);
-        let script = format!("[Convert]::ToBase64String([IO.File]::ReadAllBytes('{escaped}'))");
-
+        let script = download_script(remote_path);
         let output = self.run_powershell(host, &script).await?;
-        if output.exit_code != 0 {
-            return Err(WinrmError::Transfer(format!(
-                "download failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )));
-        }
-
-        let b64 = String::from_utf8_lossy(&output.stdout);
-        let data = B64
-            .decode(b64.trim_ascii())
-            .map_err(|e| WinrmError::Transfer(format!("base64 decode of downloaded file: {e}")))?;
-
-        let total = data.len() as u64;
-        std::fs::write(local_path, &data).map_err(|e| {
-            WinrmError::Transfer(format!(
-                "failed to write local file {}: {e}",
-                local_path.display()
-            ))
-        })?;
-
-        Ok(total)
+        write_download(&output, local_path)
     }
+
+    /// Download a file from a remote Windows host, giving up after `timeout`.
+    ///
+    /// Like [`download_file`](Self::download_file), but the remote read must
+    /// finish within `timeout`, as for
+    /// [`run_powershell_with_timeout`](Self::run_powershell_with_timeout):
+    /// on expiry the shell is deleted and [`WinrmError::Timeout`] is returned
+    /// with `timeout` rounded up to whole seconds. The limit covers the
+    /// transfer from the host, not the local write that follows it.
+    ///
+    /// Returns the number of bytes downloaded.
+    pub async fn download_file_with_timeout(
+        &self,
+        host: &str,
+        remote_path: &str,
+        local_path: &Path,
+        timeout: std::time::Duration,
+    ) -> Result<u64, WinrmError> {
+        validate_remote_path(remote_path)?;
+        let script = download_script(remote_path);
+        let output = self
+            .run_powershell_with_timeout(host, &script, timeout)
+            .await?;
+        write_download(&output, local_path)
+    }
+}
+
+/// The remote script that prints `remote_path` as base64.
+fn download_script(remote_path: &str) -> String {
+    let escaped = escape_ps_single_quoted(remote_path);
+    format!("[Convert]::ToBase64String([IO.File]::ReadAllBytes('{escaped}'))")
+}
+
+/// Decode the base64 a download script printed and write it to `local_path`.
+fn write_download(output: &CommandOutput, local_path: &Path) -> Result<u64, WinrmError> {
+    if output.exit_code != 0 {
+        return Err(WinrmError::Transfer(format!(
+            "download failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+
+    let b64 = String::from_utf8_lossy(&output.stdout);
+    let data = B64
+        .decode(b64.trim_ascii())
+        .map_err(|e| WinrmError::Transfer(format!("base64 decode of downloaded file: {e}")))?;
+
+    let total = data.len() as u64;
+    std::fs::write(local_path, &data).map_err(|e| {
+        WinrmError::Transfer(format!(
+            "failed to write local file {}: {e}",
+            local_path.display()
+        ))
+    })?;
+
+    Ok(total)
 }
 
 #[cfg(test)]

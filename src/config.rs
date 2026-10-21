@@ -38,7 +38,9 @@ pub struct WinrmConfig {
     /// output within it comes back as an empty poll and polling goes on, so
     /// `WinrmClient::run_command` and `run_powershell` wait for the command
     /// however long it stays silent (no overall limit; use the
-    /// `*_with_cancel` variants or `tokio::time::timeout` to bound them).
+    /// `*_with_timeout` variants, `WinrmClient::run_command_with_timeout` and
+    /// `run_powershell_with_timeout`, to bound them, or `*_with_cancel` to
+    /// stop them from elsewhere).
     /// `Shell::run_command` additionally gives up after
     /// `2 * operation_timeout_secs` in total.
     pub operation_timeout_secs: u64,

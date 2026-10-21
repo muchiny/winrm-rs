@@ -115,6 +115,29 @@ assert_eq!(output.exit_code, 0);
 println!("{}", String::from_utf8_lossy(&output.stdout));
 ```
 
+### Bounding a call with a total timeout
+
+`run_command` and `run_powershell` wait as long as the command runs, so a
+script that hangs silently (`Read-Host`, `pause`) blocks them. The
+`*_with_timeout` variants give up after a total time: the command is
+terminated, the remote shell is deleted, and the call returns
+`WinrmError::Timeout(secs)` (the timeout rounded up to whole seconds).
+
+```rust
+use std::time::Duration;
+
+match client
+    .run_powershell_with_timeout("win-server", "Get-Service", Duration::from_secs(30))
+    .await
+{
+    Ok(output) => println!("{}", String::from_utf8_lossy(&output.stdout)),
+    Err(WinrmError::Timeout(secs)) => eprintln!("no answer after {secs}s"),
+    Err(e) => return Err(e.into()),
+}
+```
+
+`run_command_with_timeout` and `download_file_with_timeout` work the same way.
+
 ### Raw command execution
 
 ```rust

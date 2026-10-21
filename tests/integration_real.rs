@@ -661,6 +661,72 @@ async fn max_output_bytes_aborts_and_releases_shell() {
     assert_eq!(after, before, "shell leaked after max_output_bytes abort");
 }
 
+/// `run_powershell_with_timeout` on a command that never ends: it must give up
+/// with `Timeout(8)`, well inside the 600 s the script sleeps, and must have
+/// deleted the remote shell (counted through the marker `IdleTimeOut`, with a
+/// positive control so a failed enumeration cannot read as 0).
+#[tokio::test]
+#[ignore]
+async fn run_powershell_with_timeout_expires_and_releases_shell() {
+    // Unique per process, below the server's 7200 s default ceiling and
+    // outside the range `max_output_bytes_aborts_and_releases_shell` uses.
+    let marker = 7000 + u64::from(std::process::id() % 150);
+    let (client, host) = test_client_with(|c| c.idle_timeout_secs = Some(marker))
+        .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let (counter, _) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+
+    let control = client.open_shell(&host).await.expect("open control shell");
+    let seen = open_shell_count_with_idle_timeout(&counter, &host, marker).await;
+    control.close().await.expect("close control shell");
+    assert_eq!(seen, 1, "marker filter did not see the control shell");
+
+    let before = open_shell_count_with_idle_timeout(&counter, &host, marker).await;
+    assert_eq!(before, 0, "marker {marker} already used by a stale shell");
+
+    let started = std::time::Instant::now();
+    let err = client
+        .run_powershell_with_timeout(&host, "Start-Sleep 600", std::time::Duration::from_secs(8))
+        .await
+        .unwrap_err();
+    let elapsed = started.elapsed();
+
+    let after = open_shell_count_with_idle_timeout(&counter, &host, marker).await;
+    eprintln!("timeout after {elapsed:?}; marked open shells: before={before} after={after}");
+
+    assert!(matches!(err, WinrmError::Timeout(8)), "got {err:?}");
+    assert!(
+        elapsed >= std::time::Duration::from_secs(8)
+            && elapsed < std::time::Duration::from_secs(15),
+        "gave up after {elapsed:?}"
+    );
+    assert_eq!(after, before, "shell leaked after the timeout");
+}
+
+/// A command that finishes inside the limit returns its output as
+/// `run_powershell` would, and leaves no shell.
+#[tokio::test]
+#[ignore]
+async fn run_powershell_with_timeout_returns_output_of_a_fast_command() {
+    let marker = 7150 + u64::from(std::process::id() % 40);
+    let (client, host) = test_client_with(|c| c.idle_timeout_secs = Some(marker))
+        .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let (counter, _) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+
+    let out = client
+        .run_powershell_with_timeout(
+            &host,
+            "'fast-ok'; exit 3",
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .expect("a fast command must not time out");
+
+    assert_eq!(out.exit_code, 3);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("fast-ok"));
+    let after = open_shell_count_with_idle_timeout(&counter, &host, marker).await;
+    assert_eq!(after, 0, "shell leaked after a successful bounded call");
+}
+
 /// The cap counts raw bytes as received, before CLIXML is decoded. Tabs are
 /// escaped as `_x0009_` (7 bytes for 1), so this script decodes to ~29 KB of
 /// stderr, under the 64 KiB cap, while the raw CLIXML is ~160 KB, far over it.

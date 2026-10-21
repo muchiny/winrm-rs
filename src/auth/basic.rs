@@ -91,7 +91,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let http = reqwest::Client::new();
+        let http = crate::transport::test_http_client();
         let auth = BasicAuth::new("admin", "pass");
         let result = auth
             .send_authenticated(&http, &server.uri(), "<soap/>".into())
@@ -107,7 +107,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let http = reqwest::Client::new();
+        let http = crate::transport::test_http_client();
         let auth = BasicAuth::new("user", "wrong");
         let err = auth
             .send_authenticated(&http, &server.uri(), "<soap/>".into())
@@ -130,7 +130,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let http = reqwest::Client::new();
+        let http = crate::transport::test_http_client();
         let auth = BasicAuth::new("user", "pass");
         let err = auth
             .send_authenticated(&http, &server.uri(), "<soap/>".into())
@@ -150,7 +150,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let http = reqwest::Client::new();
+        let http = crate::transport::test_http_client();
         let auth = BasicAuth::new("user", "pass");
         let err = auth
             .send_authenticated(&http, &server.uri(), "<soap/>".into())

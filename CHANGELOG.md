@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **TLS now uses `ring` only.** `reqwest` is built with `rustls-no-provider`
+  and `rustls` with `default-features = false`, dropping `aws-lc-rs`,
+  `aws-lc-sys`, `cmake` and `quinn` from the dependency tree (no C toolchain
+  needed). The `ring` crypto provider is installed in `HttpTransport::new`.
+
 ## [1.2.2] - 2026-09-04
 
 CredSSP shipped in 1.2.1; this one makes PSRP shells disconnectable. Found by

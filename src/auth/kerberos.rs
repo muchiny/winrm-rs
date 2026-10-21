@@ -109,7 +109,7 @@ mod tests {
         let auth = KerberosAuth {
             service_principal: "HTTP/test".into(),
         };
-        let http = reqwest::Client::new();
+        let http = crate::transport::test_http_client();
         let result = auth
             .send_authenticated(&http, "http://unused", "body".into())
             .await;

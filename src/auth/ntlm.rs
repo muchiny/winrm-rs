@@ -428,13 +428,19 @@ mod tests {
     #[test]
     fn unseal_body_rejects_short_data_with_exact_boundary() {
         let mut session = NtlmSession::from_auth(&[0u8; 16]);
-        // Marker + sig_len=100 (LE) + only 10 bytes of data + end boundary
+        // Marker + sig_len=100 (LE) + only 10 bytes of data + end boundary,
+        // framed as Windows frames it (boundary right after the payload).
         let mut bad = b"application/octet-stream\r\n".to_vec();
         bad.extend_from_slice(&100u32.to_le_bytes()); // sig_len=100
         bad.extend_from_slice(&[0xAA; 10]); // only 10 bytes (< 100)
-        bad.extend_from_slice(b"\r\n--Encrypted Boundary--\r\n");
+        bad.extend_from_slice(b"--Encrypted Boundary--\r\n");
         let err = unseal_body(&mut session, &bad).unwrap_err();
-        assert!(format!("{err}").contains("too short"));
+        // The framing check, not the 16-byte floor in `NtlmSession::unseal`
+        // (whose message also says "too short").
+        assert!(
+            format!("{err}").contains("data too short for signature"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -462,10 +468,13 @@ mod tests {
         let mut session = NtlmSession::from_auth(&[0u8; 16]);
         let mut data = b"application/octet-stream\r\n".to_vec();
         data.extend_from_slice(&100u32.to_le_bytes());
-        // Empty sealed payload — sealed_data.len() (0) < sig_len (100)
-        data.extend_from_slice(format!("\r\n{ENCRYPTED_BOUNDARY}--").as_bytes());
+        // Empty sealed payload, Windows framing: sealed_data.len() (0) < sig_len (100)
+        data.extend_from_slice(format!("{ENCRYPTED_BOUNDARY}--\r\n").as_bytes());
         let err = unseal_body(&mut session, &data).unwrap_err();
-        assert!(format!("{err}").contains("too short"));
+        assert!(
+            format!("{err}").contains("data too short for signature"),
+            "{err}"
+        );
     }
 
     #[test]

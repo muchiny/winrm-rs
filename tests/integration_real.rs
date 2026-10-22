@@ -3261,3 +3261,337 @@ async fn kerberos_two_commands_on_one_client() {
         );
     }
 }
+
+// === Kerberos over HTTPS (DC bench) ===
+//
+// Needs the DC's HTTPS listener (`setup_dc_https_listener`, once) and the
+// host port `WINRM_TEST_KRB_HTTPS_PORT` forwarded to the DC's 5986 (see
+// tests/vagrant/dc/README.md).
+
+/// BENCH ONLY. Create the DC's WinRM HTTPS listener (self-signed certificate
+/// for `dc.winrm.test`) and open 5986 in its firewall. Idempotent: an
+/// existing HTTPS listener is left as it is. Not undone.
+#[cfg(feature = "kerberos")]
+#[tokio::test]
+#[ignore]
+async fn setup_dc_https_listener() {
+    let (client, host) = kerberos_client_from_env(|_| {});
+    let script = r#"
+        $existing = Get-WSManInstance winrm/config/Listener -SelectorSet @{Address="*"; Transport="HTTPS"} -ErrorAction SilentlyContinue
+        if ($existing) {
+            Write-Output "HTTPS listener already exists"
+        } else {
+            $cert = New-SelfSignedCertificate -DnsName "dc.winrm.test","dc" -CertStoreLocation Cert:\LocalMachine\My
+            New-WSManInstance winrm/config/Listener -SelectorSet @{Address="*"; Transport="HTTPS"} -ValueSet @{CertificateThumbprint=$cert.Thumbprint} | Out-Null
+            Write-Output "HTTPS listener created: $($cert.Thumbprint)"
+        }
+        Remove-NetFirewallRule -DisplayName "WinRM DC HTTPS" -ErrorAction SilentlyContinue
+        New-NetFirewallRule -DisplayName "WinRM DC HTTPS" -Direction Inbound -LocalPort 5986 -Protocol TCP -Action Allow -Profile Any | Out-Null
+        Write-Output "firewall rule WinRM DC HTTPS: 5986/tcp allowed"
+    "#;
+    let output = client
+        .run_powershell(&host, script)
+        .await
+        .expect("set up the DC HTTPS listener");
+    eprintln!("{}", String::from_utf8_lossy(&output.stdout).trim());
+    assert_eq!(
+        output.exit_code,
+        0,
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Kerberos client for the DC's HTTPS listener (self-signed certificate, so
+/// `accept_invalid_certs`), on the host port `WINRM_TEST_KRB_HTTPS_PORT`.
+#[cfg(feature = "kerberos")]
+fn kerberos_https_client_from_env(tweak: impl FnOnce(&mut WinrmConfig)) -> (WinrmClient, String) {
+    let port: u16 = std::env::var("WINRM_TEST_KRB_HTTPS_PORT")
+        .expect(
+            "export WINRM_TEST_KRB_HTTPS_PORT (vm-connect-dc.sh) and run setup_dc_https_listener",
+        )
+        .parse()
+        .expect("WINRM_TEST_KRB_HTTPS_PORT must be a port number");
+    kerberos_client_from_env(|c| {
+        c.use_tls = true;
+        c.accept_invalid_certs = true;
+        c.port = port;
+        tweak(c);
+    })
+}
+
+/// `AuthMethod::Kerberos` over HTTPS: TLS protects the messages, the
+/// Kerberos token authenticates the request (SPN `HTTP/dc.winrm.test`, the
+/// same as over HTTP).
+#[cfg(feature = "kerberos")]
+#[tokio::test]
+#[ignore]
+async fn kerberos_over_https_whoami() {
+    let (client, host) = kerberos_https_client_from_env(|_| {});
+    let output = client
+        .run_command(&host, "whoami", &[])
+        .await
+        .expect("kerberos whoami over https");
+    assert_eq!(output.exit_code, 0);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
+    assert!(
+        stdout.contains("winrm\\vagrant"),
+        "expected WINRM\\vagrant, got: {stdout:?}"
+    );
+}
+
+// === Kerberos with `AllowUnencrypted = false` on the DC ===
+//
+// The DC bench runs with `AllowUnencrypted = true`. These tests flip it to
+// `false` for their own duration and restore it afterwards, even when they
+// fail. They change server state that the other Kerberos tests see, so run
+// them on their own:
+//
+//   cargo test --features kerberos --test integration_real allow_unencrypted_false -- --ignored --test-threads=1
+
+/// Read or set the DC's `AllowUnencrypted` through `client`; returns the
+/// value read after the optional change.
+#[cfg(feature = "kerberos")]
+async fn dc_allow_unencrypted(
+    client: &WinrmClient,
+    host: &str,
+    set: Option<bool>,
+) -> Result<bool, WinrmError> {
+    let script = match set {
+        Some(v) => format!(
+            "Set-Item WSMan:\\localhost\\Service\\AllowUnencrypted ${v}; \
+             (Get-Item WSMan:\\localhost\\Service\\AllowUnencrypted).Value"
+        ),
+        None => "(Get-Item WSMan:\\localhost\\Service\\AllowUnencrypted).Value".to_string(),
+    };
+    let out = client.run_powershell(host, &script).await?;
+    let text = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .to_ascii_lowercase();
+    match text.as_str() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(WinrmError::Transfer(format!(
+            "unexpected AllowUnencrypted output {other:?}, stderr {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        ))),
+    }
+}
+
+/// NTLM-sealed client to the DC over HTTP: independent of the Kerberos code
+/// under test, and it works whatever `AllowUnencrypted` says. Used to restore
+/// the bench.
+#[cfg(feature = "kerberos")]
+fn dc_ntlm_sealed_client() -> (WinrmClient, String) {
+    let (_, host) = kerberos_client_from_env(|_| {});
+    let port: u16 = std::env::var("WINRM_TEST_KRB_PORT")
+        .expect("WINRM_TEST_KRB_PORT")
+        .parse()
+        .expect("WINRM_TEST_KRB_PORT must be a port number");
+    let config = WinrmConfig {
+        auth_method: AuthMethod::Ntlm,
+        encryption: EncryptionMode::Always,
+        port,
+        ..Default::default()
+    };
+    let client = WinrmClient::new(config, WinrmCredentials::new("vagrant", "vagrant", "WINRM"))
+        .expect("build NTLM client");
+    (client, host)
+}
+
+/// Run `body` with `AllowUnencrypted = false` on the DC, then restore `true`
+/// whatever happened (a panic in `body` included), and re-raise `body`'s
+/// panic after the restore. The flip goes through an unencrypted Kerberos
+/// request, accepted while the server still allows it; the restore through
+/// an NTLM-sealed one, accepted either way.
+#[cfg(feature = "kerberos")]
+async fn with_dc_requiring_encryption<F, Fut>(body: F)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let (plain, host) = kerberos_client_from_env(|c| c.encryption = EncryptionMode::Never);
+    assert!(
+        dc_allow_unencrypted(&plain, &host, None)
+            .await
+            .expect("read AllowUnencrypted over unencrypted Kerberos"),
+        "the DC bench must start with AllowUnencrypted = true"
+    );
+    // The answer to the flip may already be refused: check through NTLM.
+    let flipped = dc_allow_unencrypted(&plain, &host, Some(false)).await;
+    eprintln!("flip to false over unencrypted Kerberos: {flipped:?}");
+    let (ntlm, ntlm_host) = dc_ntlm_sealed_client();
+    let now = dc_allow_unencrypted(&ntlm, &ntlm_host, None).await;
+    let outcome = if matches!(now, Ok(false)) {
+        tokio::spawn(body()).await
+    } else {
+        Ok(())
+    };
+    let restored = dc_allow_unencrypted(&ntlm, &ntlm_host, Some(true)).await;
+    eprintln!("restore AllowUnencrypted = true over NTLM sealing: {restored:?}");
+    assert!(
+        matches!(restored, Ok(true)),
+        "RESTORE FAILED: set AllowUnencrypted back to true by hand: {restored:?}"
+    );
+    assert!(
+        matches!(now, Ok(false)),
+        "AllowUnencrypted did not become false: {now:?}"
+    );
+    if let Err(e) = outcome {
+        std::panic::resume_unwind(e.into_panic());
+    }
+}
+
+/// Measured: with `AllowUnencrypted = false`, an unencrypted Kerberos
+/// request over HTTP gets an HTTP 500 with an empty body. The client reports
+/// it with a hint at the cause instead of an opaque `HTTP 500`.
+#[cfg(feature = "kerberos")]
+#[tokio::test]
+#[ignore]
+async fn kerberos_unsealed_with_allow_unencrypted_false_is_a_clear_error() {
+    with_dc_requiring_encryption(|| async {
+        let (client, host) = kerberos_client_from_env(|c| c.encryption = EncryptionMode::Never);
+        let err = client
+            .run_command(&host, "whoami", &[])
+            .await
+            .expect_err("an unencrypted Kerberos request must be refused");
+        let text = err.to_string();
+        eprintln!("unsealed Kerberos, AllowUnencrypted = false: {err:?}");
+        assert!(
+            text.contains("AllowUnencrypted"),
+            "error should point at AllowUnencrypted: {text}"
+        );
+    })
+    .await;
+}
+
+/// Kerberos client on plain HTTP with the default `EncryptionMode::Auto`
+/// (sealed), connected to the DC through a `RecordingForwarder`. The host
+/// string stays `dc.winrm.test` (it names the service principal); only the
+/// port points at the forwarder, which relays to the DC bench port.
+#[cfg(feature = "kerberos")]
+async fn sealed_kerberos_client(
+    tweak: impl FnOnce(&mut WinrmConfig),
+) -> (WinrmClient, RecordingForwarder, String) {
+    assert_eq!(WinrmConfig::default().encryption, EncryptionMode::Auto);
+    let dc_port = std::env::var("WINRM_TEST_KRB_PORT").expect("WINRM_TEST_KRB_PORT");
+    let forwarder = RecordingForwarder::start(format!("127.0.0.1:{dc_port}")).await;
+    let port = forwarder.addr.port();
+    let (client, host) = kerberos_client_from_env(|c| {
+        c.port = port;
+        tweak(c);
+    });
+    (client, forwarder, host)
+}
+
+/// Requests that went out sealed, as seen by `forwarder`, after checking
+/// what holds for a Kerberos-sealed client: no request body crossed
+/// unsealed, the authentication request carried no body, and each
+/// connection authenticated once (one `Negotiate` request per connection).
+#[cfg(feature = "kerberos")]
+fn kerberos_sealed_traffic(forwarder: &RecordingForwarder) -> usize {
+    let requests = forwarder.requests();
+    let sealed = requests.iter().filter(|r| r.sealed).count();
+    let negotiate = forwarder.count_to_server("Authorization: Negotiate");
+    let connections = forwarder.connections();
+    let handshake_bodies: usize = requests
+        .iter()
+        .filter(|r| r.authorization)
+        .map(|r| r.body_len)
+        .sum();
+    eprintln!(
+        "connections: {connections}, requests: {}, sealed: {sealed}, Negotiate: {negotiate}, \
+         plaintext bodies: {}",
+        requests.len(),
+        forwarder.plaintext_bodies()
+    );
+    assert_eq!(
+        forwarder.plaintext_bodies(),
+        0,
+        "a request body crossed unsealed"
+    );
+    assert_eq!(
+        handshake_bodies, 0,
+        "the authentication request carried a body"
+    );
+    assert_eq!(negotiate, connections, "one authentication per connection");
+    sealed
+}
+
+/// Kerberos message encryption against a server that requires it
+/// (`AllowUnencrypted = false`): a command, a 200 KB upload and download
+/// round trip, and a silent command whose `TimedOut` faults come back
+/// sealed. Every SOAP body crosses sealed, each connection authenticates once.
+#[cfg(feature = "kerberos")]
+#[tokio::test]
+#[ignore]
+async fn kerberos_sealed_with_allow_unencrypted_false() {
+    with_dc_requiring_encryption(|| async {
+        let (client, forwarder, host) = sealed_kerberos_client(|_| {}).await;
+        let output = client
+            .run_command(&host, "whoami", &[])
+            .await
+            .expect("sealed kerberos whoami");
+        assert_eq!(output.exit_code, 0);
+        let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
+        assert!(stdout.contains("winrm\\vagrant"), "got {stdout:?}");
+
+        // 200 001 varied bytes: about a hundred upload chunks, several
+        // sealed Receive answers for the download.
+        let content: Vec<u8> = (0u32..200_001)
+            .map(|i| u8::try_from((i.wrapping_mul(2_654_435_761) >> 24) & 0xFF).unwrap_or(0))
+            .collect();
+        let local_upload = std::env::temp_dir().join("winrm_rs_krb_sealed_upload.bin");
+        let local_download = std::env::temp_dir().join("winrm_rs_krb_sealed_download.bin");
+        std::fs::write(&local_upload, &content).expect("write local file");
+        let remote_path = r"C:\Windows\Temp\winrm_rs_krb_sealed_large_test.bin";
+        let up = client
+            .upload_file(&host, &local_upload, remote_path)
+            .await
+            .expect("upload over sealed Kerberos");
+        assert_eq!(up, content.len() as u64);
+        let down = client
+            .download_file(&host, remote_path, &local_download)
+            .await
+            .expect("download over sealed Kerberos");
+        assert_eq!(down, content.len() as u64);
+        let downloaded = std::fs::read(&local_download).expect("read downloaded file");
+        assert!(downloaded == content, "sealed round-trip mismatch");
+        let _ = client
+            .run_powershell(&host, &format!("Remove-Item '{remote_path}' -Force"))
+            .await;
+        let _ = std::fs::remove_file(&local_upload);
+        let _ = std::fs::remove_file(&local_download);
+        let sealed = kerberos_sealed_traffic(&forwarder);
+        assert!(
+            sealed >= 300,
+            "expected hundreds of sealed requests, got {sealed}"
+        );
+
+        let (silent, silent_forwarder, host) =
+            sealed_kerberos_client(|c| c.operation_timeout_secs = SILENT_OP_SECS).await;
+        assert_silent_command_completes(&silent, &host).await;
+        kerberos_sealed_traffic(&silent_forwarder);
+        assert!(
+            silent_forwarder.count_to_client("HTTP/1.1 500") >= 1,
+            "expected sealed TimedOut faults (HTTP 500)"
+        );
+    })
+    .await;
+}
+
+/// `EncryptionMode::Always` seals Kerberos over HTTPS too, inside TLS (the
+/// server accepting the sealed requests is the evidence; the wire is TLS).
+#[cfg(feature = "kerberos")]
+#[tokio::test]
+#[ignore]
+async fn kerberos_encryption_always_over_https() {
+    let (client, host) = kerberos_https_client_from_env(|c| c.encryption = EncryptionMode::Always);
+    let output = client
+        .run_command(&host, "whoami", &[])
+        .await
+        .expect("kerberos whoami sealed inside https");
+    assert_eq!(output.exit_code, 0);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
+    assert!(stdout.contains("winrm\\vagrant"), "got {stdout:?}");
+}

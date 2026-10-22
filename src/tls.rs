@@ -32,15 +32,16 @@ use crate::error::WinrmError;
 /// It can also be pinned ([`CertHandle::pin`], only when it has a target):
 /// from then on a handshake with `target` that presents any other end-entity
 /// certificate is refused, and so is a handshake for any server name other
-/// than `target` and the HTTPS proxy's (see [`Self::with_proxy`]), so no HTTP
+/// than `target` and the HTTPS proxies' (see [`Self::with_proxies`]), so no HTTP
 /// byte goes out on such a connection. Kerberos over TLS pins the
 /// certificate its channel binding was computed for.
 #[derive(Debug)]
 pub(crate) struct CertCapturingVerifier {
     inner: Arc<dyn ServerCertVerifier>,
     target: Option<ServerName<'static>>,
-    /// Server name of an `https://` proxy: its handshake stays unpinned.
-    proxy: Option<ServerName<'static>>,
+    /// Server names of the `https://` proxies the client may go through:
+    /// their own handshakes stay unpinned.
+    proxies: Vec<ServerName<'static>>,
     captured: Arc<Mutex<Captured>>,
     pinned: Arc<Mutex<Option<Vec<u8>>>>,
 }
@@ -111,16 +112,17 @@ impl CertCapturingVerifier {
         Self {
             inner,
             target,
-            proxy: None,
+            proxies: Vec::new(),
             captured: Arc::new(Mutex::new(Captured::None)),
             pinned: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// The server name of the client's `https://` proxy, whose own TLS
-    /// handshake goes through this verifier too and is never pinned.
-    pub(crate) fn with_proxy(mut self, proxy: Option<ServerName<'static>>) -> Self {
-        self.proxy = proxy;
+    /// The server names of the `https://` proxies the client may go
+    /// through, whose own TLS handshakes go through this verifier too and
+    /// are never pinned (they are still verified by the inner verifier).
+    pub(crate) fn with_proxies(mut self, proxies: Vec<ServerName<'static>>) -> Self {
+        self.proxies = proxies;
         self
     }
 
@@ -159,9 +161,12 @@ impl ServerCertVerifier for CertCapturingVerifier {
             // Not the WinRM host: the HTTPS proxy's own handshake, which is
             // neither recorded nor pinned. Once pinned, any other name is
             // refused.
-            if pinned.is_some() && self.proxy.as_ref() != Some(server_name) {
+            if pinned.is_some() && !self.proxies.contains(server_name) {
                 return Err(PinMismatch::refuse(
-                    "TLS server name differs from the pinned endpoint's; refusing the handshake",
+                    "TLS server name differs from the pinned endpoint's (an HTTPS proxy that \
+                     is neither `WinrmConfig::proxy` nor taken from HTTPS_PROXY / ALL_PROXY, \
+                     such as a system proxy setting, is not supported here); refusing the \
+                     handshake",
                 ));
             }
             return Ok(verified);
@@ -589,7 +594,7 @@ mod tests {
     fn pinned_verifier_leaves_the_proxy_leg_unpinned() {
         let verifier =
             CertCapturingVerifier::new(Arc::new(AcceptAllVerifier), Some(target("winrm.host")))
-                .with_proxy(Some(target("proxy.host")));
+                .with_proxies(vec![target("proxy.host"), target("all.proxy.host")]);
         let handle = verifier.cert_handle();
         handle.pin(vec![7, 7]).unwrap();
         let other = CertificateDer::from(vec![9]);
@@ -597,6 +602,7 @@ mod tests {
             verifier.verify_server_cert(&other, &[], &target(name), &[], UnixTime::now())
         };
         assert!(verify("proxy.host").is_ok(), "proxy leg");
+        assert!(verify("all.proxy.host").is_ok(), "second proxy leg");
         for name in ["winrm.host", "evil.host"] {
             let err = verify(name).unwrap_err();
             assert!(is_pin_mismatch(&err), "{name}: {err:?}");

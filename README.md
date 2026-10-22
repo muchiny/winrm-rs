@@ -107,7 +107,10 @@ computed for the certificate learnt on an unauthenticated probe request;
 that certificate is then pinned in the connection's verifier, so the
 AP-REQ's connection, and every later one, presents that same certificate or
 fails at its TLS handshake (any other server name than the endpoint's, the
-`https://` proxy's own leg aside, is refused too; a host that is no valid
+`https://` proxy's own leg aside, is refused too: the proxy of
+`WinrmConfig::proxy`, else any `https://` proxy in `HTTPS_PROXY` /
+`ALL_PROXY`; a proxy from system settings, which reqwest only reads when a
+crate in the build enables its `system-proxy` feature, is refused; a host that is no valid
 TLS server name once the URL is parsed is refused before the AP-REQ). Accepted by `CbtHardeningLevel = Strict`; a
 server certificate with no binding hash (Ed25519, unknown algorithm) is
 refused. `EncryptionMode::Never` over plain HTTP has none of this.

@@ -86,6 +86,15 @@ pub struct WinrmConfig {
     /// bytes: TLS, and the certificate, stay end-to-end with the WinRM host.
     /// The same applies to a proxy taken from the `HTTPS_PROXY` / `ALL_PROXY`
     /// environment variables, which `reqwest` uses when this field is `None`.
+    ///
+    /// Kerberos over HTTPS pins the server certificate in the connection's
+    /// verifier and refuses a TLS handshake for any other server name than
+    /// the endpoint's, except an `https://` proxy's own: this one, else any
+    /// `https://` proxy named in `HTTPS_PROXY`, `https_proxy`, `ALL_PROXY` or
+    /// `all_proxy`. A proxy that `reqwest` takes from system settings (only
+    /// when a crate in the build enables its `system-proxy` feature: Windows
+    /// registry, macOS configuration) is refused with an error naming that
+    /// cause; set it here instead.
     pub proxy: Option<String>,
     /// Console output code page (default: 65001 = UTF-8).
     ///

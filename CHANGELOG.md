@@ -401,7 +401,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the handshake carried (raw caller host versus parsed URL host: IDN,
   short or octal IPv4, `win01?x`): the target now comes from the parsed
   URL, a pin without a target is refused, and a pinned verifier refuses
-  any other server name except the proxy's own leg.
+  any other server name except the proxy's own leg: `WinrmConfig::proxy`,
+  or when it is `None`, any `https://` proxy named in `HTTPS_PROXY` /
+  `ALL_PROXY` (and their lowercase forms), which reqwest uses then and
+  which the first version refused. A proxy reqwest takes from system
+  settings (its `system-proxy` feature, off in this crate) stays refused,
+  with an error naming that cause.
 - **NTLM message sealing no longer falls back to plaintext, and the client
   sends each sealed request once.** With `EncryptionMode::Auto` over HTTP or
   `Always`: the handshake that sets up sealing ends with an empty Type 3

@@ -263,6 +263,42 @@ fn url_server_name(url: &str) -> Option<rustls::pki_types::ServerName<'static>> 
     rustls::pki_types::ServerName::try_from(host.to_string()).ok()
 }
 
+/// Server names of the `https://` proxies a client built from `config` may
+/// do a TLS handshake with, for the pinned verifier's proxy exception:
+/// [`WinrmConfig::proxy`] when set (reqwest then ignores the environment),
+/// else every `https://` proxy in `HTTPS_PROXY`, `https_proxy`, `ALL_PROXY`
+/// or `all_proxy`, read through `var`.
+///
+/// For the environment this is a superset of what reqwest uses (it takes
+/// the first of each pair, prefers `HTTPS_PROXY` over `ALL_PROXY` for an
+/// `https://` endpoint, and skips the proxy for hosts in `NO_PROXY`): a
+/// name listed here that reqwest does not use is never the name of a
+/// handshake, since the dedicated client only connects to the endpoint (no
+/// redirects) and to its proxy, so the extra exception is inert. `http://`,
+/// scheme-less (taken as `http://`) and SOCKS proxies only relay bytes and
+/// do no TLS of their own. A proxy from system settings (reqwest's
+/// `system-proxy` feature, off in this crate's build) is not covered: the
+/// pin refuses its handshake.
+fn proxy_server_names(
+    config: &WinrmConfig,
+    var: impl Fn(&str) -> Option<String>,
+) -> Vec<rustls::pki_types::ServerName<'static>> {
+    if let Some(proxy) = config.proxy.as_deref() {
+        return url_server_name(proxy).into_iter().collect();
+    }
+    ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]
+        .into_iter()
+        .filter_map(var)
+        .filter(|value| {
+            value
+                .trim()
+                .get(..8)
+                .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+        })
+        .filter_map(|value| url_server_name(value.trim()))
+        .collect()
+}
+
 /// Strip scheme, userinfo, port, and path from a host string.
 ///
 /// Defensive: callers are supposed to pass `"hostname"` or `"10.0.0.1"`,
@@ -748,7 +784,14 @@ impl HttpTransport {
                     Arc::clone(verifier),
                     url_server_name(&self.endpoint(host)),
                 )
-                .with_proxy(self.config.proxy.as_deref().and_then(url_server_name));
+                .with_proxies(proxy_server_names(&self.config, |name| {
+                    // Tests build their clients without environment proxies.
+                    if cfg!(test) {
+                        None
+                    } else {
+                        std::env::var(name).ok()
+                    }
+                }));
                 let handle = capturing.cert_handle();
                 let mut config = base.clone();
                 config
@@ -2058,6 +2101,47 @@ mod tests {
         let creds = WinrmCredentials::new("u", "p", "");
         let result = HttpTransport::new(config, creds);
         assert!(result.is_err(), "expected error for invalid proxy URL");
+    }
+
+    /// The pinned verifier's proxy exception covers the configured proxy,
+    /// else the `https://` proxies of the environment (reqwest uses them
+    /// when `WinrmConfig::proxy` is `None`); proxies without TLS of their
+    /// own add nothing.
+    #[test]
+    fn proxy_server_names_cover_the_configured_or_environment_https_proxies() {
+        use rustls::pki_types::ServerName;
+        let name = |n: &str| ServerName::try_from(n.to_string()).unwrap();
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |key: &str| {
+                vars.iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| (*v).to_string())
+            }
+        };
+        let none = WinrmConfig::default();
+        assert_eq!(
+            proxy_server_names(
+                &none,
+                env(&[
+                    ("HTTPS_PROXY", "https://user:pw@proxy.corp:3128"),
+                    ("all_proxy", " HTTPS://All.Corp/ "),
+                    ("https_proxy", "http://plain.corp:3128"),
+                    ("ALL_PROXY", "socks5://socks.corp:1080"),
+                ])
+            ),
+            vec![name("proxy.corp"), name("all.corp")]
+        );
+        assert!(proxy_server_names(&none, env(&[("HTTPS_PROXY", "proxy.corp:3128")])).is_empty());
+        assert!(proxy_server_names(&none, env(&[])).is_empty());
+        let explicit = WinrmConfig {
+            proxy: Some("http://explicit.corp:8080".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            proxy_server_names(&explicit, env(&[("HTTPS_PROXY", "https://proxy.corp")])),
+            vec![name("explicit.corp")],
+            "an explicit proxy makes reqwest ignore the environment"
+        );
     }
 
     #[test]

@@ -794,6 +794,16 @@ async fn max_output_bytes_counts_raw_clixml_stderr() {
     const CAP: usize = 64 * 1024;
     const SCRIPT: &str = "1..40 | % { Write-Error ([string][char]9 * 500) }";
 
+    if is_server_2012_r2().await {
+        eprintln!(
+            "SKIP max_output_bytes_counts_raw_clixml_stderr: PowerShell 4.0 on Server \
+             2012 R2 renders each Write-Error with the source statement and 80-column \
+             padding (about 2.3 KB per error instead of 0.7 KB), so the decoded stderr \
+             no longer fits under the cap and the precondition of this test cannot hold"
+        );
+        return;
+    }
+
     // Precondition: uncapped, the decoded stderr fits under the cap.
     let (uncapped, host) = test_client_with(|c| c.max_output_bytes = None)
         .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
@@ -1884,6 +1894,12 @@ async fn ntlm_encryption_always_over_https() {
 #[tokio::test]
 #[ignore]
 async fn silent_command_completes_over_certificate_auth() {
+    if is_server_2012_r2().await {
+        eprintln!(
+            "SKIP silent_command_completes_over_certificate_auth: no TLS cipher suite shared with Server 2012 R2 (see basic_over_https_works)"
+        );
+        return;
+    }
     let (client, host) =
         cert_client_from_env("WINRM_TEST_CLIENT_CERT", "WINRM_TEST_CLIENT_KEY", |c| {
             c.operation_timeout_secs = SILENT_OP_SECS
@@ -2226,6 +2242,12 @@ async fn http_proxy_carries_ntlm_over_http() {
 #[tokio::test]
 #[ignore]
 async fn http_proxy_connect_carries_https() {
+    if is_server_2012_r2().await {
+        eprintln!(
+            "SKIP http_proxy_connect_carries_https: no TLS cipher suite shared with Server 2012 R2 (see basic_over_https_works)"
+        );
+        return;
+    }
     let proxy = TestProxy::http().await;
     let proxy_url = format!("http://{}", proxy.addr);
     let (client, host) = test_client_with(|c| {
@@ -3084,6 +3106,15 @@ fn test_client_rogue_cert() -> Option<(WinrmClient, String)> {
 #[ignore]
 async fn setup_certificate_auth() {
     use base64::Engine as _;
+    if is_server_2012_r2().await {
+        eprintln!(
+            "SKIP setup_certificate_auth: Server 2012 R2 cannot do certificate \
+             authentication here: its HTTPS listener shares no TLS cipher suite with \
+             rustls (see basic_over_https_works) and `netsh http update sslcert ... \
+             clientcertnegotiation=enable` does not exist on that release"
+        );
+        return;
+    }
     let (client, host) = test_client_ntlm().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let ca_path = cert_auth_ca_path().expect("set WINRM_TEST_CLIENT_CERT (make-client-cert.sh)");
     let ca_pem = std::fs::read_to_string(&ca_path)
@@ -3199,6 +3230,12 @@ if ($Matches[1] -ne 'Enabled') { exit 3 }
 #[tokio::test]
 #[ignore]
 async fn certificate_auth_whoami() {
+    if is_server_2012_r2().await {
+        eprintln!(
+            "SKIP certificate_auth_whoami: no TLS cipher suite shared with Server 2012 R2 (see basic_over_https_works)"
+        );
+        return;
+    }
     let (client, host) = test_client_cert()
         .expect("set WINRM_TEST_HOST, WINRM_TEST_PASS and eval tests/scripts/make-client-cert.sh");
     let out = client
@@ -3227,6 +3264,12 @@ async fn certificate_auth_whoami() {
 #[tokio::test]
 #[ignore]
 async fn certificate_auth_unmapped_cert_is_rejected() {
+    if is_server_2012_r2().await {
+        eprintln!(
+            "SKIP certificate_auth_unmapped_cert_is_rejected: no TLS cipher suite shared with Server 2012 R2 (see basic_over_https_works)"
+        );
+        return;
+    }
     const BENCH: &str =
         "set WINRM_TEST_HOST, WINRM_TEST_PASS and eval tests/scripts/make-client-cert.sh";
     let (mapped, host) = test_client_cert().expect(BENCH);

@@ -108,14 +108,17 @@ pub(crate) fn peer_certificate(
 /// (see [`crate::tls::CertHandle::pin`]): that one is reported as such, as
 /// an authentication failure, nothing having been sent.
 pub(crate) fn send_error(e: reqwest::Error) -> WinrmError {
-    let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(&e);
-    while let Some(cause) = source {
-        if cause.to_string().contains("(pinned)") {
-            return WinrmError::AuthFailed(format!(
-                "TLS handshake refused: {cause}; nothing was sent on that connection"
-            ));
+    if crate::tls::is_pin_mismatch(&e) {
+        let mut detail = String::new();
+        let mut source = std::error::Error::source(&e);
+        while let Some(cause) = source {
+            detail = cause.to_string();
+            source = cause.source();
         }
-        source = cause.source();
+        return WinrmError::AuthFailed(format!(
+            "TLS handshake refused by the pinned certificate check: {detail}; nothing was sent \
+             on that connection"
+        ));
     }
     WinrmError::Http(e)
 }

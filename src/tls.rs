@@ -29,16 +29,64 @@ use crate::error::WinrmError;
 /// the same one; otherwise the certificate of a given connection cannot be
 /// told.
 ///
-/// It can also be pinned ([`CertHandle::pin`]): from then on a handshake with
-/// `target` that presents any other end-entity certificate is refused, so no
-/// HTTP byte goes out on that connection. Kerberos over TLS pins the
+/// It can also be pinned ([`CertHandle::pin`], only when it has a target):
+/// from then on a handshake with `target` that presents any other end-entity
+/// certificate is refused, and so is a handshake for any server name other
+/// than `target` and the HTTPS proxy's (see [`Self::with_proxy`]), so no HTTP
+/// byte goes out on such a connection. Kerberos over TLS pins the
 /// certificate its channel binding was computed for.
 #[derive(Debug)]
 pub(crate) struct CertCapturingVerifier {
     inner: Arc<dyn ServerCertVerifier>,
     target: Option<ServerName<'static>>,
+    /// Server name of an `https://` proxy: its handshake stays unpinned.
+    proxy: Option<ServerName<'static>>,
     captured: Arc<Mutex<Captured>>,
     pinned: Arc<Mutex<Option<Vec<u8>>>>,
+}
+
+/// Why a pinned [`CertCapturingVerifier`] refused a handshake, carried as
+/// `rustls::Error::Other` so callers can recognise it by type.
+#[derive(Debug)]
+pub(crate) struct PinMismatch(&'static str);
+
+impl std::fmt::Display for PinMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for PinMismatch {}
+
+impl PinMismatch {
+    fn refuse(why: &'static str) -> Error {
+        Error::Other(rustls::OtherError(Arc::new(Self(why))))
+    }
+}
+
+/// Whether `err`, or an error it wraps (an `std::io::Error` around a
+/// `rustls::Error`, ...), is a [`PinMismatch`].
+pub(crate) fn is_pin_mismatch(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(err);
+    while let Some(e) = current {
+        if e.is::<PinMismatch>() {
+            return true;
+        }
+        if let Some(Error::Other(other)) = e.downcast_ref::<Error>()
+            && other.0.is::<PinMismatch>()
+        {
+            return true;
+        }
+        if let Some(inner) = e
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+            && is_pin_mismatch(inner)
+        {
+            return true;
+        }
+        current = e.source();
+    }
+    false
 }
 
 /// Certificates a [`CertCapturingVerifier`] has accepted.
@@ -63,9 +111,17 @@ impl CertCapturingVerifier {
         Self {
             inner,
             target,
+            proxy: None,
             captured: Arc::new(Mutex::new(Captured::None)),
             pinned: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// The server name of the client's `https://` proxy, whose own TLS
+    /// handshake goes through this verifier too and is never pinned.
+    pub(crate) fn with_proxy(mut self, proxy: Option<ServerName<'static>>) -> Self {
+        self.proxy = proxy;
+        self
     }
 
     /// Return a clone-able handle to read what was recorded and to pin.
@@ -73,6 +129,7 @@ impl CertCapturingVerifier {
         CertHandle {
             captured: Arc::clone(&self.captured),
             pinned: Arc::clone(&self.pinned),
+            has_target: self.target.is_some(),
         }
     }
 }
@@ -93,20 +150,28 @@ impl ServerCertVerifier for CertCapturingVerifier {
             ocsp_response,
             now,
         )?;
-        if self.target.as_ref() != Some(server_name) {
-            return Ok(verified);
-        }
-        if let Some(pin) = self
+        let pinned = self
             .pinned
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_deref()
-            && pin != end_entity.as_ref()
+            .clone();
+        if self.target.as_ref() != Some(server_name) {
+            // Not the WinRM host: the HTTPS proxy's own handshake, which is
+            // neither recorded nor pinned. Once pinned, any other name is
+            // refused.
+            if pinned.is_some() && self.proxy.as_ref() != Some(server_name) {
+                return Err(PinMismatch::refuse(
+                    "TLS server name differs from the pinned endpoint's; refusing the handshake",
+                ));
+            }
+            return Ok(verified);
+        }
+        if let Some(pin) = pinned
+            && pin.as_slice() != end_entity.as_ref()
         {
-            return Err(Error::General(
+            return Err(PinMismatch::refuse(
                 "server certificate differs from the one this connection's channel binding was \
-                 computed for (pinned); refusing the handshake"
-                    .into(),
+                 computed for (pinned); refusing the handshake",
             ));
         }
         // A panic while the lock was held would leave it poisoned. The writer
@@ -154,6 +219,8 @@ impl ServerCertVerifier for CertCapturingVerifier {
 pub(crate) struct CertHandle {
     captured: Arc<Mutex<Captured>>,
     pinned: Arc<Mutex<Option<Vec<u8>>>>,
+    /// The verifier has a target server name, so a pin can take effect.
+    has_target: bool,
 }
 
 impl CertHandle {
@@ -168,13 +235,25 @@ impl CertHandle {
     /// that present another end-entity certificate fail.
     // Only Kerberos pins (and the tests); `expect` would be unfulfilled in
     // test builds without the feature.
+    ///
+    /// Fails, pinning nothing, when the verifier has no target server name
+    /// (the endpoint host is not a valid TLS server name): a pin could then
+    /// not take effect, and the caller must not go on as if it did.
     #[cfg_attr(not(feature = "kerberos"), allow(dead_code))]
-    pub(crate) fn pin(&self, cert_der: Vec<u8>) {
+    pub(crate) fn pin(&self, cert_der: Vec<u8>) -> Result<(), WinrmError> {
+        if !self.has_target {
+            return Err(WinrmError::AuthFailed(
+                "TLS: the endpoint host is not a valid TLS server name, so the server \
+                 certificate cannot be pinned; refusing to authenticate"
+                    .into(),
+            ));
+        }
         // A poisoned lock still holds a consistent value: set it anyway.
         *self
             .pinned
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cert_der);
+        Ok(())
     }
 
     /// The pinned certificate, if any.
@@ -191,6 +270,7 @@ impl CertHandle {
         Self {
             captured: Arc::new(Mutex::new(captured)),
             pinned: Arc::new(Mutex::new(None)),
+            has_target: true,
         }
     }
 }
@@ -492,16 +572,63 @@ mod tests {
                 .is_ok()
         };
         assert!(check(&other, "winrm.host"), "nothing pinned yet");
-        handle.pin(bound.to_vec());
+        handle.pin(bound.to_vec()).unwrap();
         assert_eq!(handle.pinned(), Some(vec![7, 7]));
         assert!(check(&bound, "winrm.host"));
         assert!(
             !check(&other, "winrm.host"),
             "another certificate is refused"
         );
+        assert!(!check(&other, "proxy.host"), "no proxy configured: refused");
+    }
+
+    /// The configured proxy's handshake stays unpinned; the origin's other
+    /// certificates and any other name are refused, as a typed
+    /// [`PinMismatch`].
+    #[test]
+    fn pinned_verifier_leaves_the_proxy_leg_unpinned() {
+        let verifier =
+            CertCapturingVerifier::new(Arc::new(AcceptAllVerifier), Some(target("winrm.host")))
+                .with_proxy(Some(target("proxy.host")));
+        let handle = verifier.cert_handle();
+        handle.pin(vec![7, 7]).unwrap();
+        let other = CertificateDer::from(vec![9]);
+        let verify = |name: &str| {
+            verifier.verify_server_cert(&other, &[], &target(name), &[], UnixTime::now())
+        };
+        assert!(verify("proxy.host").is_ok(), "proxy leg");
+        for name in ["winrm.host", "evil.host"] {
+            let err = verify(name).unwrap_err();
+            assert!(is_pin_mismatch(&err), "{name}: {err:?}");
+            let wrapped = std::io::Error::new(std::io::ErrorKind::InvalidData, err);
+            assert!(is_pin_mismatch(&wrapped), "{name}: wrapped in io::Error");
+        }
+        assert!(!is_pin_mismatch(&Error::General("other".into())));
+    }
+
+    /// Without a target server name the pin cannot take effect: refused.
+    #[test]
+    fn pin_without_a_target_is_refused() {
+        let verifier = CertCapturingVerifier::new(Arc::new(AcceptAllVerifier), None);
+        let handle = verifier.cert_handle();
+        assert!(handle.pin(vec![1]).is_err());
+        assert_eq!(handle.pinned(), None);
+    }
+
+    /// Once pinned, a handshake for a server name other than the target is
+    /// refused too: only the target's (pinned) and the proxy's are allowed.
+    #[test]
+    fn pinned_verifier_refuses_any_other_server_name() {
+        let verifier =
+            CertCapturingVerifier::new(Arc::new(AcceptAllVerifier), Some(target("winrm.host")));
+        let handle = verifier.cert_handle();
+        handle.pin(vec![7, 7]).unwrap();
+        let other = CertificateDer::from(vec![7, 7]);
         assert!(
-            check(&other, "proxy.host"),
-            "the proxy's handshake is not pinned"
+            verifier
+                .verify_server_cert(&other, &[], &target("evil.host"), &[], UnixTime::now())
+                .is_err(),
+            "a pinned verifier waved through another server name"
         );
     }
 

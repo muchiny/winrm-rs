@@ -247,16 +247,20 @@ pub(crate) fn max_response_bytes(config: &WinrmConfig) -> usize {
         .saturating_mul(4)
 }
 
-/// The TLS server name of a WinRM host, as `reqwest` sends it for the
-/// endpoint URL (the sanitized host, without IPv6 brackets).
-fn target_name(host: &str) -> Option<rustls::pki_types::ServerName<'static>> {
-    let host = sanitize_host(host);
+/// The TLS server name `reqwest` hands the certificate verifier for `url`:
+/// the host of the URL once parsed (`url` normalises it: IDN to punycode,
+/// short or octal IPv4 forms to dotted quads, `?` or `\\` ending the host),
+/// without IPv6 brackets, as hyper-rustls's default resolver takes it from
+/// the request URI that `reqwest` builds from the same parsed URL. `None`
+/// when the URL has no host that is a valid TLS server name.
+fn url_server_name(url: &str) -> Option<rustls::pki_types::ServerName<'static>> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
     let host = host
         .strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(&host)
-        .to_string();
-    rustls::pki_types::ServerName::try_from(host).ok()
+        .unwrap_or(host);
+    rustls::pki_types::ServerName::try_from(host.to_string()).ok()
 }
 
 /// Strip scheme, userinfo, port, and path from a host string.
@@ -657,8 +661,11 @@ impl HttpTransport {
     fn new_conn(&self, host: &str) -> Result<Box<AuthConn>, WinrmError> {
         let (tls, cert) = match &self.tls_config {
             Some((base, verifier)) => {
-                let capturing =
-                    crate::tls::CertCapturingVerifier::new(Arc::clone(verifier), target_name(host));
+                let capturing = crate::tls::CertCapturingVerifier::new(
+                    Arc::clone(verifier),
+                    url_server_name(&self.endpoint(host)),
+                )
+                .with_proxy(self.config.proxy.as_deref().and_then(url_server_name));
                 let handle = capturing.cert_handle();
                 let mut config = base.clone();
                 config
@@ -3099,19 +3106,32 @@ mod tests {
         assert!(fake.sealed().is_empty(), "log: {:?}", fake.log());
     }
 
-    /// The certificate record targets the server name reqwest uses for the
-    /// endpoint: sanitized host, IPv6 brackets removed.
+    /// The verifier's target is the server name reqwest uses for the
+    /// endpoint URL: the host after `url` parsing, IPv6 brackets removed.
+    /// Hosts that parse to another name than they read resolve to that name
+    /// (the one the handshake will carry); hosts with no valid server name
+    /// give `None`, and a pin is then refused.
     #[test]
-    fn target_name_matches_the_endpoint_host() {
+    fn verifier_target_is_the_parsed_endpoint_host() {
         use rustls::pki_types::ServerName;
-        let name = |s: &str| ServerName::try_from(s.to_string()).unwrap();
+        let name = |s: &str| Some(ServerName::try_from(s.to_string()).unwrap());
+        let transport = basic_transport(5986);
+        let target = |host: &str| url_server_name(&transport.endpoint(host));
+        assert_eq!(target("win-01.corp.local"), name("win-01.corp.local"));
+        assert_eq!(target("10.0.0.5"), name("10.0.0.5"));
+        assert_eq!(target("[::1]"), name("::1"));
+        assert_eq!(target("http://win-01/wsman"), name("win-01"));
+        assert_eq!(target("bücher.example"), name("xn--bcher-kva.example"));
+        assert_eq!(target("10.1"), name("10.0.0.1"));
+        assert_eq!(target("010.0.0.1"), name("8.0.0.1"));
+        assert_eq!(target("win01?x"), name("win01"));
+        assert_eq!(target("win01\\x"), name("win01"));
+        assert_eq!(target("win01\t"), name("win01"));
+        assert_eq!(target(""), None);
+        assert_eq!(target("win 01"), None);
         assert_eq!(
-            target_name("win-01.corp.local"),
-            Some(name("win-01.corp.local"))
+            url_server_name("https://proxy.corp:3128"),
+            name("proxy.corp")
         );
-        assert_eq!(target_name("10.0.0.5"), Some(name("10.0.0.5")));
-        assert_eq!(target_name("[::1]"), Some(name("::1")));
-        assert_eq!(target_name("http://win-01/wsman"), Some(name("win-01")));
-        assert_eq!(target_name(""), None);
     }
 }

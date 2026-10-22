@@ -382,7 +382,7 @@ impl KerberosAuth {
                     "Kerberos over TLS: internal: no verifier to pin the bound certificate".into(),
                 )
             })?;
-            handle.pin(der.clone());
+            handle.pin(der.clone())?;
             Some(der)
         } else {
             None

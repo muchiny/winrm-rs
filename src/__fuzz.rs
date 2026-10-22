@@ -382,6 +382,48 @@ pub fn sanitize_host(input: &str) -> String {
     crate::transport::sanitize_host(input)
 }
 
+/// What the URL parser reads back from an endpoint URL.
+#[derive(Debug)]
+pub struct EndpointParts {
+    /// The host as the parser normalised it (lowercase, punycode, IPv4).
+    pub host: Option<String>,
+    /// Whether the parser took the host for a domain (not an IP address).
+    pub is_domain: bool,
+    pub port: Option<u16>,
+    pub path: String,
+    pub has_query: bool,
+    pub has_fragment: bool,
+    pub has_userinfo: bool,
+}
+
+/// `None` when `validate_host` refuses `input`. Otherwise the host
+/// `sanitize_host` kept, the endpoint URL the transport builds from it, and
+/// that URL as the parser reads it back (`Err` with the parser's message
+/// when it refuses the URL: the request then fails before anything is sent).
+pub fn accepted_host_endpoint(
+    input: &str,
+    use_tls: bool,
+    port: u16,
+) -> Option<(String, String, Result<EndpointParts, String>)> {
+    crate::transport::validate_host(input).ok()?;
+    let sanitized = crate::transport::sanitize_host(input);
+    let url = crate::transport::endpoint_url(use_tls, &sanitized, port);
+    let parsed = reqwest::Url::parse(&url)
+        .map(|u| EndpointParts {
+            host: u.host_str().map(str::to_string),
+            is_domain: u
+                .host_str()
+                .is_some_and(|h| !h.starts_with('[') && h.parse::<std::net::Ipv4Addr>().is_err()),
+            port: u.port(),
+            path: u.path().to_string(),
+            has_query: u.query().is_some(),
+            has_fragment: u.fragment().is_some(),
+            has_userinfo: !u.username().is_empty() || u.password().is_some(),
+        })
+        .map_err(|e| e.to_string());
+    Some((sanitized, url, parsed))
+}
+
 /// Reject remote paths that are over-long or contain control characters.
 pub fn validate_remote_path(path: &str) -> Result<(), WinrmError> {
     crate::transfer::validate_remote_path(path)
@@ -453,4 +495,77 @@ pub fn encode_spnego_response(ntlm_token: &[u8], mech_list_mic: Option<&[u8]>) -
 #[cfg(feature = "credssp")]
 pub fn extract_subject_public_key(cert_der: &[u8]) -> Result<Vec<u8>, crate::error::CredSspError> {
     crate::asn1::extract_subject_public_key(cert_der)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The invariants `fuzz_transport_host` asserts for accepted hosts,
+    /// checked here on the shapes most likely to break them.
+    fn check_accepted(host: &str) {
+        for use_tls in [false, true] {
+            let Some((accepted, url, parsed)) = accepted_host_endpoint(host, use_tls, 5985) else {
+                continue;
+            };
+            assert!(!accepted.is_empty(), "{host:?}");
+            assert!(
+                !accepted
+                    .chars()
+                    .any(|c| matches!(c, '?' | '#' | '\\') || c.is_whitespace() || c.is_control()),
+                "{host:?} → {accepted:?}"
+            );
+            let Ok(parts) = parsed else { continue };
+            assert_eq!(parts.port, Some(5985), "{url}");
+            assert_eq!(parts.path, "/wsman", "{url}");
+            assert!(
+                !parts.has_query && !parts.has_fragment && !parts.has_userinfo,
+                "{url}"
+            );
+            if parts.is_domain && accepted.is_ascii() {
+                assert_eq!(
+                    parts.host.as_deref(),
+                    Some(accepted.to_ascii_lowercase().as_str()),
+                    "{url}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn accepted_hosts_read_back_from_their_endpoint_url() {
+        for host in [
+            "win01",
+            "WIN01.Corp.Local",
+            "10.0.0.5",
+            "10.1",
+            "0x10",
+            "a..b",
+            "xn--zz",
+            "win01.",
+            "_a",
+            "-a-",
+            "[::1]",
+            "[fe80::1]:5986",
+            "é.example",
+            "u:p@win01:5985/x",
+            "win01?x",
+            "win01#x",
+            "win01\\x",
+            "win 01",
+            "\t",
+            "",
+        ] {
+            check_accepted(host);
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn accepted_hosts_read_back_from_their_endpoint_url_prop(
+            host in "[a-zA-Z0-9._:@/\\[\\]?#%\\\\ -]{0,24}"
+        ) {
+            check_accepted(&host);
+        }
+    }
 }

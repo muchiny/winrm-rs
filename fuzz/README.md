@@ -60,7 +60,7 @@ drives; "invariant" is what it asserts beyond *must not panic*.
 
 | Target | Source | Invariant |
 |---|---|---|
-| `fuzz_transport_host` | `transport::sanitize_host` | no `/` or `@` survives; the rebuilt URL has one authority |
+| `fuzz_transport_host` | `transport::sanitize_host`, `transport::validate_host` | no `/` or `@` survives; the rebuilt URL has one authority; an accepted host has no `?`, `#`, `\`, whitespace or control character, and its endpoint URL (when the URL parser takes it) reads back with that host, the port, `/wsman`, and no userinfo, query or fragment |
 | `fuzz_transfer_path` | `validate_remote_path`, `escape_ps_single_quoted` | accepted paths are bounded and control-free; quote runs stay even-length |
 | `fuzz_powershell_encode` | `command::encode_powershell_command` | output is ASCII base64 and roundtrips |
 

@@ -332,6 +332,12 @@ pub(crate) fn sanitize_host(input: &str) -> String {
     s.to_string()
 }
 
+/// The WinRM endpoint URL for a host [`sanitize_host`] already stripped.
+pub(crate) fn endpoint_url(use_tls: bool, sanitized_host: &str, port: u16) -> String {
+    let scheme = if use_tls { "https" } else { "http" };
+    format!("{scheme}://{sanitized_host}:{port}/wsman")
+}
+
 /// `host` as it may be logged: anything [`sanitize_host`] would strip as
 /// userinfo (up to the last `@` after an optional scheme) is replaced by
 /// `<redacted>`, so a `user:password@host` string never reaches a log.
@@ -565,7 +571,6 @@ impl HttpTransport {
     /// through [`Self::checked_endpoint`], which refuses a host that is not
     /// a host name (see [`validate_host`]) before anything is sent.
     pub(crate) fn endpoint(&self, host: &str) -> String {
-        let scheme = if self.config.use_tls { "https" } else { "http" };
         let sanitized = sanitize_host(host);
         if sanitized != host {
             tracing::warn!(
@@ -574,7 +579,7 @@ impl HttpTransport {
                 "host string contained scheme/path/userinfo; using sanitized form"
             );
         }
-        format!("{scheme}://{sanitized}:{}/wsman", self.config.port)
+        endpoint_url(self.config.use_tls, &sanitized, self.config.port)
     }
 
     /// [`Self::endpoint`] for a host that [`validate_host`] accepts, else

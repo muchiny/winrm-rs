@@ -8,10 +8,10 @@ déduit de la lecture du code.
 
 | Crate | Commit | Ce qui a été exécuté |
 |---|---|---|
-| `winrm-rs` | `0e61241` (branche `test/live-coverage`, dernier commit de code ou de test après le troisième tour de correctifs de T18) : suite live complète contre Server 2025 avec `--features credssp,__internal` (81 tests, variables du banc exportées à la main, `vm-connect.sh` restant bloqué sur gsudo), **81 passés, 0 échoué** (218 s, parallélisme par défaut) ; à `d6aeb2c` : 81 passés (213 s) ; à `3759367` : 81 passés (209 s) ; même résultat à `c0f0d2e` (213 s). Avant : `f43bfb0` (dernier commit de code ou de test, après `31a02eb` qui ajoute les API `*_with_timeout` ; le commit de documentation qui le suit ne touche que le `CHANGELOG` et ce document ; les runs ci-dessous ont été faits sur cet arbre) | Suite live complète contre Server 2025 avec `--features credssp,__internal` (80 tests), les deux `eval` du banc faits : **80 passés, 0 échoué** (463 s) avec `--test-threads=1` ; en parallélisme par défaut, **80 passés, 0 échoué** (207 s ; `shell_run_command_times_out` reste sensible à la charge). Server 2012 R2 (VM reconstruite) : les tests NTLM et deux tests Basic seulement, voir « Limites connues ». Runs précédents : à `824128c` et `f82af53`, 78 passés en série comme en parallèle ; à `fcfdffc`, 78 passés en série, 77 passés et 1 échoué (`shell_run_command_times_out`) en parallèle ; à `a19c202`, 66 passés en série, 65 passés et 1 échoué en parallèle. Les tests à timeout court se lisent plus fiablement avec `--test-threads=1` (voir l'en-tête de `tests/integration_real.rs`). |
+| `winrm-rs` | `0e61241` (branche `test/live-coverage`, troisième tour de correctifs de l'épinglage du certificat Kerberos ; c'est l'arbre du dernier run live complet. Les commits de code et de test venus après lui, sur cette branche, n'ont pas été rejoués en live : refus d'un hôte qui n'est pas un nom d'hôte, nouvelles tentatives de création de shell dans les tests à timeout court, `tokio` 1.54.1, puis les correctifs de la revue finale (journaux sans identifiants, en-têtes `Authorization` sensibles, extraction d'éléments linéaire, proxys `https://` de l'environnement admis par le vérificateur épinglé, erreurs bornées)) : suite live complète contre Server 2025 avec `--features credssp,__internal` (81 tests, variables du banc exportées à la main, `vm-connect.sh` restant bloqué sur gsudo), **81 passés, 0 échoué** (218 s, parallélisme par défaut) ; à `d6aeb2c` : 81 passés (213 s) ; à `3759367` : 81 passés (209 s) ; même résultat à `c0f0d2e` (213 s). Avant : `f43bfb0` (dernier commit de code ou de test, après `31a02eb` qui ajoute les API `*_with_timeout` ; le commit de documentation qui le suit ne touche que le `CHANGELOG` et ce document ; les runs ci-dessous ont été faits sur cet arbre) | Suite live complète contre Server 2025 avec `--features credssp,__internal` (80 tests), les deux `eval` du banc faits : **80 passés, 0 échoué** (463 s) avec `--test-threads=1` ; en parallélisme par défaut, **80 passés, 0 échoué** (207 s ; `shell_run_command_times_out` reste sensible à la charge). Server 2012 R2 (VM reconstruite) : les tests NTLM et deux tests Basic seulement, voir « Limites connues ». Runs précédents : à `824128c` et `f82af53`, 78 passés en série comme en parallèle ; à `fcfdffc`, 78 passés en série, 77 passés et 1 échoué (`shell_run_command_times_out`) en parallèle ; à `a19c202`, 66 passés en série, 65 passés et 1 échoué en parallèle. Les tests à timeout court se lisent plus fiablement avec `--test-threads=1` (voir l'en-tête de `tests/integration_real.rs`). |
 | `winrm-rs` (Kerberos) | `0e61241` (troisième tour : cible du vérificateur prise de l'URL analysée, épinglage refusé sans cible, tout autre nom refusé une fois épinglé ; avant lui `d6aeb2c`, certificat épinglé après la sonde) ; groupes `kerberos` (7 passés) et `dc_cbt` (2 passés) rejoués à `0e61241`, le groupe `allow_unencrypted_false` à `d6aeb2c` (code TLS seul changé depuis) | Contre le contrôleur de domaine `winrm.test` (banc séparé, `tests/vagrant/dc/README.md`), avec `--features kerberos` et un TGT obtenu par `kinit vagrant@WINRM.TEST`, le 2026-10-22 : `... kerberos -- --ignored --skip allow_unencrypted_false --skip dc_cbt` → **7 passés, 0 échoué** (23 s) ; `... allow_unencrypted_false -- --ignored --test-threads=1` → **3 passés, 0 échoué** (298 s ; `AllowUnencrypted` remis à `true` après chacun) ; `... dc_cbt -- --ignored --test-threads=1` → **2 passés, 0 échoué** (15 s ; `CbtHardeningLevel` remis à `Relaxed` après chacun). Runs précédents : `3759367` (6 + 3 + 2 passés, sans épinglage) ; `c53acbe`/`1967dbf` (5 + 2 passés, sans binding de canal) ; `f4827bb`, 3 passés sur HTTP sans chiffrement. |
-| `psrp-rs` | `4a79189` (`origin/main`) ; mesuré au plus tard contre `winrm-rs` `f43bfb0`, pas rejoué aux commits de T18 | Suite live (8 tests) contre le `winrm-rs` local (`[patch.crates-io]`, worktree jetable) : **8 passés, 0 échoué** contre `winrm-rs` `a19c202` (Basic), puis contre `83a71c3` en Basic et en NTLM sur HTTP. Contre `winrm-rs` `fcfdffc`, `f82af53`, `824128c` puis `f43bfb0` (scellement qui échoue fermé et sans renvoi, une connexion authentifiée par échange, CBT de la connexion) : **8 passés** avec Basic sur HTTP (réglage par défaut de la suite) et **8 passés** avec `PSRP_INTEGRATION_AUTH=ntlm` (NTLM scellé sur HTTP), à chaque commit. Ce run NTLM, à travers un relais TCP enregistreur qui garde chaque connexion à part : 8 connexions (une par client), 2 requêtes `Negotiate` par connexion, 72 requêtes et 72 réponses `multipart/encrypted`, aucun corps de requête en clair (les Type 1 et Type 3 n'en portent pas), aucun HTTP 400 ni 500. |
-| `bridge-mcp` | `f44a5fa` (v4.0.2, worktree jetable ; `origin/main` est maintenant `ec9310e`) ; mesuré au plus tard contre `winrm-rs` `f43bfb0`, pas rejoué aux commits de T18 | Smoke en ligne de commande par `winrm` puis par `psrp` (hôtes NTLM sur HTTP) : `hostname` renvoie `winrm-2025`, `Get-Date` renvoie la date du banc (2026-10-21), sur les deux protocoles. Fait contre `winrm-rs` `a19c202`, `83a71c3`, `fcfdffc`, `f82af53`, `824128c`, puis `f43bfb0` (avec `psrp-rs` `4a79189`) : 4 appels sur 4 réussis à chaque fois (1,8 à 2,7 s chacun à `f43bfb0`), à travers le relais enregistreur : 4 connexions, 2 requêtes `Negotiate` par connexion, 26 requêtes scellées, aucun corps de requête en clair, aucun HTTP 400. Journal d'audit redirigé vers un fichier jetable. |
+| `psrp-rs` | `4a79189` (`origin/main`) ; mesuré au plus tard contre `winrm-rs` `f43bfb0`, pas rejoué depuis (scellement Kerberos, épinglage, correctifs de revue) | Suite live (8 tests) contre le `winrm-rs` local (`[patch.crates-io]`, worktree jetable) : **8 passés, 0 échoué** contre `winrm-rs` `a19c202` (Basic), puis contre `83a71c3` en Basic et en NTLM sur HTTP. Contre `winrm-rs` `fcfdffc`, `f82af53`, `824128c` puis `f43bfb0` (scellement qui échoue fermé et sans renvoi, une connexion authentifiée par échange, CBT de la connexion) : **8 passés** avec Basic sur HTTP (réglage par défaut de la suite) et **8 passés** avec `PSRP_INTEGRATION_AUTH=ntlm` (NTLM scellé sur HTTP), à chaque commit. Ce run NTLM, à travers un relais TCP enregistreur qui garde chaque connexion à part : 8 connexions (une par client), 2 requêtes `Negotiate` par connexion, 72 requêtes et 72 réponses `multipart/encrypted`, aucun corps de requête en clair (les Type 1 et Type 3 n'en portent pas), aucun HTTP 400 ni 500. |
+| `bridge-mcp` | `f44a5fa` (v4.0.2, worktree jetable ; `origin/main` est maintenant `ec9310e`) ; mesuré au plus tard contre `winrm-rs` `f43bfb0`, pas rejoué depuis (scellement Kerberos, épinglage, correctifs de revue) | Smoke en ligne de commande par `winrm` puis par `psrp` (hôtes NTLM sur HTTP) : `hostname` renvoie `winrm-2025`, `Get-Date` renvoie la date du banc (2026-10-21), sur les deux protocoles. Fait contre `winrm-rs` `a19c202`, `83a71c3`, `fcfdffc`, `f82af53`, `824128c`, puis `f43bfb0` (avec `psrp-rs` `4a79189`) : 4 appels sur 4 réussis à chaque fois (1,8 à 2,7 s chacun à `f43bfb0`), à travers le relais enregistreur : 4 connexions, 2 requêtes `Negotiate` par connexion, 26 requêtes scellées, aucun corps de requête en clair, aucun HTTP 400. Journal d'audit redirigé vers un fichier jetable. |
 
 Banc : une VM Windows Server 2025 (`winrm-2025`) sous Hyper-V, atteinte par
 `tests/scripts/vm-connect.sh` (HTTP `55985`, HTTPS `55986`, compte `vagrant`).
@@ -22,17 +22,22 @@ forêt `winrm.test` (VM Hyper-V `winrm-rs-dc`, hôte `dc`), atteinte par
 Au départ de la campagne (avant tout ajout de test), les 52 tests live
 existants passaient : 52 passés, 0 échoué, 0 sauté (sans la feature `credssp`).
 
-Les tests ajoutés par la campagne portent le total à 76, ou 78 avec la
-feature `credssp` (`credssp_run_command_whoami` et
+Les tests ajoutés par la campagne portent le total à 79 sans feature, ou 81
+avec la feature `credssp` (`credssp_run_command_whoami` et
 `silent_command_completes_over_credssp` sont sous `#[cfg(feature =
-"credssp")]`) : 13 jusqu'à `a19c202`, 3 avec `eddd4f6` (une commande
-silencieuse par méthode d'authentification live), 5 avec `83a71c3`
+"credssp")]`), et à 94 avec les 13 tests Kerberos (compte des fonctions
+`#[ignore]` de `tests/integration_real.rs` par attribut `cfg`) : 13 jusqu'à
+`a19c202`, 3 avec `eddd4f6` (une commande silencieuse par méthode
+d'authentification live, dont celle de CredSSP), 5 avec `83a71c3`
 (transferts, annulation, Ctrl+C et shells concurrents en NTLM scellé, plus
 la référence Basic des shells concurrents), 1 avec `d7dde44`
-(`streaming_clixml_stderr_yields_records_before_exit`), puis 3 avec
-`fcfdffc` (1,5 Mo de sortie en NTLM scellé avec deux `MaxEnvelopeSize`,
-`EncryptionMode::Always` sur HTTPS). Les runs complets à `fcfdffc` les
-exécutent tous.
+(`streaming_clixml_stderr_yields_records_before_exit`), 3 avec `fcfdffc`
+(1,5 Mo de sortie en NTLM scellé avec deux `MaxEnvelopeSize`,
+`EncryptionMode::Always` sur HTTPS), puis 3 avec les API à délai total et
+l'annulation qui libère le shell (`run_powershell_with_timeout_expires_and_releases_shell`,
+`run_powershell_with_timeout_returns_output_of_a_fast_command`,
+`run_powershell_with_cancel_releases_shell`). Le run complet à `0e61241` les
+exécute tous (81 avec `credssp`).
 Les tests Kerberos, sous `#[cfg(feature = "kerberos")]`, s'y ajoutent
 (`kerberos_run_command_whoami`, `kerberos_two_commands_on_one_client`,
 `silent_command_completes_over_kerberos`, puis avec `1967dbf`
@@ -187,11 +192,13 @@ ouvert.
   mappage de certificat client, `clientcertnegotiation` activé sur
   `0.0.0.0:5986`.
 
-Historique complet des commits de la campagne :
-`git log --oneline ba57cdf..f43bfb0`, plus le commit de documentation qui
-suit. `87190a6..ba57cdf` sont les quatre commits issus de l'instantané de
-travail de l'utilisateur (le décodeur CLIXML, scindé en quatre avant
-publication), hors de cette campagne.
+Historique complet des commits de la branche : `git log --oneline
+252c555..test/live-coverage` (`252c555` est la fusion de la PR #3 sur `main`,
+base de la branche). Les quatre premiers commits de cette plage (le
+rafraîchissement de `fuzz/Cargo.lock`, le décodeur CLIXML en flux, le
+réassemblage du stderr CLIXML entre scrutations, la cible de fuzz et les
+proptests qui vont avec) viennent de l'instantané de travail de
+l'utilisateur, scindé avant publication, et sont hors de cette campagne.
 
 ## Légende
 
@@ -216,6 +223,10 @@ Tests de `tests/integration_real.rs` sauf mention contraire.
 | Proxy SOCKS5 | `socks5_proxy_carries_ntlm` | ✅ 2026-10-21 | ⏭ à mesurer (suite complète 2012 R2 en attente) | — non applicable |
 | `max_output_bytes` déclenché, erreur `Transfer`, aucun shell laissé ouvert | `max_output_bytes_aborts_and_releases_shell` | ✅ 2026-10-21 | ⏭ à mesurer (suite complète 2012 R2 en attente) | — non applicable |
 | `max_output_bytes` compte les octets bruts du stderr CLIXML | `max_output_bytes_counts_raw_clixml_stderr` | ✅ 2026-10-21 | ⏭ à mesurer (suite complète 2012 R2 en attente) | — non applicable |
+| `run_powershell_with_timeout` : délai total atteint, `Timeout(8)` rendu entre 8 et 15 s, shell distant supprimé | `run_powershell_with_timeout_expires_and_releases_shell` (`Start-Sleep 600` ; shells comptés par un `IdleTimeOut` marqueur, avec témoin positif) | ✅ 2026-10-22 | ⏭ à mesurer (suite complète 2012 R2 en attente) | — non applicable |
+| `run_powershell_with_timeout` : une commande rapide rend sa sortie et son code de sortie, aucun shell laissé | `run_powershell_with_timeout_returns_output_of_a_fast_command` | ✅ 2026-10-22 | ⏭ à mesurer (suite complète 2012 R2 en attente) | — non applicable |
+| `run_powershell_with_cancel` : `Cancelled` rendu en moins de 10 s, terminaison et suppression du shell envoyées, aucun shell laissé | `run_powershell_with_cancel_releases_shell` (annulation après 3 s d'un `Start-Sleep 600`) | ✅ 2026-10-22 | ⏭ à mesurer (suite complète 2012 R2 en attente) | — non applicable |
+| stderr CLIXML en flux : les enregistrements vidés tôt arrivent à `receive_next` avant la fin de la commande | `streaming_clixml_stderr_yields_records_before_exit` | ✅ 2026-10-22 | ⏭ à mesurer (suite complète 2012 R2 en attente) | — non applicable |
 | `connect_timeout_secs` respecté | `connect_timeout_is_honoured` | ✅ 2026-10-21 | ⏭ à mesurer (suite complète 2012 R2 en attente) | — non applicable |
 | Délai total de `Shell::run_command` (`operation_timeout_secs * 2`) | `shell_run_command_times_out` (timeout d'opération de 15 s) | ✅ 2026-10-21 | ⏭ à mesurer (suite complète 2012 R2 en attente) | — non applicable |
 | Commande silencieuse plus longue que `operation_timeout_secs` menée à terme (après D1), Basic sur HTTP | `silent_command_longer_than_operation_timeout_completes` (20 s de silence, timeout d'opération de 15 s ; 22 à 25 s mesurées) | ✅ 2026-10-21 | ⏭ à mesurer (suite complète 2012 R2 en attente) | — non applicable |
@@ -229,7 +240,7 @@ Tests de `tests/integration_real.rs` sauf mention contraire.
 | Ctrl+C en NTLM scellé sur HTTP | `ntlm_sealed_shell_signal_ctrl_c` (5 requêtes scellées, une seule poignée de main) | ✅ 2026-10-21 | ✅ 2026-10-21 (VM reconstruite) | — non applicable |
 | Shells concurrents sur un même client en NTLM scellé sur HTTP | `ntlm_sealed_concurrent_shells`, référence `concurrent_shells_timings_basic` (tous terminent ; un `echo` lancé pendant le Receive de 10 s de l'autre shell prend 0,19 s en NTLM scellé, contre 10,3 s avant `74578d2` et 0,15 à 0,18 s en Basic ; le test exige moins de 3 s ; 2 connexions, une poignée de main chacune) | ✅ 2026-10-21 | ✅ 2026-10-21 (VM reconstruite) | — non applicable |
 | 1,5 Mo de sortie en NTLM scellé, `MaxEnvelopeSize` par défaut puis 500 Ko | `ntlm_sealed_large_output_default_envelope`, `ntlm_sealed_large_output_500k_envelope` (sortie complète ; plus grosse réponse HTTP 149 Ko puis 155 Ko : Server 2025 plafonne un Receive vers 150 Ko même avec 500 Ko, bien sous le plafond de 2 Mio du client) | ✅ 2026-10-21 | ✅ 2026-10-21 (VM reconstruite) | — non applicable |
-| `EncryptionMode::Always` : NTLM scellé à l'intérieur de HTTPS | `ntlm_encryption_always_over_https` | ✅ 2026-10-21 | ⏭ sauté : aucune suite TLS commune avec rustls (voir « Limites connues ») | — non applicable |
+| `EncryptionMode::Always` sur HTTPS en NTLM : accepté par le serveur | `ntlm_encryption_always_over_https` (prouve seulement que le serveur accepte l'échange ; que les corps partent bien scellés dans TLS est vu sur le fil par `always_seals_inside_tls_seen_by_a_relay_with_dc_cbt_none`, ligne « `EncryptionMode::Always` : Kerberos et NTLM scellés à l'intérieur de HTTPS » plus bas) | ✅ 2026-10-21 | ⏭ sauté : aucune suite TLS commune avec rustls (voir « Limites connues ») | — non applicable |
 | API bas niveau : `create_shell`, `execute_command`, `receive_output`, `signal_terminate`, `delete_shell` | `low_level_command_lifecycle` | ✅ 2026-10-21 | ⏭ à mesurer (suite complète 2012 R2 en attente) | — non applicable |
 | `signal_terminate` arrête une commande en cours | `signal_terminate_stops_running_command` (shell et commande créés avec un client au timeout par défaut ; scrutation, arrêt et vidage avec un timeout d'opération de 15 s) | ✅ 2026-10-21 | ⏭ à mesurer (suite complète 2012 R2 en attente) | — non applicable |
 | `open_psrp_shell` | psrp-rs (`4a79189`) : les 8 tests live, dont `live_smoke_one_plus_one` | ✅ 2026-10-21 | ⏭ à mesurer (suite complète 2012 R2 en attente) | — non applicable |
@@ -244,7 +255,7 @@ Tests de `tests/integration_real.rs` sauf mention contraire.
 | Kerberos non chiffré (`EncryptionMode::Never`) refusé par `AllowUnencrypted = false` : erreur claire | `kerberos_unsealed_with_allow_unencrypted_false_is_a_clear_error` (HTTP 500 au corps vide ; le message nomme `AllowUnencrypted` et les remèdes ; avant `c53acbe` : `AuthFailed("HTTP 500 Internal Server Error: ")`) | — non applicable (banc hors domaine) | n/a : pas de KDC sur cette VM | ✅ 2026-10-22 |
 | Binding de canal Kerberos sur HTTPS (RFC 5929 `tls-server-end-point`) | `kerberos_channel_binding_through_a_tls_relay_is_refused` (relais TLS présentant son propre certificat : refusé sous `Relaxed`, `Auto` et `Always`, aucun corps SOAP n'atteint le relais) ; `kerberos_over_https_with_dc_cbt_strict` (`Strict` : `Auto` et `Always` en direct passent, le relais est refusé) | — non applicable (banc hors domaine) | n/a : pas de KDC sur cette VM | ✅ 2026-10-22 |
 | Binding de canal Kerberos : cas scindé (la sonde passe intacte jusqu'au contrôleur, la connexion suivante est terminée par un relais avec un autre certificat) | `kerberos_channel_binding_split_relay_fails_at_the_handshake` (`Auto` et `Always` : la poignée de main TLS de la connexion de l'AP-REQ est refusée par le vérificateur épinglé, le relais ne reçoit aucune requête ; avant `b1f5d7f` l'AP-REQ atteignait le relais) ; rejoué sous `Strict` dans `kerberos_over_https_with_dc_cbt_strict` | — non applicable (banc hors domaine) | n/a : pas de KDC sur cette VM | ✅ 2026-10-22 |
-| Kerberos sur HTTPS (`Auto`, connexion authentifiée une fois) : requêtes suivantes restées sur la connexion authentifiée | mesure ad hoc : envoi de 20 Ko puis téléchargement de 200 Ko sur HTTPS, 10 essais par case, runtime current-thread et multi-thread, 0 et 4 cessions de main : 10/10 partout, exactement 2 connexions TCP par essai (la sonde, puis la connexion authentifiée) | — non applicable (banc hors domaine) | n/a : pas de KDC sur cette VM | ✅ 2026-10-22 |
+| Kerberos sur HTTPS (`Auto`, connexion authentifiée une fois) : requêtes suivantes restées sur la connexion authentifiée | aucun test nommé ; mesure ad hoc du 2026-10-22 : envoi de 20 Ko puis téléchargement de 200 Ko sur HTTPS, 10 essais par case, runtime current-thread et multi-thread, 0 et 4 cessions de main : 10/10 partout, exactement 2 connexions TCP par essai (la sonde, puis la connexion authentifiée) | — non applicable (banc hors domaine) | n/a : pas de KDC sur cette VM | ⏭ pas de test nommé (mesure ad hoc concluante, voir « Tests ») |
 | Course du pool des connexions dédiées (requête scellée partie sur une connexion TCP neuve non authentifiée) | `sealed_download_after_upload_stays_on_its_connection_allow_unencrypted_false` (3 tours Kerberos + 3 tours NTLM, chacun sur une seule connexion) ; mesure ad hoc, `AllowUnencrypted = false`, envoi de 20 Ko puis téléchargement de 200 Ko, 10 essais par case : runtime current-thread 0/10 réussis sans céder la main, 10/10 en cédant 4 fois, Kerberos comme NTLM ; runtime multi-thread 10/10 avec 0 ou 4 ; avec `AllowUnencrypted = true` aucun échec (7 téléchargements, 80 sorties de 1,5 Mo) | — non applicable (banc hors domaine) | n/a : pas de KDC sur cette VM | ✅ 2026-10-22 (atténué, pas fermé) |
 | Doc de `AuthMethod::CredSsp` (disait « Not yet implemented ») | relue contre `credssp_run_command_whoami` | doc corrigée le 2026-10-21 (relecture ; le passage live est la ligne CredSSP plus bas) | — non applicable (relecture de documentation) | — non applicable |
 
@@ -317,13 +328,16 @@ ne figurent pas dans la matrice.
   inconnu) est refusé. L'épinglage vise le nom de serveur que `reqwest`
   transmet réellement (l'hôte de l'URL analysée : IDN en punycode, `10.1`
   en `10.0.0.1`, `win01?x` en `win01`) ; une fois épinglé, tout autre nom est
-  refusé sauf la poignée de main propre au proxy `https://`, et un hôte sans
-  nom de serveur TLS valide est refusé avant l'AP-REQ (`0e61241`).
+  refusé sauf la poignée de main propre au proxy `https://` (celui de
+  `WinrmConfig::proxy`, sinon ceux de `HTTPS_PROXY` / `ALL_PROXY` ; un proxy
+  tiré des réglages système, que `reqwest` ne lit qu'avec sa feature
+  `system-proxy`, est refusé), et un hôte sans nom de serveur TLS valide est
+  refusé avant l'AP-REQ (`0e61241`).
   `EncryptionMode::Never` sur HTTP simple n'a rien de tout cela. Côté serveur,
   l'intégrité sur HTTP face à un attaquant actif suppose `AllowUnencrypted =
   false` (NTLM comme Kerberos). La branche SSPI de `cross-krb5` (client
   Windows) n'est ni compilée ici ni testée : un job CI `kerberos-windows`
-  (check + clippy) l'ajoute, sans test ; sur un client Windows `Auto` scelle
+  (check + clippy) la compile en CI, sans test et sans résultat consulté ici ; sur un client Windows `Auto` scelle
   désormais, `EncryptionMode::Never` est le recours. L'hôte doit être le nom
   du serveur (SPN `HTTP/<hôte>`), pas une adresse ; le banc passe par une
   ligne `127.0.0.1 dc.winrm.test` dans `/etc/hosts`. Le port HTTPS `57986`
@@ -363,7 +377,7 @@ ne figurent pas dans la matrice.
   création du shell dans cette fenêtre : sous un run entièrement parallèle sur un
   serveur chargé, elle peut la dépasser et échouer par `TimedOut` (reproduit
   avec 24 sessions PowerShell liées au CPU lancées en parallèle sur l'hôte :
-  `Err(Soap(TimedOut))` de `open_shell` après environ 15 s). Depuis T19,
+  `Err(Soap(TimedOut))` de `open_shell` après environ 15 s). Depuis,
   `shell_run_command_times_out` et les tests de commande silencieuse
   réessayent une création ou un démarrage de commande échoué (6 créations et
   3 exécutions au plus pour le premier, 3 exécutions pour les autres) et
@@ -380,18 +394,31 @@ ne figurent pas dans la matrice.
   transport.
 - **Le crate ne fait confiance qu'aux racines webpki.** Il n'existe pas d'option
   pour une CA privée ; les CA internes poussent donc à `accept_invalid_certs`.
-- **`WinrmClient::run_command` et `run_powershell` (donc aussi
-  `download_file`) n'ont pas de délai total.** `operation_timeout_secs` borne
-  chaque Receive, pas la commande. Depuis le correctif de D1, une commande
-  bloquée et muette (`Read-Host`, `pause`, un processus bloqué) fait attendre
-  l'appel jusqu'à sa fin au lieu d'échouer après environ
-  `operation_timeout_secs` ; c'est un changement de comportement, documenté
-  dans le `CHANGELOG` (`### Changed`) et la rustdoc. Remède :
-  `run_command_with_cancel` / `run_powershell_with_cancel` ou
-  `tokio::time::timeout` ; l'appel abandonné ne supprime pas le shell distant,
-  que le serveur récupère après son idle timeout. `Shell::run_command` garde
-  son délai total de `2 * operation_timeout_secs`. `run_wql` ne scrute pas
+- **`WinrmClient::run_command`, `run_powershell` et `download_file` n'ont
+  pas de délai total.** `operation_timeout_secs` borne chaque Receive, pas la
+  commande. Depuis le correctif de D1, une commande bloquée et muette
+  (`Read-Host`, `pause`, un processus bloqué) fait attendre l'appel jusqu'à sa
+  fin au lieu d'échouer après environ `operation_timeout_secs` ; c'est un
+  changement de comportement, documenté dans le `CHANGELOG` (`### Changed` et
+  « Upgrading from 1.2.x ») et la rustdoc. Remède : les variantes à délai
+  total `run_command_with_timeout`, `run_powershell_with_timeout` et
+  `download_file_with_timeout` (`WinrmError::Timeout`), ou les variantes
+  `*_with_cancel` (`WinrmError::Cancelled`) ; à l'expiration comme à
+  l'annulation, elles demandent la terminaison de la commande puis
+  suppriment le shell distant (au mieux, chaque étape bornée), ce que
+  mesurent `run_powershell_with_timeout_expires_and_releases_shell` et
+  `run_powershell_with_cancel_releases_shell`. Un `tokio::time::timeout`
+  posé par l'appelant, lui, abandonne l'appel sans rien envoyer : le shell
+  reste jusqu'à l'idle timeout du serveur. `Shell::run_command` garde son
+  délai total de `2 * operation_timeout_secs`. `run_wql` ne scrute pas
   Receive et n'est pas concerné.
+- **`Shell::run_command` n'arrête pas la commande quand il abandonne.** À son
+  délai total (`WinrmError::Timeout(2 * operation_timeout_secs)`) ou au
+  plafond `max_output_bytes` (`WinrmError::Transfer`), il rend l'erreur sans
+  envoyer de terminaison : la commande continue dans le shell, qui reste
+  ouvert jusqu'à `Shell::close` (ou l'idle timeout). Les méthodes de
+  `WinrmClient` (`run_command`, `*_with_timeout`, `*_with_cancel`), elles,
+  envoient la terminaison. Comportement antérieur à la campagne, inchangé.
 - **Scellement NTLM et NTLM sur TLS : ce qui reste.** Les suites relevées
   par les audits sont traitées par `74578d2`, `9493f59` et `ad908b3` (repli
   en clair, Type 3 à corps vide, aucun renvoi d'une requête scellée, corps
@@ -401,11 +428,17 @@ ne figurent pas dans la matrice.
   de la connexion qui porte le défi, nouvelles tentatives limitées aux
   erreurs de connexion pour toutes les méthodes, au plus 32 échanges NTLM
   simultanés par client). Restent : `EncryptionMode::Never` envoie tout en
-  clair sur HTTP (réservé au débogage) ; le comportement face à un serveur
-  qui refuse le trafic non chiffré (`AllowUnencrypted = false`, réglage par
-  défaut de Windows) n'a pas été mesuré, le banc l'autorise ; la cible de
-  fuzz est compilée mais n'a pas tourné, et le `fuzz/Cargo.lock` est à
-  rafraîchir ; un proxy HTTP qui transfère les requêtes (sans tunnel) sans
+  clair sur HTTP (réservé au débogage) ; face à un serveur qui refuse le
+  trafic non chiffré (`AllowUnencrypted = false`, réglage par défaut de
+  Windows), le scellement n'est mesuré que sur le contrôleur de domaine,
+  NTLM et Kerberos (`sealed_download_after_upload_stays_on_its_connection_allow_unencrypted_false`,
+  `kerberos_sealed_with_allow_unencrypted_false`), le banc Server 2025
+  l'autorise ; les cibles de fuzz (`fuzz_ntlm_unseal_body` comprise) sont
+  compilées et rejouent leurs corpus (`scripts/fuzz.sh build` puis `smoke`,
+  21 cibles), quatre d'entre elles (`fuzz_clixml_stderr`,
+  `fuzz_ntlm_unseal_body`, `fuzz_kerberos_sealed`, `fuzz_asn1_cert`) ont
+  tourné 20 s chacune sans plantage, mais aucune campagne longue n'a eu
+  lieu, et `fuzz/Cargo.lock` a été rafraîchi (`cargo audit` propre) ; un proxy HTTP qui transfère les requêtes (sans tunnel) sans
   garder une connexion serveur par connexion cliente casse la liaison NTLM à
   la connexion : les requêtes scellées échouent alors, sans partir en clair ;
   un 401 sur une connexion inactive que le serveur a fermée sans l'annoncer

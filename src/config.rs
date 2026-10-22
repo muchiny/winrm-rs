@@ -161,17 +161,21 @@ impl Default for WinrmConfig {
 /// When using HTTP (not HTTPS), sealing encrypts and signs each SOAP message
 /// to prevent eavesdropping and tampering (MS-WSMV 2.2.9.1): with the NTLM
 /// session (RC4, NTLM signatures), or with the Kerberos context (GSS-API wrap
-/// with confidentiality, AES enctypes only). When using HTTPS, the TLS layer
-/// provides that, making sealing redundant.
+/// with confidentiality; only RFC 4121 "CFX" wrap tokens are accepted, so AES
+/// session keys: an RC4-only realm cannot seal and needs [`Self::Never`]).
+/// When using HTTPS, the TLS layer provides that, making sealing redundant.
 ///
 /// When sealing applies, it applies to every SOAP body, failing closed: the
 /// authentication runs with empty request bodies (NTLM handshake; Kerberos
 /// AP-REQ, whose answer must carry the server's AP-REP), each request is
 /// sealed on the connection the server bound the session to, and the answer
 /// must unseal (a sealed SOAP fault is reported as such). NTLM refuses a
-/// replayed answer by its sequence number; WinRM's Kerberos answers all carry
-/// sequence number 0, so a Kerberos answer must instead name its request's
-/// `MessageID` in `RelatesTo`. No request body is ever sent
+/// replayed answer by its sequence number. WinRM's Kerberos answers all carry
+/// sequence number 0 and no replay or sequence detection is negotiated, so
+/// the Kerberos session detects no replay: a Kerberos answer must instead
+/// name its request's `MessageID` in `RelatesTo` (a request without one is
+/// not sent), and a sealed request replayed by an active attacker on the
+/// same authenticated connection is not detected. No request body is ever sent
 /// unsealed, and the client sends each request once: any failure, an HTTP
 /// 401 included, is returned as an error and the connection discarded. (A
 /// 401 on a reused connection usually means the server closed it, but on
@@ -182,6 +186,17 @@ impl Default for WinrmConfig {
 /// (not tunnelling) HTTP proxy that does not keep one server connection per client
 /// connection breaks that binding, and sealed requests then fail with errors
 /// rather than going out unsealed.
+///
+/// Sealing protects the messages of this client. Server side, integrity on
+/// plain HTTP against an active network attacker also needs the server to
+/// refuse unencrypted messages (`AllowUnencrypted = false`), for NTLM as for
+/// Kerberos: a server that allows them runs unprotected requests (from a
+/// client with [`Self::Never`], or Basic).
+///
+/// On a Windows client, Kerberos sealing goes through the SSPI branch of
+/// `cross-krb5`, which this project builds in CI but has not tested against a
+/// server: with the `kerberos` feature, [`Self::Auto`] now seals Kerberos
+/// over HTTP, and [`Self::Never`] is the way back if that fails.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub enum EncryptionMode {
     /// Seal every SOAP body over HTTP; over HTTPS rely on TLS and send them
@@ -218,16 +233,22 @@ pub enum AuthMethod {
     /// address. Credentials come from the ticket cache (`kinit`), not from
     /// [`WinrmCredentials`].
     ///
-    /// What it guarantees: authentication of the client and, when the server
-    /// answers with its token, of the server (mutual authentication).
-    /// Message confidentiality and integrity come from HTTPS, or from
-    /// Kerberos sealing ([`EncryptionMode::Auto`] over HTTP, or
-    /// [`EncryptionMode::Always`]), which runs one context per connection and
-    /// requires mutual authentication. With [`EncryptionMode::Never`] over
-    /// HTTP, each request authenticates with a fresh context but its body and
-    /// the answer cross the network in plaintext, unprotected. Over HTTPS no
-    /// channel binding token is sent, so a server with `CbtHardeningLevel =
-    /// Strict` may refuse it (validated only against `Relaxed`).
+    /// What it guarantees: authentication of the client and, through the
+    /// server's AP-REP, of the server (mutual authentication). Message
+    /// confidentiality and integrity come from HTTPS, or from Kerberos
+    /// sealing ([`EncryptionMode::Auto`] over HTTP, or
+    /// [`EncryptionMode::Always`]). Both run on dedicated connections
+    /// authenticated once, and require the AP-REP. Over HTTPS the AP-REQ
+    /// carries a channel binding (RFC 5929 `tls-server-end-point`) for the
+    /// certificate of its connection, which must be the certificate an
+    /// unauthenticated request just before saw (validated against
+    /// `CbtHardeningLevel = Relaxed` and `Strict`); with `accept_invalid_certs`
+    /// that binding is what keeps an attacker in the middle from using the
+    /// authentication on the real server. With [`EncryptionMode::Never`] over
+    /// HTTP, each request authenticates with a fresh context, the AP-REP is
+    /// checked only when the answer carries one, and body and answer cross the
+    /// network in plaintext, unprotected. See [`EncryptionMode`] for the
+    /// replay limit of Kerberos sealing and the Windows-client caveat.
     Kerberos,
     /// TLS client certificate authentication. Requires HTTPS (`use_tls = true`).
     ///

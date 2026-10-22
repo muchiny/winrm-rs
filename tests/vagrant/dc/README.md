@@ -36,7 +36,8 @@ a startup scheduled task (`winrm-rs-ensure-vagrant`, script
 recreates or repairs it at every boot in case it does not.
 
 WinRM on the DC: Basic, Negotiate and Kerberos on, `AllowUnencrypted = true`,
-`CbtHardeningLevel = Relaxed`. winrm-rs seals Kerberos messages over HTTP by
+`CbtHardeningLevel = Relaxed` (the starting state the toggle tests below
+check and restore). winrm-rs seals Kerberos messages over HTTP by
 default (`EncryptionMode::Auto`), so it does not need `AllowUnencrypted`; the
 bench keeps it `true` for the `EncryptionMode::Never` tests and as the
 starting state the `AllowUnencrypted = false` tests flip and restore (below).
@@ -86,9 +87,20 @@ kinit vagrant@WINRM.TEST                  # password: vagrant
 klist                                      # krbtgt/WINRM.TEST@WINRM.TEST
 kvno HTTP/dc.winrm.test@WINRM.TEST         # service ticket for the SPN
 cargo test --features kerberos --test integration_real setup_dc_https_listener -- --ignored   # once
-cargo test --features kerberos --test integration_real kerberos -- --ignored --nocapture --skip allow_unencrypted_false
+cargo test --features kerberos --test integration_real kerberos -- --ignored --nocapture --skip allow_unencrypted_false --skip dc_cbt
 cargo test --features kerberos --test integration_real allow_unencrypted_false -- --ignored --nocapture --test-threads=1
+cargo test --features kerberos --test integration_real dc_cbt -- --ignored --nocapture --test-threads=1
 ```
+
+The `*dc_cbt*` tests set `CbtHardeningLevel` (`None`, `Strict`) for their
+own duration and restore `Relaxed` through an NTLM-sealed request over HTTP
+(channel binding does not concern HTTP), even when the body panicked. They
+and `kerberos_channel_binding_through_a_tls_relay_is_refused` use a
+TLS-terminating relay inside the test (a certificate made for the run with
+the `openssl` command) to read the traffic inside TLS and to check that a
+channel binding naming another certificate is refused. Restore by hand if a
+run is killed in between: `Set-Item
+WSMan:\localhost\Service\Auth\CbtHardeningLevel Relaxed`.
 
 The `kerberos_*https*` tests use `WINRM_TEST_KRB_HTTPS_PORT` (exported by
 `vm-connect-dc.sh`) with `accept_invalid_certs` (self-signed certificate).

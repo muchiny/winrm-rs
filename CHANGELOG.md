@@ -43,21 +43,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   AP-REQ; its answer must carry the server's AP-REP (mutual
   authentication), which completes the context. The wrap token is sent in
   the layout Windows SSPI uses (the 28-byte trailer rotated into the 60-byte
-  header, RRC = 28), as pyspnego does with MIT krb5; the MIME protocol is
+  header, RRC = 28), the buffers pyspnego 0.12.1 sends with MIT krb5
+  (`_gss.py` `wrap_winrm`: `wrap_iov` with header, data and padding, no
+  trailer buffer); the MIME protocol is
   `application/HTTP-SPNEGO-session-encrypted`, since the tokens go under the
   `Negotiate` HTTP scheme (`HTTP-Kerberos-session-encrypted` gets HTTP 415).
-  Only RFC 4121 tokens (AES enctypes) are accepted. Fail-closed rules as for
+  Only RFC 4121 (CFX) sealed wrap tokens are accepted, which in practice
+  means AES session keys: an RC4 context produces RFC 4757 tokens and fails
+  the call (a realm that only has RC4 worked before under `Auto` over HTTP
+  and now needs `EncryptionMode::Never`). Fail-closed rules as for
   NTLM sealing: no plaintext fallback, a sealed request is never resent (a
   401 included), the answer must be a sealed wrap token from the server that
   unwraps and has the announced length, the response size cap applies, and a
   failure discards the connection. WinRM sends every Kerberos answer with
-  sequence number 0, so replay is checked differently: a sealed answer must
-  name the request's `MessageID` in `RelatesTo`. Validated live against a
-  Server 2025 domain controller with `AllowUnencrypted = false`
+  sequence number 0, and cross-krb5 negotiates no replay or sequence
+  detection, so the Kerberos session itself detects no replay: a sealed
+  answer must name the request's `MessageID` in `RelatesTo` (a request
+  without one is not sent), and a sealed request replayed on the same
+  authenticated connection by an active attacker is not detected.
+  Validated live against a Server 2025 domain controller with `AllowUnencrypted = false`
   (`kerberos_sealed_with_allow_unencrypted_false`: `whoami`, a 200 KB upload
   and download round trip with 322 sealed requests on one connection and one
   authentication, a silent command whose `TimedOut` faults come back sealed),
-  and inside HTTPS with `Always` (`kerberos_encryption_always_over_https`).
+  and inside HTTPS with `Always`: a TLS-terminating relay in
+  `always_seals_inside_tls_seen_by_a_relay_with_dc_cbt_none` sees every SOAP
+  body sealed (5 of 5, Kerberos and NTLM), and none under `Auto`.
+  Windows clients: the SSPI branch of cross-krb5 (`cfg(windows)`) is not
+  compiled or tested by this project's live runs (a CI job now checks that
+  it builds); a Windows client using `--features kerberos` with `Auto` now
+  seals over HTTP, and `EncryptionMode::Never` is the way back if that fails.
+- **Kerberos channel binding over HTTPS** (RFC 5929 `tls-server-end-point`).
+  Kerberos over HTTPS now runs on dedicated connections authenticated once:
+  an unauthenticated request with an empty body learns the endpoint's
+  certificate (Windows answers 401 and closes that connection), the AP-REQ
+  carries GSS channel bindings for it, the connection that carried the AP-REQ
+  must have presented the same certificate, and the server's AP-REP is
+  required; later requests on the connection carry no `Authorization`
+  header. Validated live: `CbtHardeningLevel = Strict` accepts it
+  (`kerberos_over_https_with_dc_cbt_strict`, `Auto` and `Always`), and a
+  TLS-terminating relay is refused under `Relaxed` and `Strict`
+  (`kerberos_channel_binding_through_a_tls_relay_is_refused`).
 
 ### Fixed
 
@@ -70,15 +95,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (`kerberos_unsealed_with_allow_unencrypted_false_is_a_clear_error`).
 - **`EncryptionMode::Always` with Kerberos silently sent plaintext.** The
   mode applied to NTLM only; it now seals Kerberos too (see `### Added`).
-- **A sealed request could go out on a new, unauthenticated TCP connection
-  right after a large answer** (NTLM and Kerberos): `hyper` hands the
-  connection back to the dedicated client's pool from a task of its own, and
-  a request sent before that task ran opened a new connection, which got an
-  HTTP 401 and failed the call (measured: every Kerberos-sealed download
-  after ~150 KB answers failed on a current-thread runtime). A sealed
-  exchange now yields to the runtime before sending. This narrows the
-  window without closing it; if it still happens the request fails closed
-  as before (error, not resent).
+- **Retry backoff overflowed for `max_retries >= 58`** (`100 * 2^attempt`
+  ms): it now saturates.
 - **`WinrmClient::run_command_with_cancel` / `run_powershell_with_cancel`
   leaked the remote shell on cancellation.** They only dropped the call in
   flight, so the command kept running and the shell stayed on the host until
@@ -193,9 +211,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   one (RC4) cannot seal and fails the call. Unsealed Kerberos (HTTPS under
   `Auto`, or `Never`) is unchanged.
 - **Sealed-request error texts name the method**: "HTTP 401 to a sealed
-  NTLM request ...", "server answered a sealed NTLM request without sealing
-  ...", "the server closes the connection right after NTLM authentication
-  ..." (same variants as before).
+  NTLM request on an authenticated connection ...", "server answered a
+  sealed NTLM request without sealing ...", "the server closes the
+  connection right after NTLM authentication ..." (same variants as
+  before). The 401 text now names both causes: the server closed an idle
+  connection, or the client's pool sent the request on a fresh,
+  unauthenticated connection.
+- **Kerberos over HTTPS authenticates once per connection** instead of once
+  per request (see channel binding under `### Added`), one extra
+  unauthenticated request per new connection, and now requires the
+  server's AP-REP. Only `EncryptionMode::Never` over plain HTTP keeps a
+  context per request (AP-REP checked when present, not required).
+- **Pool race on dedicated connections: mitigated, not closed.** `hyper`
+  hands a connection back to its client's pool from a task of its own; a
+  sealed request sent before that task ran went out on a new,
+  unauthenticated TCP connection and failed with an HTTP 401 (fail-closed:
+  error, not resent). Measured against the DC with `AllowUnencrypted =
+  false`, a 20 KB upload then a 200 KB download, 10 runs per cell: on a
+  current-thread runtime 0 of 10 passed without yields and 10 of 10 with 4,
+  for Kerberos and NTLM alike; on a multi-thread runtime 10 of 10 with 0 or
+  4. With `AllowUnencrypted = true` no run failed (5 Kerberos and 2 NTLM
+  download runs, and 80 large-output runs over every method, runtime and
+  yield count), which is why NTLM, always measured against the 2025 bench
+  (`true`), never showed it: the trigger is the server's timing, not the
+  method. New live test
+  `sealed_download_after_upload_stays_on_its_connection_allow_unencrypted_false`.
+  A dedicated exchange now yields to the runtime 4 times before sending (the
+  number is empirical); pinning one `hyper` connection per dedicated
+  connection would close the race and is not done (it needs a Cargo change).
 - **Behaviour change: NTLM-sealed requests fail closed** (see `### Security`).
   A server that answers sealed requests with an error used to get the
   request again in plaintext after a fresh handshake, which worked when it
@@ -381,7 +424,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `tests/vagrant/dc/README.md`): `kerberos_run_command_whoami` (runs as
   `winrm\vagrant`), `kerberos_two_commands_on_one_client` and
   `silent_command_completes_over_kerberos` pass over HTTP with a TGT from
-  `kinit`; HTTPS with Kerberos was not measured. The server's
+  `kinit`. The server's
   mutual-authentication token (AP-REP) was observed being verified with
   `KRB5_TRACE` (no test asserts it). At that point Kerberos SOAP bodies
   were not encrypted (with `AllowUnencrypted = false` every request ended in
@@ -389,16 +432,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   clear error are listed under `### Added` and `### Fixed`.
 - **Kerberos over HTTPS validated live** (`kerberos_over_https_whoami`,
   DC HTTPS listener from `setup_dc_https_listener`, self-signed certificate
-  with `accept_invalid_certs`): it worked without code change, with the
-  same SPN `HTTP/<host>`. No channel binding token is sent; the bench runs
-  `CbtHardeningLevel = Relaxed` and `Strict` was not measured.
+  with `accept_invalid_certs`): it first worked without code change (no
+  channel binding, `CbtHardeningLevel = Relaxed`), and now with channel
+  binding under `Relaxed` and `Strict`.
 - **`AuthMethod::Kerberos` documentation corrected.** It said "SPNEGO
   Negotiate tokens"; the tokens are raw Kerberos GSS-API tokens (mechanism
   krb5) sent under the `Negotiate` HTTP scheme, whose Windows acceptor takes
   them. The rustdoc, the crate-level table and the README now state what
   Kerberos guarantees: authentication (mutual when the server answers with
-  its token, required for sealing), and message confidentiality only
-  through HTTPS or Kerberos sealing.
+  its token, required for sealing and HTTPS), and message confidentiality
+  only through HTTPS or Kerberos sealing. Sealing protects the messages of
+  a client that seals; a server with `AllowUnencrypted = true` still runs
+  unencrypted, unprotected requests (from a client with
+  `EncryptionMode::Never`, or Basic), so integrity on plain HTTP against an
+  active network attacker, server side, also needs `AllowUnencrypted =
+  false` (NTLM as Kerberos).
 
 ## [1.2.2] - 2026-09-04
 

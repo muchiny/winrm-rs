@@ -93,13 +93,28 @@ let client = WinrmClient::new(
 let out = client.run_command("server.corp.example", "whoami", &[]).await?;
 ```
 
-Kerberos authenticates the client (and the server, through its answer
-token). Message confidentiality comes from HTTPS (`use_tls = true`) or, over
-HTTP, from Kerberos sealing, which `EncryptionMode::Auto` (the default)
-applies: each SOAP body is wrapped with the connection's Kerberos context
-(GSS-API wrap with confidentiality, AES enctypes), so the server can keep
-`AllowUnencrypted = false`. `EncryptionMode::Never` sends the bodies in
-plaintext over HTTP. Over HTTPS no channel binding token is sent.
+Kerberos authenticates the client and, through its AP-REP, the server
+(required for sealing and over HTTPS; only `EncryptionMode::Never` over
+plain HTTP accepts an answer without it). Message confidentiality comes from
+HTTPS (`use_tls = true`) or, over HTTP, from Kerberos sealing, which
+`EncryptionMode::Auto` (the default) applies: each SOAP body is wrapped with
+the connection's Kerberos context (GSS-API wrap with confidentiality; only
+RFC 4121 tokens, so AES session keys: an RC4-only realm needs
+`EncryptionMode::Never`), so the server can keep `AllowUnencrypted = false`.
+`EncryptionMode::Never` sends the bodies in plaintext over HTTP. Over HTTPS
+the AP-REQ carries a channel binding (RFC 5929 `tls-server-end-point`) for
+the certificate of its connection, accepted by `CbtHardeningLevel = Strict`.
+
+Limits: WinRM sends its sealed Kerberos answers with sequence number 0, so
+the Kerberos session detects no replay; each sealed answer is bound to its
+request through `RelatesTo`, and a sealed request replayed by an active
+attacker on the same authenticated connection is not detected. Sealing
+protects this client's messages; server side, integrity on plain HTTP also
+needs `AllowUnencrypted = false` (for NTLM as for Kerberos), since a server
+that allows unencrypted traffic runs unprotected requests from other
+clients. On a Windows client the SSPI path of `cross-krb5` is compiled in CI
+but not tested live: with `--features kerberos`, `Auto` now seals over HTTP,
+and `EncryptionMode::Never` is the way back if that fails.
 
 ### Certificate authentication
 
@@ -241,7 +256,7 @@ cargo fmt --check         # format check
 
 Everything the crate parses off the network — NTLM messages, WS-Management
 SOAP responses, CredSSP DER — and everything it splices into an outgoing
-request is covered by 20 libFuzzer targets. They assert protocol invariants
+request is covered by 21 libFuzzer targets. They assert protocol invariants
 (no input can inject XML markup into an envelope, no Type 3 security buffer
 escapes its message, `encode`/`decode` roundtrip) rather than only the absence
 of panics.

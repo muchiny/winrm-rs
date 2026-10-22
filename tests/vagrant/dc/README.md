@@ -17,9 +17,29 @@ All credentials are throwaway values for this lab VM only:
 DSRM `Vagrant-DSRM-2025!`. The domain password policy is relaxed (no
 complexity, no minimum length, no expiry) so that `vagrant` is accepted.
 
-The `Vagrantfile` and the `tests/scripts/vm-*.sh` scripts are git-ignored
-like the other benches' (`.gitignore`: dev-only files); this README is the
-tracked description.
+The `Vagrantfile` and the `tests/scripts/vm-*.sh` scripts are local only:
+`.gitignore` lists `Vagrantfile` and `tests/scripts/vm-*.sh`, like the other
+benches' files, so a fresh clone has neither and this README is the tracked
+description. To rebuild the bench, write them from it:
+
+- a `Vagrantfile` that brings up the VM of the table above on Hyper-V,
+  promotes it to the `winrm.test` domain controller and leaves WinRM in the
+  state described below (Basic, Negotiate and Kerberos on,
+  `AllowUnencrypted = true`, `CbtHardeningLevel = Relaxed`, `WINRM\vagrant`
+  present);
+- `tests/scripts/vm-up-dc.sh`, which copies it to the Vagrant directory on
+  Windows and runs `vagrant up`;
+- `tests/scripts/vm-connect-dc.sh`, which creates the host port proxies and
+  firewall rules (section "Exposure on the host network"), the
+  `/etc/hosts` line and the private `krb5.conf` (section "WSL client"), and
+  prints only `export` lines on stdout: `WINRM_TEST_KRB_HOST`
+  (`dc.winrm.test`), `WINRM_TEST_KRB_PORT`, `WINRM_TEST_KRB_HTTPS_PORT`,
+  `WINRM_TEST_KRB_USER`, `WINRM_TEST_KRB_PASS`, `KRB5_CONFIG` and
+  `KRB5CCNAME`.
+
+The commands below run elevated Windows tools through `gsudo`; `$G` stands
+for the path of your `gsudo.exe` as WSL sees it, for instance
+`G="/mnt/c/Program Files/gsudo/<version>/gsudo.exe"`.
 
 ## Bring up
 
@@ -51,7 +71,7 @@ If `vagrant up` runs detached (no console for gsudo), launch it on the
 Windows side and read the log:
 
 ```bash
-"/mnt/c/Program Files/gsudo/2.6.1/gsudo.exe" powershell.exe -Command \
+"$G" powershell.exe -Command \
   "Start-Process powershell.exe -ArgumentList '-NoProfile','-File','C:\winrm-rs-dc-vagrant\up.ps1' -WindowStyle Hidden"
 iconv -f utf-16le -t utf-8 /mnt/c/winrm-rs-dc-vagrant/up.log | tr -d '\r' | tail
 ```
@@ -156,7 +176,6 @@ localhost (`Set-NetFirewallRule -DisplayName 'WinRM DC HTTP','WinRM DC HTTPS','W
 ## Stop (keeps the VM)
 
 ```bash
-G="/mnt/c/Program Files/gsudo/2.6.1/gsudo.exe"
 "$G" powershell.exe -Command "Stop-VM winrm-rs-dc"
 ```
 
@@ -166,14 +185,12 @@ Warning: this deletes the VM and its disks; the domain is lost and the next
 `vm-up-dc.sh` rebuilds it from scratch.
 
 ```bash
-G="/mnt/c/Program Files/gsudo/2.6.1/gsudo.exe"
 "$G" powershell.exe -Command "cd C:\winrm-rs-dc-vagrant; & 'C:\Program Files\Vagrant\bin\vagrant.exe' destroy -f"
 ```
 
 ## Remove the host and WSL side
 
 ```bash
-G="/mnt/c/Program Files/gsudo/2.6.1/gsudo.exe"
 "$G" cmd.exe /c "netsh interface portproxy delete v4tov4 listenaddress=0.0.0.0 listenport=57985 & netsh interface portproxy delete v4tov4 listenaddress=0.0.0.0 listenport=57986 & netsh interface portproxy delete v4tov4 listenaddress=0.0.0.0 listenport=57088"
 "$G" powershell.exe -Command "Remove-NetFirewallRule -DisplayName 'WinRM DC HTTP','WinRM DC HTTPS','WinRM DC KDC'"
 rm -rf target/winrm-krb5

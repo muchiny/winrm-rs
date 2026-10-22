@@ -122,9 +122,10 @@ attacker on the same authenticated connection is not detected. Sealing
 protects this client's messages; server side, integrity on plain HTTP also
 needs `AllowUnencrypted = false` (for NTLM as for Kerberos), since a server
 that allows unencrypted traffic runs unprotected requests from other
-clients. On a Windows client the SSPI path of `cross-krb5` is built by a CI
-job (not yet run) and not tested live: with `--features kerberos`, `Auto` now seals over HTTP,
-and `EncryptionMode::Never` is the way back if that fails.
+clients. On a Windows client the SSPI path of `cross-krb5` is built and
+linted by the `kerberos-windows` CI job and not tested live: with
+`--features kerberos`, `Auto` now seals over HTTP, and
+`EncryptionMode::Never` is the way back if that fails.
 
 ### Certificate authentication
 

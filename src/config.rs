@@ -270,9 +270,10 @@ impl std::fmt::Debug for EnvVarNames<'_> {
 /// client with [`Self::Never`], or Basic).
 ///
 /// On a Windows client, Kerberos sealing goes through the SSPI branch of
-/// `cross-krb5`, which a CI job builds (not yet run) and which has not been
-/// tested against a server: with the `kerberos` feature, [`Self::Auto`] now seals Kerberos
-/// over HTTP, and [`Self::Never`] is the way back if that fails.
+/// `cross-krb5`, which the `kerberos-windows` CI job builds and lints and
+/// which has not been tested against a server: with the `kerberos` feature,
+/// [`Self::Auto`] now seals Kerberos over HTTP, and [`Self::Never`] is the
+/// way back if that fails.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub enum EncryptionMode {
     /// Seal every SOAP body over HTTP; over HTTPS rely on TLS and send them

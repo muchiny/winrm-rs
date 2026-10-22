@@ -282,6 +282,11 @@ pub enum EncryptionMode {
     Auto,
     /// Seal every SOAP body, over HTTPS too (inside TLS).
     ///
+    /// **Only NTLM and Kerberos can seal.** With Basic, Certificate or
+    /// CredSSP this setting protects nothing: for those methods the only
+    /// protection is TLS (HTTPS), and Basic over plain HTTP stays in
+    /// plaintext.
+    ///
     /// NTLM and Kerberos only. With [`AuthMethod::Basic`],
     /// [`AuthMethod::Certificate`] or [`AuthMethod::CredSsp`] it changes
     /// nothing and refuses nothing: those methods never seal, so Basic over

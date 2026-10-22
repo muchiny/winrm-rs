@@ -526,9 +526,17 @@ fn header_get<'a>(
 /// "CredSSP <b64>" possibly mixed with other schemes).
 #[cfg(feature = "credssp")]
 fn extract_credssp_token_str(www_auth: &str) -> Option<String> {
-    let upper = www_auth.to_uppercase();
-    let pos = upper.find("CREDSSP ")?;
-    let after = &www_auth[pos + "CREDSSP ".len()..];
+    // ASCII-only case folding keeps every byte offset of `www_auth` valid:
+    // `to_uppercase` can change the byte length of non-ASCII characters
+    // (`ɐ` is 2 bytes, `Ɐ` is 3), so its offsets would slice the original
+    // off a character boundary and panic.
+    const SCHEME: &[u8] = b"CREDSSP ";
+    let pos = www_auth
+        .as_bytes()
+        .windows(SCHEME.len())
+        .position(|w| w.eq_ignore_ascii_case(SCHEME))?;
+    // `pos + SCHEME.len()` follows an ASCII space, so it is a char boundary.
+    let after = www_auth.get(pos + SCHEME.len()..)?;
     let token: String = after
         .chars()
         .take_while(|c| !c.is_whitespace() && *c != ',')
@@ -1066,6 +1074,21 @@ mod tests {
             extract_credssp_token_str("Negotiate, credssp ABCDEF, Basic"),
             Some("ABCDEF".to_string())
         );
+    }
+
+    /// A non-ASCII character whose uppercase form is longer in UTF-8
+    /// (`ɐ` → `Ɐ`) before the scheme must neither panic nor shift the cut.
+    #[test]
+    fn extract_credssp_token_str_survives_non_ascii_before_the_scheme() {
+        assert_eq!(
+            extract_credssp_token_str("ɐ CredSSP éé"),
+            Some("éé".to_string())
+        );
+        assert_eq!(
+            extract_credssp_token_str("ɐɐɐɐ, CredSSP QUJD, Basic"),
+            Some("QUJD".to_string())
+        );
+        assert_eq!(extract_credssp_token_str("ɐ ẞ ſ"), None);
     }
 
     #[test]

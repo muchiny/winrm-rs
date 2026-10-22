@@ -73,6 +73,7 @@ the details.
   with stderr exactly as the server sent it, to feed a `StderrDecoder`.
   `receive_output` itself still decodes each response on its own, so a
   CLIXML document split across responses comes back partly raw there.
+  Asked for in #1.
 
 - **Total deadline for the one-shot calls:**
   `WinrmClient::run_command_with_timeout`, `run_powershell_with_timeout` and
@@ -273,7 +274,8 @@ the details.
   in the worst case. Several documents after one marker, and a marker
   doubled by nested PowerShell, all decode. `WinrmClient::receive_output`
   decodes each response on its own; use `receive_output_raw` with a
-  `StderrDecoder` to decode across polls. Reported in #1.
+  `StderrDecoder` to decode across polls. Reported, with the analysis of
+  both failure modes, by @ol-etienne-saimond in #1.
 - **Warning, verbose and debug records were dropped** from CLIXML stderr; only
   error records were kept. They now come through with the console prefixes
   `WARNING: `, `VERBOSE: ` and `DEBUG: `. Progress and information records

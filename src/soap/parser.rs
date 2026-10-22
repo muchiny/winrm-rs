@@ -331,6 +331,11 @@ pub(crate) fn message_id(request: &str) -> Option<String> {
     extract_element_text(request, "MessageID")
 }
 
+/// The first `RelatesTo` of a response, if it has one.
+pub(crate) fn relates_to(response: &str) -> Option<String> {
+    extract_element_text(response, "RelatesTo")
+}
+
 /// Check that `response` answers `request`: the request must carry a
 /// `wsa:MessageID` and the response a `RelatesTo` with the same value
 /// (compared without regard to case: Windows may change the case of the
@@ -339,7 +344,7 @@ pub(crate) fn check_relates_to(request: &str, response: &str) -> Result<(), Stri
     let Some(message_id) = message_id(request) else {
         return Err("the request carries no MessageID".into());
     };
-    match extract_element_text(response, "RelatesTo") {
+    match relates_to(response) {
         Some(relates_to) if relates_to.eq_ignore_ascii_case(&message_id) => Ok(()),
         Some(_) => Err("its RelatesTo names another request".into()),
         None => Err("it carries no RelatesTo".into()),

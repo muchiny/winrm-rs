@@ -188,6 +188,16 @@ pub fn kerberos_windows_layout(
     crate::auth::kerberos::windows_layout(header, data, padding, trailer)
 }
 
+/// The `wsa:MessageID` of a request (`soap::parser::message_id`).
+pub fn message_id(request: &str) -> Option<String> {
+    crate::soap::parser::message_id(request)
+}
+
+/// The first `RelatesTo` of a response (`soap::parser::relates_to`).
+pub fn relates_to(response: &str) -> Option<String> {
+    crate::soap::parser::relates_to(response)
+}
+
 /// `RelatesTo` binding of an answer to its request
 /// (`soap::parser::check_relates_to`).
 pub fn check_relates_to(request: &str, response: &str) -> Result<(), String> {

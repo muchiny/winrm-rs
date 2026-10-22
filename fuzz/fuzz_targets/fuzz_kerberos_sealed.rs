@@ -4,7 +4,8 @@
 //! wrap-token checks of an answer, the conversion of a `gss_wrap_iov` result
 //! to the Windows SSPI layout, and the `RelatesTo` binding of an answer to
 //! its request. None may panic; errors stay short; the layout conversion is
-//! a right rotation by the RRC it writes.
+//! a right rotation by the RRC it writes; a binding is accepted only when the
+//! request's `MessageID` equals the response's first `RelatesTo`.
 //!
 //! Input layout: one byte choosing the part, then the rest.
 //! - 0: the rest is a sealed answer body: parsed, then its token checked.
@@ -16,7 +17,7 @@
 use libfuzzer_sys::fuzz_target;
 use winrm_rs::__fuzz::{
     check_relates_to, kerberos_check_acceptor_sealed, kerberos_parse_sealed,
-    kerberos_windows_layout,
+    kerberos_windows_layout, message_id, relates_to,
 };
 
 /// The first `n` bytes of `r` (or all of it), and the rest.
@@ -72,7 +73,13 @@ fuzz_target!(|data: &[u8]| {
             let (request, response) = rest.split_at(usize::from(at).min(rest.len()));
             let request = String::from_utf8_lossy(request);
             let response = String::from_utf8_lossy(response);
-            let _ = check_relates_to(&request, &response);
+            if check_relates_to(&request, &response).is_ok() {
+                // Accepted only when the request names itself and the
+                // response's first RelatesTo names the same, ignoring case.
+                let id = message_id(&request).expect("accepted without a MessageID");
+                let answered = relates_to(&response).expect("accepted without a RelatesTo");
+                assert!(id.eq_ignore_ascii_case(&answered), "{id} vs {answered}");
+            }
         }
     }
 });

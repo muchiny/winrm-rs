@@ -3723,12 +3723,27 @@ impl TlsRecordingRelay {
     /// `dc.winrm.test`), presenting a certificate made for the run with the
     /// `openssl` command.
     fn start(upstream_port: u16) -> Self {
+        Self::start_with(upstream_port, false)
+    }
+
+    /// Like [`Self::start`], but when `pass_first` the first connection is
+    /// relayed as raw TCP, untouched (the client sees the DC's own
+    /// certificate on it), and only the later ones are terminated with the
+    /// relay's certificate: the split an attacker in the middle would use
+    /// against a binding computed on one connection and used on another.
+    fn start_with(upstream_port: u16, pass_first: bool) -> Self {
         use rustls::pki_types::pem::PemObject;
         use std::io::Write;
         use std::sync::{Arc, Mutex};
 
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let dir = std::env::temp_dir().join(format!("winrm_rs_tls_relay_{}", std::process::id()));
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!(
+            "winrm_rs_tls_relay_{}_{unique}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).expect("relay temp dir");
         let (cert_path, key_path) = (dir.join("cert.pem"), dir.join("key.pem"));
         let status = std::process::Command::new("openssl")
@@ -3765,7 +3780,30 @@ impl TlsRecordingRelay {
         let requests: Arc<Mutex<Vec<RelayedRequest>>> = Arc::default();
         let recorded = Arc::clone(&requests);
         std::thread::spawn(move || {
+            let mut passed = !pass_first;
             for client in listener.incoming().flatten() {
+                if !passed {
+                    passed = true;
+                    let Ok(upstream) = std::net::TcpStream::connect(("127.0.0.1", upstream_port))
+                    else {
+                        continue;
+                    };
+                    let (Ok(mut c_read), Ok(mut u_read)) =
+                        (client.try_clone(), upstream.try_clone())
+                    else {
+                        continue;
+                    };
+                    let (mut c_write, mut u_write) = (client, upstream);
+                    std::thread::spawn(move || {
+                        let _ = std::io::copy(&mut c_read, &mut u_write);
+                        let _ = u_write.shutdown(std::net::Shutdown::Write);
+                    });
+                    std::thread::spawn(move || {
+                        let _ = std::io::copy(&mut u_read, &mut c_write);
+                        let _ = c_write.shutdown(std::net::Shutdown::Write);
+                    });
+                    continue;
+                }
                 let (server_config, client_config, recorded) = (
                     Arc::clone(&server_config),
                     Arc::clone(&client_config),
@@ -3962,6 +4000,46 @@ async fn kerberos_channel_binding_through_a_tls_relay_is_refused() {
     );
 }
 
+/// The split case: the unauthenticated probe goes through untouched (the
+/// client learns the DC's real certificate and binds to it), but the next
+/// connection, which would carry the AP-REQ, is terminated by the relay with
+/// its own certificate. The dedicated client's verifier is pinned to the
+/// probe's certificate, so that handshake fails and nothing is sent on it:
+/// the relay records no request at all.
+#[cfg(feature = "kerberos")]
+async fn assert_split_relay_fails_at_the_handshake() {
+    let https_port: u16 = std::env::var("WINRM_TEST_KRB_HTTPS_PORT")
+        .expect("WINRM_TEST_KRB_HTTPS_PORT")
+        .parse()
+        .expect("port");
+    for mode in [EncryptionMode::Auto, EncryptionMode::Always] {
+        let relay = TlsRecordingRelay::start_with(https_port, true);
+        let (client, host) = kerberos_client_through_relay(&relay, mode.clone());
+        let err = client
+            .run_command(&host, "whoami", &[])
+            .await
+            .expect_err("the AP-REQ connection presents another certificate");
+        eprintln!("{mode:?} split relay: {err}");
+        assert!(
+            relay.requests().is_empty(),
+            "{mode:?}: the terminated connection carried requests: {:?}",
+            relay.requests()
+        );
+        assert!(
+            matches!(&err, WinrmError::AuthFailed(m) if m.contains("TLS handshake refused") && m.contains("pinned")),
+            "{mode:?}: expected the pinned verifier's refusal, got {err:?}"
+        );
+    }
+}
+
+/// The split case under the DC's default `CbtHardeningLevel = Relaxed`.
+#[cfg(feature = "kerberos")]
+#[tokio::test]
+#[ignore]
+async fn kerberos_channel_binding_split_relay_fails_at_the_handshake() {
+    assert_split_relay_fails_at_the_handshake().await;
+}
+
 /// With `CbtHardeningLevel = None` the DC ignores channel bindings, so the
 /// relay can watch the traffic inside TLS: `EncryptionMode::Always` sends
 /// every SOAP body sealed (Kerberos and NTLM), `Auto` sends them as is
@@ -4021,7 +4099,8 @@ async fn always_seals_inside_tls_seen_by_a_relay_with_dc_cbt_none() {
 
 /// `CbtHardeningLevel = Strict` requires channel bindings: Kerberos over
 /// HTTPS still works, unsealed (`Auto`) and sealed (`Always`), since the
-/// AP-REQ carries them; through the relay it is refused.
+/// AP-REQ carries them; through the relay it is refused, and the split relay
+/// fails at the handshake as under `Relaxed`.
 #[cfg(feature = "kerberos")]
 #[tokio::test]
 #[ignore]
@@ -4046,6 +4125,11 @@ async fn kerberos_over_https_with_dc_cbt_strict() {
             .await
             .expect_err("relay binding refused under Strict");
         eprintln!("through the relay under Strict: {err}");
+        assert!(
+            err.to_string().contains("Kerberos authentication rejected"),
+            "{err}"
+        );
+        assert_split_relay_fails_at_the_handshake().await;
     })
     .await;
 }

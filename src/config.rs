@@ -102,9 +102,11 @@ pub struct WinrmConfig {
     /// Each `(key, value)` pair is injected into the shell's environment
     /// at creation time via `<rsp:Environment>`.
     pub env_vars: Vec<(String, String)>,
-    /// Message encryption mode for NTLM (default: [`EncryptionMode::Auto`]).
+    /// Message encryption mode for NTLM and Kerberos (default:
+    /// [`EncryptionMode::Auto`]).
     ///
-    /// Controls whether NTLM sealing is applied to SOAP message bodies.
+    /// Controls whether SOAP message bodies are sealed (encrypted and signed)
+    /// with the NTLM session or the Kerberos context.
     pub encryption: EncryptionMode,
     /// Custom HTTP `User-Agent` header (default: `None` = `winrm-rs/<version>`).
     pub user_agent: Option<String>,
@@ -152,25 +154,32 @@ impl Default for WinrmConfig {
     }
 }
 
-/// Controls whether NTLM message encryption (sealing) is applied to SOAP bodies
-/// ([`AuthMethod::Ntlm`] only; the other methods ignore it).
+/// Controls whether message encryption (sealing) is applied to SOAP bodies
+/// ([`AuthMethod::Ntlm`] and [`AuthMethod::Kerberos`]; the other methods
+/// ignore it).
 ///
-/// When using HTTP (not HTTPS), NTLM sealing encrypts and signs each SOAP
-/// message to prevent eavesdropping and tampering. When using HTTPS, the TLS
-/// layer provides that, making sealing redundant.
+/// When using HTTP (not HTTPS), sealing encrypts and signs each SOAP message
+/// to prevent eavesdropping and tampering (MS-WSMV 2.2.9.1): with the NTLM
+/// session (RC4, NTLM signatures), or with the Kerberos context (GSS-API wrap
+/// with confidentiality, AES enctypes only). When using HTTPS, the TLS layer
+/// provides that, making sealing redundant.
 ///
 /// When sealing applies, it applies to every SOAP body, failing closed: the
-/// NTLM handshake runs with empty request bodies, each request is sealed on
-/// the connection the server bound the session to, and the answer must unseal
-/// (a sealed SOAP fault is reported as such). No request body is ever sent
+/// authentication runs with empty request bodies (NTLM handshake; Kerberos
+/// AP-REQ, whose answer must carry the server's AP-REP), each request is
+/// sealed on the connection the server bound the session to, and the answer
+/// must unseal (a sealed SOAP fault is reported as such). NTLM refuses a
+/// replayed answer by its sequence number; WinRM's Kerberos answers all carry
+/// sequence number 0, so a Kerberos answer must instead name its request's
+/// `MessageID` in `RelatesTo`. No request body is ever sent
 /// unsealed, and the client sends each request once: any failure, an HTTP
 /// 401 included, is returned as an error and the connection discarded. (A
 /// 401 on a reused connection usually means the server closed it, but on
 /// plain HTTP an attacker can also forward the sealed request to the server,
 /// let it run, and answer 401 itself, so a resend could run it twice.)
 ///
-/// NTLM binds its session to one TCP connection: a forwarding (not
-/// tunnelling) HTTP proxy that does not keep one server connection per client
+/// NTLM and Kerberos bind their session to one TCP connection: a forwarding
+/// (not tunnelling) HTTP proxy that does not keep one server connection per client
 /// connection breaks that binding, and sealed requests then fail with errors
 /// rather than going out unsealed.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -183,7 +192,9 @@ pub enum EncryptionMode {
     Always,
     /// Never seal: over HTTP, SOAP bodies (commands, their output, file
     /// contents) cross the network in plaintext, and the server must allow
-    /// unencrypted traffic (`AllowUnencrypted`). **Use only for debugging.**
+    /// unencrypted traffic (`AllowUnencrypted`; Windows answers otherwise
+    /// with an HTTP 500 and an empty body, reported as such for Kerberos).
+    /// **Use only for debugging.**
     Never,
 }
 
@@ -200,8 +211,23 @@ pub enum AuthMethod {
     Ntlm,
     /// Kerberos authentication (requires `kerberos` feature and prior `kinit`).
     ///
-    /// Uses SPNEGO Negotiate tokens via the system Kerberos library.
-    /// The service principal is derived as `HTTP/<hostname>`.
+    /// Sends raw Kerberos GSS-API tokens (mechanism krb5, RFC 4121; not
+    /// SPNEGO-wrapped) under the `Negotiate` HTTP scheme, via the system
+    /// Kerberos library (`cross-krb5`). The service principal is derived as
+    /// `HTTP/<hostname>` from the host string, so connect by name, not by
+    /// address. Credentials come from the ticket cache (`kinit`), not from
+    /// [`WinrmCredentials`].
+    ///
+    /// What it guarantees: authentication of the client and, when the server
+    /// answers with its token, of the server (mutual authentication).
+    /// Message confidentiality and integrity come from HTTPS, or from
+    /// Kerberos sealing ([`EncryptionMode::Auto`] over HTTP, or
+    /// [`EncryptionMode::Always`]), which runs one context per connection and
+    /// requires mutual authentication. With [`EncryptionMode::Never`] over
+    /// HTTP, each request authenticates with a fresh context but its body and
+    /// the answer cross the network in plaintext, unprotected. Over HTTPS no
+    /// channel binding token is sent, so a server with `CbtHardeningLevel =
+    /// Strict` may refuse it (validated only against `Relaxed`).
     Kerberos,
     /// TLS client certificate authentication. Requires HTTPS (`use_tls = true`).
     ///

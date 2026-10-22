@@ -19,6 +19,8 @@ use crate::auth::certificate::CertificateAuth;
 #[cfg(feature = "credssp")]
 use crate::auth::credssp::CredSspAuth;
 use crate::auth::kerberos::KerberosAuth;
+#[cfg(feature = "kerberos")]
+use crate::auth::kerberos::KerberosSession;
 use crate::auth::ntlm::{self as ntlm_auth, NtlmAuth};
 use crate::config::{AuthMethod, EncryptionMode, WinrmConfig, WinrmCredentials};
 use crate::error::{SoapError, WinrmError};
@@ -27,20 +29,20 @@ use crate::soap;
 use crate::tls::{CertHandle, ClientAuthCert};
 use rustls::client::danger::ServerCertVerifier;
 
-/// A dedicated NTLM connection: a `reqwest` client that keeps at most one
-/// TCP connection, the certificate handle of its own TLS verifier (HTTPS),
-/// and, for sealed messages, the NTLM session the server bound to that
-/// connection during the handshake.
+/// A dedicated connection: a `reqwest` client that keeps at most one TCP
+/// connection, the certificate handle of its own TLS verifier (HTTPS), and,
+/// for sealed messages, the NTLM session or Kerberos context the server bound
+/// to that connection during the handshake.
 ///
-/// NTLM sealing state and NTLM channel binding both belong to one TCP
-/// connection, and `reqwest` cannot pin a request to a connection, so each
-/// such connection has a client of its own. It is used by one request at a
-/// time (checked out of the transport's pool for the whole exchange) and goes
+/// Sealing state (NTLM and Kerberos) and NTLM channel binding belong to one
+/// TCP connection, and `reqwest` cannot pin a request to a connection, so
+/// each such connection has a client of its own. It is used by one request at
+/// a time (checked out of the transport's pool for the whole exchange) and goes
 /// back to the pool only after a clean exchange; one involved in a failure,
 /// or dropped mid-exchange (cancellation), is discarded with its session.
 /// The pool holds boxes, so checking a connection in and out moves a pointer,
 /// not the session's key material.
-struct NtlmConn {
+struct AuthConn {
     host: String,
     http: reqwest::Client,
     /// Certificates this client's verifier accepted (HTTPS). TLS session
@@ -52,33 +54,111 @@ struct NtlmConn {
     /// through a proxy).
     cert: Option<CertHandle>,
     /// Sealing session (sealed connections only).
-    session: Option<NtlmSession>,
+    session: Option<Sealer>,
     idle_since: Instant,
     /// The server announced it closes the connection (`Connection: close`):
     /// its session ends with it, so it is not reused.
     closing: bool,
 }
 
-/// Idle NTLM connections a transport keeps for reuse. Each holds one TCP
-/// connection (and, sealed, one NTLM session on the server): eight covers a
-/// client running several shells in parallel (each concurrent request needs
-/// its own connection) without holding many idle sockets on the host. Extra
+/// Idle dedicated connections a transport keeps for reuse. Each holds one
+/// TCP connection (and, sealed, one NTLM or Kerberos session on the server):
+/// eight covers a client running several shells in parallel (each concurrent
+/// request needs its own connection) without holding many idle sockets on the
+/// host. Extra
 /// connections are opened as needed and the oldest idle ones closed.
-const MAX_IDLE_NTLM_CONNS: usize = 8;
+const MAX_IDLE_CONNS: usize = 8;
 
-/// An NTLM connection idle longer than this is not reused but closed: it
+/// A dedicated connection idle longer than this is not reused but closed: it
 /// stays below the 90 s idle timeout of the `reqwest` pool and the 120 s of
 /// HTTP.sys, so a reused connection is normally still the authenticated one.
-const NTLM_CONN_MAX_IDLE: Duration = Duration::from_secs(60);
+const CONN_MAX_IDLE: Duration = Duration::from_secs(60);
 
-/// NTLM exchanges a transport runs at once on dedicated connections (sealed,
-/// or over TLS): a bound on the sockets and server sessions one client can
+/// Exchanges a transport runs at once on dedicated connections (sealed, or
+/// NTLM over TLS): a bound on the sockets and server sessions one client can
 /// open. Further requests wait for a slot, within the request timeout.
-const MAX_NTLM_CONNS_IN_FLIGHT: usize = 32;
+const MAX_CONNS_IN_FLIGHT: usize = 32;
+
+/// Times a sealed exchange yields to the runtime before sending, so the
+/// dedicated client's connection is back in its pool (see
+/// [`HttpTransport::send_sealed_body`]).
+const POOL_RETURN_YIELDS: usize = 4;
+
+/// The security context that seals a connection's messages.
+#[cfg_attr(
+    feature = "kerberos",
+    expect(
+        clippy::large_enum_variant,
+        reason = "held in a boxed AuthConn; another box would add a heap copy of NTLM keys"
+    )
+)]
+enum Sealer {
+    Ntlm(NtlmSession),
+    #[cfg(feature = "kerberos")]
+    Kerberos(KerberosSession),
+}
+
+impl Sealer {
+    /// Name of the method, for error messages.
+    fn method(&self) -> &'static str {
+        match self {
+            Self::Ntlm(_) => "NTLM",
+            #[cfg(feature = "kerberos")]
+            Self::Kerberos(_) => "Kerberos",
+        }
+    }
+
+    /// Error for a sealing protocol failure: [`WinrmError::Ntlm`] for NTLM (as
+    /// before), [`WinrmError::AuthFailed`] for Kerberos (no dedicated variant).
+    fn error(&self, msg: String) -> WinrmError {
+        match self {
+            Self::Ntlm(_) => WinrmError::Ntlm(crate::error::NtlmError::InvalidMessage(msg)),
+            #[cfg(feature = "kerberos")]
+            Self::Kerberos(_) => WinrmError::AuthFailed(msg),
+        }
+    }
+
+    /// Seal `body`: the HTTP `Content-Type` and the framed body.
+    fn seal(&mut self, body: &str) -> Result<(String, Vec<u8>), WinrmError> {
+        match self {
+            Self::Ntlm(session) => Ok(ntlm_auth::seal_body(session, body)),
+            #[cfg(feature = "kerberos")]
+            Self::Kerberos(session) => session.seal_body(body),
+        }
+    }
+
+    /// Unseal the sealed answer to `request`, failing on anything not exactly
+    /// framed and authenticated by this session.
+    ///
+    /// NTLM refuses a replayed answer by its sequence number. WinRM sends
+    /// Kerberos answers with sequence number 0, so a Kerberos answer is bound
+    /// to its request instead: it must carry the request's `MessageID` as
+    /// `RelatesTo` (an earlier answer of the session, replayed, names another
+    /// request).
+    fn unseal_answer(&mut self, request: &str, data: &[u8]) -> Result<String, WinrmError> {
+        match self {
+            Self::Ntlm(session) => {
+                let _ = request;
+                ntlm_auth::unseal_body(session, data)
+            }
+            #[cfg(feature = "kerberos")]
+            Self::Kerberos(session) => {
+                let text = session.unseal_body(data)?;
+                crate::soap::parser::check_relates_to(request, &text).map_err(|e| {
+                    WinrmError::AuthFailed(format!(
+                        "Kerberos message encryption: the sealed answer does not answer this \
+                         request: {e}"
+                    ))
+                })?;
+                Ok(text)
+            }
+        }
+    }
+}
 
 /// How a sealed exchange failed.
 enum SealedFailure {
-    /// HTTP 401: the connection no longer carries its NTLM session.
+    /// HTTP 401: the connection no longer carries its sealing session.
     Unauthorized,
     /// A SOAP fault, sealed by the server: a clean exchange.
     Fault(SoapError),
@@ -94,17 +174,17 @@ pub(crate) struct HttpTransport {
     config: WinrmConfig,
     credentials: WinrmCredentials,
     /// rustls configuration of [`Self::http`] and its server certificate
-    /// verifier (HTTPS only), the base of the dedicated NTLM clients.
+    /// verifier (HTTPS only), the base of the dedicated clients.
     tls_config: Option<(rustls::ClientConfig, Arc<dyn ServerCertVerifier>)>,
-    /// Idle dedicated NTLM connections. The lock is only held to check one
+    /// Idle dedicated connections. The lock is only held to check one
     /// out or back in, never across an HTTP exchange.
     #[expect(
         clippy::vec_box,
-        reason = "boxed so pool moves copy a pointer, not NTLM key material"
+        reason = "boxed so pool moves copy a pointer, not key material"
     )]
-    ntlm_pool: Mutex<Vec<Box<NtlmConn>>>,
-    /// Slots for NTLM exchanges in flight on dedicated connections.
-    ntlm_slots: tokio::sync::Semaphore,
+    conn_pool: Mutex<Vec<Box<AuthConn>>>,
+    /// Slots for exchanges in flight on dedicated connections.
+    conn_slots: tokio::sync::Semaphore,
     /// `wsmv:SessionId` value stamped on every request (`uuid:<UPPERCASE>`),
     /// one per transport. See [`crate::soap::envelope::with_session_id`].
     session_id: String,
@@ -266,7 +346,7 @@ impl HttpTransport {
 
         // NTLM channel binding takes the server certificate of the connection
         // that carried the challenge: from the response (`tls_info`), or from
-        // the verifier of a dedicated single-connection client (see `NtlmConn`).
+        // the verifier of a dedicated single-connection client (see `AuthConn`).
         let tls_config = if config.use_tls {
             let root_store =
                 rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -301,8 +381,8 @@ impl HttpTransport {
             config,
             credentials,
             tls_config,
-            ntlm_pool: Mutex::new(Vec::new()),
-            ntlm_slots: tokio::sync::Semaphore::new(MAX_NTLM_CONNS_IN_FLIGHT),
+            conn_pool: Mutex::new(Vec::new()),
+            conn_slots: tokio::sync::Semaphore::new(MAX_CONNS_IN_FLIGHT),
             session_id: format!("uuid:{}", uuid::Uuid::new_v4().to_string().to_uppercase()),
         })
     }
@@ -358,8 +438,8 @@ impl HttpTransport {
                 auth.send_authenticated(&self.http, &url, body).await?
             }
             AuthMethod::Ntlm => {
-                if self.seals_ntlm() {
-                    self.send_ntlm_sealed(host, &url, &body).await?
+                if self.seals() {
+                    self.send_sealed(host, &url, &body).await?
                 } else if self.config.use_tls {
                     self.send_ntlm_over_tls(host, &url, &body).await?
                 } else {
@@ -369,12 +449,14 @@ impl HttpTransport {
                 }
             }
             AuthMethod::Kerberos => {
-                let host_part = host.split(':').next().unwrap_or(host);
-                let auth = KerberosAuth {
-                    service_principal: format!("HTTP/{host_part}"),
-                    max_response_bytes: self.max_response_bytes(),
-                };
-                auth.send_authenticated(&self.http, &url, body).await?
+                // Without the feature, the stub's error says it is needed.
+                if cfg!(feature = "kerberos") && self.seals() {
+                    self.send_sealed(host, &url, &body).await?
+                } else {
+                    self.kerberos_auth(host)
+                        .send_authenticated(&self.http, &url, body)
+                        .await?
+                }
             }
             AuthMethod::Certificate => {
                 let auth = CertificateAuth {
@@ -406,15 +488,27 @@ impl HttpTransport {
         Ok(response_text)
     }
 
-    /// Whether NTLM requests are sealed: `EncryptionMode::Auto` seals over
-    /// plain HTTP only, `Always` over HTTPS too, `Never` never.
-    fn seals_ntlm(&self) -> bool {
-        matches!(self.config.auth_method, AuthMethod::Ntlm)
-            && match self.config.encryption {
-                EncryptionMode::Always => true,
-                EncryptionMode::Never => false,
-                EncryptionMode::Auto => !self.config.use_tls,
-            }
+    /// Whether requests are sealed (NTLM and Kerberos only):
+    /// `EncryptionMode::Auto` seals over plain HTTP only, `Always` over HTTPS
+    /// too, `Never` never.
+    fn seals(&self) -> bool {
+        matches!(
+            self.config.auth_method,
+            AuthMethod::Ntlm | AuthMethod::Kerberos
+        ) && match self.config.encryption {
+            EncryptionMode::Always => true,
+            EncryptionMode::Never => false,
+            EncryptionMode::Auto => !self.config.use_tls,
+        }
+    }
+
+    /// Kerberos authenticator for `host` (service principal `HTTP/<host>`).
+    fn kerberos_auth(&self, host: &str) -> KerberosAuth {
+        let host_part = host.split(':').next().unwrap_or(host);
+        KerberosAuth {
+            service_principal: format!("HTTP/{host_part}"),
+            max_response_bytes: self.max_response_bytes(),
+        }
     }
 
     /// NTLM authenticator for this transport's credentials.
@@ -429,56 +523,56 @@ impl HttpTransport {
 
     #[expect(
         clippy::vec_box,
-        reason = "boxed so pool moves copy a pointer, not NTLM key material"
+        reason = "boxed so pool moves copy a pointer, not key material"
     )]
-    fn ntlm_pool(&self) -> MutexGuard<'_, Vec<Box<NtlmConn>>> {
+    fn conn_pool(&self) -> MutexGuard<'_, Vec<Box<AuthConn>>> {
         // The guard is only held for vector operations, which do not leave
         // the pool inconsistent if they panic.
-        self.ntlm_pool
+        self.conn_pool
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Check out the most recently used idle NTLM connection to `host`
+    /// Check out the most recently used idle dedicated connection to `host`
     /// (sealed or not), closing those idle for longer than
-    /// [`NTLM_CONN_MAX_IDLE`].
-    fn take_ntlm_conn(&self, host: &str, sealed: bool) -> Option<Box<NtlmConn>> {
-        let mut pool = self.ntlm_pool();
-        pool.retain(|c| c.idle_since.elapsed() < NTLM_CONN_MAX_IDLE);
+    /// [`CONN_MAX_IDLE`].
+    fn take_conn(&self, host: &str, sealed: bool) -> Option<Box<AuthConn>> {
+        let mut pool = self.conn_pool();
+        pool.retain(|c| c.idle_since.elapsed() < CONN_MAX_IDLE);
         let at = pool
             .iter()
             .rposition(|c| c.host == host && c.session.is_some() == sealed)?;
         Some(pool.remove(at))
     }
 
-    /// Return an NTLM connection after a clean exchange, closing the oldest
-    /// idle ones beyond [`MAX_IDLE_NTLM_CONNS`].
-    fn return_ntlm_conn(&self, mut conn: Box<NtlmConn>) {
+    /// Return a dedicated connection after a clean exchange, closing the oldest
+    /// idle ones beyond [`MAX_IDLE_CONNS`].
+    fn return_conn(&self, mut conn: Box<AuthConn>) {
         if conn.closing {
             return;
         }
         conn.idle_since = Instant::now();
-        let mut pool = self.ntlm_pool();
+        let mut pool = self.conn_pool();
         pool.push(conn);
-        let excess = pool.len().saturating_sub(MAX_IDLE_NTLM_CONNS);
+        let excess = pool.len().saturating_sub(MAX_IDLE_CONNS);
         pool.drain(..excess);
     }
 
-    /// Wait for a slot to run an NTLM exchange on a dedicated connection, at
+    /// Wait for a slot to run an exchange on a dedicated connection, at
     /// most as long as one request may take.
-    async fn ntlm_slot(&self) -> Result<tokio::sync::SemaphorePermit<'_>, WinrmError> {
+    async fn conn_slot(&self) -> Result<tokio::sync::SemaphorePermit<'_>, WinrmError> {
         let wait = self.config.operation_timeout_secs.saturating_add(10);
-        match tokio::time::timeout(Duration::from_secs(wait), self.ntlm_slots.acquire()).await {
+        match tokio::time::timeout(Duration::from_secs(wait), self.conn_slots.acquire()).await {
             Ok(Ok(permit)) => Ok(permit),
             // The semaphore is never closed.
             Ok(Err(_)) | Err(_) => Err(WinrmError::Timeout(wait)),
         }
     }
 
-    /// A dedicated NTLM connection to `host`, not yet used: a client keeping
+    /// A dedicated connection to `host`, not yet used: a client keeping
     /// one connection, and over HTTPS its own capturing verifier with TLS
     /// session resumption off.
-    fn new_ntlm_conn(&self, host: &str) -> Result<Box<NtlmConn>, WinrmError> {
+    fn new_conn(&self, host: &str) -> Result<Box<AuthConn>, WinrmError> {
         let (tls, cert) = match &self.tls_config {
             Some((base, verifier)) => {
                 let capturing =
@@ -493,7 +587,7 @@ impl HttpTransport {
             }
             None => (None, None),
         };
-        Ok(Box::new(NtlmConn {
+        Ok(Box::new(AuthConn {
             host: host.to_string(),
             http: build_http_client(&self.config, tls, 1)?,
             cert,
@@ -503,40 +597,77 @@ impl HttpTransport {
         }))
     }
 
-    /// Open a sealed connection to `host`: a new dedicated connection and an
-    /// NTLM handshake on it whose Type 3 carries no body.
+    /// Open a sealed connection to `host`: a new dedicated connection and a
+    /// handshake on it that carries no body (NTLM: empty Type 3; Kerberos:
+    /// AP-REQ on an empty request, AP-REP in the answer).
     ///
-    /// A Type 3 answered with `Connection: close` ends the connection the
+    /// A handshake answered with `Connection: close` ends the connection the
     /// session is bound to before any sealed request: that connection is
     /// dropped and a new one authenticated, once; a server that closes again
     /// cannot carry sealed messages and gets an error.
-    async fn open_sealed_conn(&self, host: &str, url: &str) -> Result<Box<NtlmConn>, WinrmError> {
+    async fn open_sealed_conn(&self, host: &str, url: &str) -> Result<Box<AuthConn>, WinrmError> {
         for _ in 0..2 {
-            let mut conn = self.new_ntlm_conn(host)?;
-            let (session_key, closing) = self
-                .ntlm_auth()
-                .authenticate(&conn.http, conn.cert.as_ref(), url)
+            let mut conn = self.new_conn(host)?;
+            let (session, closing) = self
+                .sealing_handshake(&conn.http, conn.cert.as_ref(), host, url)
                 .await?;
             if closing {
                 debug!(
-                    "server closed the connection after NTLM authentication; authenticating a new one"
+                    method = session.method(),
+                    "server closed the connection after authentication; authenticating a new one"
                 );
                 continue;
             }
-            // The session (keys, RC4 S-boxes) is built on the stack and then
-            // moved into the boxed connection: that stack copy is not wiped.
-            conn.session = Some(NtlmSession::from_auth(&session_key));
+            conn.session = Some(session);
             return Ok(conn);
         }
-        Err(WinrmError::Ntlm(crate::error::NtlmError::InvalidMessage(
-            "the server closes the connection right after NTLM authentication, so no sealed \
-             message can use the session bound to it"
-                .into(),
+        let (method, wrap): (&str, fn(String) -> WinrmError) = match self.config.auth_method {
+            AuthMethod::Ntlm => ("NTLM", |m| {
+                WinrmError::Ntlm(crate::error::NtlmError::InvalidMessage(m))
+            }),
+            _ => ("Kerberos", WinrmError::AuthFailed),
+        };
+        Err(wrap(format!(
+            "the server closes the connection right after {method} authentication, so no \
+             sealed message can use the session bound to it"
         )))
     }
 
-    /// Send a request NTLM-sealed, failing closed: no request body is ever
-    /// sent unsealed, and no request is ever sent twice.
+    /// The handshake of [`Self::open_sealed_conn`] on the dedicated client
+    /// `http` (with `cert`, its verifier's record): the sealing session, and
+    /// whether the server announced `Connection: close`. (Takes the fields,
+    /// not the connection: a Kerberos context is `Send` but not `Sync`.)
+    async fn sealing_handshake(
+        &self,
+        http: &reqwest::Client,
+        cert: Option<&CertHandle>,
+        host: &str,
+        url: &str,
+    ) -> Result<(Sealer, bool), WinrmError> {
+        match self.config.auth_method {
+            AuthMethod::Ntlm => {
+                let (session_key, closing) = self.ntlm_auth().authenticate(http, cert, url).await?;
+                // The session (keys, RC4 S-boxes) is built on the stack and
+                // then moved into the boxed connection: that stack copy is not
+                // wiped.
+                Ok((Sealer::Ntlm(NtlmSession::from_auth(&session_key)), closing))
+            }
+            #[cfg(feature = "kerberos")]
+            AuthMethod::Kerberos => {
+                let (session, closing) = self.kerberos_auth(host).establish(http, url).await?;
+                Ok((Sealer::Kerberos(session), closing))
+            }
+            _ => {
+                let _ = host;
+                Err(WinrmError::AuthFailed(
+                    "internal: message encryption requested for an auth method without it".into(),
+                ))
+            }
+        }
+    }
+
+    /// Send a request sealed (NTLM or Kerberos), failing closed: no request
+    /// body is ever sent unsealed, and no request is ever sent twice.
     ///
     /// The request goes out on an idle authenticated connection to `host`, or
     /// a new one. A SOAP fault (sealed by the server) is returned as
@@ -546,53 +677,63 @@ impl HttpTransport {
     /// server closed explains, but an active attacker can also forward the
     /// request to the server and answer 401 itself, so the request may have
     /// run and is not resent.
-    async fn send_ntlm_sealed(
-        &self,
-        host: &str,
-        url: &str,
-        body: &str,
-    ) -> Result<String, WinrmError> {
-        let _slot = self.ntlm_slot().await?;
-        let mut conn = match self.take_ntlm_conn(host, true) {
+    async fn send_sealed(&self, host: &str, url: &str, body: &str) -> Result<String, WinrmError> {
+        let _slot = self.conn_slot().await?;
+        let mut conn = match self.take_conn(host, true) {
             Some(conn) => conn,
             None => self.open_sealed_conn(host, url).await?,
         };
         match Self::send_sealed_body(&mut conn, url, body, self.max_response_bytes()).await {
             Ok(text) => {
-                self.return_ntlm_conn(conn);
+                self.return_conn(conn);
                 Ok(text)
             }
             Err(SealedFailure::Fault(fault)) => {
-                self.return_ntlm_conn(conn);
+                self.return_conn(conn);
                 Err(WinrmError::Soap(fault))
             }
             Err(SealedFailure::Unauthorized) => {
-                Err(WinrmError::Ntlm(crate::error::NtlmError::InvalidMessage(
-                    "HTTP 401 to an NTLM-sealed request: the connection's NTLM session is no \
-                     longer valid (usually the server closed an idle connection); the request \
-                     was NOT resent, as it may already have run: retry the call if it is safe \
-                     to run again"
-                        .into(),
-                )))
+                let session = conn.session.as_ref();
+                let method = session.map_or("sealing", Sealer::method);
+                let msg = format!(
+                    "HTTP 401 to a sealed {method} request: the connection's {method} session is \
+                     no longer valid (usually the server closed an idle connection); the \
+                     request was NOT resent, as it may already have run: retry the call if it \
+                     is safe to run again"
+                );
+                Err(match session {
+                    Some(session) => session.error(msg),
+                    None => WinrmError::AuthFailed(msg),
+                })
             }
             Err(SealedFailure::Error(e)) => Err(e),
         }
     }
 
     /// One sealed exchange on `conn`. Only the outcome decides what happens
-    /// to the connection (see [`Self::send_ntlm_sealed`]).
+    /// to the connection (see [`Self::send_sealed`]).
     async fn send_sealed_body(
-        conn: &mut NtlmConn,
+        conn: &mut AuthConn,
         url: &str,
         body: &str,
         max_response_bytes: usize,
     ) -> Result<String, SealedFailure> {
         let Some(session) = conn.session.as_mut() else {
             return Err(SealedFailure::Error(WinrmError::AuthFailed(
-                "internal: sealed exchange on a connection without an NTLM session".into(),
+                "internal: sealed exchange on a connection without a sealing session".into(),
             )));
         };
-        let (content_type, sealed) = ntlm_auth::seal_body(session, body);
+        let (content_type, sealed) = session.seal(body).map_err(SealedFailure::Error)?;
+        // `hyper` hands a connection back to the client's pool from a task of
+        // its own once the previous answer is fully read; a request sent
+        // before that task runs opens a new TCP connection, which carries no
+        // session and gets a 401 (measured: Kerberos-sealed downloads after
+        // ~150 KB answers, on a current-thread runtime). Yielding first lets
+        // that task run. This narrows the window, it does not close it: the
+        // request still fails closed (401 error, not resent) if it happens.
+        for _ in 0..POOL_RETURN_YIELDS {
+            tokio::task::yield_now().await;
+        }
         let resp = conn
             .http
             .post(url)
@@ -621,21 +762,24 @@ impl HttpTransport {
             .map_err(SealedFailure::Error)?;
 
         if status.is_success() {
-            return ntlm_auth::unseal_body(session, &bytes).map_err(SealedFailure::Error);
+            return session
+                .unseal_answer(body, &bytes)
+                .map_err(SealedFailure::Error);
         }
         // Windows seals the answer to a sealed request, a SOAP fault (HTTP
         // 500) included. An error answer that is not sealed is not trusted:
         // its body is neither parsed nor quoted.
         if !labelled_sealed {
-            return Err(SealedFailure::Error(WinrmError::Ntlm(
-                crate::error::NtlmError::InvalidMessage(format!(
-                    "server answered an NTLM-sealed request without sealing: HTTP {status} \
-                     ({} bytes)",
-                    bytes.len()
-                )),
-            )));
+            let method = session.method();
+            return Err(SealedFailure::Error(session.error(format!(
+                "server answered a sealed {method} request without sealing: HTTP {status} \
+                 ({} bytes)",
+                bytes.len()
+            ))));
         }
-        let text = ntlm_auth::unseal_body(session, &bytes).map_err(SealedFailure::Error)?;
+        let text = session
+            .unseal_answer(body, &bytes)
+            .map_err(SealedFailure::Error)?;
         if status.as_u16() == 500
             && let Err(fault) = crate::soap::parser::check_soap_fault(&text)
         {
@@ -651,24 +795,24 @@ impl HttpTransport {
     /// handshake per request whose Type 3 carries the body and a channel
     /// binding token computed from the certificate of the connection that
     /// carried the challenge. Runs on a dedicated connection (see
-    /// [`NtlmConn`]), so that certificate is known even through a proxy.
+    /// [`AuthConn`]), so that certificate is known even through a proxy.
     async fn send_ntlm_over_tls(
         &self,
         host: &str,
         url: &str,
         body: &str,
     ) -> Result<String, WinrmError> {
-        let _slot = self.ntlm_slot().await?;
-        let conn = match self.take_ntlm_conn(host, false) {
+        let _slot = self.conn_slot().await?;
+        let conn = match self.take_conn(host, false) {
             Some(conn) => conn,
-            None => self.new_ntlm_conn(host)?,
+            None => self.new_conn(host)?,
         };
         let result = self
             .ntlm_auth()
             .send_with_binding(&conn.http, conn.cert.as_ref(), url, body)
             .await;
         if matches!(result, Ok(_) | Err(WinrmError::Soap(_))) {
-            self.return_ntlm_conn(conn);
+            self.return_conn(conn);
         }
         result
     }
@@ -2312,7 +2456,7 @@ mod tests {
     /// NTLM seals with `Auto` over HTTP and with `Always`; never with
     /// `Never`, and never for another method.
     #[test]
-    fn seals_ntlm_follows_mode_and_scheme() {
+    fn seals_follows_mode_and_scheme_for_ntlm_and_kerberos() {
         let seals = |auth_method: AuthMethod, encryption: EncryptionMode, use_tls: bool| {
             HttpTransport::new(
                 WinrmConfig {
@@ -2324,7 +2468,7 @@ mod tests {
                 WinrmCredentials::new("u", "p", ""),
             )
             .unwrap()
-            .seals_ntlm()
+            .seals()
         };
         for (mode, http, https) in [
             (EncryptionMode::Auto, true, false),
@@ -2341,6 +2485,16 @@ mod tests {
                 https,
                 "{mode:?} HTTPS"
             );
+            assert_eq!(
+                seals(AuthMethod::Kerberos, mode.clone(), false),
+                http,
+                "{mode:?} Kerberos HTTP"
+            );
+            assert_eq!(
+                seals(AuthMethod::Kerberos, mode.clone(), true),
+                https,
+                "{mode:?} Kerberos HTTPS"
+            );
             assert!(
                 !seals(AuthMethod::Basic, mode.clone(), false),
                 "{mode:?} Basic"
@@ -2351,22 +2505,22 @@ mod tests {
     // --- Bounded in-flight NTLM connections ---
 
     #[tokio::test]
-    async fn ntlm_slots_default_to_32() {
+    async fn conn_slots_default_to_32() {
         let (_server, _fake, transport, _host) = sealed_setup().await;
         assert_eq!(
-            transport.ntlm_slots.available_permits(),
-            MAX_NTLM_CONNS_IN_FLIGHT
+            transport.conn_slots.available_permits(),
+            MAX_CONNS_IN_FLIGHT
         );
-        assert_eq!(MAX_NTLM_CONNS_IN_FLIGHT, 32);
+        assert_eq!(MAX_CONNS_IN_FLIGHT, 32);
     }
 
     /// With every slot taken, a request waits, and gets a slot once one is
     /// released.
     #[tokio::test]
-    async fn a_request_waits_for_a_free_ntlm_slot() {
+    async fn a_request_waits_for_a_free_conn_slot() {
         let (_server, fake, mut transport, host) = sealed_setup().await;
-        transport.ntlm_slots = tokio::sync::Semaphore::new(1);
-        let held = transport.ntlm_slots.try_acquire().unwrap();
+        transport.conn_slots = tokio::sync::Semaphore::new(1);
+        let held = transport.conn_slots.try_acquire().unwrap();
         let start = std::time::Instant::now();
         let (reply, ()) = tokio::join!(
             transport.send_soap_with_retry(&host, "<a/>".into()),
@@ -2383,7 +2537,7 @@ mod tests {
     /// A request that cannot get a slot within the request timeout fails
     /// with `Timeout` (time is paused, so the wait is instant).
     #[tokio::test(start_paused = true)]
-    async fn waiting_for_an_ntlm_slot_respects_the_request_timeout() {
+    async fn waiting_for_a_conn_slot_respects_the_request_timeout() {
         let config = WinrmConfig {
             auth_method: AuthMethod::Ntlm,
             operation_timeout_secs: 5,
@@ -2391,22 +2545,22 @@ mod tests {
         };
         let mut transport =
             HttpTransport::new(config, WinrmCredentials::new(USER, PASS, "")).unwrap();
-        transport.ntlm_slots = tokio::sync::Semaphore::new(1);
-        let _held = transport.ntlm_slots.try_acquire().unwrap();
-        let err = transport.ntlm_slot().await.unwrap_err();
+        transport.conn_slots = tokio::sync::Semaphore::new(1);
+        let _held = transport.conn_slots.try_acquire().unwrap();
+        let err = transport.conn_slot().await.unwrap_err();
         assert!(matches!(err, WinrmError::Timeout(15)), "{err:?}");
     }
 
     /// A waiting request dropped (cancelled) leaves no slot taken.
     #[tokio::test]
-    async fn a_cancelled_wait_for_an_ntlm_slot_takes_no_slot() {
+    async fn a_cancelled_wait_for_a_conn_slot_takes_no_slot() {
         let (_server, _fake, mut transport, _host) = sealed_setup().await;
-        transport.ntlm_slots = tokio::sync::Semaphore::new(1);
-        let held = transport.ntlm_slots.try_acquire().unwrap();
-        let waited = tokio::time::timeout(Duration::from_millis(50), transport.ntlm_slot()).await;
+        transport.conn_slots = tokio::sync::Semaphore::new(1);
+        let held = transport.conn_slots.try_acquire().unwrap();
+        let waited = tokio::time::timeout(Duration::from_millis(50), transport.conn_slot()).await;
         assert!(waited.is_err(), "the wait should still be pending");
         drop(held);
-        assert_eq!(transport.ntlm_slots.available_permits(), 1);
+        assert_eq!(transport.conn_slots.available_permits(), 1);
     }
 
     /// Through a proxy (no TLS details on the response), a dedicated NTLM
@@ -2422,7 +2576,7 @@ mod tests {
         let transport = ntlm_tls_transport(port_a, spawn_connect_proxy());
         // Both servers are "127.0.0.1" (different ports): the same target
         // name for the client's certificate record.
-        let conn = transport.new_ntlm_conn("127.0.0.1").unwrap();
+        let conn = transport.new_conn("127.0.0.1").unwrap();
         let auth = transport.ntlm_auth();
         let send = |port: u16| {
             let url = format!("https://127.0.0.1:{port}/wsman");

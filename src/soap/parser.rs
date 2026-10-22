@@ -326,8 +326,54 @@ fn extract_subcode_value(xml: &str) -> Option<String> {
     Some(inner)
 }
 
+/// Check that `response` answers `request`: when the request carries a
+/// `wsa:MessageID`, the response must carry a `RelatesTo` with the same
+/// value (compared without regard to case: Windows may change the case of
+/// the UUID). A request without a `MessageID` binds nothing. Returns what is
+/// wrong otherwise.
+#[cfg(any(feature = "kerberos", test))]
+pub(crate) fn check_relates_to(request: &str, response: &str) -> Result<(), String> {
+    let Some(message_id) = extract_element_text(request, "MessageID") else {
+        return Ok(());
+    };
+    match extract_element_text(response, "RelatesTo") {
+        Some(relates_to) if relates_to.eq_ignore_ascii_case(&message_id) => Ok(()),
+        Some(_) => Err("its RelatesTo names another request".into()),
+        None => Err("it carries no RelatesTo".into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    // --- RelatesTo binding of a response to its request ---
+
+    const REQ: &str = "<s:Envelope><s:Header><wsa:MessageID>uuid:0a1B2c3D-0000-4000-8000-00000000abcd</wsa:MessageID></s:Header></s:Envelope>";
+
+    #[test]
+    fn relates_to_matching_the_message_id_is_accepted() {
+        let resp = "<s:Envelope><s:Header><a:RelatesTo>uuid:0A1B2C3D-0000-4000-8000-00000000ABCD</a:RelatesTo></s:Header><s:Body/></s:Envelope>";
+        assert_eq!(check_relates_to(REQ, resp), Ok(()));
+    }
+
+    #[test]
+    fn relates_to_of_another_request_is_refused() {
+        let resp = "<s:Envelope><s:Header><a:RelatesTo>uuid:11111111-0000-4000-8000-00000000abcd</a:RelatesTo></s:Header></s:Envelope>";
+        let err = check_relates_to(REQ, resp).unwrap_err();
+        assert!(err.contains("RelatesTo"), "{err}");
+    }
+
+    #[test]
+    fn missing_relates_to_is_refused_when_the_request_has_a_message_id() {
+        let err = check_relates_to(REQ, "<s:Envelope><s:Body/></s:Envelope>").unwrap_err();
+        assert!(err.contains("RelatesTo"), "{err}");
+    }
+
+    #[test]
+    fn a_request_without_message_id_binds_nothing() {
+        assert_eq!(check_relates_to("<s:Envelope/>", "<s:Envelope/>"), Ok(()));
+    }
+
     use super::*;
 
     #[test]

@@ -70,7 +70,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   body sealed (5 of 5, Kerberos and NTLM), and none under `Auto`.
   Windows clients: the SSPI branch of cross-krb5 (`cfg(windows)`) is not
   compiled here nor tested live (a CI job, not yet run, builds and lints
-  it builds); a Windows client using `--features kerberos` with `Auto` now
+  it); a Windows client using `--features kerberos` with `Auto` now
   seals over HTTP, and `EncryptionMode::Never` is the way back if that fails.
 - **Kerberos channel binding over HTTPS** (RFC 5929 `tls-server-end-point`).
   Kerberos over HTTPS now runs on dedicated connections authenticated once:

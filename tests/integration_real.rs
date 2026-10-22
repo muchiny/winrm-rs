@@ -2324,10 +2324,7 @@ fn test_client_https_ntlm() -> Option<(WinrmClient, String)> {
     let host = std::env::var("WINRM_TEST_HOST").ok()?;
     let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
     let pass = std::env::var("WINRM_TEST_PASS").ok()?;
-    let port: u16 = std::env::var("WINRM_TEST_HTTPS_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(55986);
+    let port: u16 = https_test_port();
 
     let config = WinrmConfig {
         auth_method: AuthMethod::Ntlm,
@@ -2466,10 +2463,7 @@ async fn basic_over_https_works() {
     let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
     let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
     let pass = std::env::var("WINRM_TEST_PASS").expect("WINRM_TEST_PASS");
-    let port: u16 = std::env::var("WINRM_TEST_HTTPS_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(55986);
+    let port: u16 = https_test_port();
 
     let config = WinrmConfig {
         auth_method: AuthMethod::Basic,
@@ -2511,10 +2505,7 @@ async fn credssp_run_command_whoami() {
     let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
     let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
     let pass = std::env::var("WINRM_TEST_PASS").expect("WINRM_TEST_PASS");
-    let port: u16 = std::env::var("WINRM_TEST_HTTPS_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(55986);
+    let port: u16 = https_test_port();
 
     let config = WinrmConfig {
         auth_method: AuthMethod::CredSsp,

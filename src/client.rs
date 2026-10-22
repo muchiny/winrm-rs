@@ -866,6 +866,16 @@ mod tests {
     use wiremock::matchers::{body_string_contains, header, method};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    /// A path under the temp directory that no other test, test run or
+    /// leftover can share (process id and a random suffix).
+    fn unique_temp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "{name}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ))
+    }
+
     fn test_creds() -> WinrmCredentials {
         WinrmCredentials::new("admin", "pass", "")
     }
@@ -1783,7 +1793,7 @@ mod tests {
 
     #[tokio::test]
     async fn certificate_auth_dispatch_with_wiremock() {
-        let dir = std::env::temp_dir().join("winrm-rs-test-cert");
+        let dir = unique_temp_path("winrm-rs-test-cert");
         std::fs::create_dir_all(&dir).unwrap();
         let cert_path = dir.join("cert.pem");
         let key_path = dir.join("key.pem");
@@ -2121,7 +2131,7 @@ mod tests {
             .await;
 
         let client = WinrmClient::new(basic_config(port), test_creds()).unwrap();
-        let local_path = std::env::temp_dir().join("winrm-rs-test-download.bin");
+        let local_path = unique_temp_path("winrm-rs-test-download.bin");
         let result = client
             .download_file("127.0.0.1", "C:\\remote\\file.txt", &local_path)
             .await;
@@ -2154,7 +2164,7 @@ mod tests {
 
     #[test]
     fn certificate_auth_reads_valid_pem_files() {
-        let dir = std::env::temp_dir().join("winrm-rs-test-cert-valid");
+        let dir = unique_temp_path("winrm-rs-test-cert-valid");
         std::fs::create_dir_all(&dir).unwrap();
         let cert_path = dir.join("test_cert.pem");
         let key_path = dir.join("test_key.pem");
@@ -2181,7 +2191,7 @@ mod tests {
 
     #[test]
     fn certificate_auth_reads_pem_files_invalid() {
-        let dir = std::env::temp_dir().join("winrm-rs-test-cert-read");
+        let dir = unique_temp_path("winrm-rs-test-cert-read");
         std::fs::create_dir_all(&dir).unwrap();
         let cert_path = dir.join("test_cert.pem");
         let key_path = dir.join("test_key.pem");
@@ -2212,7 +2222,7 @@ mod tests {
 
     #[test]
     fn certificate_auth_missing_key_path_with_valid_cert_file() {
-        let dir = std::env::temp_dir().join("winrm-rs-test-cert-nokey");
+        let dir = unique_temp_path("winrm-rs-test-cert-nokey");
         std::fs::create_dir_all(&dir).unwrap();
         let cert_path = dir.join("test_cert.pem");
         std::fs::write(&cert_path, b"cert data").unwrap();
@@ -2251,7 +2261,7 @@ mod tests {
 
     #[test]
     fn certificate_auth_nonexistent_key_file() {
-        let dir = std::env::temp_dir().join("winrm-rs-test-cert-nokey2");
+        let dir = unique_temp_path("winrm-rs-test-cert-nokey2");
         std::fs::create_dir_all(&dir).unwrap();
         let cert_path = dir.join("test_cert.pem");
         std::fs::write(&cert_path, b"cert data").unwrap();
@@ -2385,7 +2395,7 @@ mod tests {
         let server = MockServer::start().await;
         let port = server.address().port();
 
-        let dir = std::env::temp_dir().join("winrm-rs-test-upload");
+        let dir = unique_temp_path("winrm-rs-test-upload");
         std::fs::create_dir_all(&dir).unwrap();
         let local_file = dir.join("upload_test.txt");
         std::fs::write(&local_file, b"hello upload content").unwrap();
@@ -2444,7 +2454,7 @@ mod tests {
         let server = MockServer::start().await;
         let port = server.address().port();
 
-        let dir = std::env::temp_dir().join("winrm-rs-test-upload-fail");
+        let dir = unique_temp_path("winrm-rs-test-upload-fail");
         std::fs::create_dir_all(&dir).unwrap();
         let local_file = dir.join("upload_fail.txt");
         std::fs::write(&local_file, b"test data").unwrap();
@@ -2541,7 +2551,7 @@ mod tests {
             .await;
 
         let client = WinrmClient::new(basic_config(port), test_creds()).unwrap();
-        let local_path = std::env::temp_dir().join("winrm-rs-test-dlfail.bin");
+        let local_path = unique_temp_path("winrm-rs-test-dlfail.bin");
         let result = client
             .download_file("127.0.0.1", "C:\\nonexistent.txt", &local_path)
             .await;
@@ -2558,7 +2568,7 @@ mod tests {
         let server = MockServer::start().await;
         let port = server.address().port();
 
-        let dir = std::env::temp_dir().join("winrm-rs-test-upload-multi");
+        let dir = unique_temp_path("winrm-rs-test-upload-multi");
         std::fs::create_dir_all(&dir).unwrap();
         let local_file = dir.join("small.txt");
         std::fs::write(&local_file, b"tiny").unwrap();
@@ -2654,7 +2664,7 @@ mod tests {
             .await;
 
         let client = WinrmClient::new(basic_config(port), test_creds()).unwrap();
-        let local_path = std::env::temp_dir().join("winrm-rs-test-dl2.bin");
+        let local_path = unique_temp_path("winrm-rs-test-dl2.bin");
         let result = client
             .download_file("127.0.0.1", "C:\\remote\\data.bin", &local_path)
             .await;
@@ -2782,7 +2792,7 @@ mod tests {
         let server = MockServer::start().await;
         let port = server.address().port();
 
-        let dir = std::env::temp_dir().join("winrm-rs-test-upload-multi-chunk");
+        let dir = unique_temp_path("winrm-rs-test-upload-multi-chunk");
         std::fs::create_dir_all(&dir).unwrap();
         let local_file = dir.join("multi.bin");
         // 4001 bytes = 3 chunks with CHUNK_SIZE=2000 (2000 + 2000 + 1)
@@ -3143,7 +3153,7 @@ mod tests {
         let server = MockServer::start().await;
         let port = server.address().port();
 
-        let dir = std::env::temp_dir().join("winrm-rs-test-upload-writebytes");
+        let dir = unique_temp_path("winrm-rs-test-upload-writebytes");
         std::fs::create_dir_all(&dir).unwrap();
         let local_file = dir.join("small.txt");
         std::fs::write(&local_file, b"test-data").unwrap();

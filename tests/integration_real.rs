@@ -501,6 +501,70 @@ async fn powershell_stderr_clixml_parsed() {
     );
 }
 
+/// `Write-Host` text reaches stdout. powershell.exe 5.0 and later also copy it
+/// into the CLIXML stderr as an information record, which the decoder drops,
+/// so the text must come out once, on stdout only. PowerShell 4.0 (Server
+/// 2012 R2) has no information stream, so the raw-stderr half, which proves
+/// the copy exists, only runs on newer hosts.
+#[tokio::test]
+#[ignore]
+async fn write_host_reaches_stdout_once() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let script = "Write-Host 'host-marker'";
+    let output = client
+        .run_powershell(&host, script)
+        .await
+        .expect("run Write-Host");
+    assert_eq!(output.exit_code, 0);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("host-marker"),
+        "Write-Host text missing from stdout: {stdout:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("host-marker"),
+        "Write-Host text duplicated into decoded stderr: {stderr:?}"
+    );
+
+    if is_server_2012_r2().await {
+        eprintln!(
+            "SKIP write_host_reaches_stdout_once (raw half): PowerShell 4.0 on \
+             Server 2012 R2 has no information stream"
+        );
+        return;
+    }
+    let shell_id = client.create_shell(&host).await.expect("create shell");
+    let encoded = winrm_rs::encode_powershell_command(script);
+    let cmd_id = client
+        .execute_command(
+            &host,
+            &shell_id,
+            "powershell.exe",
+            &["-EncodedCommand", &encoded],
+        )
+        .await
+        .expect("execute Write-Host");
+    let mut raw = Vec::new();
+    loop {
+        let poll = client
+            .receive_output_raw(&host, &shell_id, &cmd_id)
+            .await
+            .expect("receive raw");
+        raw.extend(poll.stderr);
+        if poll.done {
+            break;
+        }
+    }
+    client.delete_shell(&host, &shell_id).await.ok();
+    let raw = String::from_utf8_lossy(&raw);
+    assert!(
+        raw.contains("<Obj S=\"information\"") && raw.contains("host-marker"),
+        "no information record carrying the Write-Host text in raw stderr, so \
+         the decoded-stderr check above proves nothing: {raw:?}"
+    );
+}
+
 /// Large stderr comes back as the `#< CLIXML` marker alone in one Receive
 /// response, then the document cut mid-tag across the next ones (seen on
 /// Server 2025 at ~300 KiB). Warnings and XML entities must survive too.

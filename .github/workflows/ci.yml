@@ -74,6 +74,21 @@ jobs:
       - run: cargo nextest run --features kerberos
       - run: cargo test --doc --features kerberos
 
+  kerberos-windows:
+    # The SSPI branch of cross-krb5 (and the `cfg(windows)` wrap code of
+    # src/auth/kerberos.rs) only compiles on Windows; no Kerberos test runs
+    # here (no KDC), this checks that the code builds and lints clean.
+    name: Kerberos (windows, check + clippy)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked --all-targets --features kerberos
+      - run: cargo clippy --locked --all-targets --features kerberos -- -D warnings
+
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
@@ -224,6 +239,7 @@ jobs:
       - clippy
       - test
       - test-kerberos
+      - kerberos-windows
       - coverage
       - doc
       - msrv
@@ -239,6 +255,7 @@ jobs:
             "${{ needs.clippy.result }}" \
             "${{ needs.test.result }}" \
             "${{ needs.test-kerberos.result }}" \
+            "${{ needs.kerberos-windows.result }}" \
             "${{ needs.coverage.result }}" \
             "${{ needs.doc.result }}" \
             "${{ needs.msrv.result }}" \

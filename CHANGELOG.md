@@ -7,8 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **PowerShell stderr lost text or leaked raw CLIXML.** Measured on Server
+  2025: a large stderr arrives as the `#< CLIXML` marker alone in one Receive
+  response, then the `<Objs>` document cut mid-tag, even mid-escape, across
+  the next ones. Each slice was decoded on its own, so the marker slice
+  decoded to nothing and the rest came through as raw XML. `run_command`,
+  `run_powershell`, `Shell::run_command` and `Shell::receive_next` now buffer
+  a document until `</Objs>` before decoding it; `WinrmClient::receive_output`
+  and `parse_receive_output` decode whole responses. Reported in #1.
+- **Warning, verbose and debug records were dropped** from CLIXML stderr; only
+  error records were kept. They now come through with the console prefixes
+  `WARNING: `, `VERBOSE: ` and `DEBUG: `. Progress and information records
+  are still skipped (`Write-Host` text already reaches stdout).
+- **XML entities were left encoded** in decoded stderr (`2&gt;$null`), and
+  only four `_xHHHH_` escapes were understood. All entities, numeric
+  references and `_xHHHH_` escapes, surrogate pairs included, are decoded.
+
 ### Changed
 
+- **`max_output_bytes` counts stderr bytes as received**, before CLIXML
+  decoding, so it also bounds a document still being buffered. CLIXML is
+  several times larger than the text it decodes to, so a cap tuned to
+  decoded output trips sooner on PowerShell stderr.
+- **A `#< CLIXML` marker only opens a document at the start of a line and
+  when `<Objs` follows it.** A native tool that prints the marker in the
+  middle of its output keeps that output as plain text.
 - **TLS now uses `ring` only.** `reqwest` is built with `rustls-no-provider`
   and `rustls` with `default-features = false`, dropping `aws-lc-rs`,
   `aws-lc-sys`, `cmake` and `quinn` from the dependency tree (no C toolchain

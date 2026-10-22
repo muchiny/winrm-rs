@@ -153,6 +153,30 @@ impl WinrmClient {
         shell_id: &str,
         command_id: &str,
     ) -> Result<soap::ReceiveOutput, WinrmError> {
+        let response = self.receive_response(host, shell_id, command_id).await?;
+        soap::parse_receive_output(&response).map_err(WinrmError::Soap)
+    }
+
+    /// [`receive_output`](Self::receive_output) with stderr left undecoded,
+    /// for callers that keep a [`ClixmlDecoder`](soap::clixml::ClixmlDecoder)
+    /// across polls.
+    pub(crate) async fn receive_output_raw(
+        &self,
+        host: &str,
+        shell_id: &str,
+        command_id: &str,
+    ) -> Result<soap::ReceiveOutput, WinrmError> {
+        let response = self.receive_response(host, shell_id, command_id).await?;
+        soap::parse_receive_output_raw(&response).map_err(WinrmError::Soap)
+    }
+
+    /// Send one Receive request and return the response body.
+    async fn receive_response(
+        &self,
+        host: &str,
+        shell_id: &str,
+        command_id: &str,
+    ) -> Result<String, WinrmError> {
         let config = self.transport.config();
         let envelope = soap::receive_output_request(
             &self.transport.endpoint(host),
@@ -161,8 +185,7 @@ impl WinrmClient {
             config.operation_timeout_secs,
             config.max_envelope_size,
         );
-        let response = self.transport.send_soap_with_retry(host, envelope).await?;
-        soap::parse_receive_output(&response).map_err(WinrmError::Soap)
+        self.transport.send_soap_with_retry(host, envelope).await
     }
 
     /// Send a terminate signal to a running command.
@@ -246,15 +269,22 @@ impl WinrmClient {
         let max_output = self.transport.config().max_output_bytes;
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
+        let mut stderr_decoder = soap::clixml::ClixmlDecoder::new();
+        // Raw bytes received, so the cap also bounds stderr still buffered
+        // in the decoder.
+        let mut received = 0usize;
         let mut exit_code: Option<i32> = None;
 
         loop {
-            let output = self.receive_output(host, shell_id, &command_id).await?;
+            let output = self.receive_output_raw(host, shell_id, &command_id).await?;
+            received = received
+                .saturating_add(output.stdout.len())
+                .saturating_add(output.stderr.len());
             stdout.extend_from_slice(&output.stdout);
-            stderr.extend_from_slice(&output.stderr);
+            stderr.extend(stderr_decoder.push(&output.stderr));
 
             if let Some(cap) = max_output
-                && stdout.len() + stderr.len() > cap
+                && received > cap
             {
                 self.signal_terminate(host, shell_id, &command_id)
                     .await
@@ -272,6 +302,7 @@ impl WinrmClient {
                 break;
             }
         }
+        stderr.extend(stderr_decoder.finish());
 
         // Best-effort signal terminate
         self.signal_terminate(host, shell_id, &command_id)
@@ -1527,6 +1558,102 @@ mod tests {
         assert_eq!(chunk2.stdout, b"chunk2");
         assert!(chunk2.done);
         assert_eq!(chunk2.exit_code, Some(0));
+    }
+
+    /// stderr slices as Server 2025 sends a large CLIXML document: the marker
+    /// alone, then the body cut mid-escape across Receive responses.
+    const SPLIT_CLIXML: [&[u8]; 3] = [
+        b"#< CLIXML\r\n",
+        b"<Objs><S S=\"Error\">denied_x000D__x000A",
+        b"_</S></Objs>",
+    ];
+
+    /// Mount Create, Execute, one Receive per stderr slice (the last one
+    /// Done), then a catch-all for Signal/Delete.
+    async fn mount_stderr_receives(server: &MockServer, slices: &[&[u8]]) {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD as B64;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>CLIXML-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
+            ))
+            .up_to_n_times(1)
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>CLIXML-CMD</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
+            ))
+            .up_to_n_times(1)
+            .mount(server)
+            .await;
+        for (i, slice) in slices.iter().enumerate() {
+            let state = if i + 1 == slices.len() {
+                r#"<rsp:CommandState CommandId="CLIXML-CMD" State="http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Done"><rsp:ExitCode>1</rsp:ExitCode></rsp:CommandState>"#
+            } else {
+                r#"<rsp:CommandState CommandId="CLIXML-CMD" State="http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Running"/>"#
+            };
+            let body = format!(
+                r#"<s:Envelope><s:Body><rsp:ReceiveResponse><rsp:Stream Name="stderr" CommandId="CLIXML-CMD">{}</rsp:Stream>{state}</rsp:ReceiveResponse></s:Body></s:Envelope>"#,
+                B64.encode(slice)
+            );
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .up_to_n_times(1)
+                .mount(server)
+                .await;
+        }
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r"<s:Envelope><s:Body/></s:Envelope>"),
+            )
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn run_command_reassembles_clixml_split_across_receives() {
+        let server = MockServer::start().await;
+        mount_stderr_receives(&server, &SPLIT_CLIXML).await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+
+        let output = client
+            .run_command("127.0.0.1", "powershell.exe", &[])
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stderr), "denied\r\n");
+        assert_eq!(output.exit_code, 1);
+    }
+
+    #[tokio::test]
+    async fn shell_run_command_reassembles_clixml_split_across_receives() {
+        let server = MockServer::start().await;
+        mount_stderr_receives(&server, &SPLIT_CLIXML).await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        let shell = client.open_shell("127.0.0.1").await.unwrap();
+
+        let output = shell.run_command("powershell.exe", &[]).await.unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stderr), "denied\r\n");
+    }
+
+    #[tokio::test]
+    async fn receive_next_reassembles_clixml_split_across_receives() {
+        let server = MockServer::start().await;
+        mount_stderr_receives(&server, &SPLIT_CLIXML).await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        let shell = client.open_shell("127.0.0.1").await.unwrap();
+        let cmd_id = shell.start_command("powershell.exe", &[]).await.unwrap();
+
+        let mut stderr = Vec::new();
+        loop {
+            let chunk = shell.receive_next(&cmd_id).await.unwrap();
+            stderr.extend(chunk.stderr);
+            if chunk.done {
+                break;
+            }
+        }
+        assert_eq!(String::from_utf8_lossy(&stderr), "denied\r\n");
     }
 
     #[tokio::test]

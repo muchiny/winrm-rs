@@ -440,6 +440,67 @@ async fn powershell_stderr_clixml_parsed() {
     );
 }
 
+/// Large stderr comes back as the `#< CLIXML` marker alone in one Receive
+/// response, then the document cut mid-tag across the next ones (seen on
+/// Server 2025 at ~300 KiB). Warnings and XML entities must survive too.
+const LARGE_CLIXML_SCRIPT: &str = "Write-Warning 'careful now'; \
+     1..400 | % { Write-Error ('bulk-' + ('x' * 200) + $_) }; \
+     Write-Error 'tail 2>$null <done>'";
+
+fn assert_large_clixml_decoded(stderr: &[u8]) {
+    let stderr = String::from_utf8_lossy(stderr);
+    assert!(
+        stderr.starts_with("WARNING: careful now\r\n"),
+        "warning record lost: {}",
+        &stderr[..stderr.len().min(200)]
+    );
+    // Each error also echoes the script line, which holds `'bulk-'` but
+    // never `bulk-x`.
+    assert_eq!(stderr.matches("bulk-x").count(), 400, "error records lost");
+    // PowerShell wraps error text at the console width, so check the
+    // entity-bearing pieces separately.
+    assert!(
+        stderr.contains("tail 2>$null") && stderr.contains("<done>"),
+        "XML entities not decoded"
+    );
+    for raw in ["#< CLIXML", "<Objs", "<S S=", "_x000D_", "&gt;"] {
+        assert!(!stderr.contains(raw), "raw CLIXML leaked: {raw}");
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn powershell_large_clixml_stderr_reassembled() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let output = client
+        .run_powershell(&host, LARGE_CLIXML_SCRIPT)
+        .await
+        .expect("run large stderr script");
+    assert_large_clixml_decoded(&output.stderr);
+}
+
+#[tokio::test]
+#[ignore]
+async fn streaming_large_clixml_stderr_reassembled() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let shell = client.open_shell(&host).await.expect("open shell");
+    let encoded = winrm_rs::encode_powershell_command(LARGE_CLIXML_SCRIPT);
+    let cmd_id = shell
+        .start_command("powershell.exe", &["-EncodedCommand", &encoded])
+        .await
+        .expect("start command");
+    let mut stderr = Vec::new();
+    loop {
+        let chunk = shell.receive_next(&cmd_id).await.expect("receive");
+        stderr.extend(chunk.stderr);
+        if chunk.done {
+            break;
+        }
+    }
+    shell.close().await.ok();
+    assert_large_clixml_decoded(&stderr);
+}
+
 // === Working directory ===
 
 #[tokio::test]

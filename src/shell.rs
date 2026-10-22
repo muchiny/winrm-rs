@@ -3,6 +3,8 @@
 // Wraps a shell ID and provides methods to run commands, send input,
 // and signal Ctrl+C within a persistent shell.
 
+use std::collections::HashMap;
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use tracing::debug;
@@ -10,6 +12,7 @@ use tracing::debug;
 use crate::client::WinrmClient;
 use crate::command::CommandOutput;
 use crate::error::WinrmError;
+use crate::soap::clixml::ClixmlDecoder;
 use crate::soap::{self, ReceiveOutput};
 
 /// A reusable WinRM shell session.
@@ -29,6 +32,7 @@ pub struct Shell<'a> {
     /// Defaults to `RESOURCE_URI_CMD` for standard command shells;
     /// PSRP shells use `RESOURCE_URI_PSRP`.
     resource_uri: String,
+    stderr_decoders: Mutex<StderrDecoders>,
 }
 
 impl<'a> Shell<'a> {
@@ -39,6 +43,7 @@ impl<'a> Shell<'a> {
             shell_id,
             closed: false,
             resource_uri: crate::soap::namespaces::RESOURCE_URI_CMD.to_string(),
+            stderr_decoders: Mutex::default(),
         }
     }
 
@@ -54,6 +59,7 @@ impl<'a> Shell<'a> {
             shell_id,
             closed: false,
             resource_uri,
+            stderr_decoders: Mutex::default(),
         }
     }
 
@@ -83,18 +89,25 @@ impl<'a> Shell<'a> {
         let result = tokio::time::timeout(timeout_duration, async {
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
+            let mut stderr_decoder = ClixmlDecoder::new();
+            // Raw bytes received, so the cap also bounds stderr still
+            // buffered in the decoder.
+            let mut received = 0usize;
             let mut exit_code: Option<i32> = None;
 
             loop {
                 let output: ReceiveOutput = self
                     .client
-                    .receive_output(&self.host, &self.shell_id, &command_id)
+                    .receive_output_raw(&self.host, &self.shell_id, &command_id)
                     .await?;
+                received = received
+                    .saturating_add(output.stdout.len())
+                    .saturating_add(output.stderr.len());
                 stdout.extend_from_slice(&output.stdout);
-                stderr.extend_from_slice(&output.stderr);
+                stderr.extend(stderr_decoder.push(&output.stderr));
 
                 if let Some(cap) = max_output
-                    && stdout.len() + stderr.len() > cap
+                    && received > cap
                 {
                     return Err(WinrmError::Transfer(format!(
                         "command output exceeded max_output_bytes ({cap})"
@@ -107,6 +120,7 @@ impl<'a> Shell<'a> {
                     break;
                 }
             }
+            stderr.extend(stderr_decoder.finish());
 
             // Best-effort signal terminate
             self.client
@@ -307,6 +321,11 @@ impl<'a> Shell<'a> {
     /// Returns a single [`ReceiveOutput`] representing one poll cycle.
     /// Callers should accumulate stdout/stderr and stop when
     /// [`done`](ReceiveOutput::done) is `true`.
+    ///
+    /// PowerShell CLIXML on stderr is decoded across polls: a document split
+    /// over several Receive responses is held back until it is complete, so a
+    /// poll may return an empty `stderr` while the command is still writing
+    /// it. Anything still buffered comes out on the `done` poll.
     pub async fn receive_next(&self, command_id: &str) -> Result<ReceiveOutput, WinrmError> {
         let endpoint = self.client.endpoint(&self.host);
         let config = self.client.config();
@@ -337,7 +356,14 @@ impl<'a> Shell<'a> {
             )
         };
         let response = self.client.send_soap_raw(&self.host, envelope).await?;
-        soap::parse_receive_output(&response).map_err(WinrmError::Soap)
+        let mut output = soap::parse_receive_output_raw(&response).map_err(WinrmError::Soap)?;
+
+        output.stderr = self
+            .stderr_decoders
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .decode(command_id, &output.stderr, output.done);
+        Ok(output)
     }
 
     /// Get the shell ID.
@@ -396,6 +422,63 @@ impl<'a> Shell<'a> {
     }
 }
 
+/// Commands tracked at once by [`StderrDecoders`]. WinRM caps a shell at 25
+/// concurrent processes (`MaxProcessesPerShell`), so past this the oldest
+/// entry belongs to a command the caller stopped polling.
+const MAX_STREAMED_COMMANDS: usize = 32;
+
+/// stderr decoders of the commands polled through [`Shell::receive_next`],
+/// keyed by command ID, so a CLIXML document split across polls is
+/// reassembled.
+#[derive(Default)]
+struct StderrDecoders {
+    /// Command ID to (insertion sequence, decoder).
+    by_command: HashMap<String, (u64, ClixmlDecoder)>,
+    next_seq: u64,
+}
+
+impl StderrDecoders {
+    /// Decode one poll's stderr for `command_id`; `done` releases whatever
+    /// the command's decoder still buffers and forgets it.
+    fn decode(&mut self, command_id: &str, chunk: &[u8], done: bool) -> Vec<u8> {
+        if !self.by_command.contains_key(command_id) {
+            if self.by_command.len() >= MAX_STREAMED_COMMANDS {
+                self.evict_oldest();
+            }
+            let seq = self.next_seq;
+            self.next_seq = self.next_seq.wrapping_add(1);
+            self.by_command
+                .insert(command_id.to_string(), (seq, ClixmlDecoder::new()));
+        }
+        let Some((_, decoder)) = self.by_command.get_mut(command_id) else {
+            return chunk.to_vec();
+        };
+        let mut out = decoder.push(chunk);
+        if done {
+            out.extend(decoder.finish());
+            self.by_command.remove(command_id);
+        }
+        out
+    }
+
+    fn evict_oldest(&mut self) {
+        let oldest = self
+            .by_command
+            .iter()
+            .min_by_key(|(_, (seq, _))| *seq)
+            .map(|(id, _)| id.clone());
+        if let Some(id) = oldest {
+            debug!(command_id = %id, "dropping stderr decoder of a command never polled to Done");
+            self.by_command.remove(&id);
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.by_command.len()
+    }
+}
+
 impl Drop for Shell<'_> {
     fn drop(&mut self) {
         if !self.closed {
@@ -404,6 +487,39 @@ impl Drop for Shell<'_> {
                 "shell dropped without close -- resources may leak on server"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod stderr_decoder_tests {
+    use super::*;
+
+    #[test]
+    fn decoder_is_kept_across_polls_and_dropped_when_done() {
+        let mut decoders = StderrDecoders::default();
+        assert!(
+            decoders
+                .decode("c1", b"#< CLIXML\r\n<Objs><S S=\"Error\">a", false)
+                .is_empty()
+        );
+        assert_eq!(decoders.len(), 1);
+        assert_eq!(decoders.decode("c1", b"</S></Objs>", true), b"a");
+        assert_eq!(decoders.len(), 0);
+    }
+
+    #[test]
+    fn abandoned_commands_are_evicted_oldest_first() {
+        let mut decoders = StderrDecoders::default();
+        for i in 0..MAX_STREAMED_COMMANDS + 10 {
+            decoders.decode(&format!("c{i}"), b"#< CLIXML\r\n<Objs>", false);
+        }
+        assert_eq!(decoders.len(), MAX_STREAMED_COMMANDS);
+        // The newest command is still tracked and decodes normally.
+        let newest = format!("c{}", MAX_STREAMED_COMMANDS + 9);
+        assert_eq!(
+            decoders.decode(&newest, b"<S S=\"Error\">z</S></Objs>", true),
+            b"z"
+        );
     }
 }
 

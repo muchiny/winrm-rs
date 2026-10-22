@@ -88,6 +88,9 @@ pub struct WinrmConfig {
     /// reached, the operation returns [`crate::error::WinrmError::Transfer`]
     /// and the shell is best-effort closed. Set to `None` to disable the
     /// cap (pre-1.1 behaviour).
+    ///
+    /// The cap counts bytes as received, before PowerShell CLIXML on stderr
+    /// is decoded, so it also bounds stderr still buffered by the decoder.
     pub max_output_bytes: Option<usize>,
 }
 

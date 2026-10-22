@@ -22,10 +22,10 @@ forêt `winrm.test` (VM Hyper-V `winrm-rs-dc`, hôte `dc`), atteinte par
 Au départ de la campagne (avant tout ajout de test), les 52 tests live
 existants passaient : 52 passés, 0 échoué, 0 sauté (sans la feature `credssp`).
 
-Les tests ajoutés par la campagne portent le total à 79 sans feature, ou 81
+Les tests ajoutés par la campagne portent le total à 80 sans feature, ou 82
 avec la feature `credssp` (`credssp_run_command_whoami` et
 `silent_command_completes_over_credssp` sont sous `#[cfg(feature =
-"credssp")]`), et à 94 avec les 13 tests Kerberos (compte des fonctions
+"credssp")]`), et à 95 avec les 13 tests Kerberos (compte des fonctions
 `#[ignore]` de `tests/integration_real.rs` par attribut `cfg`) : 13 jusqu'à
 `a19c202`, 3 avec `eddd4f6` (une commande silencieuse par méthode
 d'authentification live, dont celle de CredSSP), 5 avec `83a71c3`
@@ -36,8 +36,10 @@ la référence Basic des shells concurrents), 1 avec `d7dde44`
 `EncryptionMode::Always` sur HTTPS), puis 3 avec les API à délai total et
 l'annulation qui libère le shell (`run_powershell_with_timeout_expires_and_releases_shell`,
 `run_powershell_with_timeout_returns_output_of_a_fast_command`,
-`run_powershell_with_cancel_releases_shell`). Les runs complets à `0e61241` et à `2ab43dc`
-les exécutent tous (81 avec `credssp`).
+`run_powershell_with_cancel_releases_shell`), puis 1 avec `d3bf664`
+(`write_host_reaches_stdout_once`). Les runs complets à `0e61241` et à `2ab43dc`
+exécutent tous les autres (81 avec `credssp`) ; `write_host_reaches_stdout_once`
+a été lancé seul, le 2026-10-22 à `d3bf664`, contre Server 2025 et Server 2012 R2.
 Les tests Kerberos, sous `#[cfg(feature = "kerberos")]`, s'y ajoutent
 (`kerberos_run_command_whoami`, `kerberos_two_commands_on_one_client`,
 `silent_command_completes_over_kerberos`, puis avec `1967dbf`
@@ -227,6 +229,7 @@ Tests de `tests/integration_real.rs` sauf mention contraire.
 | `run_powershell_with_timeout` : une commande rapide rend sa sortie et son code de sortie, aucun shell laissé | `run_powershell_with_timeout_returns_output_of_a_fast_command` | ✅ 2026-10-22 | ✅ 2026-10-22 | — non applicable |
 | `run_powershell_with_cancel` : `Cancelled` rendu en moins de 10 s, terminaison et suppression du shell envoyées, aucun shell laissé | `run_powershell_with_cancel_releases_shell` (annulation après 3 s d'un `Start-Sleep 600`) | ✅ 2026-10-22 | ✅ 2026-10-22 | — non applicable |
 | stderr CLIXML en flux : les enregistrements vidés tôt arrivent à `receive_next` avant la fin de la commande | `streaming_clixml_stderr_yields_records_before_exit` | ✅ 2026-10-22 | ✅ 2026-10-22 | — non applicable |
+| Texte de `Write-Host` sur stdout, une seule fois : sa copie en enregistrement information du stderr CLIXML est écartée au décodage (soulevé par #1) | `write_host_reaches_stdout_once` (vérifie aussi, sur le stderr brut de `receive_output_raw`, que la copie existe) | ✅ 2026-10-22 | ✅ 2026-10-22 (moitié stdout et stderr décodé ; moitié brute sautée : PowerShell 4.0 n'a pas de flux information, stderr brut vide pour un `Write-Host` seul) | — non applicable |
 | `connect_timeout_secs` respecté | `connect_timeout_is_honoured` | ✅ 2026-10-21 | ✅ 2026-10-22 | — non applicable |
 | Délai total de `Shell::run_command` (`operation_timeout_secs * 2`) | `shell_run_command_times_out` (timeout d'opération de 15 s) | ✅ 2026-10-21 | ✅ 2026-10-22 | — non applicable |
 | Commande silencieuse plus longue que `operation_timeout_secs` menée à terme (après D1), Basic sur HTTP | `silent_command_longer_than_operation_timeout_completes` (20 s de silence, timeout d'opération de 15 s ; 22 à 25 s mesurées) | ✅ 2026-10-21 | ✅ 2026-10-22 | — non applicable |
@@ -381,6 +384,9 @@ ne figurent pas dans la matrice.
     sorte que la précondition du test (stderr décodé nettement sous le plafond
     de 64 Kio) ne peut pas tenir. Le plafonnement sur les octets bruts n'est donc
     pas mesuré sur 2012 R2 ; `max_output_bytes_aborts_and_releases_shell` y passe.
+  `write_host_reaches_stdout_once`, ajouté après ce run, y saute seulement sa
+  moitié brute (garde `is_server_2012_r2()`) : PowerShell 4.0 n'a pas de flux
+  information et n'écrit donc pas de copie de `Write-Host` dans le stderr.
   Les lignes `psrp-rs` et `bridge-mcp` ne sont pas mesurées sur 2012 R2.
 - **Les tests à timeout court dépendent de la charge du serveur.** Ceux qui
   utilisent un `operation_timeout_secs` de 15 s (`shell_run_command_times_out`,

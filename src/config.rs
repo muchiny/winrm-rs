@@ -280,6 +280,14 @@ pub enum EncryptionMode {
     #[default]
     Auto,
     /// Seal every SOAP body, over HTTPS too (inside TLS).
+    ///
+    /// NTLM and Kerberos only. With [`AuthMethod::Basic`],
+    /// [`AuthMethod::Certificate`] or [`AuthMethod::CredSsp`] it changes
+    /// nothing and refuses nothing: those methods never seal, so Basic over
+    /// plain HTTP still sends the credentials and every SOAP body in
+    /// plaintext. The client logs a WARN at construction in that case (and
+    /// one for any Basic over plain HTTP). Certificate and CredSSP require
+    /// HTTPS, whose TLS protects the bodies.
     Always,
     /// Never seal: over HTTP, SOAP bodies (commands, their output, file
     /// contents) cross the network in plaintext, and the server must allow

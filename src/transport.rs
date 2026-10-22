@@ -493,6 +493,17 @@ impl HttpTransport {
             );
         }
 
+        if config.encryption == EncryptionMode::Always
+            && !matches!(config.auth_method, AuthMethod::Ntlm | AuthMethod::Kerberos)
+        {
+            tracing::warn!(
+                auth_method = method_name(&config.auth_method),
+                use_tls = config.use_tls,
+                "EncryptionMode::Always has no effect with this auth method: only NTLM and \
+                 Kerberos seal SOAP bodies, so nothing is sealed"
+            );
+        }
+
         if matches!(config.auth_method, AuthMethod::CredSsp) && !config.use_tls {
             return Err(WinrmError::AuthFailed(
                 "CredSSP requires HTTPS (set use_tls = true)".into(),
@@ -2142,6 +2153,25 @@ mod tests {
             vec![name("explicit.corp")],
             "an explicit proxy makes reqwest ignore the environment"
         );
+    }
+
+    /// `Always` with a method that never seals is accepted (SemVer), but
+    /// says so at construction.
+    #[tracing_test::traced_test]
+    #[test]
+    fn always_with_a_method_that_never_seals_is_accepted_with_a_warning() {
+        let transport = HttpTransport::new(
+            WinrmConfig {
+                auth_method: AuthMethod::Basic,
+                encryption: EncryptionMode::Always,
+                ..Default::default()
+            },
+            WinrmCredentials::new("admin", "pass", ""),
+        );
+        assert!(transport.is_ok());
+        assert!(!transport.unwrap().seals());
+        assert!(logs_contain("EncryptionMode::Always has no effect"));
+        assert!(logs_contain("auth_method=\"Basic\""));
     }
 
     #[test]

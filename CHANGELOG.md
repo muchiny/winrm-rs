@@ -254,6 +254,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   enum has no Kerberos variant). A context whose session key is not an AES
   one (RC4) cannot seal and fails the call. Unsealed Kerberos (HTTPS under
   `Auto`, or `Never`) is unchanged.
+- **`EncryptionMode::Always` with Basic, Certificate or CredSSP is now
+  stated to do nothing, and logged.** Those methods never seal: `Always`
+  is accepted (as before) and Basic over plain HTTP still sends the
+  credentials and the bodies in plaintext. The client now logs a WARN at
+  construction when `Always` is set with one of them, and the
+  `EncryptionMode::Always` rustdoc and the README say so.
 - **Sealed-request error texts name the method**: "HTTP 401 to a sealed
   NTLM request on an authenticated connection ...", "server answered a
   sealed NTLM request without sealing ...", "the server closes the

@@ -222,7 +222,7 @@ let bytes = client.download_file("win-server", "C:\\remote\\file.bin", Path::new
 | `client_cert_pem` | `None` | Path to client cert PEM (Certificate auth) |
 | `client_key_pem` | `None` | Path to client key PEM (Certificate auth) |
 | `proxy` | `None` | HTTP proxy URL (e.g. `http://proxy:8080`) |
-| `encryption` | `Auto` | Message sealing for NTLM and Kerberos: `Auto` (over HTTP only), `Always`, `Never` |
+| `encryption` | `Auto` | Message sealing for NTLM and Kerberos: `Auto` (over HTTP only), `Always`, `Never`. No effect with Basic, Certificate or CredSSP, `Always` included (Basic over HTTP stays plaintext; a WARN is logged) |
 
 ## Roadmap
 

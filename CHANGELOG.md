@@ -7,11 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-10-22
+
+Every public feature run against live Windows hosts (Server 2025, Server
+2012 R2, and a Server 2025 domain controller for Kerberos), and the defects
+that turned up, fixed. `docs/validation/live-matrix.md` names the live test
+behind each result.
+
 ### Upgrading from 1.2.x
 
 The public API only grows (no item removed or changed in signature), but
-behaviour changes in ways callers can see, so this release needs a minor
-version bump (1.3.0), not a patch. One line each; the sections below give
+behaviour changes in ways callers can see, so this is a minor release, not
+a patch. One line each; the sections below give
 the details.
 
 - A `w:TimedOut` fault on Receive is now an empty poll, not
@@ -952,7 +959,10 @@ considered stable and covered by SemVer guarantees.
 - Raw command execution (`cmd.exe` or any executable)
 - Full shell lifecycle: create, execute, receive, signal, delete
 
-[Unreleased]: https://github.com/muchiny/winrm-rs/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/muchiny/winrm-rs/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/muchiny/winrm-rs/compare/v1.2.2...v1.3.0
+[1.2.2]: https://github.com/muchiny/winrm-rs/compare/v1.2.1...v1.2.2
+[1.2.1]: https://github.com/muchiny/winrm-rs/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/muchiny/winrm-rs/compare/v1.1.2...v1.2.0
 [1.1.2]: https://github.com/muchiny/winrm-rs/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/muchiny/winrm-rs/compare/v1.0.0...v1.1.1

@@ -102,8 +102,13 @@ the connection's Kerberos context (GSS-API wrap with confidentiality; only
 RFC 4121 tokens, so AES session keys: an RC4-only realm needs
 `EncryptionMode::Never`), so the server can keep `AllowUnencrypted = false`.
 `EncryptionMode::Never` sends the bodies in plaintext over HTTP. Over HTTPS
-the AP-REQ carries a channel binding (RFC 5929 `tls-server-end-point`) for
-the certificate of its connection, accepted by `CbtHardeningLevel = Strict`.
+the AP-REQ carries a channel binding (RFC 5929 `tls-server-end-point`)
+computed for the certificate learnt on an unauthenticated probe request;
+that certificate is then pinned in the connection's verifier, so the
+AP-REQ's connection, and every later one, presents that same certificate or
+fails at its TLS handshake. Accepted by `CbtHardeningLevel = Strict`; a
+server certificate with no binding hash (Ed25519, unknown algorithm) is
+refused. `EncryptionMode::Never` over plain HTTP has none of this.
 
 Limits: WinRM sends its sealed Kerberos answers with sequence number 0, so
 the Kerberos session detects no replay; each sealed answer is bound to its
@@ -112,8 +117,8 @@ attacker on the same authenticated connection is not detected. Sealing
 protects this client's messages; server side, integrity on plain HTTP also
 needs `AllowUnencrypted = false` (for NTLM as for Kerberos), since a server
 that allows unencrypted traffic runs unprotected requests from other
-clients. On a Windows client the SSPI path of `cross-krb5` is compiled in CI
-but not tested live: with `--features kerberos`, `Auto` now seals over HTTP,
+clients. On a Windows client the SSPI path of `cross-krb5` is built by a CI
+job (not yet run) and not tested live: with `--features kerberos`, `Auto` now seals over HTTP,
 and `EncryptionMode::Never` is the way back if that fails.
 
 ### Certificate authentication

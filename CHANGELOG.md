@@ -69,20 +69,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `always_seals_inside_tls_seen_by_a_relay_with_dc_cbt_none` sees every SOAP
   body sealed (5 of 5, Kerberos and NTLM), and none under `Auto`.
   Windows clients: the SSPI branch of cross-krb5 (`cfg(windows)`) is not
-  compiled or tested by this project's live runs (a CI job now checks that
+  compiled here nor tested live (a CI job, not yet run, builds and lints
   it builds); a Windows client using `--features kerberos` with `Auto` now
   seals over HTTP, and `EncryptionMode::Never` is the way back if that fails.
 - **Kerberos channel binding over HTTPS** (RFC 5929 `tls-server-end-point`).
   Kerberos over HTTPS now runs on dedicated connections authenticated once:
-  an unauthenticated request with an empty body learns the endpoint's
-  certificate (Windows answers 401 and closes that connection), the AP-REQ
-  carries GSS channel bindings for it, the connection that carried the AP-REQ
-  must have presented the same certificate, and the server's AP-REP is
-  required; later requests on the connection carry no `Authorization`
-  header. Validated live: `CbtHardeningLevel = Strict` accepts it
-  (`kerberos_over_https_with_dc_cbt_strict`, `Auto` and `Always`), and a
-  TLS-terminating relay is refused under `Relaxed` and `Strict`
-  (`kerberos_channel_binding_through_a_tls_relay_is_refused`).
+  an unauthenticated request with an empty body (the probe) learns the
+  endpoint's certificate (Windows answers 401 and closes that connection),
+  the binding is computed for that certificate, and the certificate is then
+  pinned in the dedicated client's verifier for the client's whole life:
+  the connection that carries the AP-REQ, and every later one, must present
+  that same certificate or its TLS handshake fails before any HTTP byte is
+  written. Every answer on such a connection is also checked against it.
+  The server's AP-REP is required; later requests on the connection carry
+  no `Authorization` header. A server whose certificate defines no channel
+  binding hash (Ed25519, unknown signature algorithm) is refused (fail
+  closed), as NTLM over TLS already did. Not protected:
+  `EncryptionMode::Never` over plain HTTP (no TLS, no binding, AP-REP
+  optional). Validated live: `CbtHardeningLevel = Strict` accepts it
+  (`kerberos_over_https_with_dc_cbt_strict`, `Auto` and `Always`); a
+  TLS-terminating relay is refused by the server under `Relaxed` and
+  `Strict` (`kerberos_channel_binding_through_a_tls_relay_is_refused`); and
+  a relay that passes the probe through and terminates the next connection
+  fails at the client's TLS handshake, nothing sent
+  (`kerberos_channel_binding_split_relay_fails_at_the_handshake`, also under
+  `Strict`).
 
 ### Fixed
 
@@ -220,7 +231,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **Kerberos over HTTPS authenticates once per connection** instead of once
   per request (see channel binding under `### Added`), one extra
   unauthenticated request per new connection, and now requires the
-  server's AP-REP. Only `EncryptionMode::Never` over plain HTTP keeps a
+  server's AP-REP. Later requests depend on staying on the authenticated
+  connection (a lost one fails the request with a 401 error, not resent);
+  measured with a 20 KB upload then a 200 KB download over HTTPS, 10 runs
+  per cell: 10 of 10 on current-thread and multi-thread runtimes with 0 or
+  4 yields, always exactly 2 TCP connections (probe and authenticated
+  one). Only `EncryptionMode::Never` over plain HTTP keeps a
   context per request (AP-REP checked when present, not required).
 - **Pool race on dedicated connections: mitigated, not closed.** `hyper`
   hands a connection back to its client's pool from a task of its own; a
@@ -338,6 +354,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+- **Kerberos channel binding could be split across connections** (found in
+  review before release, never shipped): the binding was computed from the
+  probe connection's certificate while the AP-REQ went on a new connection
+  checked only on its answer, so an attacker holding a certificate the
+  client accepts (`accept_invalid_certs`) could pass the probe through,
+  terminate the AP-REQ connection and relay the AP-REQ, bound to the real
+  certificate, to the server. The bound certificate is now pinned in the
+  dedicated client's verifier before the AP-REQ (see `### Added`); measured
+  live with a split relay before (the AP-REQ reached the relay) and after
+  (handshake refused, no request).
 - **NTLM message sealing no longer falls back to plaintext, and the client
   sends each sealed request once.** With `EncryptionMode::Auto` over HTTP or
   `Always`: the handshake that sets up sealing ends with an empty Type 3

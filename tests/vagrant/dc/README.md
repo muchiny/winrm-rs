@@ -98,7 +98,10 @@ own duration and restore `Relaxed` through an NTLM-sealed request over HTTP
 and `kerberos_channel_binding_through_a_tls_relay_is_refused` use a
 TLS-terminating relay inside the test (a certificate made for the run with
 the `openssl` command) to read the traffic inside TLS and to check that a
-channel binding naming another certificate is refused. Restore by hand if a
+channel binding naming another certificate is refused;
+`kerberos_channel_binding_split_relay_fails_at_the_handshake` relays the
+first connection (the unauthenticated probe) untouched and terminates the
+next one, which the client's pinned verifier must refuse at the handshake. Restore by hand if a
 run is killed in between: `Set-Item
 WSMan:\localhost\Service\Auth\CbtHardeningLevel Relaxed`.
 

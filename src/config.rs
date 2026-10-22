@@ -194,8 +194,8 @@ impl Default for WinrmConfig {
 /// client with [`Self::Never`], or Basic).
 ///
 /// On a Windows client, Kerberos sealing goes through the SSPI branch of
-/// `cross-krb5`, which this project builds in CI but has not tested against a
-/// server: with the `kerberos` feature, [`Self::Auto`] now seals Kerberos
+/// `cross-krb5`, which a CI job builds (not yet run) and which has not been
+/// tested against a server: with the `kerberos` feature, [`Self::Auto`] now seals Kerberos
 /// over HTTP, and [`Self::Never`] is the way back if that fails.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub enum EncryptionMode {
@@ -239,12 +239,16 @@ pub enum AuthMethod {
     /// sealing ([`EncryptionMode::Auto`] over HTTP, or
     /// [`EncryptionMode::Always`]). Both run on dedicated connections
     /// authenticated once, and require the AP-REP. Over HTTPS the AP-REQ
-    /// carries a channel binding (RFC 5929 `tls-server-end-point`) for the
-    /// certificate of its connection, which must be the certificate an
-    /// unauthenticated request just before saw (validated against
-    /// `CbtHardeningLevel = Relaxed` and `Strict`); with `accept_invalid_certs`
-    /// that binding is what keeps an attacker in the middle from using the
-    /// authentication on the real server. With [`EncryptionMode::Never`] over
+    /// carries a channel binding (RFC 5929 `tls-server-end-point`) computed
+    /// for the certificate learnt on an unauthenticated probe request; that
+    /// certificate is then pinned in the connection's own verifier, so the
+    /// connection that carries the AP-REQ, and every later one, presents that
+    /// same certificate or fails at its TLS handshake before any HTTP byte is
+    /// written (validated against `CbtHardeningLevel = Relaxed` and
+    /// `Strict`). With `accept_invalid_certs`, binding and pin are what keep
+    /// an attacker in the middle from using the authentication on the real
+    /// server; a certificate whose signature algorithm defines no binding
+    /// hash (Ed25519, unknown) is refused. With [`EncryptionMode::Never`] over
     /// HTTP, each request authenticates with a fresh context, the AP-REP is
     /// checked only when the answer carries one, and body and answer cross the
     /// network in plaintext, unprotected. See [`EncryptionMode`] for the

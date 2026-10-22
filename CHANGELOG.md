@@ -228,6 +228,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   only four `_xHHHH_` escapes were understood. All entities, numeric
   references and `_xHHHH_` escapes, surrogate pairs included, are decoded.
   A signed (`&#+65;`) or NUL (`&#0;`) numeric reference stays as written.
+- **Server text in error messages is bounded.** `download failed: …` and
+  `upload chunk N failed: …` quoted the whole remote stderr, and a CredSSP
+  answer with a bad status line quoted that line (up to 1 MiB): they now
+  quote at most 512 characters and give the full size, like the other
+  errors that quote a server body.
+- **A CredSSP `WWW-Authenticate` header with a non-ASCII character before
+  the `CredSSP` scheme panicked** (`ɐ CredSSP …`): the scheme was found in
+  an uppercased copy whose byte offsets differ. It is now found with ASCII
+  case folding.
+- **Parsing an element out of a response was quadratic** in the number of
+  opening tags without a closing tag (20 000 in 1 MiB took over 20 s in a
+  debug build); it is now linear.
 
 ### Changed
 

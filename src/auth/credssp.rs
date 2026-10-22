@@ -456,7 +456,10 @@ impl CredSspConnection {
             .nth(1)
             .and_then(|s| s.parse().ok())
             .ok_or_else(|| {
-                WinrmError::AuthFailed(format!("CredSSP: bad status line: {status_line}"))
+                WinrmError::AuthFailed(format!(
+                    "CredSSP: bad status line: {}",
+                    crate::auth::excerpt(status_line)
+                ))
             })?;
 
         let mut headers: std::collections::HashMap<String, String> =

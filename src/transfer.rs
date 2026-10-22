@@ -104,7 +104,7 @@ impl WinrmClient {
                 shell.close().await.ok();
                 return Err(WinrmError::Transfer(format!(
                     "upload chunk {i} failed: {}",
-                    String::from_utf8_lossy(&output.stderr)
+                    crate::auth::excerpt(&String::from_utf8_lossy(&output.stderr))
                 )));
             }
         }
@@ -195,7 +195,7 @@ fn write_download(output: &CommandOutput, local_path: &Path) -> Result<u64, Winr
     if output.exit_code != 0 {
         return Err(WinrmError::Transfer(format!(
             "download failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            crate::auth::excerpt(&String::from_utf8_lossy(&output.stderr))
         )));
     }
 
@@ -279,5 +279,28 @@ mod tests {
             assert_eq!(run % 2, 0, "odd trailing quote run in {escaped:?}");
             assert_eq!(escaped.replace("''", "'"), input);
         }
+    }
+
+    /// The remote stderr quoted in a failed download is bounded.
+    #[test]
+    fn download_failure_quotes_a_bounded_stderr() {
+        let output = CommandOutput {
+            stdout: Vec::new(),
+            stderr: "E".repeat(100_000).into_bytes(),
+            exit_code: 1,
+        };
+        let path = std::env::temp_dir().join(format!(
+            "winrm-rs-download-failure-{}",
+            uuid::Uuid::new_v4()
+        ));
+        match write_download(&output, &path) {
+            Err(WinrmError::Transfer(msg)) => {
+                assert!(msg.len() < 1_000, "{} bytes", msg.len());
+                assert!(msg.starts_with("download failed: EEE"), "{msg}");
+                assert!(msg.ends_with("[100000 bytes in total]"), "{msg}");
+            }
+            other => panic!("expected a transfer error, got {other:?}"),
+        }
+        assert!(!path.exists());
     }
 }

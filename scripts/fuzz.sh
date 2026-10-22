@@ -51,6 +51,7 @@ TARGETS=(
   "fuzz_soap_enumerate:soap"
   "fuzz_soap_envelope:soap"
   "fuzz_xml_escape:soap"
+  "fuzz_clixml_stderr:soap"
   "fuzz_transport_host:shell"
   "fuzz_transfer_path:shell"
   "fuzz_powershell_encode:shell"

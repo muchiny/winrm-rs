@@ -1,6 +1,6 @@
 # Fuzzing `winrm-rs`
 
-18 libFuzzer targets covering everything the crate parses off the network and
+19 libFuzzer targets covering everything the crate parses off the network and
 everything it splices into an outgoing request. Driven through
 [`scripts/fuzz.sh`](../scripts/fuzz.sh).
 
@@ -52,6 +52,7 @@ drives; "invariant" is what it asserts beyond *must not panic*.
 | `fuzz_soap_enumerate` | `parse_enumerate_response` | `EndOfSequence` clears the context; the context cannot inject into the next `Pull` |
 | `fuzz_soap_envelope` | all envelope builders | **no input can add XML markup** — tag counts match an empty-input baseline |
 | `fuzz_xml_escape` | `envelope::xml_escape` | complete (no raw markup survives) and reversible |
+| `fuzz_clixml_stderr` | `soap/clixml.rs::ClixmlDecoder` | output does not depend on how stderr is sliced; plain stderr passes through; output ≤ 3× input |
 
 ### Input validation
 

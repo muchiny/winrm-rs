@@ -207,7 +207,7 @@ cargo fmt --check         # format check
 
 Everything the crate parses off the network — NTLM messages, WS-Management
 SOAP responses, CredSSP DER — and everything it splices into an outgoing
-request is covered by 18 libFuzzer targets. They assert protocol invariants
+request is covered by 19 libFuzzer targets. They assert protocol invariants
 (no input can inject XML markup into an envelope, no Type 3 security buffer
 escapes its message, `encode`/`decode` roundtrip) rather than only the absence
 of panics.

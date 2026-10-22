@@ -117,6 +117,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "fuzz_clixml_stderr"
+path = "fuzz_targets/fuzz_clixml_stderr.rs"
+test = false
+doc = false
+bench = false
+
 # --- Input validation --------------------------------------------------------
 
 [[bin]]

@@ -1,6 +1,6 @@
 # libFuzzer dictionary for WS-Management SOAP responses and envelopes.
 # Used by: fuzz_soap_parse, fuzz_soap_enumerate, fuzz_soap_envelope,
-#          fuzz_xml_escape
+#          fuzz_xml_escape, fuzz_clixml_stderr
 
 # Envelope skeleton
 env_open="<s:Envelope"
@@ -72,3 +72,20 @@ entity="<!ENTITY"
 pi="<?xml"
 close_tag="</"
 self_close="/>"
+
+# PowerShell CLIXML on stderr (fuzz_clixml_stderr)
+clixml_marker="#< CLIXML"
+clixml_marker_crlf="#< CLIXML\x0d\x0a"
+clixml_objs_open="<Objs Version=\"1.1.0.1\">"
+clixml_objs_short="<Objs>"
+clixml_objs_close="</Objs>"
+clixml_error="<S S=\"Error\">"
+clixml_warning="<S S=\"warning\">"
+clixml_verbose="<S S=\"verbose\">"
+clixml_s_close="</S>"
+clixml_obj_info="<Obj S=\"information\">"
+clixml_crlf_escape="_x000D__x000A_"
+clixml_surrogates="_xD83D__xDE00_"
+clixml_escaped_underscore="_x005F_"
+xml_gt="&gt;"
+xml_numeric="&#x1B;"

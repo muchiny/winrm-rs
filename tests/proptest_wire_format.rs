@@ -11,6 +11,8 @@
 //!   UTF-8 input, output is pure ASCII (safe to splice into HTTP/SOAP)
 //! - SOAP parser: never panics on adversarial input
 //! - `parse_challenge`: never panics on adversarial input ≤ 16 KiB
+//! - stderr CLIXML decoder: output does not depend on how the stream is
+//!   sliced into Receive responses, and never panics
 //!
 //! Run with: `cargo test --features __internal --test proptest_wire_format`
 
@@ -77,5 +79,50 @@ proptest! {
         buf.extend_from_slice(&rest);
         let result = winrm_rs::__fuzz::parse_challenge(&buf);
         prop_assert!(result.is_err(), "parse_challenge must reject non-NTLMSSP signature");
+    }
+}
+
+// P-CLIXML-1 — decoding stderr in arbitrary slices gives the same text as
+// decoding it in one piece. Inputs are built from CLIXML fragments so the
+// marker, tags, entities and escapes land on slice boundaries.
+fn clixml_fragment() -> impl Strategy<Value = Vec<u8>> {
+    prop_oneof![
+        Just(b"#< CLIXML\r\n".to_vec()),
+        Just(b"<Objs Version=\"1.1.0.1\">".to_vec()),
+        Just(b"</Objs>".to_vec()),
+        Just(b"<S S=\"Error\">".to_vec()),
+        Just(b"<S S=\"warning\">".to_vec()),
+        Just(b"<S S=\"verbose\">".to_vec()),
+        Just(b"<Obj S=\"progress\"><S N=\"x\">p</S></Obj>".to_vec()),
+        Just(b"</S>".to_vec()),
+        Just(b"_x000D__x000A_".to_vec()),
+        Just(b"_xD83D__xDE00_".to_vec()),
+        Just(b"&lt;&amp;&#x41;".to_vec()),
+        Just("é€".as_bytes().to_vec()),
+        proptest::collection::vec(any::<u8>(), 0..16),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+    #[test]
+    fn clixml_decoding_does_not_depend_on_slicing(
+        fragments in proptest::collection::vec(clixml_fragment(), 0..24),
+        cuts in proptest::collection::vec(any::<prop::sample::Index>(), 0..8),
+    ) {
+        let stream: Vec<u8> = fragments.concat();
+        let whole = winrm_rs::__fuzz::decode_clixml_stderr(&[&stream]);
+
+        let mut points: Vec<usize> = cuts.iter().map(|c| c.index(stream.len() + 1)).collect();
+        points.sort_unstable();
+        let mut slices: Vec<&[u8]> = Vec::new();
+        let mut start = 0;
+        for p in points {
+            slices.push(&stream[start..p]);
+            start = p;
+        }
+        slices.push(&stream[start..]);
+
+        prop_assert_eq!(winrm_rs::__fuzz::decode_clixml_stderr(&slices), whole);
     }
 }

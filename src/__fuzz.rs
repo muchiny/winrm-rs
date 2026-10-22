@@ -163,6 +163,17 @@ pub fn parse_receive_output(xml: &str) -> Result<ReceiveOutput, SoapError> {
     crate::soap::parser::parse_receive_output(xml)
 }
 
+/// Feed `chunks` in order to one stderr CLIXML decoder, then finish it.
+pub fn decode_clixml_stderr(chunks: &[&[u8]]) -> Vec<u8> {
+    let mut decoder = crate::soap::clixml::ClixmlDecoder::new();
+    let mut out = Vec::new();
+    for chunk in chunks {
+        out.extend(decoder.push(chunk));
+    }
+    out.extend(decoder.finish());
+    out
+}
+
 pub fn check_soap_fault(xml: &str) -> Result<(), SoapError> {
     crate::soap::parser::check_soap_fault(xml)
 }

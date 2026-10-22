@@ -48,6 +48,7 @@ jobs:
           - fuzz_soap_enumerate
           - fuzz_soap_envelope
           - fuzz_xml_escape
+          - fuzz_clixml_stderr
           - fuzz_transport_host
           - fuzz_transfer_path
           - fuzz_powershell_encode

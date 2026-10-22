@@ -9,6 +9,7 @@ pub(crate) mod certificate;
 pub(crate) mod credssp;
 pub(crate) mod kerberos;
 pub(crate) mod ntlm;
+pub(crate) mod sealed;
 
 use crate::error::WinrmError;
 

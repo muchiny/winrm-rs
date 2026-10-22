@@ -7,6 +7,7 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use zeroize::Zeroizing;
 
 use crate::auth::AuthTransport;
+use crate::auth::sealed;
 use crate::error::{NtlmError, WinrmError};
 use crate::ntlm;
 
@@ -27,9 +28,6 @@ pub(crate) struct NtlmAuth {
     pub(crate) max_response_bytes: usize,
 }
 
-const ENCRYPTED_BOUNDARY: &str = "--Encrypted Boundary";
-const ENCRYPTED_CONTENT_TYPE: &str = "multipart/encrypted;protocol=\"application/HTTP-SPNEGO-session-encrypted\";boundary=\"Encrypted Boundary\"";
-
 /// Length of an NTLM message signature (MS-NLMP 2.2.2.9.1).
 const SIGNATURE_LEN: usize = 16;
 
@@ -37,74 +35,16 @@ const SIGNATURE_LEN: usize = 16;
 pub(crate) fn seal_body(session: &mut ntlm::NtlmSession, body: &str) -> (String, Vec<u8>) {
     let sealed = session.seal(body.as_bytes());
     // sealed = signature(16) + ciphertext
-    let sig_len = 16u32;
-
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&sig_len.to_le_bytes());
-    payload.extend_from_slice(&sealed);
-
-    let header_part = format!(
-        "{ENCRYPTED_BOUNDARY}\r\n\
-         \tContent-Type: application/HTTP-SPNEGO-session-encrypted\r\n\
-         \tOriginalContent: type=application/soap+xml;charset=UTF-8;Length={}\r\n\
-         {ENCRYPTED_BOUNDARY}\r\n\
-         \tContent-Type: application/octet-stream\r\n",
-        body.len()
-    );
-
-    let mut mime_body = header_part.into_bytes();
-    mime_body.extend_from_slice(&payload);
-    // The closing boundary follows the sealed payload directly, as Windows
-    // frames it; a CRLF in between makes HTTP.sys reject the request (400).
-    mime_body.extend_from_slice(format!("{ENCRYPTED_BOUNDARY}--\r\n").as_bytes());
-
-    (ENCRYPTED_CONTENT_TYPE.to_string(), mime_body)
-}
-
-/// Header lines of a sealed body's first part (between the opening boundary
-/// and the octet-stream part), without their leading tab or spaces.
-fn header_lines(header: &[u8]) -> impl Iterator<Item = &[u8]> {
-    header
-        .split(|&b| b == b'\n')
-        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
-        .map(|line| line.trim_ascii_start())
-        .filter(|line| !line.is_empty())
-}
-
-/// Whether the first part declares the SPNEGO-encrypted content type (NTLM
-/// through Negotiate), as pypsrp checks.
-fn declares_spnego_encryption(header: &[u8]) -> bool {
-    header_lines(header).any(|line| {
-        line.eq_ignore_ascii_case(b"Content-Type: application/HTTP-SPNEGO-session-encrypted")
-    })
-}
-
-/// The `Length=N` value of the first part's `OriginalContent:` line.
-fn original_length(header: &[u8]) -> Option<usize> {
-    const NAME: &[u8] = b"originalcontent:";
-    const KEY: &[u8] = b"Length=";
-    let line = header_lines(header).find(|line| {
-        line.get(..NAME.len())
-            .is_some_and(|name| name.eq_ignore_ascii_case(NAME))
-    })?;
-    let at = line.windows(KEY.len()).position(|w| w == KEY)?;
-    let number = line.get(at + KEY.len()..)?;
-    // At most 10 digits, and the line ends right after the number.
-    if number.is_empty() || number.len() > 10 || !number.iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-    std::str::from_utf8(number).ok()?.parse().ok()
+    let (signature, ciphertext) = sealed.split_at(SIGNATURE_LEN.min(sealed.len()));
+    sealed::frame(sealed::SPNEGO_PROTOCOL, body.len(), signature, ciphertext)
 }
 
 /// Extract and unseal the SOAP body of a multipart/encrypted response.
 ///
-/// The framing must be exactly what Windows sends (MS-WSMV 2.2.9.1): the
-/// opening boundary, a header part whose `OriginalContent` gives the
-/// plaintext `Length`, the octet-stream part made of a 4-byte signature
-/// length (16), the 16-byte signature and `Length` bytes of ciphertext, then
-/// the closing boundary right after the payload. Anything else is an error,
-/// as is a signature that does not verify. Nothing is allocated from the
-/// claimed length.
+/// The framing must be exactly what Windows sends (see [`sealed::parse`]),
+/// with the SPNEGO protocol and a 16-byte signature as the header. Anything
+/// else is an error, as is a signature that does not verify. Nothing is
+/// allocated from the claimed length.
 pub(crate) fn unseal_body(
     session: &mut ntlm::NtlmSession,
     data: &[u8],
@@ -115,53 +55,20 @@ pub(crate) fn unseal_body(
             data.len()
         )))
     };
-    let opening = format!("{ENCRYPTED_BOUNDARY}\r\n");
-    let octet_part =
-        format!("{ENCRYPTED_BOUNDARY}\r\n\tContent-Type: application/octet-stream\r\n");
-    let closing = format!("{ENCRYPTED_BOUNDARY}--");
-
-    let rest = data
-        .strip_prefix(opening.as_bytes())
-        .ok_or_else(|| bad("missing opening boundary"))?;
-    let part_at = rest
-        .windows(octet_part.len())
-        .position(|w| w == octet_part.as_bytes())
-        .ok_or_else(|| bad("missing octet-stream part"))?;
-    let (header, rest) = rest
-        .split_at_checked(part_at)
-        .ok_or_else(|| bad("missing octet-stream part"))?;
-    if !declares_spnego_encryption(header) {
-        return Err(bad(
-            "first part is not application/HTTP-SPNEGO-session-encrypted",
-        ));
-    }
-    let length =
-        original_length(header).ok_or_else(|| bad("missing or invalid OriginalContent Length"))?;
-    let payload = rest
-        .get(octet_part.len()..)
-        .ok_or_else(|| bad("missing octet-stream part"))?;
-
-    let (sig_len, payload) = payload
-        .split_first_chunk::<4>()
-        .ok_or_else(|| bad("truncated signature length"))?;
-    if usize::try_from(u32::from_le_bytes(*sig_len)).ok() != Some(SIGNATURE_LEN) {
-        return Err(bad("signature length is not 16"));
-    }
-    let sealed_len = SIGNATURE_LEN
-        .checked_add(length)
-        .ok_or_else(|| bad("OriginalContent Length out of range"))?;
-    let (sealed, trailer) = payload
-        .split_at_checked(sealed_len)
-        .ok_or_else(|| bad("payload shorter than its OriginalContent Length"))?;
-    let after = trailer
-        .strip_prefix(closing.as_bytes())
-        .ok_or_else(|| bad("closing boundary does not follow the payload"))?;
-    if !(after.is_empty() || after == b"\r\n") {
-        return Err(bad("data after the closing boundary"));
-    }
-
-    let plaintext = session.unseal(sealed).map_err(WinrmError::Ntlm)?;
-    if plaintext.len() != length {
+    let frame = sealed::parse(
+        data,
+        sealed::SPNEGO_PROTOCOL,
+        |len| {
+            if len == SIGNATURE_LEN {
+                Ok(())
+            } else {
+                Err("signature length is not 16")
+            }
+        },
+        bad,
+    )?;
+    let plaintext = session.unseal(frame.sealed).map_err(WinrmError::Ntlm)?;
+    if plaintext.len() != frame.length {
         return Err(bad("plaintext length differs from OriginalContent Length"));
     }
     String::from_utf8(plaintext).map_err(|_| bad("plaintext is not UTF-8"))
@@ -395,6 +302,8 @@ impl AuthTransport for NtlmAuth {
 mod tests {
     use super::*;
     use crate::ntlm::NtlmSession;
+
+    const ENCRYPTED_BOUNDARY: &str = "--Encrypted Boundary";
 
     #[test]
     fn seal_body_produces_multipart_format() {

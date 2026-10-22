@@ -10,14 +10,14 @@
 //! cargo test --test integration_real -- --ignored
 //! ```
 //!
-//! With the ferrum.windows Vagrant VM:
+//! With the Hyper-V bench VM (`tests/vagrant/2025/Vagrantfile`), the helper
+//! script starts it if needed and prints those variables:
 //! ```bash
-//! vagrant.exe up --provider=hyperv
-//! export WINRM_TEST_HOST=$(just vm-ip)
-//! export WINRM_TEST_USER=vagrant
-//! export WINRM_TEST_PASS=vagrant
+//! eval "$(tests/scripts/vm-connect.sh 2>/dev/null | tr -d '\r')"
 //! cargo test --test integration_real -- --ignored
 //! ```
+//! (`tests/scripts/vm-connect-2012r2.sh` does the same for the Server 2012 R2
+//! bench.)
 //!
 //! The certificate tests (`certificate_auth_*`,
 //! `silent_command_completes_over_certificate_auth`) also need

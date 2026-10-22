@@ -239,11 +239,12 @@ fn build_inner_openssl_tls() -> Result<OpenSslMemTls, WinrmError> {
     // (MS-CSSP §3.1.5.1): the client computes a hash over the server's
     // SubjectPublicKeyInfo + a nonce, the NTLM session seals it, and
     // the server is expected to echo the symmetric counter-hash. The
-    // pubKeyAuth check is performed at line ~795 below; if it fails we
-    // abort with `CredSspError::PublicKeyMismatch`. So an X.509 chain
-    // check on this leg would be redundant — and crucially, the
-    // outer/transport leg already validates the chain (see
-    // `CredSspConnection::connect`).
+    // pubKeyAuth check is performed after the NTLM exchange (see the
+    // `expected_server_hash` comparison in `CredSspConnection`'s
+    // handshake); if it fails we abort with
+    // `CredSspError::PublicKeyMismatch`. So an X.509 chain check on this
+    // leg would be redundant — and crucially, the outer/transport leg
+    // already validates the chain (see `CredSspConnection::connect`).
     builder.set_verify(SslVerifyMode::NONE);
     // Force TLS 1.2 to match what Microsoft CredSSP server expects.
     builder

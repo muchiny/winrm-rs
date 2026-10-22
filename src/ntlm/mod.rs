@@ -56,6 +56,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 /// the sealing/signing key material lives, and its `Drop` ensures it does
 /// not survive the session in the process heap.
 #[derive(Zeroize, ZeroizeOnDrop)]
+#[cfg_attr(test, derive(Clone))]
 pub struct NtlmSession {
     client_sign_key: [u8; 16],
     server_sign_key: [u8; 16],
@@ -103,6 +104,21 @@ impl NtlmSession {
             client_seal_handle: Rc4State::new(&client_seal_key),
             server_seal_handle: Rc4State::new(&server_seal_key),
         }
+    }
+
+    /// The server's view of the session derived from the same key: what it
+    /// seals, a client [`Self::from_auth`] session unseals, and back.
+    ///
+    /// For tests and the `__internal` fuzz surface only: builds the sealed
+    /// bodies a WinRM server sends.
+    #[cfg(any(test, feature = "__internal"))]
+    pub(crate) fn server_side(exported_session_key: &[u8; 16]) -> Self {
+        let mut session = Self::from_auth(exported_session_key);
+        std::mem::swap(&mut session.client_sign_key, &mut session.server_sign_key);
+        std::mem::swap(&mut session.client_seal_key, &mut session.server_seal_key);
+        session.client_seal_handle = Rc4State::new(&session.client_seal_key);
+        session.server_seal_handle = Rc4State::new(&session.server_seal_key);
+        session
     }
 
     fn derive_key(session_key: &[u8; 16], magic: &[u8]) -> [u8; 16] {
@@ -317,6 +333,19 @@ impl NtlmSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_side_session_mirrors_the_client_session() {
+        let key = [0x42; 16];
+        let mut client = NtlmSession::from_auth(&key);
+        let mut server = NtlmSession::server_side(&key);
+        for i in 0..2u8 {
+            let to_server = client.seal(&[b'c', i]);
+            assert_eq!(server.unseal(&to_server).unwrap(), [b'c', i]);
+            let to_client = server.seal(&[b's', i]);
+            assert_eq!(client.unseal(&to_client).unwrap(), [b's', i]);
+        }
+    }
 
     fn unhex(s: &str) -> Vec<u8> {
         (0..s.len())

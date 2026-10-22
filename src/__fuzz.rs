@@ -126,9 +126,10 @@ pub fn build_ntlmv2_blob(
     crate::ntlm::crypto::build_ntlmv2_blob(timestamp, client_challenge, target_info)
 }
 
-/// Compute the `tls-server-end-point` channel binding token from a DER cert.
-pub fn compute_channel_bindings(cert_der: &[u8]) -> [u8; 16] {
-    crate::ntlm::crypto::compute_channel_bindings(cert_der)
+/// Compute the `tls-server-end-point` channel binding token from a DER cert
+/// (`None` when its signature algorithm defines no channel binding).
+pub fn compute_channel_bindings(cert_der: &[u8]) -> Option<[u8; 16]> {
+    crate::ntlm::crypto::compute_channel_bindings(cert_der).ok()
 }
 
 pub fn hmac_md5(key: &[u8], data: &[u8]) -> [u8; 16] {
@@ -143,6 +144,64 @@ pub fn hmac_md5(key: &[u8], data: &[u8]) -> [u8; 16] {
 /// derived sealing key, so the fuzz harness must uphold the same invariant.
 pub fn rc4_process(key: &[u8], data: &mut [u8]) {
     crate::ntlm::crypto::Rc4State::new(key).process(data);
+}
+
+/// Unseal a multipart/encrypted WinRM response with the client session of
+/// `key` (`auth/ntlm.rs::unseal_body`).
+pub fn unseal_body(key: &[u8; 16], data: &[u8]) -> Result<String, WinrmError> {
+    let mut session = crate::ntlm::NtlmSession::from_auth(key);
+    crate::auth::ntlm::unseal_body(&mut session, data)
+}
+
+/// A response sealed by the server side of the session of `key`, framed as
+/// Windows frames it (`auth/ntlm.rs::seal_body` with server keys).
+pub fn seal_body_as_server(key: &[u8; 16], plaintext: &str) -> Vec<u8> {
+    let mut server = crate::ntlm::NtlmSession::server_side(key);
+    crate::auth::ntlm::seal_body(&mut server, plaintext).1
+}
+
+// ---------------------------------------------------------------------------
+// Kerberos message encryption, pure parts (`src/auth/kerberos.rs`,
+// `src/auth/sealed.rs`, `src/soap/parser.rs`): no GSS-API, no KDC
+// ---------------------------------------------------------------------------
+
+/// Parse a Kerberos-sealed answer (`kerberos::parse_sealed_answer`): the
+/// token (security header then data) and the announced plaintext length.
+pub fn kerberos_parse_sealed(data: &[u8]) -> Result<(Vec<u8>, usize), WinrmError> {
+    crate::auth::kerberos::parse_sealed_answer(data).map(|f| (f.sealed.to_vec(), f.length))
+}
+
+/// RFC 4121 checks of a sealed answer's token
+/// (`kerberos::check_acceptor_sealed`).
+pub fn kerberos_check_acceptor_sealed(token: &[u8]) -> Result<(), WinrmError> {
+    crate::auth::kerberos::check_acceptor_sealed(token)
+}
+
+/// `gss_wrap_iov` buffers to the Windows SSPI layout
+/// (`kerberos::windows_layout`).
+pub fn kerberos_windows_layout(
+    header: &[u8],
+    data: &[u8],
+    padding: &[u8],
+    trailer: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>), WinrmError> {
+    crate::auth::kerberos::windows_layout(header, data, padding, trailer)
+}
+
+/// The `wsa:MessageID` of a request (`soap::parser::message_id`).
+pub fn message_id(request: &str) -> Option<String> {
+    crate::soap::parser::message_id(request)
+}
+
+/// The first `RelatesTo` of a response (`soap::parser::relates_to`).
+pub fn relates_to(response: &str) -> Option<String> {
+    crate::soap::parser::relates_to(response)
+}
+
+/// `RelatesTo` binding of an answer to its request
+/// (`soap::parser::check_relates_to`).
+pub fn check_relates_to(request: &str, response: &str) -> Result<(), String> {
+    crate::soap::parser::check_relates_to(request, response)
 }
 
 // ---------------------------------------------------------------------------
@@ -161,6 +220,17 @@ pub fn parse_command_id(xml: &str) -> Result<String, SoapError> {
 
 pub fn parse_receive_output(xml: &str) -> Result<ReceiveOutput, SoapError> {
     crate::soap::parser::parse_receive_output(xml)
+}
+
+/// Feed `chunks` in order to one stderr CLIXML decoder, then finish it.
+pub fn decode_clixml_stderr(chunks: &[&[u8]]) -> Vec<u8> {
+    let mut decoder = crate::soap::clixml::ClixmlDecoder::new();
+    let mut out = Vec::new();
+    for chunk in chunks {
+        out.extend(decoder.push(chunk));
+    }
+    out.extend(decoder.finish());
+    out
 }
 
 pub fn check_soap_fault(xml: &str) -> Result<(), SoapError> {
@@ -312,6 +382,48 @@ pub fn sanitize_host(input: &str) -> String {
     crate::transport::sanitize_host(input)
 }
 
+/// What the URL parser reads back from an endpoint URL.
+#[derive(Debug)]
+pub struct EndpointParts {
+    /// The host as the parser normalised it (lowercase, punycode, IPv4).
+    pub host: Option<String>,
+    /// Whether the parser took the host for a domain (not an IP address).
+    pub is_domain: bool,
+    pub port: Option<u16>,
+    pub path: String,
+    pub has_query: bool,
+    pub has_fragment: bool,
+    pub has_userinfo: bool,
+}
+
+/// `None` when `validate_host` refuses `input`. Otherwise the host
+/// `sanitize_host` kept, the endpoint URL the transport builds from it, and
+/// that URL as the parser reads it back (`Err` with the parser's message
+/// when it refuses the URL: the request then fails before anything is sent).
+pub fn accepted_host_endpoint(
+    input: &str,
+    use_tls: bool,
+    port: u16,
+) -> Option<(String, String, Result<EndpointParts, String>)> {
+    crate::transport::validate_host(input).ok()?;
+    let sanitized = crate::transport::sanitize_host(input);
+    let url = crate::transport::endpoint_url(use_tls, &sanitized, port);
+    let parsed = reqwest::Url::parse(&url)
+        .map(|u| EndpointParts {
+            host: u.host_str().map(str::to_string),
+            is_domain: u
+                .host_str()
+                .is_some_and(|h| !h.starts_with('[') && h.parse::<std::net::Ipv4Addr>().is_err()),
+            port: u.port(),
+            path: u.path().to_string(),
+            has_query: u.query().is_some(),
+            has_fragment: u.fragment().is_some(),
+            has_userinfo: !u.username().is_empty() || u.password().is_some(),
+        })
+        .map_err(|e| e.to_string());
+    Some((sanitized, url, parsed))
+}
+
 /// Reject remote paths that are over-long or contain control characters.
 pub fn validate_remote_path(path: &str) -> Result<(), WinrmError> {
     crate::transfer::validate_remote_path(path)
@@ -383,4 +495,77 @@ pub fn encode_spnego_response(ntlm_token: &[u8], mech_list_mic: Option<&[u8]>) -
 #[cfg(feature = "credssp")]
 pub fn extract_subject_public_key(cert_der: &[u8]) -> Result<Vec<u8>, crate::error::CredSspError> {
     crate::asn1::extract_subject_public_key(cert_der)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The invariants `fuzz_transport_host` asserts for accepted hosts,
+    /// checked here on the shapes most likely to break them.
+    fn check_accepted(host: &str) {
+        for use_tls in [false, true] {
+            let Some((accepted, url, parsed)) = accepted_host_endpoint(host, use_tls, 5985) else {
+                continue;
+            };
+            assert!(!accepted.is_empty(), "{host:?}");
+            assert!(
+                !accepted
+                    .chars()
+                    .any(|c| matches!(c, '?' | '#' | '\\') || c.is_whitespace() || c.is_control()),
+                "{host:?} → {accepted:?}"
+            );
+            let Ok(parts) = parsed else { continue };
+            assert_eq!(parts.port, Some(5985), "{url}");
+            assert_eq!(parts.path, "/wsman", "{url}");
+            assert!(
+                !parts.has_query && !parts.has_fragment && !parts.has_userinfo,
+                "{url}"
+            );
+            if parts.is_domain && accepted.is_ascii() {
+                assert_eq!(
+                    parts.host.as_deref(),
+                    Some(accepted.to_ascii_lowercase().as_str()),
+                    "{url}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn accepted_hosts_read_back_from_their_endpoint_url() {
+        for host in [
+            "win01",
+            "WIN01.Corp.Local",
+            "10.0.0.5",
+            "10.1",
+            "0x10",
+            "a..b",
+            "xn--zz",
+            "win01.",
+            "_a",
+            "-a-",
+            "[::1]",
+            "[fe80::1]:5986",
+            "é.example",
+            "u:p@win01:5985/x",
+            "win01?x",
+            "win01#x",
+            "win01\\x",
+            "win 01",
+            "\t",
+            "",
+        ] {
+            check_accepted(host);
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn accepted_hosts_read_back_from_their_endpoint_url_prop(
+            host in "[a-zA-Z0-9._:@/\\[\\]?#%\\\\ -]{0,24}"
+        ) {
+            check_accepted(&host);
+        }
+    }
 }

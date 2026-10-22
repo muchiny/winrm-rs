@@ -5,6 +5,11 @@
 // focus on behaviour observable through the public API + wiremock; deeper
 // crypto / parser regressions live in unit tests next to the affected
 // module.
+//
+// The clients here are built through the public API, which (outside the
+// crate's own unit tests) lets `reqwest` read `HTTP_PROXY` / `ALL_PROXY` from
+// the environment. These tests talk to a loopback mock server: if your shell
+// exports a proxy, make sure `NO_PROXY` covers `127.0.0.1`.
 
 use winrm_rs::{AuthMethod, WinrmClient, WinrmConfig, WinrmCredentials};
 use wiremock::matchers::method;

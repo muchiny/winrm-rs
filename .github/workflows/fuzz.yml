@@ -44,10 +44,13 @@ jobs:
           - fuzz_ntlm_crypto
           - fuzz_ntlm_seal
           - fuzz_ntlm_session
+          - fuzz_ntlm_unseal_body
+          - fuzz_kerberos_sealed
           - fuzz_soap_parse
           - fuzz_soap_enumerate
           - fuzz_soap_envelope
           - fuzz_xml_escape
+          - fuzz_clixml_stderr
           - fuzz_transport_host
           - fuzz_transfer_path
           - fuzz_powershell_encode

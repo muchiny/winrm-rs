@@ -30,7 +30,7 @@ async fn main() -> Result<(), winrm_rs::WinrmError> {
 
 - **NTLMv2 authentication** -- pure Rust, no OpenSSL or system SSPI required
 - **Basic authentication** -- for test environments or HTTPS-secured endpoints
-- **Kerberos authentication** -- via `cross-krb5`, feature-gated (`--features kerberos`)
+- **Kerberos authentication** -- via `cross-krb5`, feature-gated (`--features kerberos`); raw Kerberos GSS-API tokens under the `Negotiate` scheme, messages sealed with the Kerberos context over HTTP
 - **Certificate authentication** -- TLS client certificate auth
 - **PowerShell execution** -- scripts auto-encoded as UTF-16LE Base64 (`-EncodedCommand`)
 - **Raw command execution** -- `cmd.exe` or any executable with arbitrary arguments
@@ -89,7 +89,43 @@ let client = WinrmClient::new(
     },
     WinrmCredentials::new("user", "", ""),
 )?;
+// Connect by host name: the service principal is HTTP/<host>.
+let out = client.run_command("server.corp.example", "whoami", &[]).await?;
 ```
+
+Kerberos authenticates the client and, through its AP-REP, the server
+(required for sealing and over HTTPS; only `EncryptionMode::Never` over
+plain HTTP accepts an answer without it). Message confidentiality comes from
+HTTPS (`use_tls = true`) or, over HTTP, from Kerberos sealing, which
+`EncryptionMode::Auto` (the default) applies: each SOAP body is wrapped with
+the connection's Kerberos context (GSS-API wrap with confidentiality; only
+RFC 4121 tokens, so AES session keys: an RC4-only realm needs
+`EncryptionMode::Never`), so the server can keep `AllowUnencrypted = false`.
+`EncryptionMode::Never` sends the bodies in plaintext over HTTP. Over HTTPS
+the AP-REQ carries a channel binding (RFC 5929 `tls-server-end-point`)
+computed for the certificate learnt on an unauthenticated probe request;
+that certificate is then pinned in the connection's verifier, so the
+AP-REQ's connection, and every later one, presents that same certificate or
+fails at its TLS handshake (any other server name than the endpoint's, the
+`https://` proxy's own leg aside, is refused too: the proxy of
+`WinrmConfig::proxy`, else any `https://` proxy in `HTTPS_PROXY` /
+`ALL_PROXY`; a proxy from system settings, which reqwest only reads when a
+crate in the build enables its `system-proxy` feature, is refused; a host that is no valid
+TLS server name once the URL is parsed is refused before the AP-REQ). Accepted by `CbtHardeningLevel = Strict`; a
+server certificate with no binding hash (Ed25519, unknown algorithm) is
+refused. `EncryptionMode::Never` over plain HTTP has none of this.
+
+Limits: WinRM sends its sealed Kerberos answers with sequence number 0, so
+the Kerberos session detects no replay; each sealed answer is bound to its
+request through `RelatesTo`, and a sealed request replayed by an active
+attacker on the same authenticated connection is not detected. Sealing
+protects this client's messages; server side, integrity on plain HTTP also
+needs `AllowUnencrypted = false` (for NTLM as for Kerberos), since a server
+that allows unencrypted traffic runs unprotected requests from other
+clients. On a Windows client the SSPI path of `cross-krb5` is built and
+linted by the `kerberos-windows` CI job and not tested live: with
+`--features kerberos`, `Auto` now seals over HTTP, and
+`EncryptionMode::Never` is the way back if that fails.
 
 ### Certificate authentication
 
@@ -114,6 +150,29 @@ let output = client.run_powershell("win-server", "$PSVersionTable | ConvertTo-Js
 assert_eq!(output.exit_code, 0);
 println!("{}", String::from_utf8_lossy(&output.stdout));
 ```
+
+### Bounding a call with a total timeout
+
+`run_command` and `run_powershell` wait as long as the command runs, so a
+script that hangs silently (`Read-Host`, `pause`) blocks them. The
+`*_with_timeout` variants give up after a total time: the command is
+terminated, the remote shell is deleted, and the call returns
+`WinrmError::Timeout(secs)` (the timeout rounded up to whole seconds).
+
+```rust
+use std::time::Duration;
+
+match client
+    .run_powershell_with_timeout("win-server", "Get-Service", Duration::from_secs(30))
+    .await
+{
+    Ok(output) => println!("{}", String::from_utf8_lossy(&output.stdout)),
+    Err(WinrmError::Timeout(secs)) => eprintln!("no answer after {secs}s"),
+    Err(e) => return Err(e.into()),
+}
+```
+
+`run_command_with_timeout` and `download_file_with_timeout` work the same way.
 
 ### Raw command execution
 
@@ -164,6 +223,7 @@ let bytes = client.download_file("win-server", "C:\\remote\\file.bin", Path::new
 | `client_cert_pem` | `None` | Path to client cert PEM (Certificate auth) |
 | `client_key_pem` | `None` | Path to client key PEM (Certificate auth) |
 | `proxy` | `None` | HTTP proxy URL (e.g. `http://proxy:8080`) |
+| `encryption` | `Auto` | Message sealing for NTLM and Kerberos: `Auto` (over HTTP only), `Always`, `Never`. No effect with Basic, Certificate or CredSSP, `Always` included (Basic over HTTP stays plaintext; a WARN is logged) |
 
 ## Roadmap
 
@@ -185,7 +245,7 @@ let bytes = client.download_file("win-server", "C:\\remote\\file.bin", Path::new
 | NTLM | pure Rust (NTLMv2) | via requests-ntlm | built-in |
 | Kerberos | via cross-krb5 (v0.4) | via requests-kerberos | built-in |
 | Certificate | built-in (v0.4) | yes | yes |
-| Encryption | NTLM sealing (v0.3) | via pywinrm[credssp] | built-in |
+| Encryption | NTLM sealing (v0.3), Kerberos sealing | via pywinrm[credssp] | built-in |
 | TLS backend | rustls | OpenSSL | Go stdlib |
 | PowerShell encoding | built-in | built-in | built-in |
 | Shell reuse | yes (v0.2) | yes | yes |
@@ -207,7 +267,7 @@ cargo fmt --check         # format check
 
 Everything the crate parses off the network — NTLM messages, WS-Management
 SOAP responses, CredSSP DER — and everything it splices into an outgoing
-request is covered by 18 libFuzzer targets. They assert protocol invariants
+request is covered by 21 libFuzzer targets. They assert protocol invariants
 (no input can inject XML markup into an envelope, no Type 3 security buffer
 escapes its message, `encode`/`decode` roundtrip) rather than only the absence
 of panics.

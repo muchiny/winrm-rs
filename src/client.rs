@@ -3,6 +3,12 @@
 // Communicates with the WinRM service (WS-Management) over HTTP(S).
 // Supports NTLM, Basic, Kerberos, and Certificate authentication.
 
+use std::future::Future;
+use std::pin::pin;
+use std::task::Poll;
+use std::time::Duration;
+
+use tokio::time::Instant;
 use tracing::debug;
 
 use crate::builder::WinrmClientBuilder;
@@ -33,7 +39,7 @@ impl WinrmClient {
     /// Builds the underlying HTTP client with the configured timeouts and TLS
     /// settings. Returns [`WinrmError::Http`] if the HTTP client cannot be
     /// constructed (e.g. invalid TLS configuration).
-    #[tracing::instrument(level = "debug", skip(credentials))]
+    #[tracing::instrument(level = "debug", skip(config, credentials))]
     pub fn new(config: WinrmConfig, credentials: WinrmCredentials) -> Result<Self, WinrmError> {
         Ok(Self {
             transport: HttpTransport::new(config, credentials)?,
@@ -72,7 +78,11 @@ impl WinrmClient {
     /// The shell uses UTF-8 codepage (65001) and disables the user profile
     /// (`WINRS_NOPROFILE`). The caller must eventually call
     /// [`delete_shell`](Self::delete_shell) to release server resources.
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, host),
+        fields(host = %crate::transport::redact_userinfo(host))
+    )]
     pub async fn create_shell(&self, host: &str) -> Result<String, WinrmError> {
         let config = self.transport.config();
         let envelope = soap::create_shell_request(&self.transport.endpoint(host), config);
@@ -88,7 +98,11 @@ impl WinrmClient {
     ///
     /// Returns a [`Shell`] whose subsequent operations (Execute, Receive,
     /// Send, Signal, Delete) will use the PowerShell resource URI.
-    #[tracing::instrument(level = "debug", skip(self, creation_xml_b64))]
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, creation_xml_b64, host),
+        fields(host = %crate::transport::redact_userinfo(host))
+    )]
     pub async fn open_psrp_shell(
         &self,
         host: &str,
@@ -121,7 +135,11 @@ impl WinrmClient {
     ///
     /// The caller is responsible for subsequently calling
     /// [`receive_output`](Self::receive_output) to poll for results.
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, host),
+        fields(host = %crate::transport::redact_userinfo(host))
+    )]
     pub async fn execute_command(
         &self,
         host: &str,
@@ -146,13 +164,73 @@ impl WinrmClient {
     ///
     /// Must be called repeatedly until [`ReceiveOutput::done`](soap::ReceiveOutput::done)
     /// is `true`. Each call may return partial output that should be accumulated.
-    #[tracing::instrument(level = "debug", skip(self))]
+    ///
+    /// A command that stays silent for the configured `operation_timeout_secs`
+    /// makes the server answer with a WS-Management `TimedOut` fault. That
+    /// is not a failure (the command keeps running), so it is returned as an
+    /// empty, not-done output: no stdout, no stderr, no exit code. Keep
+    /// polling. Any other fault is an error.
+    ///
+    /// PowerShell CLIXML on stderr is decoded within this one response only,
+    /// with a fresh decoder that is finished at the end of the response. A
+    /// document the server splits across responses (Server 2025 does for
+    /// large stderr) then comes back partly decoded and partly as raw XML.
+    /// To decode stderr across polls, call
+    /// [`receive_output_raw`](Self::receive_output_raw) and feed its stderr
+    /// to one [`StderrDecoder`](crate::StderrDecoder) per command, or use
+    /// [`Shell::receive_next`](crate::Shell::receive_next), which does that.
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, host),
+        fields(host = %crate::transport::redact_userinfo(host))
+    )]
     pub async fn receive_output(
         &self,
         host: &str,
         shell_id: &str,
         command_id: &str,
     ) -> Result<soap::ReceiveOutput, WinrmError> {
+        let polled = async {
+            let response = self.receive_response(host, shell_id, command_id).await?;
+            soap::parse_receive_output(&response).map_err(WinrmError::Soap)
+        }
+        .await;
+        empty_poll_on_timeout(polled)
+    }
+
+    /// [`receive_output`](Self::receive_output) with stderr returned exactly
+    /// as the server sent it, PowerShell CLIXML included.
+    ///
+    /// Feed each poll's stderr, in order, to one
+    /// [`StderrDecoder`](crate::StderrDecoder) per command to decode CLIXML
+    /// that spans several responses; its documentation has an example. A
+    /// `TimedOut` fault is an empty, not-done poll here too.
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, host),
+        fields(host = %crate::transport::redact_userinfo(host))
+    )]
+    pub async fn receive_output_raw(
+        &self,
+        host: &str,
+        shell_id: &str,
+        command_id: &str,
+    ) -> Result<soap::ReceiveOutput, WinrmError> {
+        let polled = async {
+            let response = self.receive_response(host, shell_id, command_id).await?;
+            soap::parse_receive_output_raw(&response).map_err(WinrmError::Soap)
+        }
+        .await;
+        empty_poll_on_timeout(polled)
+    }
+
+    /// Send one Receive request and return the response body.
+    async fn receive_response(
+        &self,
+        host: &str,
+        shell_id: &str,
+        command_id: &str,
+    ) -> Result<String, WinrmError> {
         let config = self.transport.config();
         let envelope = soap::receive_output_request(
             &self.transport.endpoint(host),
@@ -161,15 +239,18 @@ impl WinrmClient {
             config.operation_timeout_secs,
             config.max_envelope_size,
         );
-        let response = self.transport.send_soap_with_retry(host, envelope).await?;
-        soap::parse_receive_output(&response).map_err(WinrmError::Soap)
+        self.transport.send_soap_with_retry(host, envelope).await
     }
 
     /// Send a terminate signal to a running command.
     ///
     /// This is a best-effort operation -- errors are typically non-fatal
     /// since the shell will be deleted shortly after.
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, host),
+        fields(host = %crate::transport::redact_userinfo(host))
+    )]
     pub async fn signal_terminate(
         &self,
         host: &str,
@@ -194,7 +275,11 @@ impl WinrmClient {
     /// an error occurred. The high-level [`run_command`](Self::run_command)
     /// and [`run_powershell`](Self::run_powershell) methods handle this
     /// automatically.
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, host),
+        fields(host = %crate::transport::redact_userinfo(host))
+    )]
     pub async fn delete_shell(&self, host: &str, shell_id: &str) -> Result<(), WinrmError> {
         self.delete_shell_with_resource_uri(
             host,
@@ -211,54 +296,248 @@ impl WinrmClient {
     /// This is the primary entry point for command execution. It handles the
     /// full shell lifecycle: create -> execute -> poll -> signal -> delete.
     /// The shell is always cleaned up, even if the command fails.
-    #[tracing::instrument(level = "debug", skip(self))]
+    ///
+    /// # No overall time limit
+    ///
+    /// The call returns when the command ends, however long that takes.
+    /// [`operation_timeout_secs`](crate::WinrmConfig::operation_timeout_secs)
+    /// bounds each Receive poll, not the command: a poll that finds no output
+    /// within it is an empty poll and polling goes on. A command that hangs
+    /// silently (`Read-Host`, `pause`, a blocked process) therefore blocks
+    /// this call until it ends. To bound it, use
+    /// [`run_command_with_timeout`](Self::run_command_with_timeout) or stop it
+    /// from elsewhere with
+    /// [`run_command_with_cancel`](Self::run_command_with_cancel); both
+    /// terminate the command and delete the shell. Dropping this future (a
+    /// `tokio::time::timeout`, a `select!` arm that loses) cannot delete the
+    /// shell, which the server then reaps after its idle timeout.
+    /// [`Shell::run_command`] has a total deadline of
+    /// `2 * operation_timeout_secs`.
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, host),
+        fields(host = %crate::transport::redact_userinfo(host))
+    )]
     pub async fn run_command(
         &self,
         host: &str,
         command: &str,
         args: &[&str],
     ) -> Result<CommandOutput, WinrmError> {
-        let shell_id = self.create_shell(host).await?;
+        self.run_command_until(host, command, args, std::future::pending(), false)
+            .await
+    }
+
+    /// Run a command with a total time limit.
+    ///
+    /// Like [`run_command`](Self::run_command), but the whole call (shell
+    /// creation, execution and polling) must finish within `timeout`. When it
+    /// does not, the command is told to terminate (best effort), the remote
+    /// shell is deleted (best effort), and the call returns
+    /// [`WinrmError::Timeout`] carrying `timeout` rounded **up** to whole
+    /// seconds, at least 1: `1500 ms` and `2 s` both give `Timeout(2)`, and
+    /// `Duration::ZERO` gives `Timeout(1)` without sending anything.
+    ///
+    /// The limit counts wall-clock time of the command itself: empty polls
+    /// (the `w:TimedOut` fault a silent command provokes every
+    /// [`operation_timeout_secs`](crate::WinrmConfig::operation_timeout_secs))
+    /// do not extend it. A `timeout` too large to add to the current time
+    /// never expires.
+    ///
+    /// # Clean-up
+    ///
+    /// The shell is deleted on success, on error and on expiry, with two
+    /// exceptions that leave it to the server's idle timeout: the host does
+    /// not answer the Create request within the clean-up budget after the
+    /// deadline (the shell's id is then unknown), or the future is dropped
+    /// before it completes (deleting needs an `async` drop), exactly like
+    /// [`run_command`](Self::run_command).
+    ///
+    /// When the deadline passes during shell creation, Create is not aborted:
+    /// the call waits for its answer, then deletes the shell it returned.
+    /// Every clean-up request (terminate, delete) is bounded by
+    /// `operation_timeout_secs` capped at 10 s, so after expiry the call can
+    /// overrun `timeout` by up to about 30 s on a host that stops answering
+    /// (Create wait plus two requests). The same bound applies to the
+    /// requests that follow a command that finished in time; a deadline that
+    /// passes after the command has finished is ignored and its output is
+    /// returned.
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// # use std::time::Duration;
+    /// # use winrm_rs::{WinrmClient, WinrmConfig, WinrmCredentials, WinrmError};
+    /// # async fn example() -> Result<(), WinrmError> {
+    /// # let client = WinrmClient::new(WinrmConfig::default(), WinrmCredentials::new("u","p",""))?;
+    /// match client
+    ///     .run_command_with_timeout("server", "ipconfig", &["/all"], Duration::from_secs(30))
+    ///     .await
+    /// {
+    ///     Ok(out) => println!("exit {}", out.exit_code),
+    ///     Err(WinrmError::Timeout(secs)) => eprintln!("gave up after {secs}s"),
+    ///     Err(e) => return Err(e),
+    /// }
+    /// # Ok(()) }
+    /// ```
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, host),
+        fields(host = %crate::transport::redact_userinfo(host))
+    )]
+    pub async fn run_command_with_timeout(
+        &self,
+        host: &str,
+        command: &str,
+        args: &[&str],
+        timeout: Duration,
+    ) -> Result<CommandOutput, WinrmError> {
+        self.run_command_until(host, command, args, deadline_stop(timeout), true)
+            .await
+    }
+
+    /// Shell lifecycle shared by [`run_command`](Self::run_command),
+    /// [`run_command_with_timeout`](Self::run_command_with_timeout) and
+    /// [`run_command_with_cancel`](Self::run_command_with_cancel).
+    ///
+    /// `stop` resolves to the error to return when the caller wants the call
+    /// to end early (deadline, cancellation); it is never polled again once
+    /// it has resolved. `stoppable` says whether `stop` can ever resolve,
+    /// which makes the clean-up requests bounded by
+    /// [`cleanup_budget`](Self::cleanup_budget) instead of by the HTTP
+    /// timeout alone.
+    ///
+    /// A stop that resolves while the command is being created, started or
+    /// polled terminates the command (if it started) and deletes the shell,
+    /// then returns the stop's error. A stop that resolves after the command
+    /// has finished is ignored: its output is returned.
+    async fn run_command_until(
+        &self,
+        host: &str,
+        command: &str,
+        args: &[&str],
+        stop: impl Future<Output = WinrmError>,
+        stoppable: bool,
+    ) -> Result<CommandOutput, WinrmError> {
+        let budget = stoppable.then(|| self.cleanup_budget());
+        let mut stop = pin!(stop);
+
+        // A stop that is already due must not put a Create on the wire.
+        if let Poll::Ready(reason) =
+            std::future::poll_fn(|cx| Poll::Ready(stop.as_mut().poll(cx))).await
+        {
+            return Err(reason);
+        }
+
+        let mut create = pin!(self.create_shell(host));
+        let shell_id = tokio::select! {
+            biased;
+            reason = &mut stop => {
+                // Create is on the wire and the shell may already exist:
+                // let it answer (bounded) so that the shell can be deleted.
+                let waited = bounded(self.cleanup_budget(), &mut create).await;
+                if let Ok(shell_id) = waited {
+                    self.release_shell(host, &shell_id, None, Some(self.cleanup_budget())).await;
+                }
+                return Err(reason);
+            }
+            created = &mut create => created?,
+        };
         debug!(shell_id = %shell_id, "WinRM shell created");
 
-        let result = self.run_in_shell(host, &shell_id, command, args).await;
+        let mut command_id = None;
+        let polled = {
+            let run = self.run_in_shell(host, &shell_id, command, args, &mut command_id);
+            tokio::select! {
+                biased;
+                result = run => Ok(result),
+                reason = &mut stop => Err(reason),
+            }
+        };
 
-        // Always clean up the shell
-        self.delete_shell(host, &shell_id)
+        match polled {
+            Ok(result) => {
+                // The command ended on its own: the clean-up runs outside
+                // the stop, so a late deadline cannot discard its output.
+                // Only a command that completed is signalled (a failed
+                // Receive leaves it to the shell Delete).
+                let finished = result.is_ok().then_some(command_id.as_deref()).flatten();
+                self.release_shell(host, &shell_id, finished, budget).await;
+                result
+            }
+            Err(reason) => {
+                let budget = Some(self.cleanup_budget());
+                self.release_shell(host, &shell_id, command_id.as_deref(), budget)
+                    .await;
+                Err(reason)
+            }
+        }
+    }
+
+    /// Best effort: terminate `command_id` (if any), then delete the shell.
+    /// Each request is bounded by `budget` when there is one.
+    async fn release_shell(
+        &self,
+        host: &str,
+        shell_id: &str,
+        command_id: Option<&str>,
+        budget: Option<Duration>,
+    ) {
+        if let Some(command_id) = command_id {
+            best_effort(budget, self.signal_terminate(host, shell_id, command_id))
+                .await
+                .inspect_err(|e| debug!(error = %e, "failed to terminate command (best-effort)"))
+                .ok();
+        }
+        best_effort(budget, self.delete_shell(host, shell_id))
             .await
             .inspect_err(|e| debug!(error = %e, "failed to delete WinRM shell (best-effort)"))
             .ok();
+    }
 
-        result
+    /// Longest an expiry clean-up request may take: `operation_timeout_secs`,
+    /// at most 10 s, at least 1 s.
+    fn cleanup_budget(&self) -> Duration {
+        Duration::from_secs(self.transport.config().operation_timeout_secs.clamp(1, 10))
     }
 
     /// Run a command in an existing shell, polling output until completion.
+    ///
+    /// `started` receives the command id as soon as the command is running,
+    /// so a caller that drops this future (a deadline) can still signal it.
+    /// Signalling the finished command is the caller's job.
     async fn run_in_shell(
         &self,
         host: &str,
         shell_id: &str,
         command: &str,
         args: &[&str],
+        started: &mut Option<String>,
     ) -> Result<CommandOutput, WinrmError> {
         let command_id = self.execute_command(host, shell_id, command, args).await?;
         debug!(command_id = %command_id, "WinRM command started");
+        let command_id: &str = started.insert(command_id);
 
         let max_output = self.transport.config().max_output_bytes;
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
+        let mut stderr_decoder = soap::clixml::ClixmlDecoder::new();
+        // Raw bytes received, so the cap also bounds stderr still buffered
+        // in the decoder.
+        let mut received = 0usize;
         let mut exit_code: Option<i32> = None;
 
         loop {
-            let output = self.receive_output(host, shell_id, &command_id).await?;
+            let output = self.receive_output_raw(host, shell_id, command_id).await?;
+            received = received
+                .saturating_add(output.stdout.len())
+                .saturating_add(output.stderr.len());
             stdout.extend_from_slice(&output.stdout);
-            stderr.extend_from_slice(&output.stderr);
+            stderr.extend(stderr_decoder.push(&output.stderr));
 
             if let Some(cap) = max_output
-                && stdout.len() + stderr.len() > cap
+                && received > cap
             {
-                self.signal_terminate(host, shell_id, &command_id)
-                    .await
-                    .ok();
+                self.signal_terminate(host, shell_id, command_id).await.ok();
                 return Err(WinrmError::Transfer(format!(
                     "command output exceeded max_output_bytes ({cap})"
                 )));
@@ -272,11 +551,7 @@ impl WinrmClient {
                 break;
             }
         }
-
-        // Best-effort signal terminate
-        self.signal_terminate(host, shell_id, &command_id)
-            .await
-            .ok();
+        stderr.extend(stderr_decoder.finish());
 
         Ok(CommandOutput {
             stdout,
@@ -290,7 +565,17 @@ impl WinrmClient {
     /// The script is encoded as UTF-16LE base64 and executed via
     /// `powershell.exe -EncodedCommand`, which avoids quoting and escaping
     /// issues. Internally delegates to [`run_command`](Self::run_command).
-    #[tracing::instrument(level = "debug", skip(self, script))]
+    ///
+    /// Like [`run_command`](Self::run_command), it has no overall time limit:
+    /// a script that hangs silently blocks the call until it ends. Bound it
+    /// with [`run_powershell_with_timeout`](Self::run_powershell_with_timeout)
+    /// (which also deletes the shell on expiry) or stop it from elsewhere
+    /// with [`run_powershell_with_cancel`](Self::run_powershell_with_cancel).
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, script, host),
+        fields(host = %crate::transport::redact_userinfo(host))
+    )]
     pub async fn run_powershell(
         &self,
         host: &str,
@@ -301,10 +586,66 @@ impl WinrmClient {
             .await
     }
 
+    /// Run a PowerShell script with a total time limit.
+    ///
+    /// Like [`run_powershell`](Self::run_powershell), but the whole call must
+    /// finish within `timeout`; see
+    /// [`run_command_with_timeout`](Self::run_command_with_timeout) for what
+    /// happens on expiry (terminate signal, shell deleted,
+    /// [`WinrmError::Timeout`] with `timeout` rounded up to whole seconds).
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// # use std::time::Duration;
+    /// # use winrm_rs::{WinrmClient, WinrmConfig, WinrmCredentials, WinrmError};
+    /// # async fn example() -> Result<(), WinrmError> {
+    /// # let client = WinrmClient::new(WinrmConfig::default(), WinrmCredentials::new("u","p",""))?;
+    /// // `Read-Host` would block a plain `run_powershell` forever.
+    /// let err = client
+    ///     .run_powershell_with_timeout("server", "Read-Host", Duration::from_secs(10))
+    ///     .await
+    ///     .unwrap_err();
+    /// assert!(matches!(err, WinrmError::Timeout(10)));
+    /// # Ok(()) }
+    /// ```
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, script, host),
+        fields(host = %crate::transport::redact_userinfo(host))
+    )]
+    pub async fn run_powershell_with_timeout(
+        &self,
+        host: &str,
+        script: &str,
+        timeout: Duration,
+    ) -> Result<CommandOutput, WinrmError> {
+        let encoded = encode_powershell_command(script);
+        self.run_command_with_timeout(
+            host,
+            "powershell.exe",
+            &["-EncodedCommand", &encoded],
+            timeout,
+        )
+        .await
+    }
+
     /// Execute a command with cancellation support.
     ///
     /// Like [`run_command`](Self::run_command), but can be cancelled via a
-    /// [`CancellationToken`](tokio_util::sync::CancellationToken).
+    /// [`CancellationToken`](tokio_util::sync::CancellationToken). On
+    /// cancellation the command is told to terminate (best effort), the
+    /// remote shell is deleted (best effort), and
+    /// [`WinrmError::Cancelled`] is returned. A token that is already
+    /// cancelled returns at once without sending anything.
+    ///
+    /// Clean-up works as for
+    /// [`run_command_with_timeout`](Self::run_command_with_timeout): a
+    /// cancellation during shell creation waits for Create's answer and
+    /// deletes that shell, every clean-up request is bounded by
+    /// `operation_timeout_secs` capped at 10 s, and a cancellation that
+    /// arrives after the command has finished is ignored (its output is
+    /// returned). Dropping this future cannot delete the shell (that needs an
+    /// `async` drop); the server reaps it after its idle timeout.
     pub async fn run_command_with_cancel(
         &self,
         host: &str,
@@ -312,24 +653,22 @@ impl WinrmClient {
         args: &[&str],
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<CommandOutput, WinrmError> {
-        // Honour a pre-cancelled token deterministically. Without this
-        // short-circuit `tokio::select!` polls the two arms in
-        // pseudo-random order, so on macOS the inner `run_command` future
-        // can start an HTTP request and surface a transport error
-        // *before* the cancel-arm is polled.
+        // Honour a pre-cancelled token deterministically: nothing is sent.
         if cancel.is_cancelled() {
             return Err(WinrmError::Cancelled);
         }
-        tokio::select! {
-            result = self.run_command(host, command, args) => result,
-            () = cancel.cancelled() => Err(WinrmError::Cancelled),
-        }
+        self.run_command_until(host, command, args, cancelled(cancel), true)
+            .await
     }
 
     /// Execute a PowerShell script with cancellation support.
     ///
     /// Like [`run_powershell`](Self::run_powershell), but can be cancelled via a
-    /// [`CancellationToken`](tokio_util::sync::CancellationToken).
+    /// [`CancellationToken`](tokio_util::sync::CancellationToken). Cancelling
+    /// terminates the script, deletes the remote shell and returns
+    /// [`WinrmError::Cancelled`]; see
+    /// [`run_command_with_cancel`](Self::run_command_with_cancel) for the
+    /// details.
     pub async fn run_powershell_with_cancel(
         &self,
         host: &str,
@@ -361,7 +700,11 @@ impl WinrmClient {
     /// println!("{xml}");
     /// # Ok(()) }
     /// ```
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, host),
+        fields(host = %crate::transport::redact_userinfo(host))
+    )]
     pub async fn run_wql(
         &self,
         host: &str,
@@ -421,7 +764,11 @@ impl WinrmClient {
     ///
     /// The shell should be explicitly closed via [`Shell::close`] when done.
     /// If dropped without closing, a warning is logged.
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, host),
+        fields(host = %crate::transport::redact_userinfo(host))
+    )]
     pub async fn open_shell(&self, host: &str) -> Result<Shell<'_>, WinrmError> {
         let shell_id = self.create_shell(host).await?;
         debug!(shell_id = %shell_id, "WinRM shell opened for reuse");
@@ -457,7 +804,11 @@ impl WinrmClient {
     /// Sends a WS-Man `Reconnect` SOAP request to validate that the
     /// server-side shell identified by `shell_id` is still alive and
     /// returns a [`Shell`] handle that resumes operations on it.
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, host),
+        fields(host = %crate::transport::redact_userinfo(host))
+    )]
     pub async fn reconnect_shell(
         &self,
         host: &str,
@@ -483,14 +834,103 @@ impl WinrmClient {
     }
 }
 
+/// The stop of a `*_with_timeout` call: resolves to [`WinrmError::Timeout`]
+/// once `timeout` has elapsed, counted from the moment this is called. A
+/// `timeout` too large to add to the current time never elapses.
+fn deadline_stop(timeout: Duration) -> impl Future<Output = WinrmError> {
+    let deadline = Instant::now().checked_add(timeout);
+    let secs = timeout_secs(timeout);
+    async move {
+        match deadline {
+            // A sleep whose deadline is already past is not ready on its
+            // first poll (the timer wheel has to tick), so check first.
+            Some(at) if Instant::now() >= at => {}
+            Some(at) => tokio::time::sleep_until(at).await,
+            None => std::future::pending().await,
+        }
+        WinrmError::Timeout(secs)
+    }
+}
+
+/// The stop of a `*_with_cancel` call: resolves to [`WinrmError::Cancelled`]
+/// once `cancel` is cancelled.
+async fn cancelled(cancel: tokio_util::sync::CancellationToken) -> WinrmError {
+    cancel.cancelled().await;
+    WinrmError::Cancelled
+}
+
+/// [`bounded`] when there is a `budget`, plain `fut` otherwise.
+async fn best_effort<T>(
+    budget: Option<Duration>,
+    fut: impl Future<Output = Result<T, WinrmError>>,
+) -> Result<T, WinrmError> {
+    match budget {
+        Some(budget) => bounded(budget, fut).await,
+        None => fut.await,
+    }
+}
+
+/// Await a best-effort `fut` for at most `budget`; a request that outlives it
+/// is an error like any other failed one.
+async fn bounded<T>(
+    budget: Duration,
+    fut: impl std::future::Future<Output = Result<T, WinrmError>>,
+) -> Result<T, WinrmError> {
+    tokio::time::timeout(budget, fut)
+        .await
+        .unwrap_or_else(|_| Err(WinrmError::Timeout(timeout_secs(budget))))
+}
+
+/// `timeout` in whole seconds, rounded up, at least 1: the value of the
+/// [`WinrmError::Timeout`] that a `*_with_timeout` call returns.
+pub(crate) fn timeout_secs(timeout: Duration) -> u64 {
+    timeout
+        .as_secs()
+        .saturating_add(u64::from(timeout.subsec_nanos() > 0))
+        .max(1)
+}
+
+/// Turn a `TimedOut` fault on a Receive into an empty, not-done poll.
+///
+/// The server sends that fault when a command stays silent for
+/// `OperationTimeout`; the command is still running and the caller should
+/// poll again. The wait already happened server-side, so a loop over this
+/// does not spin. Every other result passes through untouched.
+pub(crate) fn empty_poll_on_timeout(
+    polled: Result<soap::ReceiveOutput, WinrmError>,
+) -> Result<soap::ReceiveOutput, WinrmError> {
+    match polled {
+        Err(WinrmError::Soap(ref fault)) if soap::is_timed_out_fault(fault) => {
+            debug!("Receive timed out with no output; reporting an empty poll");
+            Ok(soap::ReceiveOutput {
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                exit_code: None,
+                done: false,
+            })
+        }
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{AuthMethod, EncryptionMode};
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD as B64;
-    use wiremock::matchers::{header, method};
+    use wiremock::matchers::{body_string_contains, header, method};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A path under the temp directory that no other test, test run or
+    /// leftover can share (process id and a random suffix).
+    fn unique_temp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "{name}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ))
+    }
 
     fn test_creds() -> WinrmCredentials {
         WinrmCredentials::new("admin", "pass", "")
@@ -1376,6 +1816,7 @@ mod tests {
     fn certificate_auth_requires_cert_pem() {
         let config = WinrmConfig {
             auth_method: AuthMethod::Certificate,
+            use_tls: true,
             // No client_cert_pem set
             ..Default::default()
         };
@@ -1394,6 +1835,7 @@ mod tests {
             auth_method: AuthMethod::Certificate,
             client_cert_pem: Some("/tmp/nonexistent-cert.pem".into()),
             client_key_pem: None,
+            use_tls: true,
             ..Default::default()
         };
         let result = WinrmClient::new(config, test_creds());
@@ -1407,7 +1849,7 @@ mod tests {
 
     #[tokio::test]
     async fn certificate_auth_dispatch_with_wiremock() {
-        let dir = std::env::temp_dir().join("winrm-rs-test-cert");
+        let dir = unique_temp_path("winrm-rs-test-cert");
         std::fs::create_dir_all(&dir).unwrap();
         let cert_path = dir.join("cert.pem");
         let key_path = dir.join("key.pem");
@@ -1418,9 +1860,10 @@ mod tests {
             auth_method: AuthMethod::Certificate,
             client_cert_pem: Some(cert_path.to_string_lossy().into()),
             client_key_pem: Some(key_path.to_string_lossy().into()),
+            use_tls: true,
             ..Default::default()
         };
-        // Should fail at Identity::from_pem with invalid PEM
+        // Should fail while loading the PEM files (no certificate section)
         let result = WinrmClient::new(config, test_creds());
         assert!(result.is_err());
 
@@ -1529,6 +1972,170 @@ mod tests {
         assert_eq!(chunk2.exit_code, Some(0));
     }
 
+    /// stderr slices as Server 2025 sends a large CLIXML document: the marker
+    /// alone, then the body cut mid-escape across Receive responses.
+    const SPLIT_CLIXML: [&[u8]; 3] = [
+        b"#< CLIXML\r\n",
+        b"<Objs><S S=\"Error\">denied_x000D__x000A",
+        b"_</S></Objs>",
+    ];
+
+    /// Mount Create, Execute, one Receive per stderr slice (the last one
+    /// Done), then a catch-all for Signal/Delete.
+    async fn mount_stderr_receives(server: &MockServer, slices: &[&[u8]]) {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD as B64;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>CLIXML-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
+            ))
+            .up_to_n_times(1)
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>CLIXML-CMD</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
+            ))
+            .up_to_n_times(1)
+            .mount(server)
+            .await;
+        for (i, slice) in slices.iter().enumerate() {
+            let state = if i + 1 == slices.len() {
+                r#"<rsp:CommandState CommandId="CLIXML-CMD" State="http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Done"><rsp:ExitCode>1</rsp:ExitCode></rsp:CommandState>"#
+            } else {
+                r#"<rsp:CommandState CommandId="CLIXML-CMD" State="http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Running"/>"#
+            };
+            let body = format!(
+                r#"<s:Envelope><s:Body><rsp:ReceiveResponse><rsp:Stream Name="stderr" CommandId="CLIXML-CMD">{}</rsp:Stream>{state}</rsp:ReceiveResponse></s:Body></s:Envelope>"#,
+                B64.encode(slice)
+            );
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .up_to_n_times(1)
+                .mount(server)
+                .await;
+        }
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r"<s:Envelope><s:Body/></s:Envelope>"),
+            )
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn run_command_reassembles_clixml_split_across_receives() {
+        let server = MockServer::start().await;
+        mount_stderr_receives(&server, &SPLIT_CLIXML).await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+
+        let output = client
+            .run_command("127.0.0.1", "powershell.exe", &[])
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stderr), "denied\r\n");
+        assert_eq!(output.exit_code, 1);
+    }
+
+    #[tokio::test]
+    async fn shell_run_command_reassembles_clixml_split_across_receives() {
+        let server = MockServer::start().await;
+        mount_stderr_receives(&server, &SPLIT_CLIXML).await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        let shell = client.open_shell("127.0.0.1").await.unwrap();
+
+        let output = shell.run_command("powershell.exe", &[]).await.unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stderr), "denied\r\n");
+    }
+
+    #[tokio::test]
+    async fn receive_next_reassembles_clixml_split_across_receives() {
+        let server = MockServer::start().await;
+        mount_stderr_receives(&server, &SPLIT_CLIXML).await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        let shell = client.open_shell("127.0.0.1").await.unwrap();
+        let cmd_id = shell.start_command("powershell.exe", &[]).await.unwrap();
+
+        let mut stderr = Vec::new();
+        loop {
+            let chunk = shell.receive_next(&cmd_id).await.unwrap();
+            stderr.extend(chunk.stderr);
+            if chunk.done {
+                break;
+            }
+        }
+        assert_eq!(String::from_utf8_lossy(&stderr), "denied\r\n");
+    }
+
+    #[tokio::test]
+    async fn receive_next_streams_each_record_before_the_document_closes() {
+        // powershell.exe closes its <Objs> root only when it exits; every
+        // complete record must still come out on the poll that carries it.
+        let server = MockServer::start().await;
+        let slices: [&[u8]; 3] = [
+            b"#< CLIXML\r\n<Objs Version=\"1.1.0.1\"><S S=\"Error\">first_x000D__x000A_</S>",
+            b"<S S=\"warning\">second</S>",
+            b"</Objs>",
+        ];
+        mount_stderr_receives(&server, &slices).await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        let shell = client.open_shell("127.0.0.1").await.unwrap();
+        let cmd_id = shell.start_command("powershell.exe", &[]).await.unwrap();
+
+        let polls: Vec<(String, bool)> = {
+            let mut polls = Vec::new();
+            loop {
+                let chunk = shell.receive_next(&cmd_id).await.unwrap();
+                polls.push((
+                    String::from_utf8_lossy(&chunk.stderr).into_owned(),
+                    chunk.done,
+                ));
+                if chunk.done {
+                    break polls;
+                }
+            }
+        };
+        assert_eq!(
+            polls,
+            [
+                ("first\r\n".to_string(), false),
+                ("WARNING: second\r\n".to_string(), false),
+                (String::new(), true),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn receive_output_raw_with_stderr_decoder_reassembles_split_clixml() {
+        let server = MockServer::start().await;
+        mount_stderr_receives(&server, &SPLIT_CLIXML).await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        let shell_id = client.create_shell("127.0.0.1").await.unwrap();
+        let cmd_id = client
+            .execute_command("127.0.0.1", &shell_id, "powershell.exe", &[])
+            .await
+            .unwrap();
+
+        let mut decoder = crate::StderrDecoder::new();
+        let mut raw = Vec::new();
+        let mut stderr = Vec::new();
+        loop {
+            let output = client
+                .receive_output_raw("127.0.0.1", &shell_id, &cmd_id)
+                .await
+                .unwrap();
+            raw.extend_from_slice(&output.stderr);
+            stderr.extend(decoder.push(&output.stderr));
+            if output.done {
+                break;
+            }
+        }
+        stderr.extend(decoder.finish());
+        assert_eq!(raw, SPLIT_CLIXML.concat(), "raw stderr must be untouched");
+        assert_eq!(String::from_utf8_lossy(&stderr), "denied\r\n");
+    }
+
     #[tokio::test]
     async fn download_file_with_wiremock() {
         let server = MockServer::start().await;
@@ -1580,7 +2187,7 @@ mod tests {
             .await;
 
         let client = WinrmClient::new(basic_config(port), test_creds()).unwrap();
-        let local_path = std::env::temp_dir().join("winrm-rs-test-download.bin");
+        let local_path = unique_temp_path("winrm-rs-test-download.bin");
         let result = client
             .download_file("127.0.0.1", "C:\\remote\\file.txt", &local_path)
             .await;
@@ -1613,7 +2220,7 @@ mod tests {
 
     #[test]
     fn certificate_auth_reads_valid_pem_files() {
-        let dir = std::env::temp_dir().join("winrm-rs-test-cert-valid");
+        let dir = unique_temp_path("winrm-rs-test-cert-valid");
         std::fs::create_dir_all(&dir).unwrap();
         let cert_path = dir.join("test_cert.pem");
         let key_path = dir.join("test_key.pem");
@@ -1640,7 +2247,7 @@ mod tests {
 
     #[test]
     fn certificate_auth_reads_pem_files_invalid() {
-        let dir = std::env::temp_dir().join("winrm-rs-test-cert-read");
+        let dir = unique_temp_path("winrm-rs-test-cert-read");
         std::fs::create_dir_all(&dir).unwrap();
         let cert_path = dir.join("test_cert.pem");
         let key_path = dir.join("test_key.pem");
@@ -1671,7 +2278,7 @@ mod tests {
 
     #[test]
     fn certificate_auth_missing_key_path_with_valid_cert_file() {
-        let dir = std::env::temp_dir().join("winrm-rs-test-cert-nokey");
+        let dir = unique_temp_path("winrm-rs-test-cert-nokey");
         std::fs::create_dir_all(&dir).unwrap();
         let cert_path = dir.join("test_cert.pem");
         std::fs::write(&cert_path, b"cert data").unwrap();
@@ -1710,7 +2317,7 @@ mod tests {
 
     #[test]
     fn certificate_auth_nonexistent_key_file() {
-        let dir = std::env::temp_dir().join("winrm-rs-test-cert-nokey2");
+        let dir = unique_temp_path("winrm-rs-test-cert-nokey2");
         std::fs::create_dir_all(&dir).unwrap();
         let cert_path = dir.join("test_cert.pem");
         std::fs::write(&cert_path, b"cert data").unwrap();
@@ -1729,43 +2336,6 @@ mod tests {
             err.contains("failed to read") || err.contains("key"),
             "error should mention key read failure: {err}"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test]
-    async fn certificate_auth_dispatch_in_send_soap() {
-        let server = MockServer::start().await;
-        let port = server.address().port();
-
-        Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(
-                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>CERT-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
-            ))
-            .mount(&server)
-            .await;
-
-        let dir = std::env::temp_dir().join("winrm-rs-test-cert-dispatch");
-        std::fs::create_dir_all(&dir).unwrap();
-        let cert_path = dir.join("cert.pem");
-        let key_path = dir.join("key.pem");
-        std::fs::write(&cert_path, TEST_CERT_PEM).unwrap();
-        std::fs::write(&key_path, TEST_KEY_PEM).unwrap();
-
-        let config = WinrmConfig {
-            port,
-            auth_method: AuthMethod::Certificate,
-            client_cert_pem: Some(cert_path.to_string_lossy().into()),
-            client_key_pem: Some(key_path.to_string_lossy().into()),
-            connect_timeout_secs: 5,
-            operation_timeout_secs: 10,
-            ..Default::default()
-        };
-
-        let client = WinrmClient::new(config, test_creds()).unwrap();
-        let result = client.create_shell("127.0.0.1").await;
-        assert!(result.is_ok(), "cert auth dispatch failed: {result:?}");
-        assert_eq!(result.unwrap(), "CERT-SHELL");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1881,7 +2451,7 @@ mod tests {
         let server = MockServer::start().await;
         let port = server.address().port();
 
-        let dir = std::env::temp_dir().join("winrm-rs-test-upload");
+        let dir = unique_temp_path("winrm-rs-test-upload");
         std::fs::create_dir_all(&dir).unwrap();
         let local_file = dir.join("upload_test.txt");
         std::fs::write(&local_file, b"hello upload content").unwrap();
@@ -1940,7 +2510,7 @@ mod tests {
         let server = MockServer::start().await;
         let port = server.address().port();
 
-        let dir = std::env::temp_dir().join("winrm-rs-test-upload-fail");
+        let dir = unique_temp_path("winrm-rs-test-upload-fail");
         std::fs::create_dir_all(&dir).unwrap();
         let local_file = dir.join("upload_fail.txt");
         std::fs::write(&local_file, b"test data").unwrap();
@@ -2037,7 +2607,7 @@ mod tests {
             .await;
 
         let client = WinrmClient::new(basic_config(port), test_creds()).unwrap();
-        let local_path = std::env::temp_dir().join("winrm-rs-test-dlfail.bin");
+        let local_path = unique_temp_path("winrm-rs-test-dlfail.bin");
         let result = client
             .download_file("127.0.0.1", "C:\\nonexistent.txt", &local_path)
             .await;
@@ -2054,7 +2624,7 @@ mod tests {
         let server = MockServer::start().await;
         let port = server.address().port();
 
-        let dir = std::env::temp_dir().join("winrm-rs-test-upload-multi");
+        let dir = unique_temp_path("winrm-rs-test-upload-multi");
         std::fs::create_dir_all(&dir).unwrap();
         let local_file = dir.join("small.txt");
         std::fs::write(&local_file, b"tiny").unwrap();
@@ -2150,7 +2720,7 @@ mod tests {
             .await;
 
         let client = WinrmClient::new(basic_config(port), test_creds()).unwrap();
-        let local_path = std::env::temp_dir().join("winrm-rs-test-dl2.bin");
+        let local_path = unique_temp_path("winrm-rs-test-dl2.bin");
         let result = client
             .download_file("127.0.0.1", "C:\\remote\\data.bin", &local_path)
             .await;
@@ -2220,45 +2790,39 @@ mod tests {
         assert_eq!(output.stdout, b"ok");
     }
 
+    /// A loopback port held by a bound socket that does not listen yet:
+    /// connections are refused, and no other process can take the port.
+    fn refusing_port() -> (tokio::net::TcpSocket, u16) {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let port = socket.local_addr().unwrap().port();
+        (socket, port)
+    }
+
+    /// A connection error (nothing sent) is retried with backoff: the port
+    /// refuses connections until a listener appears on it, then the request
+    /// goes through.
     #[tokio::test]
-    // Flaky on Windows: dropping a raw TCP stream doesn't reliably produce
-    // the "connection reset" error `reqwest` needs to classify the call as
-    // retryable. The same scenario is covered by the wiremock-based retry
-    // tests which run on all platforms.
+    // Windows answers a refused loopback connect only after ~2 s of SYN
+    // retries, which makes this slow and timing-sensitive there.
     #[cfg_attr(windows, ignore)]
     async fn retry_backoff_on_http_error() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicU32, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let counter = Arc::new(AtomicU32::new(0));
-        let counter_clone = counter.clone();
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        let handle = tokio::spawn(async move {
-            loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    break;
-                };
-                let call = counter_clone.fetch_add(1, Ordering::SeqCst);
-                if call == 0 {
-                    drop(stream);
-                } else {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    // Consume the request first: closing a socket with unread
-                    // data sends RST, which can discard the response in flight.
-                    let mut buf = [0u8; 4096];
-                    let _ = stream.read(&mut buf).await;
-                    let body = r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>RETRY-BACKOFF</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>";
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/xml\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    let _ = stream.write_all(response.as_bytes()).await;
-                }
-            }
+        let (socket, port) = refusing_port();
+        let server = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            let listener = socket.listen(16).unwrap();
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            let body = r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>RETRY-BACKOFF</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/xml\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
         });
 
         let config = WinrmConfig {
@@ -2266,23 +2830,17 @@ mod tests {
             auth_method: AuthMethod::Basic,
             connect_timeout_secs: 2,
             operation_timeout_secs: 5,
-            max_retries: 2,
+            max_retries: 3,
             ..Default::default()
         };
         let client = WinrmClient::new(config, test_creds()).unwrap();
         let result = client.create_shell("127.0.0.1").await;
-        assert!(
-            result.is_ok(),
-            "retry should have succeeded: {}",
-            result.err().map(|e| format!("{e}")).unwrap_or_default()
+        assert_eq!(
+            result.map_err(|e| e.to_string()),
+            Ok("RETRY-BACKOFF".to_string()),
+            "retry after refused connections should have succeeded"
         );
-        assert_eq!(result.unwrap(), "RETRY-BACKOFF");
-        assert!(
-            counter.load(Ordering::SeqCst) >= 2,
-            "should have retried at least once"
-        );
-
-        handle.abort();
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -2290,7 +2848,7 @@ mod tests {
         let server = MockServer::start().await;
         let port = server.address().port();
 
-        let dir = std::env::temp_dir().join("winrm-rs-test-upload-multi-chunk");
+        let dir = unique_temp_path("winrm-rs-test-upload-multi-chunk");
         std::fs::create_dir_all(&dir).unwrap();
         let local_file = dir.join("multi.bin");
         // 4001 bytes = 3 chunks with CHUNK_SIZE=2000 (2000 + 2000 + 1)
@@ -2501,18 +3059,19 @@ mod tests {
         );
     }
 
-    // Group 5: Retry with max_retries=1 makes exactly 2 attempts.
+    /// A request the server received is not sent again, even with retries
+    /// configured: the server accepts each connection and drops it, which
+    /// the client sees after sending (it may have run), so exactly one
+    /// connection is made.
     #[tokio::test]
-    async fn retry_max_one_makes_exactly_two_attempts() {
+    async fn retry_skips_a_request_dropped_after_sending() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicU32, Ordering};
 
         let counter = Arc::new(AtomicU32::new(0));
         let counter_clone = counter.clone();
-
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-
         let handle = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -2533,16 +3092,10 @@ mod tests {
         };
         let client = WinrmClient::new(config, test_creds()).unwrap();
         let result = client.create_shell("127.0.0.1").await;
-        assert!(result.is_err(), "should fail after all retries exhausted");
-
+        assert!(result.is_err(), "the dropped connection is an error");
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
         let attempts = counter.load(Ordering::SeqCst);
-        assert_eq!(
-            attempts, 2,
-            "max_retries=1 should make exactly 2 attempts, got {attempts}"
-        );
-
+        assert_eq!(attempts, 1, "sent once, not resent: {attempts} connections");
         handle.abort();
     }
 
@@ -2656,7 +3209,7 @@ mod tests {
         let server = MockServer::start().await;
         let port = server.address().port();
 
-        let dir = std::env::temp_dir().join("winrm-rs-test-upload-writebytes");
+        let dir = unique_temp_path("winrm-rs-test-upload-writebytes");
         std::fs::create_dir_all(&dir).unwrap();
         let local_file = dir.join("small.txt");
         std::fs::write(&local_file, b"test-data").unwrap();
@@ -2752,27 +3305,14 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Retries of refused connections back off exponentially (100 ms, then
+    /// 200 ms) rather than additively.
     #[tokio::test]
+    // Windows answers a refused loopback connect only after ~2 s of SYN
+    // retries, so three attempts would take seconds there.
+    #[cfg_attr(windows, ignore)]
     async fn retry_backoff_is_exponential_not_additive() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicU32, Ordering};
-
-        let counter = Arc::new(AtomicU32::new(0));
-        let counter_clone = counter.clone();
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        let handle = tokio::spawn(async move {
-            loop {
-                let Ok((stream, _)) = listener.accept().await else {
-                    break;
-                };
-                counter_clone.fetch_add(1, Ordering::SeqCst);
-                drop(stream);
-            }
-        });
-
+        let (_held, port) = refusing_port();
         let config = WinrmConfig {
             port,
             auth_method: AuthMethod::Basic,
@@ -2781,21 +3321,19 @@ mod tests {
             max_retries: 2,
             ..Default::default()
         };
-
         let client = WinrmClient::new(config, test_creds()).unwrap();
         let start = std::time::Instant::now();
         let result = client.create_shell("127.0.0.1").await;
         let elapsed = start.elapsed();
-
-        assert!(result.is_err());
-
+        assert!(
+            matches!(&result, Err(WinrmError::Http(e)) if e.is_connect()),
+            "{result:?}"
+        );
         assert!(
             elapsed >= std::time::Duration::from_millis(280),
             "exponential backoff should take >= 280ms total, took {}ms (catches + and / mutants)",
             elapsed.as_millis()
         );
-
-        handle.abort();
     }
 
     // Kills client.rs:354 — run_wql returning Ok("") or Ok("xyzzy")
@@ -2968,5 +3506,668 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, WinrmError::Cancelled), "got: {err}");
+    }
+
+    // --- TimedOut fault on Receive is an empty poll ---
+
+    /// The fault a Windows host sends when a Receive finds no output within
+    /// `OperationTimeout`; `prefix` is the namespace prefix the server picked.
+    fn timed_out_fault(prefix: &str) -> String {
+        format!(
+            r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><s:Fault>
+                <s:Code><s:Value>s:Receiver</s:Value><s:Subcode><s:Value>{prefix}:TimedOut</s:Value></s:Subcode></s:Code>
+                <s:Reason><s:Text xml:lang="en-US">The WS-Management service cannot complete the operation within the time specified in OperationTimeout.</s:Text></s:Reason>
+            </s:Fault></s:Body></s:Envelope>"#
+        )
+    }
+
+    /// A Receive response with `hello` on stdout and the command done.
+    const DONE_HELLO: &str = r#"<s:Envelope><s:Body><rsp:ReceiveResponse>
+        <rsp:Stream Name="stdout" CommandId="C1">aGVsbG8=</rsp:Stream>
+        <rsp:CommandState CommandId="C1" State="http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Done">
+            <rsp:ExitCode>7</rsp:ExitCode>
+        </rsp:CommandState>
+    </rsp:ReceiveResponse></s:Body></s:Envelope>"#;
+
+    /// Mount `n` HTTP 500 TimedOut faults, as a real host answers them.
+    async fn mount_timed_out_faults(server: &MockServer, prefix: &str, n: u64) {
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(timed_out_fault(prefix)))
+            .up_to_n_times(n)
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_ok(server: &MockServer, body: &'static str, n: u64) {
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .up_to_n_times(n)
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn receive_output_timed_out_fault_is_an_empty_poll() {
+        let server = MockServer::start().await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        mount_timed_out_faults(&server, "w", 1).await;
+        mount_ok(&server, DONE_HELLO, 1).await;
+
+        let first = client
+            .receive_output("127.0.0.1", "S1", "C1")
+            .await
+            .unwrap();
+        assert!(first.stdout.is_empty() && first.stderr.is_empty());
+        assert!(!first.done, "an empty poll must not end the command");
+        assert_eq!(first.exit_code, None);
+
+        let second = client
+            .receive_output("127.0.0.1", "S1", "C1")
+            .await
+            .unwrap();
+        assert_eq!(second.stdout, b"hello");
+        assert!(second.done);
+        assert_eq!(second.exit_code, Some(7));
+    }
+
+    #[tokio::test]
+    async fn receive_output_raw_timed_out_fault_is_an_empty_poll() {
+        let server = MockServer::start().await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        mount_timed_out_faults(&server, "w", 1).await;
+        mount_ok(&server, DONE_HELLO, 1).await;
+
+        let first = client
+            .receive_output_raw("127.0.0.1", "S1", "C1")
+            .await
+            .unwrap();
+        assert!(first.stdout.is_empty() && first.stderr.is_empty() && !first.done);
+        assert_eq!(first.exit_code, None);
+        let second = client
+            .receive_output_raw("127.0.0.1", "S1", "C1")
+            .await
+            .unwrap();
+        assert_eq!(second.stdout, b"hello");
+    }
+
+    #[tokio::test]
+    async fn receive_output_timed_out_fault_in_http_200_body_is_an_empty_poll() {
+        // Some stacks answer a fault with 200; the transport sees it first.
+        let server = MockServer::start().await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(timed_out_fault("w")))
+            .mount(&server)
+            .await;
+
+        let out = client
+            .receive_output("127.0.0.1", "S1", "C1")
+            .await
+            .unwrap();
+        assert!(out.stdout.is_empty() && out.stderr.is_empty() && !out.done);
+        assert_eq!(out.exit_code, None);
+    }
+
+    #[tokio::test]
+    async fn receive_output_timed_out_is_recognised_under_any_namespace_prefix() {
+        for prefix in ["w", "wsman", "x1"] {
+            let server = MockServer::start().await;
+            let client =
+                WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+            mount_timed_out_faults(&server, prefix, 1).await;
+
+            match client.receive_output("127.0.0.1", "S1", "C1").await {
+                Ok(o) => assert!(!o.done && o.stdout.is_empty(), "{prefix}"),
+                Err(e) => panic!("{prefix}:TimedOut should be an empty poll, got {e:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn receive_output_other_faults_are_still_errors() {
+        for (code, reason) in [
+            ("w:AccessDenied", "Access is denied."),
+            ("w:OperationTimedOut", "not the poll timeout"),
+            ("s:Receiver", "Shell not found"),
+        ] {
+            let server = MockServer::start().await;
+            let client =
+                WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+            let fault = format!(
+                r"<s:Envelope><s:Body><s:Fault><s:Code><s:Value>s:Receiver</s:Value><s:Subcode><s:Value>{code}</s:Value></s:Subcode></s:Code>
+                <s:Reason><s:Text>{reason}</s:Text></s:Reason></s:Fault></s:Body></s:Envelope>"
+            );
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(500).set_body_string(fault))
+                .mount(&server)
+                .await;
+
+            let err = client
+                .receive_output("127.0.0.1", "S1", "C1")
+                .await
+                .err()
+                .expect("a non-TimedOut fault must be an error");
+            assert!(
+                matches!(&err, WinrmError::Soap(crate::error::SoapError::Fault { code: c, .. }) if c == code),
+                "{code} must stay an error, got {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn signal_terminate_timed_out_fault_is_still_an_error() {
+        // Only Receive gets the empty-poll treatment.
+        let server = MockServer::start().await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        mount_timed_out_faults(&server, "w", 1).await;
+
+        let err = client
+            .signal_terminate("127.0.0.1", "S1", "C1")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WinrmError::Soap(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn run_command_keeps_polling_through_timed_out_faults() {
+        let server = MockServer::start().await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        mount_ok(
+            &server,
+            r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>S1</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
+            1,
+        )
+        .await;
+        mount_ok(
+            &server,
+            r"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>C1</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
+            1,
+        )
+        .await;
+        mount_timed_out_faults(&server, "w", 2).await;
+        mount_ok(&server, DONE_HELLO, 1).await;
+        mount_ok(&server, "<s:Envelope><s:Body/></s:Envelope>", u64::MAX).await;
+
+        let out = client.run_command("127.0.0.1", "slow", &[]).await.unwrap();
+        assert_eq!(out.stdout, b"hello");
+        assert_eq!(out.exit_code, 7);
+    }
+
+    // --- Total deadline: run_command_with_timeout / run_powershell_with_timeout ---
+
+    const SHELL_S1: &str = r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>S1</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>";
+    const COMMAND_C1: &str = r"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>C1</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>";
+    const EMPTY_BODY: &str = "<s:Envelope><s:Body/></s:Envelope>";
+
+    /// Mount Create (once), Execute (once), then `receive` for every Receive,
+    /// then an empty 200 for anything else (Signal, Delete).
+    async fn mount_hanging_command(server: &MockServer, receive: ResponseTemplate) {
+        mount_ok(server, SHELL_S1, 1).await;
+        mount_ok(server, COMMAND_C1, 1).await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("windows/shell/Receive"))
+            .respond_with(receive)
+            .mount(server)
+            .await;
+        mount_ok(server, EMPTY_BODY, u64::MAX).await;
+    }
+
+    /// The SOAP bodies the mock server received, in order.
+    async fn received_bodies(server: &MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect()
+    }
+
+    fn count_containing(bodies: &[String], needle: &str) -> usize {
+        bodies.iter().filter(|b| b.contains(needle)).count()
+    }
+
+    fn silent_poll() -> ResponseTemplate {
+        // The host holds a Receive for OperationTimeout, then faults; the
+        // delay stands in for that wait and keeps the loop from spinning.
+        ResponseTemplate::new(500)
+            .set_body_string(timed_out_fault("w"))
+            .set_delay(std::time::Duration::from_millis(100))
+    }
+
+    #[test]
+    fn timeout_secs_is_the_ceiling_with_a_floor_of_one() {
+        use std::time::Duration;
+        assert_eq!(timeout_secs(Duration::ZERO), 1);
+        assert_eq!(timeout_secs(Duration::from_nanos(1)), 1);
+        assert_eq!(timeout_secs(Duration::from_secs(1)), 1);
+        assert_eq!(timeout_secs(Duration::from_millis(1001)), 2);
+        assert_eq!(timeout_secs(Duration::from_millis(1500)), 2);
+        assert_eq!(timeout_secs(Duration::from_secs(2)), 2);
+        assert_eq!(timeout_secs(Duration::new(2, 1)), 3);
+        assert_eq!(timeout_secs(Duration::MAX), u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn run_command_with_timeout_expires_signals_and_deletes_the_shell() {
+        use std::time::{Duration, Instant};
+        let server = MockServer::start().await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        mount_hanging_command(&server, silent_poll()).await;
+
+        let started = Instant::now();
+        let err = client
+            .run_command_with_timeout("127.0.0.1", "hang", &[], Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert!(matches!(err, WinrmError::Timeout(2)), "got {err:?}");
+        assert!(
+            elapsed >= Duration::from_millis(1900) && elapsed < Duration::from_secs(4),
+            "expired after {elapsed:?}"
+        );
+        let bodies = received_bodies(&server).await;
+        assert_eq!(
+            count_containing(&bodies, "signal/terminate"),
+            1,
+            "{bodies:?}"
+        );
+        assert_eq!(
+            count_containing(&bodies, "transfer/Delete"),
+            1,
+            "{bodies:?}"
+        );
+        // The command is told to stop before its shell is deleted.
+        let signal_at = bodies.iter().position(|b| b.contains("signal/terminate"));
+        let delete_at = bodies.iter().position(|b| b.contains("transfer/Delete"));
+        assert!(signal_at < delete_at, "signal must precede delete");
+    }
+
+    #[tokio::test]
+    async fn run_powershell_with_timeout_expires_and_deletes_the_shell() {
+        use std::time::Duration;
+        let server = MockServer::start().await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        mount_hanging_command(&server, silent_poll()).await;
+
+        let err = client
+            .run_powershell_with_timeout("127.0.0.1", "Read-Host", Duration::from_millis(1200))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, WinrmError::Timeout(2)), "got {err:?}");
+        let bodies = received_bodies(&server).await;
+        assert_eq!(count_containing(&bodies, "-EncodedCommand"), 1);
+        assert_eq!(count_containing(&bodies, "signal/terminate"), 1);
+        assert_eq!(count_containing(&bodies, "transfer/Delete"), 1);
+    }
+
+    #[tokio::test]
+    async fn run_command_with_timeout_returns_the_output_of_a_command_that_finishes() {
+        use std::time::Duration;
+        let server = MockServer::start().await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        // Two silent polls, then the command ends well inside the limit.
+        mount_ok(&server, SHELL_S1, 1).await;
+        mount_ok(&server, COMMAND_C1, 1).await;
+        mount_timed_out_faults(&server, "w", 2).await;
+        mount_ok(&server, DONE_HELLO, 1).await;
+        mount_ok(&server, EMPTY_BODY, u64::MAX).await;
+
+        let out = client
+            .run_command_with_timeout("127.0.0.1", "slow", &[], Duration::from_secs(30))
+            .await
+            .unwrap();
+
+        assert_eq!(out.stdout, b"hello");
+        assert_eq!(out.exit_code, 7);
+        // Exactly what `run_command` sends: the usual terminate after Done and
+        // one Delete, nothing added by the deadline.
+        let bodies = received_bodies(&server).await;
+        assert_eq!(
+            count_containing(&bodies, "signal/terminate"),
+            1,
+            "{bodies:?}"
+        );
+        assert_eq!(
+            count_containing(&bodies, "transfer/Delete"),
+            1,
+            "{bodies:?}"
+        );
+        assert_eq!(count_containing(&bodies, "windows/shell/Receive"), 3);
+    }
+
+    #[tokio::test]
+    async fn run_command_with_timeout_deletes_the_shell_when_the_command_fails() {
+        use std::time::Duration;
+        let server = MockServer::start().await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        let denied = ResponseTemplate::new(500).set_body_string(
+            r"<s:Envelope><s:Body><s:Fault><s:Code><s:Value>s:Receiver</s:Value><s:Subcode><s:Value>w:AccessDenied</s:Value></s:Subcode></s:Code>
+            <s:Reason><s:Text>Access is denied.</s:Text></s:Reason></s:Fault></s:Body></s:Envelope>",
+        );
+        mount_hanging_command(&server, denied).await;
+
+        let err = client
+            .run_command_with_timeout("127.0.0.1", "x", &[], Duration::from_secs(30))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, WinrmError::Soap(_)), "got {err:?}");
+        let bodies = received_bodies(&server).await;
+        assert_eq!(
+            count_containing(&bodies, "transfer/Delete"),
+            1,
+            "{bodies:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_command_with_timeout_expiring_during_execute_deletes_the_shell() {
+        use std::time::Duration;
+        let server = MockServer::start().await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        mount_ok(&server, SHELL_S1, 1).await;
+        // Execute answers after the deadline: no command id is known yet.
+        Mock::given(method("POST"))
+            .and(body_string_contains("windows/shell/Command"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(COMMAND_C1)
+                    .set_delay(Duration::from_secs(5)),
+            )
+            .mount(&server)
+            .await;
+        mount_ok(&server, EMPTY_BODY, u64::MAX).await;
+
+        let err = client
+            .run_command_with_timeout("127.0.0.1", "x", &[], Duration::from_secs(1))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, WinrmError::Timeout(1)), "got {err:?}");
+        let bodies = received_bodies(&server).await;
+        assert_eq!(
+            count_containing(&bodies, "signal/terminate"),
+            0,
+            "{bodies:?}"
+        );
+        assert_eq!(
+            count_containing(&bodies, "transfer/Delete"),
+            1,
+            "{bodies:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_command_with_timeout_zero_expires_before_anything_is_sent() {
+        use std::time::Duration;
+        let server = MockServer::start().await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        mount_hanging_command(&server, silent_poll()).await;
+
+        let err = client
+            .run_command_with_timeout("127.0.0.1", "x", &[], Duration::ZERO)
+            .await
+            .unwrap_err();
+
+        // Asserts: Timeout(1), and the deadline is checked before Create goes
+        // on the wire, so there is no shell to leak. It does not assert any
+        // timing (the call is not slept on).
+        assert!(matches!(err, WinrmError::Timeout(1)), "got {err:?}");
+        assert!(
+            received_bodies(&server).await.is_empty(),
+            "an already-expired deadline must not send Create"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_command_with_timeout_expiring_during_create_deletes_the_created_shell() {
+        use std::time::{Duration, Instant};
+        let server = MockServer::start().await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        // Create answers after the deadline: the shell exists, id unknown
+        // until the answer comes.
+        Mock::given(method("POST"))
+            .and(body_string_contains("transfer/Create"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(SHELL_S1)
+                    .set_delay(Duration::from_millis(1500)),
+            )
+            .mount(&server)
+            .await;
+        mount_ok(&server, EMPTY_BODY, u64::MAX).await;
+
+        let started = Instant::now();
+        let err = client
+            .run_command_with_timeout("127.0.0.1", "x", &[], Duration::from_secs(1))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, WinrmError::Timeout(1)), "got {err:?}");
+        assert!(
+            started.elapsed() >= Duration::from_millis(1400),
+            "Create was aborted"
+        );
+        let bodies = received_bodies(&server).await;
+        let deletes: Vec<_> = bodies
+            .iter()
+            .filter(|b| b.contains("transfer/Delete"))
+            .collect();
+        assert_eq!(deletes.len(), 1, "{bodies:?}");
+        assert!(
+            deletes[0].contains("S1"),
+            "the created shell must be deleted"
+        );
+        assert_eq!(count_containing(&bodies, "windows/shell/Command"), 0);
+    }
+
+    #[tokio::test]
+    async fn run_command_with_timeout_does_not_discard_output_when_the_deadline_hits_the_final_terminate()
+     {
+        use std::time::Duration;
+        let server = MockServer::start().await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        mount_ok(&server, SHELL_S1, 1).await;
+        mount_ok(&server, COMMAND_C1, 1).await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("windows/shell/Receive"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(DONE_HELLO))
+            .mount(&server)
+            .await;
+        // The post-Done terminate is slow and straddles the 1 s deadline.
+        Mock::given(method("POST"))
+            .and(body_string_contains("signal/terminate"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(EMPTY_BODY)
+                    .set_delay(Duration::from_millis(1500)),
+            )
+            .mount(&server)
+            .await;
+        mount_ok(&server, EMPTY_BODY, u64::MAX).await;
+
+        let out = client
+            .run_command_with_timeout("127.0.0.1", "x", &[], Duration::from_secs(1))
+            .await
+            .expect("a finished command's output must survive a late deadline");
+
+        assert_eq!(out.stdout, b"hello");
+        let bodies = received_bodies(&server).await;
+        assert_eq!(
+            count_containing(&bodies, "transfer/Delete"),
+            1,
+            "{bodies:?}"
+        );
+    }
+
+    // --- Cancellation: run_command_with_cancel / run_powershell_with_cancel ---
+
+    /// Cancel `token` after `after`, from a task.
+    fn cancel_after(
+        token: &tokio_util::sync::CancellationToken,
+        after: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let token = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(after).await;
+            token.cancel();
+        })
+    }
+
+    #[tokio::test]
+    async fn run_command_with_cancel_terminates_and_deletes_the_shell() {
+        use std::time::Duration;
+        let server = MockServer::start().await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        mount_hanging_command(&server, silent_poll()).await;
+        let token = tokio_util::sync::CancellationToken::new();
+        let canceller = cancel_after(&token, Duration::from_millis(600));
+
+        let err = client
+            .run_command_with_cancel("127.0.0.1", "hang", &[], token)
+            .await
+            .unwrap_err();
+        canceller.await.unwrap();
+
+        assert!(matches!(err, WinrmError::Cancelled), "got {err:?}");
+        let bodies = received_bodies(&server).await;
+        assert_eq!(
+            count_containing(&bodies, "signal/terminate"),
+            1,
+            "{bodies:?}"
+        );
+        assert_eq!(
+            count_containing(&bodies, "transfer/Delete"),
+            1,
+            "{bodies:?}"
+        );
+        let signal_at = bodies.iter().position(|b| b.contains("signal/terminate"));
+        let delete_at = bodies.iter().position(|b| b.contains("transfer/Delete"));
+        assert!(signal_at < delete_at, "terminate must precede delete");
+    }
+
+    #[tokio::test]
+    async fn run_powershell_with_cancel_terminates_and_deletes_the_shell() {
+        use std::time::Duration;
+        let server = MockServer::start().await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        mount_hanging_command(&server, silent_poll()).await;
+        let token = tokio_util::sync::CancellationToken::new();
+        let canceller = cancel_after(&token, Duration::from_millis(600));
+
+        let err = client
+            .run_powershell_with_cancel("127.0.0.1", "Read-Host", token)
+            .await
+            .unwrap_err();
+        canceller.await.unwrap();
+
+        assert!(matches!(err, WinrmError::Cancelled), "got {err:?}");
+        let bodies = received_bodies(&server).await;
+        assert_eq!(
+            count_containing(&bodies, "signal/terminate"),
+            1,
+            "{bodies:?}"
+        );
+        assert_eq!(
+            count_containing(&bodies, "transfer/Delete"),
+            1,
+            "{bodies:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_command_with_cancel_during_create_deletes_the_created_shell() {
+        use std::time::Duration;
+        let server = MockServer::start().await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        Mock::given(method("POST"))
+            .and(body_string_contains("transfer/Create"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(SHELL_S1)
+                    .set_delay(Duration::from_millis(1200)),
+            )
+            .mount(&server)
+            .await;
+        mount_ok(&server, EMPTY_BODY, u64::MAX).await;
+        let token = tokio_util::sync::CancellationToken::new();
+        let canceller = cancel_after(&token, Duration::from_millis(300));
+
+        let err = client
+            .run_command_with_cancel("127.0.0.1", "x", &[], token)
+            .await
+            .unwrap_err();
+        canceller.await.unwrap();
+
+        assert!(matches!(err, WinrmError::Cancelled), "got {err:?}");
+        let bodies = received_bodies(&server).await;
+        assert_eq!(
+            count_containing(&bodies, "transfer/Delete"),
+            1,
+            "{bodies:?}"
+        );
+        assert_eq!(count_containing(&bodies, "windows/shell/Command"), 0);
+    }
+
+    #[tokio::test]
+    async fn run_command_with_cancel_that_never_fires_behaves_like_run_command() {
+        let server = MockServer::start().await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        mount_ok(&server, SHELL_S1, 1).await;
+        mount_ok(&server, COMMAND_C1, 1).await;
+        mount_ok(&server, DONE_HELLO, 1).await;
+        mount_ok(&server, EMPTY_BODY, u64::MAX).await;
+
+        let out = client
+            .run_command_with_cancel(
+                "127.0.0.1",
+                "x",
+                &[],
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(out.stdout, b"hello");
+        let bodies = received_bodies(&server).await;
+        assert_eq!(
+            count_containing(&bodies, "signal/terminate"),
+            1,
+            "{bodies:?}"
+        );
+        assert_eq!(
+            count_containing(&bodies, "transfer/Delete"),
+            1,
+            "{bodies:?}"
+        );
+    }
+    #[tokio::test]
+    async fn download_file_with_timeout_expires_on_a_silent_host() {
+        use std::time::Duration;
+        let server = MockServer::start().await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        mount_hanging_command(&server, silent_poll()).await;
+        let local = std::env::temp_dir().join(format!(
+            "winrm-rs-test-dl-timeout-{}-{}.bin",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+
+        let err = client
+            .download_file_with_timeout("127.0.0.1", "C:\\f.bin", &local, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, WinrmError::Timeout(1)), "got {err:?}");
+        assert!(!local.exists(), "nothing may be written on timeout");
+        let bodies = received_bodies(&server).await;
+        assert_eq!(
+            count_containing(&bodies, "transfer/Delete"),
+            1,
+            "{bodies:?}"
+        );
     }
 }

@@ -7,12 +7,593 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Upgrading from 1.2.x
+
+The public API only grows (no item removed or changed in signature), but
+behaviour changes in ways callers can see, so this release needs a minor
+version bump (1.3.0), not a patch. One line each; the sections below give
+the details.
+
+- A `w:TimedOut` fault on Receive is now an empty poll, not
+  `WinrmError::Soap`: silent commands keep running instead of failing.
+- `WinrmClient::run_command`, `run_powershell` and `download_file` have no
+  overall time limit any more; bound them with `run_command_with_timeout`,
+  `run_powershell_with_timeout`, `download_file_with_timeout`, or stop them
+  with `run_command_with_cancel` / `run_powershell_with_cancel`.
+- `Shell::run_command` on a silent command ends in
+  `WinrmError::Timeout(2 * operation_timeout_secs)` (it used to fail with the
+  `TimedOut` fault after one `operation_timeout_secs`).
+- An HTTP 500 carrying a SOAP fault is `WinrmError::Soap` for Certificate,
+  Kerberos and CredSSP too (it was `AuthFailed`).
+- NTLM over HTTP now really seals (`EncryptionMode::Auto`): one handshake
+  per connection, at most 32 exchanges in flight per client, up to 8 idle
+  connections kept 60 s; it fails closed and never re-sends a request, and
+  several failures that were `AuthFailed` are now `WinrmError::Ntlm`.
+- NTLM over HTTPS runs on dedicated connections (TLS session resumption
+  off; more than 32 at once wait, then `Timeout(operation_timeout_secs +
+  10)`); its channel binding follows RFC 5929, so a server certificate
+  signed with Ed25519 or an unknown algorithm is now refused.
+- Kerberos (`--features kerberos`): `Auto` seals over HTTP (an RC4-only
+  realm needs `EncryptionMode::Never`), `Always` seals inside HTTPS too;
+  over HTTPS each connection is authenticated once after an unauthenticated
+  probe, with the server's AP-REP required, the certificate pinned and a
+  channel binding; a sealed answer must name its request in `RelatesTo`.
+- `AuthMethod::Certificate` really authenticates now; `use_tls = false` is
+  `AuthFailed` at construction, and a bad certificate or key file (not a
+  regular file, over 1 MiB, bad PEM, mismatched key) is `AuthFailed` there
+  too (it was `Http`, or no error).
+- `max_retries` retries connection errors only (before anything was sent),
+  for every method.
+- Response bodies are capped at `4 * max(max_envelope_size, 512 KiB)`
+  (2 MiB by default); a larger one is `SoapError::ParseError`.
+- A host that is not a host name (`win01?x`, `win 01`, `win01\x`) is
+  refused with `AuthFailed("invalid host ...")` before anything is sent.
+- PowerShell stderr: warning, verbose and debug records now come through
+  (`WARNING: `, `VERBOSE: `, `DEBUG: `), every XML entity and `_xHHHH_`
+  escape is decoded (control characters included), records stream as they
+  complete, and `max_output_bytes` counts stderr bytes as received, before
+  decoding.
+- `run_command_with_cancel` / `run_powershell_with_cancel` now terminate
+  the command and delete the shell on cancellation.
+- `WinrmConfig`'s `Debug` output redacts the proxy userinfo and the
+  `env_vars` values.
+- New public API: `StderrDecoder`, `WinrmClient::receive_output_raw`,
+  `WinrmClient::run_command_with_timeout`, `run_powershell_with_timeout`,
+  `download_file_with_timeout`.
+
+### Added
+
+- **`StderrDecoder`**, re-exported from the crate root: the stateful
+  PowerShell CLIXML stderr decoder that `run_command`, `run_powershell`,
+  `Shell::run_command` and `Shell::receive_next` use, for callers that poll
+  Receive themselves. Keep one per command, `push` each poll's raw stderr,
+  `finish` after the last one. It implements `Debug` (buffered length only)
+  and `Default`.
+- **`WinrmClient::receive_output_raw`** (was crate-private): `receive_output`
+  with stderr exactly as the server sent it, to feed a `StderrDecoder`.
+  `receive_output` itself still decodes each response on its own, so a
+  CLIXML document split across responses comes back partly raw there.
+
+- **Total deadline for the one-shot calls:**
+  `WinrmClient::run_command_with_timeout`, `run_powershell_with_timeout` and
+  `download_file_with_timeout`, each taking a `timeout: Duration`. When it
+  elapses (shell creation and polling included; empty `TimedOut` polls do not
+  extend it) the command gets a terminate signal and the remote shell is
+  deleted, both best effort, and the call returns `WinrmError::Timeout(secs)`
+  with `timeout` rounded up to whole seconds (at least 1; `Duration::ZERO`
+  returns at once and sends nothing). A deadline that passes while the shell
+  is being created waits for Create's answer and deletes that shell. Every
+  clean-up request is bounded to `operation_timeout_secs` (at most 10 s). A
+  deadline that passes after the command has finished is ignored and its
+  output returned. The shell is released on success, error and expiry;
+  dropping the future cannot delete it, as for `run_command`. Additive: no
+  `WinrmConfig` field was added.
+- **Kerberos message encryption** (`--features kerberos`, MS-WSMV 2.2.9.1).
+  Under `EncryptionMode::Auto` over HTTP, or `Always`, every SOAP body is
+  wrapped with the Kerberos context of its connection (`gss_wrap_iov`,
+  confidentiality on) and sent as `multipart/encrypted`, so a server with
+  `AllowUnencrypted = false` is reachable over HTTP. The context is set up on
+  a dedicated connection by a request with an empty body carrying the
+  AP-REQ; its answer must carry the server's AP-REP (mutual
+  authentication), which completes the context. The wrap token is sent in
+  the layout Windows SSPI uses (the 28-byte trailer rotated into the 60-byte
+  header, RRC = 28), the buffers pyspnego 0.12.1 sends with MIT krb5
+  (`_gss.py` `wrap_winrm`: `wrap_iov` with header, data and padding, no
+  trailer buffer); the MIME protocol is
+  `application/HTTP-SPNEGO-session-encrypted`, since the tokens go under the
+  `Negotiate` HTTP scheme (`HTTP-Kerberos-session-encrypted` gets HTTP 415).
+  Only RFC 4121 (CFX) sealed wrap tokens are accepted, which in practice
+  means AES session keys: an RC4 context produces RFC 4757 tokens and fails
+  the call (a realm that only has RC4 worked before under `Auto` over HTTP
+  and now needs `EncryptionMode::Never`). Fail-closed rules as for
+  NTLM sealing: no plaintext fallback, a sealed request is never resent (a
+  401 included), the answer must be a sealed wrap token from the server that
+  unwraps and has the announced length, the response size cap applies, and a
+  failure discards the connection. WinRM sends every Kerberos answer with
+  sequence number 0, and cross-krb5 negotiates no replay or sequence
+  detection, so the Kerberos session itself detects no replay: a sealed
+  answer must name the request's `MessageID` in `RelatesTo` (a request
+  without one is not sent), and a sealed request replayed on the same
+  authenticated connection by an active attacker is not detected.
+  Validated live against a Server 2025 domain controller with `AllowUnencrypted = false`
+  (`kerberos_sealed_with_allow_unencrypted_false`: `whoami`, a 200 KB upload
+  and download round trip with 322 sealed requests on one connection and one
+  authentication, a silent command whose `TimedOut` faults come back sealed),
+  and inside HTTPS with `Always`: a TLS-terminating relay in
+  `always_seals_inside_tls_seen_by_a_relay_with_dc_cbt_none` sees every SOAP
+  body sealed (5 of 5, Kerberos and NTLM), and none under `Auto`.
+  Windows clients: the SSPI branch of cross-krb5 (`cfg(windows)`) is not
+  compiled locally nor tested live; the `kerberos-windows` CI job builds and
+  lints it on Windows; a Windows client using `--features kerberos` with `Auto` now
+  seals over HTTP, and `EncryptionMode::Never` is the way back if that fails.
+- **Kerberos channel binding over HTTPS** (RFC 5929 `tls-server-end-point`).
+  Kerberos over HTTPS now runs on dedicated connections authenticated once:
+  an unauthenticated request with an empty body (the probe) learns the
+  endpoint's certificate (Windows answers 401 and closes that connection),
+  the binding is computed for that certificate, and the certificate is then
+  pinned in the dedicated client's verifier for the client's whole life:
+  the connection that carries the AP-REQ, and every later one, must present
+  that same certificate or its TLS handshake fails before any HTTP byte is
+  written; once pinned, a handshake for any other server name is refused
+  too, except the configured `https://` proxy's own leg. The pin applies to
+  the server name `reqwest` actually uses: the host of the parsed endpoint
+  URL (IDN as punycode, `10.1` as `10.0.0.1`, `win01?x` as `win01`); a host
+  that yields no valid TLS server name cannot be pinned and is refused
+  before the AP-REQ. Every answer on such a connection is also checked
+  against the pinned certificate.
+  The server's AP-REP is required; later requests on the connection carry
+  no `Authorization` header. A server whose certificate defines no channel
+  binding hash (Ed25519, unknown signature algorithm) is refused (fail
+  closed), as NTLM over TLS already did. Not protected:
+  `EncryptionMode::Never` over plain HTTP (no TLS, no binding, AP-REP
+  optional). Validated live: `CbtHardeningLevel = Strict` accepts it
+  (`kerberos_over_https_with_dc_cbt_strict`, `Auto` and `Always`); a
+  TLS-terminating relay is refused by the server under `Relaxed` and
+  `Strict` (`kerberos_channel_binding_through_a_tls_relay_is_refused`); and
+  a relay that passes the probe through and terminates the next connection
+  fails at the client's TLS handshake, nothing sent
+  (`kerberos_channel_binding_split_relay_fails_at_the_handshake`, also under
+  `Strict`).
+
+### Fixed
+
+- **A host such as `win01?x`, `win01\x`, `win 01` or `win01#x` was accepted
+  and mis-routed.** The endpoint URL is `scheme://HOST:PORT/wsman`, so the
+  host ended the authority early: the configured port landed in the query
+  and the request went to the scheme's default port. Every request now
+  refuses a host that is still not a host name once the scheme, userinfo,
+  path and port have been stripped (as before) with `WinrmError::AuthFailed`
+  ("invalid host ..."), before anything is sent. Accepted: ASCII letters,
+  digits, `-`, `_` and `.`, non-ASCII names (punycode), and bracketed IPv6
+  literals. A port after a bracketed literal (`[::1]:5985`) is now stripped
+  like any other instead of producing a broken URL. (No dedicated error
+  variant: `WinrmError` is not `#[non_exhaustive]`.)
+- **An unencrypted Kerberos request refused for lack of encryption gave an
+  opaque `AuthFailed("HTTP 500 Internal Server Error: ")`.** Windows answers
+  an HTTP 500 with an empty body when it requires encrypted messages
+  (`AllowUnencrypted = false`). Over HTTP, that answer to an unsealed
+  Kerberos request (`EncryptionMode::Never`) now says so and points at
+  `EncryptionMode::Auto`/`Always` or HTTPS
+  (`kerberos_unsealed_with_allow_unencrypted_false_is_a_clear_error`).
+- **`EncryptionMode::Always` with Kerberos silently sent plaintext.** The
+  mode applied to NTLM only; it now seals Kerberos too (see `### Added`).
+- **Retry backoff overflowed for `max_retries >= 58`** (`100 * 2^attempt`
+  ms): it now saturates.
+- **`WinrmClient::run_command_with_cancel` / `run_powershell_with_cancel`
+  leaked the remote shell on cancellation.** They only dropped the call in
+  flight, so the command kept running and the shell stayed on the host until
+  its idle timeout (7200 s by default). They now share the lifecycle of the
+  `*_with_timeout` calls: on cancellation the command is told to terminate,
+  the shell is deleted (both best effort, bounded to `operation_timeout_secs`,
+  at most 10 s each) and `WinrmError::Cancelled` is returned, as before. A
+  cancellation during shell creation waits for Create's answer and deletes
+  that shell; one that arrives after the command has finished is ignored and
+  the output is returned. Dropping the future still cannot delete the shell.
+  Validated live against Server 2025 (`Start-Sleep 600` cancelled after 3 s
+  leaves no shell).
+- **`AuthMethod::Certificate` never authenticated (always HTTP 401).** Two
+  defects, both on the path: the transport installed its rustls config with
+  `with_no_client_auth()`, which made `reqwest` drop the client identity, so
+  no certificate was presented in the TLS handshake; and requests carried no
+  `Authorization` header, while WinRM only maps the client certificate when
+  it gets `Authorization:
+  http://schemas.dmtf.org/wbem/wsman/1/wsman/secprofile/https/mutual`
+  (MS-WSMV). Over HTTPS the rustls config is now built with the certificate
+  chain from `client_cert_pem` and the key from `client_key_pem`
+  (`PRIVATE KEY` / PKCS#8, `RSA PRIVATE KEY` / PKCS#1 or `EC PRIVATE KEY` /
+  SEC1; unencrypted keys only), and every Certificate request sends that
+  header. Server-certificate verification and channel binding are unchanged.
+  A path that is not a regular file or is over 1 MiB, a file with no
+  certificate or no key, an encrypted key, malformed PEM, or a key rustls
+  rejects (unsupported, or not matching the certificate) is now a
+  `WinrmError::AuthFailed` at construction that names the file and never
+  quotes its contents (it used to be a `WinrmError::Http` builder error, or
+  no error at all for a mismatched key). The PEM text buffers are wiped after
+  parsing. Validated live against Server 2025 with a mapped certificate
+  (whoami returns the mapped account) and an untrusted one (401).
+- **A command silent for longer than `operation_timeout_secs` failed with a
+  `TimedOut` fault.** The server answers a Receive that finds no output within
+  `OperationTimeout` with the WS-Management fault `w:TimedOut`, which means
+  "nothing yet, poll again". It was returned as `WinrmError::Soap`, so
+  `run_command`, `run_powershell` and `Shell::run_command` failed on any
+  command quiet for 60 s (the default), such as `Start-Sleep 75`. Measured on
+  Server 2025. `WinrmClient::receive_output` and `Shell::receive_next` now
+  return an empty, not-done `ReceiveOutput` for that fault, and every polling
+  loop carries on; the fault is matched on its local part, whatever namespace
+  prefix the server uses. Any other fault is still an error, and so is a
+  `TimedOut` fault on a request other than Receive. `Shell::run_command` still
+  ends in `WinrmError::Timeout(2 * operation_timeout_secs)` once its total
+  deadline is reached, whether or not the command was chatty. Callers that
+  already treated the fault as "poll again" (psrp-rs) keep working.
+  Every auth method now hands an HTTP 500 that carries a SOAP fault back as
+  `WinrmError::Soap` (Certificate, Kerberos and CredSSP returned it as
+  `WinrmError::AuthFailed`, so the fault never reached this handling), and
+  the NTLM-sealed path unseals the fault first (see the next entry).
+  Validated live against Server 2025 (`operation_timeout_secs = 15`, a
+  command silent for 20 s completes) over Basic (HTTP), NTLM over HTTP with
+  the default sealing, Certificate (HTTPS) and CredSSP (HTTPS), and Kerberos
+  (HTTP) against a `winrm.test` domain controller
+  (`silent_command_completes_over_kerberos`, 22 s).
+- **NTLM message sealing never worked: with the default
+  `EncryptionMode::Auto` over HTTP, and with `EncryptionMode::Always`, every
+  request after the first went out in plaintext.** `seal_body` put a CRLF
+  between the sealed payload and the closing `--Encrypted Boundary--`;
+  Server 2025 answers such a request with HTTP 400, which the transport took
+  for an expired session: it re-authenticated on a new connection and
+  replayed the request unsealed. The framing now follows what Windows sends
+  and pypsrp builds (closing boundary right after the payload), and
+  `unseal_body` reads it the same way (it expected a CRLF Windows does not
+  send). Windows also seals the HTTP 500 fault of a sealed request; the
+  transport now unseals it before looking for the fault, so a `TimedOut`
+  fault is an empty poll on the same sealed session instead of a
+  re-authentication and a plaintext replay of the Receive. Measured on
+  Server 2025 through a recording forwarder: a silent 20 s command made 14
+  `Negotiate` requests before (every sealed request rejected), 2 now (one
+  handshake), with every later request sealed. The bench allows unencrypted
+  traffic (`AllowUnencrypted = true`), which is why the plaintext fallback
+  went unnoticed. See also the `### Security` entry: the remaining plaintext
+  paths are gone too.
+- **PowerShell stderr lost text or leaked raw CLIXML.** Measured on Server
+  2025: a large stderr arrives as the `#< CLIXML` marker alone in one Receive
+  response, then the `<Objs>` document cut mid-tag, even mid-escape, across
+  the next ones. Each slice was decoded on its own, so the marker slice
+  decoded to nothing and the rest came through as raw XML. `run_command`,
+  `run_powershell`, `Shell::run_command` and `Shell::receive_next` now keep
+  one decoder per command across polls. It decodes each record (`<S>`
+  element) as soon as it is complete and buffers only the record still
+  arriving, so a document of any size decodes and `Shell::receive_next`
+  returns records while the command runs, although powershell.exe closes its
+  `<Objs>` document only when it exits. powershell.exe buffers its stderr
+  itself (measured on Server 2025: blocks of about 6 KiB, the rest at exit),
+  so a few small errors still arrive only when the command ends. A single
+  record longer than 16 MiB is given up on and released raw, and so is the
+  rest of that document (it is no longer decoded; a later marker at the
+  start of a line opens a new one). `Shell::receive_next` keeps at most 32
+  such decoders, so a `Shell` holds at most 32 x 16 MiB of undecoded stderr
+  in the worst case. Several documents after one marker, and a marker
+  doubled by nested PowerShell, all decode. `WinrmClient::receive_output`
+  decodes each response on its own; use `receive_output_raw` with a
+  `StderrDecoder` to decode across polls. Reported in #1.
+- **Warning, verbose and debug records were dropped** from CLIXML stderr; only
+  error records were kept. They now come through with the console prefixes
+  `WARNING: `, `VERBOSE: ` and `DEBUG: `. Progress and information records
+  are still skipped (`Write-Host` text already reaches stdout).
+- **XML entities were left encoded** in decoded stderr (`2&gt;$null`), and
+  only four `_xHHHH_` escapes were understood. All entities, numeric
+  references and `_xHHHH_` escapes, surrogate pairs included, are decoded.
+  A signed (`&#+65;`) or NUL (`&#0;`) numeric reference stays as written.
+- **Server text in error messages is bounded.** `download failed: …` and
+  `upload chunk N failed: …` quoted the whole remote stderr, and a CredSSP
+  answer with a bad status line quoted that line (up to 1 MiB): they now
+  quote at most 512 characters and give the full size, like the other
+  errors that quote a server body.
+- **A CredSSP `WWW-Authenticate` header with a non-ASCII character before
+  the `CredSSP` scheme panicked** (`ɐ CredSSP …`): the scheme was found in
+  an uppercased copy whose byte offsets differ. It is now found with ASCII
+  case folding.
+- **Parsing an element out of a response was quadratic** in the number of
+  opening tags without a closing tag (20 000 in 1 MiB took over 20 s in a
+  debug build); it is now linear.
+
 ### Changed
 
+- **Behaviour change: `EncryptionMode` applies to Kerberos**
+  (`--features kerberos`). `Auto` (the default) now seals Kerberos over HTTP,
+  where SOAP bodies used to cross in plaintext; `Always` seals inside HTTPS
+  too; `Never` keeps the old plaintext behaviour over HTTP. Sealed Kerberos
+  runs on the dedicated connections NTLM sealing uses (one context per
+  connection instead of one per request; at most 32 exchanges in flight, 8
+  idle connections kept 60 s). Kerberos-sealing errors are
+  `WinrmError::AuthFailed("Kerberos message encryption: ...")` (the error
+  enum has no Kerberos variant). A context whose session key is not an AES
+  one (RC4) cannot seal and fails the call. Unsealed Kerberos (HTTPS under
+  `Auto`, or `Never`) is unchanged.
+- **`EncryptionMode::Always` with Basic, Certificate or CredSSP is now
+  stated to do nothing, and logged.** Those methods never seal: `Always`
+  is accepted (as before) and Basic over plain HTTP still sends the
+  credentials and the bodies in plaintext. The client now logs a WARN at
+  construction when `Always` is set with one of them, and the
+  `EncryptionMode::Always` rustdoc and the README say so.
+- **Sealed-request error texts name the method**: "HTTP 401 to a sealed
+  NTLM request on an authenticated connection ...", "server answered a
+  sealed NTLM request without sealing ...", "the server closes the
+  connection right after NTLM authentication ..." (same variants as
+  before). The 401 text now names both causes: the server closed an idle
+  connection, or the client's pool sent the request on a fresh,
+  unauthenticated connection.
+- **Kerberos over HTTPS authenticates once per connection** instead of once
+  per request (see channel binding under `### Added`), one extra
+  unauthenticated request per new connection, and now requires the
+  server's AP-REP. Later requests depend on staying on the authenticated
+  connection (a lost one fails the request with a 401 error, not resent);
+  measured with a 20 KB upload then a 200 KB download over HTTPS, 10 runs
+  per cell: 10 of 10 on current-thread and multi-thread runtimes with 0 or
+  4 yields, always exactly 2 TCP connections (probe and authenticated
+  one). Only `EncryptionMode::Never` over plain HTTP keeps a
+  context per request (AP-REP checked when present, not required).
+- **Pool race on dedicated connections: mitigated, not closed.** `hyper`
+  hands a connection back to its client's pool from a task of its own; a
+  sealed request sent before that task ran went out on a new,
+  unauthenticated TCP connection and failed with an HTTP 401 (fail-closed:
+  error, not resent). Measured against the DC with `AllowUnencrypted =
+  false`, a 20 KB upload then a 200 KB download, 10 runs per cell: on a
+  current-thread runtime 0 of 10 passed without yields and 10 of 10 with 4,
+  for Kerberos and NTLM alike; on a multi-thread runtime 10 of 10 with 0 or
+  4. With `AllowUnencrypted = true` no run failed (5 Kerberos and 2 NTLM
+  download runs, and 80 large-output runs over every method, runtime and
+  yield count), which is why NTLM, always measured against the 2025 bench
+  (`true`), never showed it: the trigger is the server's timing, not the
+  method. New live test
+  `sealed_download_after_upload_stays_on_its_connection_allow_unencrypted_false`.
+  A dedicated exchange now yields to the runtime 4 times before sending (the
+  number is empirical); pinning one `hyper` connection per dedicated
+  connection would close the race and is not done (it needs a Cargo change).
+- **Behaviour change: NTLM-sealed requests fail closed** (see `### Security`).
+  A server that answers sealed requests with an error used to get the
+  request again in plaintext after a fresh handshake, which worked when it
+  allowed unencrypted traffic; the call now fails instead. What you see: an
+  HTTP error answer that is not sealed gives `WinrmError::Ntlm(..)` ("server
+  answered a sealed NTLM request without sealing: HTTP <status> (<n>
+  bytes)"); a sealed answer that does not unseal (framing, signature,
+  sequence) gives `WinrmError::Ntlm(..)` (it was `AuthFailed`); a sealed
+  4xx/5xx other than a SOAP fault gives `AuthFailed("HTTP <status>:
+  <excerpt>")`; an HTTP 401 on a sealed request gives `WinrmError::Ntlm(..)`
+  ("... session is no longer valid (usually the server closed an idle
+  connection); the request was NOT resent ... retry the call if it is safe
+  to run again"), not `AuthFailed`: it is not a credentials error (bad
+  credentials fail the handshake). The next request authenticates a new
+  connection; an answer with `Connection: close` already makes the client
+  drop that connection, so it does not get to the 401.
+  Use HTTPS (sealing is then off under `EncryptionMode::Auto`), or
+  `EncryptionMode::Never` for debugging against a server that does not seal.
+- **Behaviour change: `max_retries` retries only connection errors**, for
+  every auth method: a `WinrmError::Http` raised before anything was sent.
+  A timeout, a reset or a dropped connection after the request went out is
+  returned, since the request may have run on the server (a command, a
+  stdin write, an upload chunk would run twice). The default,
+  `max_retries = 0`, is unaffected.
+- **NTLM over HTTPS uses dedicated connections.** Each NTLM exchange over
+  TLS (sealed with `EncryptionMode::Always`, or unsealed) runs on a pooled
+  client that keeps one connection, so its channel binding token is tied to
+  that connection (see `### Security`). At most 32 NTLM exchanges run at
+  once on such connections per client; a further request waits for a free
+  one, at most `operation_timeout_secs + 10` s (then
+  `WinrmError::Timeout`), and a cancelled wait takes nothing. Performance:
+  TLS session resumption is off for these clients (direct connections
+  included), and each new connection comes with its own `reqwest::Client`,
+  so every new NTLM-over-HTTPS connection costs a full TLS handshake and a
+  client build; idle connections (up to 8, 60 s) are reused. Unsealed NTLM
+  over HTTPS used to share the transport's connection pool. A failure to
+  bind the channel (no certificate, an ambiguous one, an unsupported
+  signature algorithm) is `WinrmError::Ntlm(..)`.
+- **NTLM-sealed requests of one client no longer wait for each other.** The
+  sealing session was held under one lock for the whole HTTP exchange, so a
+  Receive long-poll on one shell held up every other request of the same
+  `WinrmClient` (measured on Server 2025: a quick `echo` took 10.3 s during
+  another shell's 10 s Receive, 0.15 s over Basic). Sealed requests now use
+  a pool of authenticated connections (one TCP connection and NTLM session
+  each, at most 8 kept idle, none reused after 60 s idle): concurrent
+  requests run on separate connections, each with its own handshake
+  (measured: 0.16 to 0.19 s for the same `echo`).
+- **Response bodies are capped** at `4 * max(max_envelope_size, 512 KiB)`
+  bytes (2 MiB by default) for every auth method, before unsealing or
+  parsing; a larger body is `WinrmError::Soap(SoapError::ParseError("response
+  body exceeds <n> bytes"))`. `MaxEnvelopeSize` bounds what the server sends;
+  the factor covers UTF-16 encoding and sealing framing, and the floor keeps
+  small `max_envelope_size` settings from rejecting legitimate faults. Error
+  messages quote at most 512 characters of a server body, and a SOAP fault's
+  code and reason are kept to 256 and 2048 characters.
+- **Behaviour change: `WinrmClient::run_command` and `run_powershell` have no
+  overall time limit any more** (nor `download_file`, which runs through
+  `run_powershell`), a consequence of the `TimedOut` fix above.
+  `operation_timeout_secs` bounds each Receive poll, not the command: a
+  command that hangs silently (`Read-Host`, `pause`, a blocked process) used
+  to fail with the `TimedOut` fault after about `operation_timeout_secs` and
+  now blocks the call until it ends. Bound it with the new
+  `run_command_with_timeout` / `run_powershell_with_timeout` /
+  `download_file_with_timeout`, or stop it from elsewhere with
+  `run_command_with_cancel` / `run_powershell_with_cancel`; all of them
+  terminate the command and delete the shell. A plain `tokio::time::timeout`
+  drops the call and leaves the remote shell to the server's idle timeout.
+  `Shell::run_command` keeps its total
+  deadline of `2 * operation_timeout_secs`. `run_wql` does not poll Receive
+  and is unchanged.
+- **Behaviour change: `AuthMethod::Certificate` with `use_tls = false` now
+  fails at construction** with `WinrmError::AuthFailed("Certificate auth
+  requires HTTPS (set use_tls = true)")`, before any file is read, like
+  CredSSP over HTTP. Such a configuration used to build but could never
+  authenticate: without TLS there is no handshake to present the certificate
+  in.
+- **Behaviour change: PowerShell warning, verbose and debug records now
+  reach stderr** (prefixed `WARNING: `, `VERBOSE: `, `DEBUG: `; see Fixed),
+  so a command that only warns, which used to return an empty stderr, now
+  returns a non-empty one. Callers that treat any stderr as failure should
+  check the exit code instead, or ignore those prefixes.
+- **Decoded stderr can hold any control character.** Every `_xHHHH_`
+  escape is decoded, so BEL, backspace, NUL and the like written by the
+  remote command come through as is (only CR, LF, tab and ESC used to).
+  Sanitise stderr before writing it to a terminal or a log viewer.
+- **`max_output_bytes` counts stderr bytes as received**, before CLIXML
+  decoding, so it also bounds a record still being buffered. CLIXML is
+  several times larger than the text it decodes to, so a cap tuned to
+  decoded output trips sooner on PowerShell stderr.
+- **A `#< CLIXML` marker only opens a document at the start of a line and
+  when `<Objs` follows it.** A native tool that prints the marker in the
+  middle of its output keeps that output as plain text.
 - **TLS now uses `ring` only.** `reqwest` is built with `rustls-no-provider`
   and `rustls` with `default-features = false`, dropping `aws-lc-rs`,
   `aws-lc-sys`, `cmake` and `quinn` from the dependency tree (no C toolchain
   needed). The `ring` crypto provider is installed in `HttpTransport::new`.
+
+### Security
+
+- **Kerberos channel binding could be split across connections** (found in
+  review before release, never shipped): the binding was computed from the
+  probe connection's certificate while the AP-REQ went on a new connection
+  checked only on its answer, so an attacker holding a certificate the
+  client accepts (`accept_invalid_certs`) could pass the probe through,
+  terminate the AP-REQ connection and relay the AP-REQ, bound to the real
+  certificate, to the server. The bound certificate is now pinned in the
+  dedicated client's verifier before the AP-REQ (see `### Added`); measured
+  live with a split relay before (the AP-REQ reached the relay) and after
+  (handshake refused, no request). A second review found the pin could
+  still be skipped when the verifier's target name differed from the name
+  the handshake carried (raw caller host versus parsed URL host: IDN,
+  short or octal IPv4, `win01?x`): the target now comes from the parsed
+  URL, a pin without a target is refused, and a pinned verifier refuses
+  any other server name except the proxy's own leg: `WinrmConfig::proxy`,
+  or when it is `None`, any `https://` proxy named in `HTTPS_PROXY` /
+  `ALL_PROXY` (and their lowercase forms), which reqwest uses then and
+  which the first version refused. A proxy reqwest takes from system
+  settings (its `system-proxy` feature, off in this crate) stays refused,
+  with an error naming that cause.
+- **NTLM message sealing no longer falls back to plaintext, and the client
+  sends each sealed request once.** With `EncryptionMode::Auto` over HTTP or
+  `Always`: the handshake that sets up sealing ends with an empty Type 3
+  body (the SOAP body used to ride on it in plaintext); every SOAP request
+  after it is sealed. A sealed request that fails is no longer re-sent in
+  plaintext after a new handshake (an active attacker on plain HTTP could
+  force that with any non-fault error answer, and a request the server had
+  already executed ran twice: a command, a stdin write, an upload chunk). It
+  is not re-sent at all, an HTTP 401 included: an attacker can forward the
+  sealed request to the server, let it run, and answer 401 itself, and no
+  client-side check (such as seeing that a new TCP connection was used)
+  rules that out, since the attacker holds the server side of the
+  authenticated connection. A body
+  labelled sealed that does not unseal is an error instead of being parsed
+  as a plaintext fault (a forged fault would have been accepted and the RC4
+  keystream desynchronised), and a failed exchange discards its connection
+  and session. `unseal_body` checks the whole MS-WSMV frame (signature
+  length 16, `OriginalContent` `Length` with checked arithmetic, payload of
+  exactly that length followed by the closing boundary, decrypted length)
+  and never quotes the body in its errors. It is strict on purpose: the
+  first part must carry exactly `Content-Type:
+  application/HTTP-SPNEGO-session-encrypted` (no trailing whitespace) and
+  `Length=` is read only from the `OriginalContent:` line; any other
+  framing is refused (fail closed). Server 2025 and Server 2012 R2 answers
+  pass. Verified on Server 2025 through a
+  recording relay: no request body crossed unsealed, one handshake per
+  connection; also with psrp-rs and bridge-mcp over NTLM on HTTP, and on
+  Server 2012 R2. New fuzz target `fuzz_ntlm_unseal_body` and proptests for
+  the framing.
+- **NTLM channel binding is computed from the right certificate.** The
+  channel binding token (CBT) of an NTLM handshake over TLS was computed
+  from the last certificate any connection of the client had verified; a
+  reused or resumed TLS connection is not verified again, so with two hosts
+  (or another connection's certificate accepted under
+  `accept_invalid_certs`) the token could bind the wrong certificate, which
+  weakens the relay protection CBT exists for. It now comes from the
+  connection that carried the challenge: the TLS details `reqwest` reports
+  on that response, or, through a proxy where it reports none, the
+  verifier of a dedicated client that keeps one connection with TLS session
+  resumption off, provided that verifier has seen a single certificate for
+  the WinRM host's server name (a background connection presenting another
+  one makes it ambiguous, and the handshake fails; the certificate of an
+  `https://` proxy, which `reqwest` verifies with a copy of the same
+  configuration, does not count). It records a certificate only once the
+  certificate is verified. Without a certain certificate, the handshake
+  fails instead of authenticating unbound. Tested with two TLS servers with
+  different certificates and through an in-process `https://` proxy with a
+  certificate of its own.
+- **NTLM channel binding uses the certificate's own hash (RFC 5929).** The
+  token hashed the certificate with SHA-256 whatever its signature
+  algorithm, so NTLM over HTTPS failed against a host whose certificate is
+  signed with SHA-384 or SHA-512 (P-384 keys, AD CS templates). The hash now
+  follows the signature algorithm, as pyspnego and pypsrp do: SHA-224/256/
+  384/512, MD5 and SHA-1 upgraded to SHA-256, RSASSA-PSS by its hash
+  parameter (absent parameters or an omitted hash: the RFC 4055 default,
+  SHA-1, so SHA-256; malformed parameters fail). An algorithm without a
+  single hash (Ed25519) or an unknown one has no defined channel binding
+  and fails the handshake, where pypsrp falls back to SHA-256. Checked
+  against known answers computed with Python `cryptography` for sixteen
+  certificates.
+- **A sealing handshake whose answer closes the connection is redone.** A
+  Type 3 answered with `Connection: close` ends the connection the session
+  is bound to; the client now authenticates a new connection (once, then
+  reports `WinrmError::Ntlm`) instead of sending the first sealed request
+  on a socket without a session.
+- **Secrets kept out of logs.** The WARN about a host string that carried
+  `user:password@` logged the original string, and the debug spans of
+  `WinrmClient` and of the transport recorded the raw `host` argument: both
+  now show `<redacted>@host`. `WinrmClient::new` no longer records the
+  configuration in its span, and `WinrmConfig`'s `Debug` (hand-written,
+  every field still listed) redacts the proxy URL's userinfo and shows only
+  the names of `env_vars`. Not changed: the debug spans of `run_command`,
+  `run_command_with_timeout`, `execute_command` and the other command
+  methods record the command and its arguments, and `trace!` logs SOAP
+  bodies, so command text (an encoded `run_powershell` script included)
+  reaches logs at `debug` level and below; keep `winrm_rs` at `info` where
+  commands carry secrets.
+- **`Authorization` headers are marked sensitive.** The Basic, NTLM
+  (Type 1 and Type 3) and Kerberos (`Negotiate`) header values are built
+  with `HeaderValue::set_sensitive(true)`, so their `Debug` form shows
+  `Sensitive` and HTTP/2 never indexes them. CredSSP writes its own HTTP
+  request inside its TLS tunnel and never logs the header; Certificate auth
+  sends a fixed, public value.
+
+### Documentation
+
+- **`AuthMethod::CredSsp` and the `credssp` feature are documented as
+  validated live.** The `AuthMethod::CredSsp` rustdoc said "Not yet
+  implemented — will return an error at runtime" and the `Cargo.toml`
+  comment on `credssp` said "not yet end-to-end validated", both wrong since
+  `credssp_run_command_whoami` passes against Server 2025. They now state
+  that, and that Server 2012 R2 is skipped (its SCHANNEL pairs GCM only with
+  static-RSA key exchange, which rustls does not support) and was not
+  measured in the latest round.
+- **Added the live validation matrix**, `docs/validation/live-matrix.md`: one
+  row per feature with the test that proves it, the commits tested
+  (`winrm-rs`, `psrp-rs`, `bridge-mcp`), the three defects the live tests
+  found (a `TimedOut` fault on Receive, `AuthMethod::Certificate`, NTLM
+  sealing) and the known limits.
+- **`AuthMethod::Kerberos` validated live for the first time**, against a
+  Windows Server 2025 domain controller (`winrm.test`, bench described in
+  `tests/vagrant/dc/README.md`): `kerberos_run_command_whoami` (runs as
+  `winrm\vagrant`), `kerberos_two_commands_on_one_client` and
+  `silent_command_completes_over_kerberos` pass over HTTP with a TGT from
+  `kinit`. The server's
+  mutual-authentication token (AP-REP) was observed being verified with
+  `KRB5_TRACE` (no test asserts it). At that point Kerberos SOAP bodies
+  were not encrypted (with `AllowUnencrypted = false` every request ended in
+  `AuthFailed("HTTP 500 Internal Server Error: ")`); Kerberos sealing and the
+  clear error are listed under `### Added` and `### Fixed`.
+- **Kerberos over HTTPS validated live** (`kerberos_over_https_whoami`,
+  DC HTTPS listener from `setup_dc_https_listener`, self-signed certificate
+  with `accept_invalid_certs`): it first worked without code change (no
+  channel binding, `CbtHardeningLevel = Relaxed`), and now with channel
+  binding under `Relaxed` and `Strict`.
+- **`AuthMethod::Kerberos` documentation corrected.** It said "SPNEGO
+  Negotiate tokens"; the tokens are raw Kerberos GSS-API tokens (mechanism
+  krb5) sent under the `Negotiate` HTTP scheme, whose Windows acceptor takes
+  them. The rustdoc, the crate-level table and the README now state what
+  Kerberos guarantees: authentication (mutual when the server answers with
+  its token, required for sealing and HTTPS), and message confidentiality
+  only through HTTPS or Kerberos sealing. Sealing protects the messages of
+  a client that seals; a server with `AllowUnencrypted = true` still runs
+  unencrypted, unprotected requests (from a client with
+  `EncryptionMode::Never`, or Basic), so integrity on plain HTTP against an
+  active network attacker, server side, also needs `AllowUnencrypted =
+  false` (NTLM as Kerberos).
 
 ## [1.2.2] - 2026-09-04
 

@@ -25,8 +25,11 @@ include = [
 [features]
 default = []
 kerberos = ["dep:cross-krb5"]
-# EXPERIMENTAL. CredSSP (double-hop delegation) is not yet end-to-end
-# validated. The OpenSSL dependency is required for the inner TLS 1.2
+# CredSSP (double-hop delegation). Experimental: validated end-to-end against
+# Windows Server 2025 (live test `credssp_run_command_whoami`); Server 2012 R2 is
+# skipped because its SCHANNEL pairs GCM only with static-RSA key exchange,
+# which rustls does not support, and was not measured in the latest round.
+# The OpenSSL dependency is required for the inner TLS 1.2
 # in-memory handshake: a `rustls` implementation was attempted and the
 # Microsoft CredSSP server silently drops the context after Type3 +
 # pubKeyAuth. See the comment block in `src/auth/credssp.rs` around the
@@ -41,7 +44,7 @@ __internal = []
 [dependencies]
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "socks"] }
 cross-krb5 = { version = "0.5", optional = true }
-tokio = { version = "1", features = ["time", "macros"] }
+tokio = { version = "1", features = ["time", "macros", "sync"] }
 base64 = "0.23"
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }

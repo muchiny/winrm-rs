@@ -181,23 +181,203 @@ pub(crate) fn current_windows_filetime() -> [u8; 8] {
     filetime.to_le_bytes()
 }
 
+/// One DER element: `(tag, content, rest)`. Definite lengths only (short
+/// form, or long form on 1 to 4 bytes), bounds-checked.
+fn der_element(input: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    let (&tag, rest) = input.split_first()?;
+    let (&first, rest) = rest.split_first()?;
+    let (len, rest) = if first < 0x80 {
+        (usize::from(first), rest)
+    } else {
+        let count = usize::from(first & 0x7F);
+        if count == 0 || count > 4 {
+            return None; // indefinite, or longer than any certificate here
+        }
+        let (bytes, rest) = rest.split_at_checked(count)?;
+        let len = bytes.iter().try_fold(0usize, |acc, &b| {
+            acc.checked_mul(256)?.checked_add(usize::from(b))
+        })?;
+        (len, rest)
+    };
+    let (content, rest) = rest.split_at_checked(len)?;
+    Some((tag, content, rest))
+}
+
+/// Hash function of the RFC 5929 `tls-server-end-point` channel binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CbtHash {
+    Sha224,
+    Sha256,
+    Sha384,
+    Sha512,
+}
+
+// DER contents of the signature algorithm OIDs (RFC 4055, RFC 5758, RFC 8017).
+const OID_MD5_RSA: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x04];
+const OID_SHA1_RSA: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x05];
+const OID_RSASSA_PSS: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0A];
+const OID_SHA256_RSA: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B];
+const OID_SHA384_RSA: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0C];
+const OID_SHA512_RSA: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0D];
+const OID_SHA224_RSA: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0E];
+const OID_ECDSA_SHA1: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x01];
+const OID_ECDSA_SHA224: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x01];
+const OID_ECDSA_SHA256: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02];
+const OID_ECDSA_SHA384: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x03];
+const OID_ECDSA_SHA512: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x04];
+// Hash OIDs, as found in RSASSA-PSS parameters.
+const OID_SHA1: &[u8] = &[0x2B, 0x0E, 0x03, 0x02, 0x1A];
+const OID_SHA256: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
+const OID_SHA384: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02];
+const OID_SHA512: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03];
+const OID_SHA224: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x04];
+
+/// The hash of the `tls-server-end-point` channel binding for a certificate
+/// (RFC 5929 section 4.1): the hash of its signature algorithm, MD5 and
+/// SHA-1 upgraded to SHA-256. `None` when the algorithm has no single hash
+/// (Ed25519, ...) or is unknown, or the bytes are not a certificate.
+///
+/// Reads only `Certificate.signatureAlgorithm` (RFC 5280): the outer
+/// SEQUENCE, the `tbsCertificate` SEQUENCE skipped, then the
+/// `AlgorithmIdentifier` and, for RSASSA-PSS, its `hashAlgorithm` parameter.
+fn cbt_hash(cert_der: &[u8]) -> Option<CbtHash> {
+    let (0x30, certificate, _) = der_element(cert_der)? else {
+        return None;
+    };
+    let (0x30, _tbs, rest) = der_element(certificate)? else {
+        return None;
+    };
+    let (0x30, algorithm, _) = der_element(rest)? else {
+        return None;
+    };
+    let (0x06, oid, params) = der_element(algorithm)? else {
+        return None;
+    };
+    match oid {
+        OID_MD5_RSA | OID_SHA1_RSA | OID_ECDSA_SHA1 | OID_SHA256_RSA | OID_ECDSA_SHA256 => {
+            Some(CbtHash::Sha256)
+        }
+        OID_SHA224_RSA | OID_ECDSA_SHA224 => Some(CbtHash::Sha224),
+        OID_SHA384_RSA | OID_ECDSA_SHA384 => Some(CbtHash::Sha384),
+        OID_SHA512_RSA | OID_ECDSA_SHA512 => Some(CbtHash::Sha512),
+        OID_RSASSA_PSS => pss_hash(params),
+        _ => None,
+    }
+}
+
+/// Hash of RSASSA-PSS parameters (RFC 4055, RFC 8017 A.2.3).
+///
+/// `RSASSA-PSS-params ::= SEQUENCE { hashAlgorithm [0] (default SHA-1),
+/// maskGenAlgorithm [1], saltLength [2], trailerField [3] }`, every field
+/// optional. Absent parameters, an empty SEQUENCE, or a SEQUENCE whose first
+/// field is `[1]`..`[3]` all leave the hash at its default, SHA-1, which the
+/// channel binding upgrades to SHA-256. Anything else that is not a
+/// well-formed `[0]` with a known hash fails closed (`None`): parameters that
+/// are not a SEQUENCE, trailing data, a malformed or unknown first field.
+fn pss_hash(params: &[u8]) -> Option<CbtHash> {
+    if params.is_empty() {
+        return Some(CbtHash::Sha256);
+    }
+    let (0x30, fields, []) = der_element(params)? else {
+        return None;
+    };
+    if fields.is_empty() {
+        return Some(CbtHash::Sha256);
+    }
+    let (tag, hash_field, _) = der_element(fields)?;
+    match tag {
+        0xA0 => {}
+        0xA1..=0xA3 => return Some(CbtHash::Sha256),
+        _ => return None,
+    }
+    let (0x30, hash_algorithm, []) = der_element(hash_field)? else {
+        return None;
+    };
+    let (0x06, oid, _) = der_element(hash_algorithm)? else {
+        return None;
+    };
+    match oid {
+        OID_SHA1 | OID_SHA256 => Some(CbtHash::Sha256),
+        OID_SHA224 => Some(CbtHash::Sha224),
+        OID_SHA384 => Some(CbtHash::Sha384),
+        OID_SHA512 => Some(CbtHash::Sha512),
+        _ => None,
+    }
+}
+
 /// Compute the 16-byte NTLM Channel Binding Token (CBT) from a DER-encoded
 /// server certificate.
 ///
 /// Per RFC 5929 (`tls-server-end-point`) and MS-NLMP 2.2.2.2:
-/// 1. SHA-256 hash of the DER-encoded end-entity certificate
+/// 1. Hash the DER-encoded end-entity certificate with the hash of its
+///    signature algorithm (SHA-256 when that is MD5 or SHA-1), as pyspnego
+///    and pypsrp do
 /// 2. Prepend `tls-server-end-point:` prefix to get the application data
 /// 3. Build `SEC_CHANNEL_BINDINGS` structure with the application data
 /// 4. MD5 hash of the entire structure → 16 bytes for `AV_CHANNEL_BINDINGS`
-pub(crate) fn compute_channel_bindings(cert_der: &[u8]) -> [u8; 16] {
-    use sha2::{Digest as Sha2Digest, Sha256};
+///
+/// # Errors
+///
+/// [`NtlmError::InvalidMessage`](crate::error::NtlmError::InvalidMessage)
+/// when the certificate cannot be read or its signature algorithm defines
+/// no channel binding (no single hash, as Ed25519, or unknown): a caller
+/// must then not authenticate without channel binding.
+pub(crate) fn compute_channel_bindings(
+    cert_der: &[u8],
+) -> Result<[u8; 16], crate::error::NtlmError> {
+    Ok(channel_bindings_with(
+        required_cbt_hash(cert_der)?,
+        cert_der,
+    ))
+}
 
-    // Step 1: SHA-256 hash of the DER-encoded server certificate
-    let cert_hash = Sha256::digest(cert_der);
+/// [`cbt_hash`], or the error for a certificate without channel binding.
+fn required_cbt_hash(cert_der: &[u8]) -> Result<CbtHash, crate::error::NtlmError> {
+    cbt_hash(cert_der).ok_or_else(|| {
+        crate::error::NtlmError::InvalidMessage(
+            "server certificate: unreadable, or its signature algorithm defines no channel \
+             binding hash (RFC 5929)"
+                .into(),
+        )
+    })
+}
+
+/// The `tls-server-end-point` channel binding application data of a
+/// DER-encoded server certificate (RFC 5929 section 4): the prefix
+/// `tls-server-end-point:` and the certificate hash (steps 1 and 2 above).
+/// This is what a GSS-API mechanism (Kerberos) takes as the
+/// `application_data` of its channel bindings.
+///
+/// # Errors
+///
+/// As [`compute_channel_bindings`]: no channel binding is defined for the
+/// certificate.
+#[cfg(any(feature = "kerberos", test))]
+pub(crate) fn tls_server_end_point(cert_der: &[u8]) -> Result<Vec<u8>, crate::error::NtlmError> {
+    Ok(end_point_app_data(required_cbt_hash(cert_der)?, cert_der))
+}
+
+/// Steps 1 and 2: `tls-server-end-point:` and the certificate's hash.
+fn end_point_app_data(hash: CbtHash, cert_der: &[u8]) -> Vec<u8> {
+    use sha2::{Digest as Sha2Digest, Sha224, Sha256, Sha384, Sha512};
+
+    // Step 1: hash of the DER-encoded server certificate
+    let cert_hash: Vec<u8> = match hash {
+        CbtHash::Sha224 => Sha224::digest(cert_der).to_vec(),
+        CbtHash::Sha256 => Sha256::digest(cert_der).to_vec(),
+        CbtHash::Sha384 => Sha384::digest(cert_der).to_vec(),
+        CbtHash::Sha512 => Sha512::digest(cert_der).to_vec(),
+    };
 
     // Step 2: Build channel binding application data per RFC 5929 §4
     let mut app_data = b"tls-server-end-point:".to_vec();
     app_data.extend_from_slice(&cert_hash);
+    app_data
+}
+
+/// The CBT of `cert_der` hashed with `hash` (steps 1 to 4 above).
+fn channel_bindings_with(hash: CbtHash, cert_der: &[u8]) -> [u8; 16] {
+    let app_data = end_point_app_data(hash, cert_der);
 
     // Step 3: Build gss_channel_bindings_struct per RFC 2744 §3.11
     // Format (as used by SSPI/pyspnego, NOT the Windows SEC_CHANNEL_BINDINGS struct):
@@ -230,6 +410,7 @@ pub(crate) fn compute_channel_bindings(cert_der: &[u8]) -> [u8; 16] {
 /// drops, even after caller-side spills (compiler-confirmed at -O2 the
 /// previous version retained S-box bytes through callee-saved registers).
 #[derive(Zeroize, ZeroizeOnDrop)]
+#[cfg_attr(test, derive(Clone))]
 pub(crate) struct Rc4State {
     s: [u8; 256],
     i: u8,
@@ -467,25 +648,274 @@ mod tests {
         assert!(data.is_empty());
     }
 
-    #[test]
-    fn compute_channel_bindings_produces_16_bytes() {
-        let fake_cert = vec![0x30, 0x82, 0x01, 0x00]; // minimal DER
-        let result = compute_channel_bindings(&fake_cert);
-        assert_eq!(result.len(), 16);
+    // --- Channel binding token: hash per RFC 5929 section 4.1 ---
+
+    fn der(pem: &str) -> Vec<u8> {
+        use rustls::pki_types::CertificateDer;
+        use rustls::pki_types::pem::PemObject;
+        CertificateDer::from_pem_slice(pem.as_bytes())
+            .unwrap()
+            .to_vec()
     }
 
-    #[test]
-    fn compute_channel_bindings_deterministic() {
-        let cert = b"test certificate DER bytes";
-        let a = compute_channel_bindings(cert);
-        let b = compute_channel_bindings(cert);
-        assert_eq!(a, b);
+    fn hex16(s: &str) -> [u8; 16] {
+        let v: Vec<u8> = (0..32)
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect();
+        v.try_into().unwrap()
     }
 
+    /// The GSS-API application data is the RFC 5929 prefix and the
+    /// certificate hash (SHA-256 here, SHA-384 for a SHA-384 signature), the
+    /// input whose MD5 structure is the NTLM CBT.
     #[test]
-    fn compute_channel_bindings_different_certs_differ() {
-        let a = compute_channel_bindings(b"cert A");
-        let b = compute_channel_bindings(b"cert B");
-        assert_ne!(a, b);
+    fn tls_server_end_point_is_prefix_and_signature_hash() {
+        use crate::test_pki as pki;
+        use sha2::{Digest as _, Sha256, Sha384};
+        let rsa = der(pki::RSA_CERT_PEM);
+        let mut expected = b"tls-server-end-point:".to_vec();
+        expected.extend_from_slice(&Sha256::digest(&rsa));
+        assert_eq!(tls_server_end_point(&rsa).unwrap(), expected);
+        let ec384 = der(pki::CBT_EC384_SHA384_PEM);
+        let mut expected = b"tls-server-end-point:".to_vec();
+        expected.extend_from_slice(&Sha384::digest(&ec384));
+        assert_eq!(tls_server_end_point(&ec384).unwrap(), expected);
+        assert!(tls_server_end_point(b"not a certificate").is_err());
+    }
+
+    /// Each fixture's CBT, as computed independently with Python
+    /// `cryptography` the way pypsrp does (see `test_pki.rs`).
+    #[test]
+    fn channel_bindings_use_the_signature_hash_per_rfc_5929() {
+        use crate::test_pki as pki;
+        for (name, pem, expected) in [
+            (
+                "ECDSA-SHA256",
+                pki::EC_CERT_PEM,
+                "1ea02a8607f9c9dab4fb259fe19a9e1b",
+            ),
+            (
+                "RSA-SHA256",
+                pki::RSA_CERT_PEM,
+                "1ed62bed97bb3daa4f28ccd5855aa77e",
+            ),
+            (
+                "ECDSA-SHA384",
+                pki::CBT_EC384_SHA384_PEM,
+                "a03a8a5e832a0781aadfd8523eb9c464",
+            ),
+            (
+                "ECDSA-SHA512",
+                pki::CBT_EC_SHA512_PEM,
+                "3dd7f3ae62ed943576eb35ef65f8b845",
+            ),
+            (
+                "RSA-SHA384",
+                pki::CBT_RSA_SHA384_PEM,
+                "2fe1a11a9763725cb3a5c4541f93d3cf",
+            ),
+            (
+                "RSA-SHA512",
+                pki::CBT_RSA_SHA512_PEM,
+                "629ccec8aa45ef0fe94b857914469b4d",
+            ),
+            (
+                "RSA-PSS-SHA384",
+                pki::CBT_RSA_PSS_SHA384_PEM,
+                "7b91ec7df99b7058719ef5d1d52c6e82",
+            ),
+            (
+                "RSA-SHA1 -> SHA-256",
+                pki::CBT_RSA_SHA1_PEM,
+                "fc13ccb20f231bc99f6bac420a2f41a2",
+            ),
+            (
+                "ECDSA-SHA1 -> SHA-256",
+                pki::CBT_EC_SHA1_PEM,
+                "c9ba9706ba5936c60283a754de02e64d",
+            ),
+            (
+                "RSA-MD5 -> SHA-256",
+                pki::CBT_RSA_MD5_PEM,
+                "ff00a2997e118bd141a54ec4b2b28f26",
+            ),
+            (
+                "RSA-SHA224",
+                pki::CBT_RSA_SHA224_PEM,
+                "414e78b8c5f88a2627d804ccfa9332d0",
+            ),
+            (
+                "ECDSA-SHA224",
+                pki::CBT_EC_SHA224_PEM,
+                "baba6260e2f3484efd86958736280cfc",
+            ),
+            (
+                "RSA-PSS-SHA256",
+                pki::CBT_RSA_PSS_SHA256_PEM,
+                "739167377b357db9fd117d08f8f9623c",
+            ),
+            (
+                "RSA-PSS-SHA512",
+                pki::CBT_RSA_PSS_SHA512_PEM,
+                "aa551ba67e2b7202137b1f35f8520adf",
+            ),
+            (
+                "RSA-PSS default parameters (SHA-1) -> SHA-256",
+                pki::CBT_RSA_PSS_DEFAULTS_PEM,
+                "95189c71c3d2a8c647bee27253c5debd",
+            ),
+            (
+                "RSA-PSS parameters absent (defaults) -> SHA-256",
+                pki::CBT_RSA_PSS_ABSENT_PEM,
+                "6a5d42ef169390590c8acf5e8107da5d",
+            ),
+        ] {
+            assert_eq!(
+                compute_channel_bindings(&der(pem)).ok(),
+                Some(hex16(expected)),
+                "{name}"
+            );
+        }
+    }
+
+    /// A signature algorithm with no single hash (Ed25519) or an unknown
+    /// one has no defined channel binding: refused, not guessed.
+    #[test]
+    fn channel_bindings_refuse_an_algorithm_without_a_hash() {
+        let err = compute_channel_bindings(&der(crate::test_pki::CBT_ED25519_PEM)).unwrap_err();
+        assert!(err.to_string().contains("signature algorithm"), "{err}");
+    }
+
+    /// Bytes that are not a certificate are refused, not hashed.
+    #[test]
+    fn channel_bindings_refuse_a_non_certificate() {
+        for bad in [
+            &b""[..],
+            b"cert A",
+            &[0x30, 0x82, 0x01, 0x00],
+            &[0x30, 0x80, 0x00, 0x00],
+            &[0x30, 0x03, 0x30, 0x01, 0x00],
+        ] {
+            assert!(compute_channel_bindings(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// Every truncation of a real certificate is refused without panicking
+    /// (the reader is bounds-checked at each element).
+    #[test]
+    fn channel_bindings_refuse_every_truncated_certificate() {
+        let cert = der(crate::test_pki::CBT_RSA_PSS_SHA384_PEM);
+        for len in 0..cert.len() {
+            assert!(
+                compute_channel_bindings(&cert[..len]).is_err(),
+                "length {len}"
+            );
+        }
+        assert!(compute_channel_bindings(&cert).is_ok());
+    }
+
+    /// A minimal certificate-shaped DER: empty tbsCertificate, then a
+    /// signature AlgorithmIdentifier with `algorithm` as its content.
+    fn cert_with_algorithm(algorithm: &[u8]) -> Vec<u8> {
+        let mut alg = vec![0x30, u8::try_from(algorithm.len()).unwrap()];
+        alg.extend_from_slice(algorithm);
+        let mut body = vec![0x30, 0x00];
+        body.extend_from_slice(&alg);
+        body.extend_from_slice(&[0x03, 0x01, 0x00]);
+        let mut cert = vec![0x30, u8::try_from(body.len()).unwrap()];
+        cert.extend_from_slice(&body);
+        cert
+    }
+
+    fn pss_with(params: &[u8]) -> Vec<u8> {
+        let mut alg = vec![0x06, 0x09];
+        alg.extend_from_slice(OID_RSASSA_PSS);
+        alg.extend_from_slice(params);
+        cert_with_algorithm(&alg)
+    }
+
+    /// RSASSA-PSS parameters (RFC 4055, RFC 8017 A.2.3): absent parameters
+    /// and an omitted `hashAlgorithm` both mean SHA-1 (so SHA-256 here);
+    /// malformed parameters fail closed instead of defaulting.
+    #[test]
+    fn pss_parameters_default_or_fail_closed() {
+        let sha256_hash_alg = [
+            0xA0, 0x0D, 0x30, 0x0B, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02,
+            0x01,
+        ];
+        let mut explicit = vec![0x30, u8::try_from(sha256_hash_alg.len()).unwrap()];
+        explicit.extend_from_slice(&sha256_hash_alg);
+        let accepted: [(&str, Vec<u8>, CbtHash); 4] = [
+            ("absent", vec![], CbtHash::Sha256),
+            ("empty SEQUENCE", vec![0x30, 0x00], CbtHash::Sha256),
+            (
+                "saltLength only ([2])",
+                vec![0x30, 0x05, 0xA2, 0x03, 0x02, 0x01, 0x14],
+                CbtHash::Sha256,
+            ),
+            ("explicit SHA-256", explicit, CbtHash::Sha256),
+        ];
+        for (name, params, hash) in accepted {
+            assert_eq!(cbt_hash(&pss_with(&params)), Some(hash), "{name}");
+        }
+        let refused: [(&str, Vec<u8>); 6] = [
+            ("NULL instead of a SEQUENCE", vec![0x05, 0x00]),
+            (
+                "first field not [0]..[3]",
+                vec![0x30, 0x03, 0x04, 0x01, 0x00],
+            ),
+            ("truncated field", vec![0x30, 0x02, 0xA0, 0x05]),
+            (
+                "[0] without an AlgorithmIdentifier",
+                vec![0x30, 0x04, 0xA0, 0x02, 0x05, 0x00],
+            ),
+            (
+                "[0] with an unknown hash OID",
+                vec![0x30, 0x07, 0xA0, 0x05, 0x30, 0x03, 0x06, 0x01, 0x2A],
+            ),
+            ("data after the parameters", vec![0x30, 0x00, 0x05, 0x00]),
+        ];
+        for (name, params) in refused {
+            assert_eq!(cbt_hash(&pss_with(&params)), None, "{name}");
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(512))]
+
+        /// Mutations of a real certificate (a flipped byte, a cut, bytes
+        /// appended) never panic, and the result is an error or the CBT
+        /// under one of the four allowed hashes.
+        #[test]
+        fn mutated_certificates_give_an_error_or_an_allowed_cbt(
+            which in 0usize..4,
+            at in proptest::prelude::any::<proptest::sample::Index>(),
+            byte in proptest::prelude::any::<u8>(),
+            mode in 0u8..3,
+            tail in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64),
+        ) {
+            use crate::test_pki as pki;
+            let pem = [
+                pki::CBT_RSA_PSS_SHA384_PEM,
+                pki::CBT_EC384_SHA384_PEM,
+                pki::CBT_RSA_SHA512_PEM,
+                pki::CBT_RSA_PSS_ABSENT_PEM,
+            ][which];
+            let mut cert = der(pem);
+            match mode {
+                0 => {
+                    let i = at.index(cert.len());
+                    cert[i] ^= byte | 1;
+                }
+                1 => cert.truncate(at.index(cert.len())),
+                _ => cert.extend_from_slice(&tail),
+            }
+            if let Ok(cbt) = compute_channel_bindings(&cert) {
+                let allowed = [CbtHash::Sha224, CbtHash::Sha256, CbtHash::Sha384, CbtHash::Sha512]
+                    .map(|h| channel_bindings_with(h, &cert));
+                proptest::prop_assert!(allowed.contains(&cbt));
+            }
+        }
     }
 }

@@ -77,7 +77,6 @@ use crate::error::WinrmError;
 use crate::ntlm;
 #[cfg(feature = "credssp")]
 use crate::ntlm::NtlmSession;
-use crate::tls::CertHandle;
 
 /// CredSSP protocol version (v6 = modern Windows 10+).
 #[cfg(feature = "credssp")]
@@ -240,11 +239,12 @@ fn build_inner_openssl_tls() -> Result<OpenSslMemTls, WinrmError> {
     // (MS-CSSP §3.1.5.1): the client computes a hash over the server's
     // SubjectPublicKeyInfo + a nonce, the NTLM session seals it, and
     // the server is expected to echo the symmetric counter-hash. The
-    // pubKeyAuth check is performed at line ~795 below; if it fails we
-    // abort with `CredSspError::PublicKeyMismatch`. So an X.509 chain
-    // check on this leg would be redundant — and crucially, the
-    // outer/transport leg already validates the chain (see
-    // CredSspConnection::connect / transport.rs CertCapturingVerifier).
+    // pubKeyAuth check is performed after the NTLM exchange (see the
+    // `expected_server_hash` comparison in `CredSspConnection`'s
+    // handshake); if it fails we abort with
+    // `CredSspError::PublicKeyMismatch`. So an X.509 chain check on this
+    // leg would be redundant — and crucially, the outer/transport leg
+    // already validates the chain (see `CredSspConnection::connect`).
     builder.set_verify(SslVerifyMode::NONE);
     // Force TLS 1.2 to match what Microsoft CredSSP server expects.
     builder
@@ -295,6 +295,8 @@ struct CredSspConnection {
     host: String,
     port: u16,
     path: String,
+    /// Largest response body accepted (see `transport::max_response_bytes`).
+    max_response_bytes: usize,
 }
 
 #[cfg(feature = "credssp")]
@@ -310,6 +312,7 @@ impl CredSspConnection {
         port: u16,
         path: &str,
         accept_invalid_certs: bool,
+        max_response_bytes: usize,
     ) -> Result<Self, WinrmError> {
         use tokio::net::TcpStream;
         use tokio_rustls::TlsConnector;
@@ -371,6 +374,7 @@ impl CredSspConnection {
             host: host.to_string(),
             port,
             path: path.to_string(),
+            max_response_bytes,
         })
     }
 
@@ -452,7 +456,10 @@ impl CredSspConnection {
             .nth(1)
             .and_then(|s| s.parse().ok())
             .ok_or_else(|| {
-                WinrmError::AuthFailed(format!("CredSSP: bad status line: {status_line}"))
+                WinrmError::AuthFailed(format!(
+                    "CredSSP: bad status line: {}",
+                    crate::auth::excerpt(status_line)
+                ))
             })?;
 
         let mut headers: std::collections::HashMap<String, String> =
@@ -480,6 +487,9 @@ impl CredSspConnection {
             .get("content-length")
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
+        if content_length > self.max_response_bytes {
+            return Err(crate::auth::body_too_large(self.max_response_bytes));
+        }
         let mut body_bytes: Vec<u8> = buf[head_end..].to_vec();
         while body_bytes.len() < content_length {
             let mut chunk = [0u8; 4096];
@@ -519,9 +529,17 @@ fn header_get<'a>(
 /// "CredSSP <b64>" possibly mixed with other schemes).
 #[cfg(feature = "credssp")]
 fn extract_credssp_token_str(www_auth: &str) -> Option<String> {
-    let upper = www_auth.to_uppercase();
-    let pos = upper.find("CREDSSP ")?;
-    let after = &www_auth[pos + "CREDSSP ".len()..];
+    // ASCII-only case folding keeps every byte offset of `www_auth` valid:
+    // `to_uppercase` can change the byte length of non-ASCII characters
+    // (`ɐ` is 2 bytes, `Ɐ` is 3), so its offsets would slice the original
+    // off a character boundary and panic.
+    const SCHEME: &[u8] = b"CREDSSP ";
+    let pos = www_auth
+        .as_bytes()
+        .windows(SCHEME.len())
+        .position(|w| w.eq_ignore_ascii_case(SCHEME))?;
+    // `pos + SCHEME.len()` follows an ASCII space, so it is a char boundary.
+    let after = www_auth.get(pos + SCHEME.len()..)?;
     let token: String = after
         .chars()
         .take_while(|c| !c.is_whitespace() && *c != ',')
@@ -560,11 +578,12 @@ pub(crate) struct CredSspAuth {
     pub(crate) username: String,
     pub(crate) password: Zeroizing<String>,
     pub(crate) domain: String,
-    pub(crate) cert_handle: Option<CertHandle>,
     /// Mirrors `WinrmConfig.accept_invalid_certs`. When true, the outer TLS
     /// channel skips chain validation. Inner TLS authentication relies on
     /// pubKeyAuth regardless (MS-CSSP §3.1.5.1).
     pub(crate) accept_invalid_certs: bool,
+    /// Largest response body read (see `transport::max_response_bytes`).
+    pub(crate) max_response_bytes: usize,
 }
 
 #[cfg(feature = "credssp")]
@@ -580,8 +599,14 @@ impl AuthTransport for CredSspAuth {
         // reqwest entirely and drive raw HTTP/1.1 over a single tokio_rustls
         // TlsStream. See CredSspConnection above.
         let (host, port, path) = parse_url(url)?;
-        let mut conn =
-            CredSspConnection::connect(&host, port, &path, self.accept_invalid_certs).await?;
+        let mut conn = CredSspConnection::connect(
+            &host,
+            port,
+            &path,
+            self.accept_invalid_certs,
+            self.max_response_bytes,
+        )
+        .await?;
 
         // Pywinrm sends the SOAP body in every CredSSP round (which is what
         // Microsoft HTTPAPI on the WSMAN listener expects). The same body is
@@ -890,10 +915,13 @@ impl AuthTransport for CredSspAuth {
             ));
         }
         if !(200..300).contains(&status) {
-            let body_text = String::from_utf8_lossy(&resp_body).into_owned();
-            return Err(WinrmError::AuthFailed(format!(
-                "CredSSP HTTP {status}: {body_text}"
-            )));
+            let body_text = String::from_utf8_lossy(&resp_body);
+            return Err(crate::auth::error_for_status(status, &body_text, || {
+                format!(
+                    "CredSSP HTTP {status}: {}",
+                    crate::auth::excerpt(&body_text)
+                )
+            }));
         }
         Ok(String::from_utf8_lossy(&resp_body).into_owned())
     }
@@ -1049,6 +1077,21 @@ mod tests {
             extract_credssp_token_str("Negotiate, credssp ABCDEF, Basic"),
             Some("ABCDEF".to_string())
         );
+    }
+
+    /// A non-ASCII character whose uppercase form is longer in UTF-8
+    /// (`ɐ` → `Ɐ`) before the scheme must neither panic nor shift the cut.
+    #[test]
+    fn extract_credssp_token_str_survives_non_ascii_before_the_scheme() {
+        assert_eq!(
+            extract_credssp_token_str("ɐ CredSSP éé"),
+            Some("éé".to_string())
+        );
+        assert_eq!(
+            extract_credssp_token_str("ɐɐɐɐ, CredSSP QUJD, Basic"),
+            Some("QUJD".to_string())
+        );
+        assert_eq!(extract_credssp_token_str("ɐ ẞ ſ"), None);
     }
 
     #[test]

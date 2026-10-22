@@ -9,7 +9,11 @@ use secrecy::SecretString;
 /// Controls the transport (HTTP vs HTTPS), timeouts, and authentication
 /// method. Use [`Default::default()`] for sensible defaults (HTTP on port
 /// 5985, NTLM auth, 30 s connect / 60 s operation timeouts).
-#[derive(Debug, Clone)]
+///
+/// Its `Debug` output lists every field but redacts the userinfo of
+/// [`proxy`](Self::proxy) (`http://<redacted>@proxy:8080`) and shows only the
+/// names of [`env_vars`](Self::env_vars), so it can be logged.
+#[derive(Clone)]
 pub struct WinrmConfig {
     /// TCP port of the WinRM listener (default: 5985 for HTTP, 5986 for HTTPS).
     pub port: u16,
@@ -29,9 +33,20 @@ pub struct WinrmConfig {
     pub accept_invalid_certs: bool,
     /// TCP connect timeout in seconds (default: 30).
     pub connect_timeout_secs: u64,
-    /// WS-Management `OperationTimeout` in seconds (default: 60). The HTTP
-    /// client timeout is set to this value plus 10 seconds to allow the server
-    /// to respond before the transport gives up.
+    /// WS-Management `OperationTimeout` in seconds (default: 60): how long the
+    /// server may hold one request. The HTTP client timeout is set to this
+    /// value plus 10 seconds to allow the server to respond before the
+    /// transport gives up.
+    ///
+    /// It bounds each Receive poll, not the command. A Receive that finds no
+    /// output within it comes back as an empty poll and polling goes on, so
+    /// `WinrmClient::run_command` and `run_powershell` wait for the command
+    /// however long it stays silent (no overall limit; use the
+    /// `*_with_timeout` variants, `WinrmClient::run_command_with_timeout` and
+    /// `run_powershell_with_timeout`, to bound them, or `*_with_cancel` to
+    /// stop them from elsewhere).
+    /// `Shell::run_command` additionally gives up after
+    /// `2 * operation_timeout_secs` in total.
     pub operation_timeout_secs: u64,
     /// Authentication method to use for all requests (default: [`AuthMethod::Ntlm`]).
     pub auth_method: AuthMethod,
@@ -40,24 +55,55 @@ pub struct WinrmConfig {
     /// Controls the `MaxEnvelopeSize` header sent in every WS-Management request.
     /// Increase this for hosts that return large responses.
     pub max_envelope_size: u32,
-    /// Maximum number of retries for transient HTTP errors (default: 0 = no retry).
+    /// Maximum number of retries for connection errors (default: 0 = no retry).
     ///
     /// Uses exponential backoff starting at 100 ms (100, 200, 400, ...).
-    /// Only `WinrmError::Http` errors trigger a retry; authentication and
-    /// SOAP faults are returned immediately.
+    /// Only a `WinrmError::Http` raised while connecting, before anything was
+    /// sent, triggers a retry, whatever the auth method: a request that went
+    /// out may have run on the server (a command, a stdin write, an upload
+    /// chunk), so a timeout, a reset or a dropped connection after sending is
+    /// returned, as are authentication errors and SOAP faults.
     pub max_retries: u32,
-    /// Path to client certificate PEM file (for `AuthMethod::Certificate`).
+    /// Path to the client certificate PEM file (for `AuthMethod::Certificate`).
+    ///
+    /// Holds one or more `CERTIFICATE` sections: the end-entity certificate
+    /// first, then any intermediates. Read when the client is built.
     pub client_cert_pem: Option<String>,
-    /// Path to client private key PEM file (for `AuthMethod::Certificate`).
+    /// Path to the client private key PEM file (for `AuthMethod::Certificate`).
+    ///
+    /// Accepted encodings: `PRIVATE KEY` (PKCS#8), `RSA PRIVATE KEY` (PKCS#1)
+    /// and `EC PRIVATE KEY` (SEC1), unencrypted. It must match the end-entity
+    /// certificate of [`client_cert_pem`](Self::client_cert_pem).
     pub client_key_pem: Option<String>,
     /// HTTP proxy URL (e.g. `"http://proxy:8080"`).
     ///
     /// When set, all WinRM HTTP(S) requests are routed through this proxy.
+    ///
+    /// Limitation with [`AuthMethod::Certificate`]: with an `https://` proxy,
+    /// `reqwest` uses the same TLS client configuration for the connection
+    /// to the proxy, so the client certificate may be presented to the proxy
+    /// if it requests one. `http://` (CONNECT) and SOCKS5 proxies only relay
+    /// bytes: TLS, and the certificate, stay end-to-end with the WinRM host.
+    /// The same applies to a proxy taken from the `HTTPS_PROXY` / `ALL_PROXY`
+    /// environment variables, which `reqwest` uses when this field is `None`.
+    ///
+    /// Kerberos over HTTPS pins the server certificate in the connection's
+    /// verifier and refuses a TLS handshake for any other server name than
+    /// the endpoint's, except an `https://` proxy's own: this one, else any
+    /// `https://` proxy named in `HTTPS_PROXY`, `https_proxy`, `ALL_PROXY` or
+    /// `all_proxy`. A proxy that `reqwest` takes from system settings (only
+    /// when a crate in the build enables its `system-proxy` feature: Windows
+    /// registry, macOS configuration) is refused with an error naming that
+    /// cause; set it here instead.
     pub proxy: Option<String>,
     /// Console output code page (default: 65001 = UTF-8).
     ///
     /// Controls the `WINRS_CODEPAGE` option in the shell creation envelope.
     /// Common values: 65001 (UTF-8), 437 (US), 850 (Western European).
+    ///
+    /// Stderr inside a PowerShell CLIXML document is decoded as UTF-8, so
+    /// with any other code page its non-ASCII characters come out mangled
+    /// (typically replaced by U+FFFD).
     pub codepage: u32,
     /// Initial working directory for the remote shell (default: `None`).
     ///
@@ -69,9 +115,11 @@ pub struct WinrmConfig {
     /// Each `(key, value)` pair is injected into the shell's environment
     /// at creation time via `<rsp:Environment>`.
     pub env_vars: Vec<(String, String)>,
-    /// Message encryption mode for NTLM (default: [`EncryptionMode::Auto`]).
+    /// Message encryption mode for NTLM and Kerberos (default:
+    /// [`EncryptionMode::Auto`]).
     ///
-    /// Controls whether NTLM sealing is applied to SOAP message bodies.
+    /// Controls whether SOAP message bodies are sealed (encrypted and signed)
+    /// with the NTLM session or the Kerberos context.
     pub encryption: EncryptionMode,
     /// Custom HTTP `User-Agent` header (default: `None` = `winrm-rs/<version>`).
     pub user_agent: Option<String>,
@@ -88,6 +136,9 @@ pub struct WinrmConfig {
     /// reached, the operation returns [`crate::error::WinrmError::Transfer`]
     /// and the shell is best-effort closed. Set to `None` to disable the
     /// cap (pre-1.1 behaviour).
+    ///
+    /// The cap counts bytes as received, before PowerShell CLIXML on stderr
+    /// is decoded, so it also bounds stderr still buffered by the decoder.
     pub max_output_bytes: Option<usize>,
 }
 
@@ -116,19 +167,139 @@ impl Default for WinrmConfig {
     }
 }
 
-/// Controls whether NTLM message encryption (sealing) is applied to SOAP bodies.
+impl std::fmt::Debug for WinrmConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Destructured so that a new field cannot be left out silently.
+        let Self {
+            port,
+            use_tls,
+            accept_invalid_certs,
+            connect_timeout_secs,
+            operation_timeout_secs,
+            auth_method,
+            max_envelope_size,
+            max_retries,
+            client_cert_pem,
+            client_key_pem,
+            proxy,
+            codepage,
+            working_directory,
+            env_vars,
+            encryption,
+            user_agent,
+            idle_timeout_secs,
+            max_output_bytes,
+        } = self;
+        let proxy = proxy.as_deref().map(crate::transport::redact_userinfo);
+        f.debug_struct("WinrmConfig")
+            .field("port", port)
+            .field("use_tls", use_tls)
+            .field("accept_invalid_certs", accept_invalid_certs)
+            .field("connect_timeout_secs", connect_timeout_secs)
+            .field("operation_timeout_secs", operation_timeout_secs)
+            .field("auth_method", auth_method)
+            .field("max_envelope_size", max_envelope_size)
+            .field("max_retries", max_retries)
+            .field("client_cert_pem", client_cert_pem)
+            .field("client_key_pem", client_key_pem)
+            .field("proxy", &proxy)
+            .field("codepage", codepage)
+            .field("working_directory", working_directory)
+            .field("env_vars", &EnvVarNames(env_vars))
+            .field("encryption", encryption)
+            .field("user_agent", user_agent)
+            .field("idle_timeout_secs", idle_timeout_secs)
+            .field("max_output_bytes", max_output_bytes)
+            .finish()
+    }
+}
+
+/// `env_vars` in [`WinrmConfig`]'s `Debug`: the names, each value replaced
+/// by `<redacted>`.
+struct EnvVarNames<'a>(&'a [(String, String)]);
+
+impl std::fmt::Debug for EnvVarNames<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map()
+            .entries(
+                self.0
+                    .iter()
+                    .map(|(name, _)| (name, format_args!("<redacted>"))),
+            )
+            .finish()
+    }
+}
+
+/// Controls whether message encryption (sealing) is applied to SOAP bodies
+/// ([`AuthMethod::Ntlm`] and [`AuthMethod::Kerberos`]; the other methods
+/// ignore it).
 ///
-/// When using HTTP (not HTTPS), NTLM sealing encrypts the SOAP body to prevent
-/// eavesdropping. When using HTTPS, the TLS layer provides encryption, making
-/// sealing redundant.
+/// When using HTTP (not HTTPS), sealing encrypts and signs each SOAP message
+/// to prevent eavesdropping and tampering (MS-WSMV 2.2.9.1): with the NTLM
+/// session (RC4, NTLM signatures), or with the Kerberos context (GSS-API wrap
+/// with confidentiality; only RFC 4121 "CFX" wrap tokens are accepted, so AES
+/// session keys: an RC4-only realm cannot seal and needs [`Self::Never`]).
+/// When using HTTPS, the TLS layer provides that, making sealing redundant.
+///
+/// When sealing applies, it applies to every SOAP body, failing closed: the
+/// authentication runs with empty request bodies (NTLM handshake; Kerberos
+/// AP-REQ, whose answer must carry the server's AP-REP), each request is
+/// sealed on the connection the server bound the session to, and the answer
+/// must unseal (a sealed SOAP fault is reported as such). NTLM refuses a
+/// replayed answer by its sequence number. WinRM's Kerberos answers all carry
+/// sequence number 0 and no replay or sequence detection is negotiated, so
+/// the Kerberos session detects no replay: a Kerberos answer must instead
+/// name its request's `MessageID` in `RelatesTo` (a request without one is
+/// not sent), and a sealed request replayed by an active attacker on the
+/// same authenticated connection is not detected. No request body is ever sent
+/// unsealed, and the client sends each request once: any failure, an HTTP
+/// 401 included, is returned as an error and the connection discarded. (A
+/// 401 on a reused connection usually means the server closed it, but on
+/// plain HTTP an attacker can also forward the sealed request to the server,
+/// let it run, and answer 401 itself, so a resend could run it twice.)
+///
+/// NTLM and Kerberos bind their session to one TCP connection: a forwarding
+/// (not tunnelling) HTTP proxy that does not keep one server connection per client
+/// connection breaks that binding, and sealed requests then fail with errors
+/// rather than going out unsealed.
+///
+/// Sealing protects the messages of this client. Server side, integrity on
+/// plain HTTP against an active network attacker also needs the server to
+/// refuse unencrypted messages (`AllowUnencrypted = false`), for NTLM as for
+/// Kerberos: a server that allows them runs unprotected requests (from a
+/// client with [`Self::Never`], or Basic).
+///
+/// On a Windows client, Kerberos sealing goes through the SSPI branch of
+/// `cross-krb5`, which the `kerberos-windows` CI job builds and lints and
+/// which has not been tested against a server: with the `kerberos` feature,
+/// [`Self::Auto`] now seals Kerberos over HTTP, and [`Self::Never`] is the
+/// way back if that fails.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub enum EncryptionMode {
-    /// Encrypt when using HTTP, skip when using HTTPS (default).
+    /// Seal every SOAP body over HTTP; over HTTPS rely on TLS and send them
+    /// unsealed (default).
     #[default]
     Auto,
-    /// Always encrypt SOAP bodies, even over HTTPS.
+    /// Seal every SOAP body, over HTTPS too (inside TLS).
+    ///
+    /// **Only NTLM and Kerberos can seal.** With Basic, Certificate or
+    /// CredSSP this setting protects nothing: for those methods the only
+    /// protection is TLS (HTTPS), and Basic over plain HTTP stays in
+    /// plaintext.
+    ///
+    /// NTLM and Kerberos only. With [`AuthMethod::Basic`],
+    /// [`AuthMethod::Certificate`] or [`AuthMethod::CredSsp`] it changes
+    /// nothing and refuses nothing: those methods never seal, so Basic over
+    /// plain HTTP still sends the credentials and every SOAP body in
+    /// plaintext. The client logs a WARN at construction in that case (and
+    /// one for any Basic over plain HTTP). Certificate and CredSSP require
+    /// HTTPS, whose TLS protects the bodies.
     Always,
-    /// Never encrypt SOAP bodies. **Use only for debugging.**
+    /// Never seal: over HTTP, SOAP bodies (commands, their output, file
+    /// contents) cross the network in plaintext, and the server must allow
+    /// unencrypted traffic (`AllowUnencrypted`; Windows answers otherwise
+    /// with an HTTP 500 and an empty body, reported as such for Kerberos).
+    /// **Use only for debugging.**
     Never,
 }
 
@@ -138,26 +309,78 @@ pub enum AuthMethod {
     /// HTTP Basic authentication. Credentials are sent as a base64-encoded
     /// `Authorization` header on every request. Only safe over HTTPS.
     Basic,
-    /// NTLMv2 challenge/response authentication (default). Performs a three-step
-    /// handshake (negotiate, challenge, authenticate) per request.
+    /// NTLMv2 challenge/response authentication (default). When requests are
+    /// sealed (see [`EncryptionMode`]), the three-step handshake (negotiate,
+    /// challenge, authenticate) runs once per connection and later requests on
+    /// that connection reuse its session; otherwise it runs for every request.
     Ntlm,
     /// Kerberos authentication (requires `kerberos` feature and prior `kinit`).
     ///
-    /// Uses SPNEGO Negotiate tokens via the system Kerberos library.
-    /// The service principal is derived as `HTTP/<hostname>`.
+    /// Sends raw Kerberos GSS-API tokens (mechanism krb5, RFC 4121; not
+    /// SPNEGO-wrapped) under the `Negotiate` HTTP scheme, via the system
+    /// Kerberos library (`cross-krb5`). The service principal is derived as
+    /// `HTTP/<hostname>` from the host string, so connect by name, not by
+    /// address. Credentials come from the ticket cache (`kinit`), not from
+    /// [`WinrmCredentials`].
+    ///
+    /// What it guarantees: authentication of the client and, through the
+    /// server's AP-REP, of the server (mutual authentication). Message
+    /// confidentiality and integrity come from HTTPS, or from Kerberos
+    /// sealing ([`EncryptionMode::Auto`] over HTTP, or
+    /// [`EncryptionMode::Always`]). Both run on dedicated connections
+    /// authenticated once, and require the AP-REP. Over HTTPS the AP-REQ
+    /// carries a channel binding (RFC 5929 `tls-server-end-point`) computed
+    /// for the certificate learnt on an unauthenticated probe request; that
+    /// certificate is then pinned in the connection's own verifier, so the
+    /// connection that carries the AP-REQ, and every later one, presents that
+    /// same certificate or fails at its TLS handshake before any HTTP byte is
+    /// written (validated against `CbtHardeningLevel = Relaxed` and
+    /// `Strict`). The pin applies to the server name `reqwest` uses, the host
+    /// of the parsed endpoint URL; once pinned, a handshake for another name
+    /// is refused (the `https://` proxy's own leg aside), and a host that is
+    /// no valid TLS server name is refused before the AP-REQ. With
+    /// `accept_invalid_certs`, binding and pin are what keep an attacker in
+    /// the middle from using the authentication on the real server; a
+    /// certificate whose signature algorithm defines no binding
+    /// hash (Ed25519, unknown) is refused. With [`EncryptionMode::Never`] over
+    /// HTTP, each request authenticates with a fresh context, the AP-REP is
+    /// checked only when the answer carries one, and body and answer cross the
+    /// network in plaintext, unprotected. See [`EncryptionMode`] for the
+    /// replay limit of Kerberos sealing and the Windows-client caveat.
     Kerberos,
-    /// TLS client certificate authentication.
+    /// TLS client certificate authentication. Requires HTTPS (`use_tls = true`).
     ///
-    /// The `reqwest::Client` is configured with the client cert at construction
-    /// time. No `Authorization` header is sent; the TLS handshake authenticates.
+    /// The certificate chain and key from `client_cert_pem` / `client_key_pem`
+    /// are presented in the TLS handshake, and every request carries
+    /// `Authorization: http://schemas.dmtf.org/wbem/wsman/1/wsman/secprofile/https/mutual`
+    /// (MS-WSMV), which tells WinRM to authenticate with that certificate. The
+    /// server must trust the issuing CA and map the certificate to a local
+    /// account (`WSMan:\localhost\ClientCertificate`). Building the client
+    /// fails with [`WinrmError::AuthFailed`](crate::WinrmError::AuthFailed)
+    /// when `use_tls` is `false` (no TLS handshake to present the certificate
+    /// in), and when a file is missing, not a regular file, over 1 MiB, holds
+    /// no certificate or no key, holds an encrypted key (unencrypted keys
+    /// only), or holds a key that does not match the certificate.
+    ///
+    /// Like credentials, the certificate belongs to the client: the same one
+    /// is presented to every host passed to the client's methods. See
+    /// [`WinrmConfig::proxy`] for `https://` proxies.
     Certificate,
-    /// CredSSP authentication for double-hop credential delegation.
+    /// CredSSP authentication for double-hop credential delegation (MS-CSSP).
     ///
-    /// Wraps NTLM or Kerberos inside a TLS channel, allowing credentials
-    /// to be delegated to the remote host for accessing network resources.
-    /// Requires HTTPS (`use_tls = true`).
+    /// Wraps NTLM inside a TLS channel, allowing credentials to be delegated
+    /// to the remote host for accessing network resources. Requires the
+    /// `credssp` cargo feature and HTTPS (`use_tls = true`): building the
+    /// client with `use_tls = false`, or sending a request without the
+    /// feature, fails with
+    /// [`WinrmError::AuthFailed`](crate::WinrmError::AuthFailed).
     ///
-    /// **Not yet implemented** — will return an error at runtime.
+    /// Validated live against Windows Server 2025 (`credssp_run_command_whoami`
+    /// in `tests/integration_real.rs`). Not validated on Windows Server 2012 R2:
+    /// its SCHANNEL pairs AES-GCM only with static-RSA key exchange, which
+    /// `rustls` does not support, so the HTTPS leg shares no cipher suite with
+    /// a default 2012 R2 listener and the live test skips there (it was not
+    /// measured on 2012 R2 in the latest validation round either).
     CredSsp,
 }
 
@@ -259,6 +482,50 @@ mod tests {
         assert_eq!(creds.username, "admin");
         assert_eq!(creds.password.expose_secret(), "s3cret");
         assert_eq!(creds.domain, "DOMAIN");
+    }
+
+    /// `Debug` keeps every field visible but not the proxy password nor the
+    /// environment variable values.
+    #[test]
+    fn config_debug_redacts_proxy_userinfo_and_env_values() {
+        let config = WinrmConfig {
+            proxy: Some("http://proxyuser:proxy-secret@proxy.corp:8080".into()),
+            env_vars: vec![("API_TOKEN".into(), "env-secret".into())],
+            ..Default::default()
+        };
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("proxy-secret"), "{debug}");
+        assert!(!debug.contains("proxyuser"), "{debug}");
+        assert!(!debug.contains("env-secret"), "{debug}");
+        assert!(
+            debug.contains("http://<redacted>@proxy.corp:8080"),
+            "{debug}"
+        );
+        assert!(debug.contains("\"API_TOKEN\": <redacted>"), "{debug}");
+        for field in [
+            "port",
+            "use_tls",
+            "accept_invalid_certs",
+            "connect_timeout_secs",
+            "operation_timeout_secs",
+            "auth_method",
+            "max_envelope_size",
+            "max_retries",
+            "client_cert_pem",
+            "client_key_pem",
+            "proxy",
+            "codepage",
+            "working_directory",
+            "env_vars",
+            "encryption",
+            "user_agent",
+            "idle_timeout_secs",
+            "max_output_bytes",
+        ] {
+            assert!(debug.contains(&format!("{field}: ")), "{field} in {debug}");
+        }
+        let plain = format!("{:?}", WinrmConfig::default());
+        assert!(plain.contains("proxy: None"), "{plain}");
     }
 
     #[test]

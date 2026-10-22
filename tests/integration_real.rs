@@ -10,21 +10,54 @@
 //! cargo test --test integration_real -- --ignored
 //! ```
 //!
-//! With the ferrum.windows Vagrant VM:
+//! With the Hyper-V bench VM (`tests/vagrant/2025/Vagrantfile`), the helper
+//! script starts it if needed and prints those variables:
 //! ```bash
-//! vagrant.exe up --provider=hyperv
-//! export WINRM_TEST_HOST=$(just vm-ip)
-//! export WINRM_TEST_USER=vagrant
-//! export WINRM_TEST_PASS=vagrant
+//! eval "$(tests/scripts/vm-connect.sh 2>/dev/null | tr -d '\r')"
 //! cargo test --test integration_real -- --ignored
 //! ```
+//! (`tests/scripts/vm-connect-2012r2.sh` does the same for the Server 2012 R2
+//! bench.)
+//!
+//! The certificate tests (`certificate_auth_*`,
+//! `silent_command_completes_over_certificate_auth`) also need
+//! `eval "$(tests/scripts/make-client-cert.sh)"`; without it they panic by
+//! design instead of passing vacuously. A full run therefore needs both
+//! `eval "$(tests/scripts/vm-connect.sh 2>/dev/null | tr -d '\r')"` (bench
+//! variables) and that one, and `--features credssp,__internal` adds the
+//! CredSSP tests.
+//!
+//! The Kerberos tests (`kerberos_*`, `silent_command_completes_over_kerberos`,
+//! `--features kerberos`) target a separate domain controller bench instead
+//! and, like the certificate tests, panic by design without its `eval`: see
+//! the "Kerberos" section at the end of this file.
+//!
+//! BENCH ONLY: the `setup_*` and `enable_*` tests change the host's
+//! configuration (HTTPS listener, CredSSP, CBT hardening, a trusted root CA
+//! and a certificate mapping) and do not undo it. Never point
+//! `WINRM_TEST_HOST` at a real machine.
+//!
+//! A few tests run with a short `operation_timeout_secs` (15 s) to exercise
+//! the Receive timeout path. Under a busy bench, a request sent with such a
+//! window (for instance shell creation while dozens of other tests hit the
+//! same host) can exceed it and fail with a `TimedOut` fault. The tests that
+//! create the shell or start the command inside that window
+//! (`shell_run_command_times_out` and the silent-command tests) retry such a
+//! failure a few times and report every one if they never get a verdict; they
+//! are still most reliable with `-- --ignored --test-threads=1`.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use winrm_rs::{
     AuthMethod, CancellationToken, EncryptionMode, WinrmClient, WinrmConfig, WinrmCredentials,
+    WinrmError,
 };
 
 fn test_client() -> Option<(WinrmClient, String)> {
+    test_client_with(|_| {})
+}
+
+/// Same as [`test_client`], with a last-minute tweak applied to the config.
+fn test_client_with(tweak: impl FnOnce(&mut WinrmConfig)) -> Option<(WinrmClient, String)> {
     let host = std::env::var("WINRM_TEST_HOST").ok()?;
     let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
     let pass = std::env::var("WINRM_TEST_PASS").ok()?;
@@ -33,13 +66,41 @@ fn test_client() -> Option<(WinrmClient, String)> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(5985);
 
-    let config = WinrmConfig {
+    let mut config = WinrmConfig {
         auth_method: AuthMethod::Basic,
         port,
         ..Default::default()
     };
+    tweak(&mut config);
     let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).ok()?;
     Some((client, host))
+}
+
+/// Number of open shells created with the given `IdleTimeOut`, as seen by
+/// WS-Management.
+///
+/// A distinctive idle timeout marks the shells a test owns (the server reports
+/// it back as `PT<n>.000S`), so shells opened or reaped concurrently by other
+/// tests do not move the count. Call it with a client that does not carry the
+/// marker, so the probe's own shell is not counted.
+async fn open_shell_count_with_idle_timeout(
+    client: &WinrmClient,
+    host: &str,
+    idle_secs: u64,
+) -> usize {
+    let script = format!(
+        "@(Get-WSManInstance -ResourceURI shell -Enumerate -ErrorAction SilentlyContinue | \
+         Where-Object {{ $_.IdleTimeOut -eq 'PT{idle_secs}.000S' }}).Count"
+    );
+    let out = client
+        .run_powershell(host, &script)
+        .await
+        .expect("count open shells");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    stdout
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("open_shell_count: cannot parse stdout {stdout:?}"))
 }
 
 /// Windows Server 2012 R2 reports OS version `6.3.x`.
@@ -440,6 +501,443 @@ async fn powershell_stderr_clixml_parsed() {
     );
 }
 
+/// Large stderr comes back as the `#< CLIXML` marker alone in one Receive
+/// response, then the document cut mid-tag across the next ones (seen on
+/// Server 2025 at ~300 KiB). Warnings and XML entities must survive too.
+const LARGE_CLIXML_SCRIPT: &str = "Write-Warning 'careful now'; \
+     1..400 | % { Write-Error ('bulk-' + ('x' * 200) + $_) }; \
+     Write-Error 'tail 2>$null <done>'";
+
+fn assert_large_clixml_decoded(stderr: &[u8]) {
+    let stderr = String::from_utf8_lossy(stderr);
+    assert!(
+        stderr.starts_with("WARNING: careful now\r\n"),
+        "warning record lost: {}",
+        stderr.chars().take(200).collect::<String>()
+    );
+    // Each error also echoes the script line, which holds `'bulk-'` but
+    // never `bulk-x`.
+    assert_eq!(stderr.matches("bulk-x").count(), 400, "error records lost");
+    // PowerShell wraps error text at the console width, so check the
+    // entity-bearing pieces separately.
+    assert!(
+        stderr.contains("tail 2>$null") && stderr.contains("<done>"),
+        "XML entities not decoded"
+    );
+    for raw in ["#< CLIXML", "<Objs", "<S S=", "_x000D_", "&gt;"] {
+        assert!(!stderr.contains(raw), "raw CLIXML leaked: {raw}");
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn powershell_large_clixml_stderr_reassembled() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let output = client
+        .run_powershell(&host, LARGE_CLIXML_SCRIPT)
+        .await
+        .expect("run large stderr script");
+    assert_large_clixml_decoded(&output.stderr);
+}
+
+#[tokio::test]
+#[ignore]
+async fn streaming_large_clixml_stderr_reassembled() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let shell = client.open_shell(&host).await.expect("open shell");
+    let encoded = winrm_rs::encode_powershell_command(LARGE_CLIXML_SCRIPT);
+    let cmd_id = shell
+        .start_command("powershell.exe", &["-EncodedCommand", &encoded])
+        .await
+        .expect("start command");
+    let mut stderr = Vec::new();
+    loop {
+        let chunk = shell.receive_next(&cmd_id).await.expect("receive");
+        stderr.extend(chunk.stderr);
+        if chunk.done {
+            break;
+        }
+    }
+    shell.close().await.ok();
+    assert_large_clixml_decoded(&stderr);
+}
+
+/// powershell.exe keeps one `<Objs>` document open until it exits, and
+/// buffers its stderr: measured on Server 2025, a few errors stay in that
+/// buffer until exit (only the `#< CLIXML` marker comes early), while a
+/// burst past it (~6 KiB) is flushed at once. Records flushed early must
+/// reach a `receive_next` caller right away, not when the document closes:
+/// the burst is written ~10 s before the last error, so its first record must
+/// arrive on a poll that is neither `done` nor already holding the last one.
+#[tokio::test]
+#[ignore]
+async fn streaming_clixml_stderr_yields_records_before_exit() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let shell = client.open_shell(&host).await.expect("open shell");
+    let encoded = winrm_rs::encode_powershell_command(
+        "1..20 | % { Write-Error ('burst-' + ('x' * 100) + $_) }; \
+         Start-Sleep -Seconds 10; Write-Error ('stream-' + 'last')",
+    );
+    let cmd_id = shell
+        .start_command("powershell.exe", &["-EncodedCommand", &encoded])
+        .await
+        .expect("start command");
+    let started = Instant::now();
+    let mut stderr = Vec::new();
+    let mut first_seen: Option<(Duration, bool, bool)> = None;
+    loop {
+        let chunk = shell.receive_next(&cmd_id).await.expect("receive");
+        stderr.extend(chunk.stderr);
+        let text = String::from_utf8_lossy(&stderr);
+        // The error text echoes the script line, which holds `'burst-'` and
+        // `'stream-'` but never `burst-x` or `stream-last`.
+        if first_seen.is_none() && text.contains("burst-x") {
+            first_seen = Some((started.elapsed(), chunk.done, text.contains("stream-last")));
+        }
+        if chunk.done {
+            break;
+        }
+    }
+    let total = started.elapsed();
+    shell.close().await.ok();
+    let text = String::from_utf8_lossy(&stderr);
+    let (at, done, with_last) = first_seen.expect("burst never decoded");
+    eprintln!("first record after {at:?}, command done after {total:?}");
+    assert!(
+        !done && !with_last,
+        "first record only arrived with the command's end ({at:?} of {total:?})"
+    );
+    assert!(
+        total.saturating_sub(at) >= Duration::from_secs(5),
+        "first record arrived {at:?} into a {total:?} run: not ahead of the sleep"
+    );
+    assert_eq!(text.matches("burst-x").count(), 20, "records lost: {text}");
+    assert!(text.contains("stream-last"), "last error lost: {text}");
+    for raw in ["#< CLIXML", "<Objs", "<S S=", "_x000D_"] {
+        assert!(!text.contains(raw), "raw CLIXML leaked: {raw}");
+    }
+}
+
+// === Output cap ===
+
+/// Hitting `max_output_bytes` aborts the call with `Transfer`, and the shell
+/// the call opened must not stay behind on the server.
+///
+/// Only shells carrying this test's own `IdleTimeOut` are counted, so the
+/// strict `after == before == 0` check holds even while other live tests open
+/// and close shells in the same process or the server reaps old ones.
+#[tokio::test]
+#[ignore]
+async fn max_output_bytes_aborts_and_releases_shell() {
+    // Unique per process, below the server's 7200 s default ceiling.
+    let marker = 4000 + u64::from(std::process::id() % 3000);
+    let (client, host) = test_client_with(|c| {
+        c.max_output_bytes = Some(64 * 1024);
+        c.idle_timeout_secs = Some(marker);
+    })
+    .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    // Unmarked client for the probes.
+    let (counter, _) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+
+    // Positive control: a marked shell must be seen, otherwise a failed
+    // enumeration would read as 0 and the test would pass vacuously.
+    let control = client.open_shell(&host).await.expect("open control shell");
+    let seen = open_shell_count_with_idle_timeout(&counter, &host, marker).await;
+    control.close().await.expect("close control shell");
+    assert_eq!(seen, 1, "marker filter did not see the control shell");
+
+    let before = open_shell_count_with_idle_timeout(&counter, &host, marker).await;
+    assert_eq!(before, 0, "marker {marker} already used by a stale shell");
+
+    let err = client
+        .run_powershell(&host, "'x' * (1024 * 1024)")
+        .await
+        .unwrap_err();
+    // `run_powershell` closes its shell before it returns, error or not.
+    let after = open_shell_count_with_idle_timeout(&counter, &host, marker).await;
+    eprintln!("marked open shells: before={before} after={after}");
+
+    assert!(
+        matches!(&err, WinrmError::Transfer(m) if m.contains("max_output_bytes")),
+        "{err}"
+    );
+    assert_eq!(after, before, "shell leaked after max_output_bytes abort");
+}
+
+/// `run_powershell_with_timeout` on a command that never ends: it must give up
+/// with `Timeout(8)`, well inside the 600 s the script sleeps, and must have
+/// deleted the remote shell (counted through the marker `IdleTimeOut`, with a
+/// positive control so a failed enumeration cannot read as 0).
+#[tokio::test]
+#[ignore]
+async fn run_powershell_with_timeout_expires_and_releases_shell() {
+    // Unique per process, below the server's 7200 s default ceiling and
+    // outside the range `max_output_bytes_aborts_and_releases_shell` uses.
+    let marker = 7000 + u64::from(std::process::id() % 150);
+    let (client, host) = test_client_with(|c| c.idle_timeout_secs = Some(marker))
+        .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let (counter, _) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+
+    let control = client.open_shell(&host).await.expect("open control shell");
+    let seen = open_shell_count_with_idle_timeout(&counter, &host, marker).await;
+    control.close().await.expect("close control shell");
+    assert_eq!(seen, 1, "marker filter did not see the control shell");
+
+    let before = open_shell_count_with_idle_timeout(&counter, &host, marker).await;
+    assert_eq!(before, 0, "marker {marker} already used by a stale shell");
+
+    let started = std::time::Instant::now();
+    let err = client
+        .run_powershell_with_timeout(&host, "Start-Sleep 600", std::time::Duration::from_secs(8))
+        .await
+        .unwrap_err();
+    let elapsed = started.elapsed();
+
+    let after = open_shell_count_with_idle_timeout(&counter, &host, marker).await;
+    eprintln!("timeout after {elapsed:?}; marked open shells: before={before} after={after}");
+
+    assert!(matches!(err, WinrmError::Timeout(8)), "got {err:?}");
+    assert!(
+        elapsed >= std::time::Duration::from_secs(8)
+            && elapsed < std::time::Duration::from_secs(15),
+        "gave up after {elapsed:?}"
+    );
+    assert_eq!(after, before, "shell leaked after the timeout");
+}
+
+/// A command that finishes inside the limit returns its output as
+/// `run_powershell` would, and leaves no shell.
+#[tokio::test]
+#[ignore]
+async fn run_powershell_with_timeout_returns_output_of_a_fast_command() {
+    let marker = 7150 + u64::from(std::process::id() % 40);
+    let (client, host) = test_client_with(|c| c.idle_timeout_secs = Some(marker))
+        .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let (counter, _) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+
+    // Control: no stale shell carries this marker, so `after == 0` means ours
+    // was released rather than that the count was already off.
+    let before = open_shell_count_with_idle_timeout(&counter, &host, marker).await;
+    assert_eq!(before, 0, "marker {marker} already used by a stale shell");
+
+    let out = client
+        .run_powershell_with_timeout(
+            &host,
+            "'fast-ok'; exit 3",
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .expect("a fast command must not time out");
+
+    assert_eq!(out.exit_code, 3);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("fast-ok"));
+    let after = open_shell_count_with_idle_timeout(&counter, &host, marker).await;
+    assert_eq!(after, 0, "shell leaked after a successful bounded call");
+}
+
+/// `run_powershell_with_cancel` on a command that never ends: cancelled after
+/// 3 s it must return `Cancelled` promptly, and the terminate + Delete it sends
+/// must leave no shell behind (before this was fixed the shell survived until
+/// its idle timeout).
+#[tokio::test]
+#[ignore]
+async fn run_powershell_with_cancel_releases_shell() {
+    // Unique per process, below the server's 7200 s default ceiling and
+    // outside the (disjoint) ranges of the other shell-count tests.
+    let marker = 3000 + u64::from(std::process::id() % 1000);
+    let (client, host) = test_client_with(|c| c.idle_timeout_secs = Some(marker))
+        .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let (counter, _) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+
+    let control = client.open_shell(&host).await.expect("open control shell");
+    let seen = open_shell_count_with_idle_timeout(&counter, &host, marker).await;
+    control.close().await.expect("close control shell");
+    assert_eq!(seen, 1, "marker filter did not see the control shell");
+
+    let before = open_shell_count_with_idle_timeout(&counter, &host, marker).await;
+    assert_eq!(before, 0, "marker {marker} already used by a stale shell");
+
+    let cancel = CancellationToken::new();
+    let canceller = {
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            cancel.cancel();
+        })
+    };
+    let started = std::time::Instant::now();
+    let err = client
+        .run_powershell_with_cancel(&host, "Start-Sleep 600", cancel)
+        .await
+        .unwrap_err();
+    let elapsed = started.elapsed();
+    canceller.await.expect("canceller task");
+
+    let after = open_shell_count_with_idle_timeout(&counter, &host, marker).await;
+    eprintln!("cancelled after {elapsed:?}; marked open shells: before={before} after={after}");
+
+    assert!(matches!(err, WinrmError::Cancelled), "got {err:?}");
+    assert!(
+        elapsed >= Duration::from_secs(3) && elapsed < Duration::from_secs(10),
+        "cancelled after {elapsed:?}"
+    );
+    assert_eq!(after, before, "shell leaked after cancellation");
+}
+
+/// The cap counts raw bytes as received, before CLIXML is decoded. Tabs are
+/// escaped as `_x0009_` (7 bytes for 1), so this script decodes to ~29 KB of
+/// stderr, under the 64 KiB cap, while the raw CLIXML is ~160 KB, far over it.
+/// Only a cap applied to the raw bytes can trip.
+#[tokio::test]
+#[ignore]
+async fn max_output_bytes_counts_raw_clixml_stderr() {
+    const CAP: usize = 64 * 1024;
+    const SCRIPT: &str = "1..40 | % { Write-Error ([string][char]9 * 500) }";
+
+    if is_server_2012_r2().await {
+        eprintln!(
+            "SKIP max_output_bytes_counts_raw_clixml_stderr: PowerShell 4.0 on Server \
+             2012 R2 renders each Write-Error with the source statement and 80-column \
+             padding (about 2.3 KB per error instead of 0.7 KB), so the decoded stderr \
+             no longer fits under the cap and the precondition of this test cannot hold"
+        );
+        return;
+    }
+
+    // Precondition: uncapped, the decoded stderr fits under the cap.
+    let (uncapped, host) = test_client_with(|c| c.max_output_bytes = None)
+        .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let out = uncapped
+        .run_powershell(&host, SCRIPT)
+        .await
+        .expect("uncapped run");
+    assert!(
+        out.stderr.len() < CAP / 2,
+        "decoded stderr ({} bytes) must stay well under the {CAP}-byte cap",
+        out.stderr.len()
+    );
+
+    let (client, host) = test_client_with(|c| c.max_output_bytes = Some(CAP))
+        .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let err = client.run_powershell(&host, SCRIPT).await.unwrap_err();
+    assert!(
+        matches!(&err, WinrmError::Transfer(m) if m.contains("max_output_bytes")),
+        "expected Transfer(max_output_bytes), got: {err}"
+    );
+}
+
+// === Low-level API ===
+
+/// Drive the whole shell/command state machine by hand, one primitive per
+/// step, instead of going through `run_command`.
+#[tokio::test]
+#[ignore]
+async fn low_level_command_lifecycle() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+
+    let shell_id = client.create_shell(&host).await.expect("create shell");
+    let cmd_id = client
+        .execute_command(
+            &host,
+            &shell_id,
+            "cmd.exe",
+            &["/c", "echo low-level & exit 7"],
+        )
+        .await
+        .expect("execute command");
+
+    let mut stdout = Vec::new();
+    let mut exit_code = None;
+    loop {
+        let chunk = client
+            .receive_output(&host, &shell_id, &cmd_id)
+            .await
+            .expect("receive output");
+        stdout.extend(chunk.stdout);
+        exit_code = chunk.exit_code.or(exit_code);
+        if chunk.done {
+            break;
+        }
+    }
+
+    client
+        .signal_terminate(&host, &shell_id, &cmd_id)
+        .await
+        .expect("signal terminate");
+    client
+        .delete_shell(&host, &shell_id)
+        .await
+        .expect("delete shell");
+
+    let stdout = String::from_utf8_lossy(&stdout);
+    assert!(
+        stdout.contains("low-level"),
+        "expected 'low-level' in stdout, got: {stdout:?}"
+    );
+    assert_eq!(exit_code, Some(7));
+}
+
+/// `signal_terminate` on a still-running command must make it reach `done`.
+///
+/// The command is silent for far longer than `operation_timeout_secs`, so the
+/// first Receive comes back as an empty, not-done poll after about 15 s: the
+/// command is provably still running when the terminate signal goes out. The
+/// shell is created and the command started with a default-timeout client, so
+/// slow setup requests on a busy bench stay out of the short window.
+#[tokio::test]
+#[ignore]
+async fn signal_terminate_stops_running_command() {
+    let (setup, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let (client, _) = test_client_with(|c| c.operation_timeout_secs = 15)
+        .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+
+    let shell_id = setup.create_shell(&host).await.expect("create shell");
+    let cmd_id = setup
+        .execute_command(
+            &host,
+            &shell_id,
+            "powershell.exe",
+            &["-Command", "Start-Sleep 600"],
+        )
+        .await
+        .expect("execute command");
+
+    // Silent for the whole operation timeout: an empty poll, not an error.
+    let first = client
+        .receive_output(&host, &shell_id, &cmd_id)
+        .await
+        .expect("first receive");
+    assert!(!first.done, "Start-Sleep 600 must not be done yet");
+
+    client
+        .signal_terminate(&host, &shell_id, &cmd_id)
+        .await
+        .expect("signal terminate");
+
+    let drained = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let chunk = client
+                .receive_output(&host, &shell_id, &cmd_id)
+                .await
+                .expect("receive after terminate");
+            if chunk.done {
+                break;
+            }
+        }
+    })
+    .await;
+
+    // Clean up before asserting so a failure does not leak the shell.
+    setup
+        .delete_shell(&host, &shell_id)
+        .await
+        .expect("delete shell");
+    assert!(
+        drained.is_ok(),
+        "command should be done within 20s after signal_terminate"
+    );
+}
+
 // === Working directory ===
 
 #[tokio::test]
@@ -599,6 +1097,844 @@ async fn cancel_long_running_command() {
     );
 }
 
+// === Timeouts ===
+
+/// `connect_timeout_secs` bounds the TCP connect to an unreachable host.
+///
+/// `10.255.255.1` is non-routable, so the SYN goes unanswered. Needs no
+/// WinRM server and no credentials, but is `#[ignore]` because it touches the
+/// network. If the local network answers with an immediate ICMP unreachable,
+/// the call fails fast and the assertion still holds.
+#[tokio::test]
+#[ignore]
+async fn connect_timeout_is_honoured() {
+    let config = WinrmConfig {
+        auth_method: AuthMethod::Basic,
+        connect_timeout_secs: 2,
+        max_retries: 0,
+        ..Default::default()
+    };
+    let client = WinrmClient::new(config, WinrmCredentials::new("u", "p", "")).unwrap();
+
+    let start = Instant::now();
+    let err = client
+        .run_command("10.255.255.1", "cmd.exe", &["/c", "ver"])
+        .await
+        .unwrap_err();
+    assert!(
+        start.elapsed() < Duration::from_secs(6),
+        "took {:?}: {err}",
+        start.elapsed()
+    );
+}
+
+/// `Shell::run_command` ends in `WinrmError::Timeout(2 * operation_timeout_secs)`
+/// once its total deadline is reached, within three operation timeouts.
+///
+/// The command stays silent far beyond that deadline. The server answers each
+/// silent Receive with a `TimedOut` fault after `OP` seconds; the shell treats
+/// those as empty polls and keeps waiting, so it is the 2 x `OP` deadline that
+/// ends the call. `OP` is 15 s so that a quiet bench creates the shell and
+/// starts the command inside that window.
+///
+/// A `Shell` is bound to the client that opened it, so the
+/// shell creation and the Execute request that starts the command run under
+/// the same short window as the Receive loop. On a busy bench either can
+/// exceed it and fail with a `TimedOut` fault (seen as `Err(Soap(TimedOut))`
+/// from `open_shell` after about 15 s, with 20 concurrent CPU-bound sessions
+/// on the host), which says nothing about the deadline under test. Each such
+/// failure is therefore retried on a fresh shell (up to `SETUP_TRIES` shell
+/// creations and `RUN_TRIES` started commands), and the test fails with every
+/// failure's text if none reaches the deadline.
+/// Any run that does reach a verdict is judged exactly: `Ok`, a `Timeout` of
+/// another length or an overlong elapsed time fail at once, never retried. A
+/// regression that surfaces the Receive `TimedOut` fault again fails every
+/// attempt, so it still turns the test red.
+#[tokio::test]
+#[ignore]
+async fn shell_run_command_times_out() {
+    const OP: u64 = 15;
+    const SETUP_TRIES: usize = 6;
+    const RUN_TRIES: usize = 3;
+    let (client, host) = test_client_with(|c| c.operation_timeout_secs = OP)
+        .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+
+    let mut failures = Vec::new();
+    let (mut setups, mut runs) = (0, 0);
+    while setups < SETUP_TRIES && runs < RUN_TRIES {
+        let shell = match client.open_shell(&host).await {
+            Ok(shell) => shell,
+            Err(e) => {
+                setups += 1;
+                eprintln!("open_shell failed (setup {setups}/{SETUP_TRIES}): {e}");
+                failures.push(format!("open_shell failed (setup {setups}): {e}"));
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+        };
+
+        let start = Instant::now();
+        let result = shell
+            .run_command("powershell.exe", &["-Command", "Start-Sleep 600"])
+            .await;
+        let elapsed = start.elapsed();
+
+        // Close regardless of the outcome, so a failing run leaves no shell behind.
+        let _ = shell.close().await;
+
+        match &result {
+            Err(WinrmError::Timeout(secs)) if *secs == 2 * OP => {
+                assert!(
+                    elapsed < Duration::from_secs(3 * OP),
+                    "timeout took {elapsed:?}"
+                );
+                return;
+            }
+            // Execute (or a Receive) failed on the wire: not a verdict on the
+            // deadline, try again on a fresh shell.
+            Err(e) if !matches!(e, WinrmError::Timeout(_)) => {
+                runs += 1;
+                eprintln!("run_command failed (run {runs}/{RUN_TRIES}): {e} after {elapsed:?}");
+                failures.push(format!(
+                    "run_command failed (run {runs}) after {elapsed:?}: {e:?}"
+                ));
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            _ => panic!(
+                "expected Err(Timeout({})), got {result:?} after {elapsed:?}",
+                2 * OP
+            ),
+        }
+    }
+    panic!(
+        "the 2 x {OP} s deadline was never reached:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// `operation_timeout_secs` of the silent-command tests: 15 s leaves room for
+/// shell creation on a busy bench, and [`SILENT_SCRIPT`] still outlasts one
+/// full silent Receive window.
+const SILENT_OP_SECS: u64 = 15;
+
+/// Silent for 20 s, then one line of output.
+const SILENT_SCRIPT: &str = "Start-Sleep 20; 'quiet-done'";
+
+/// Run [`SILENT_SCRIPT`] with `client` (built with [`SILENT_OP_SECS`]) and
+/// check that it completes: the server's `TimedOut` fault on the silent
+/// Receive must be an empty poll, whatever the auth method that carried it.
+///
+/// Shell creation and the Execute request run under the same short window, so
+/// on a busy bench one of them can fail with its own `TimedOut` fault after
+/// about 15 s (seen with 24 concurrent CPU-bound sessions on the host), which
+/// is not what is under test. A failed run is retried, up to `TRIES` runs in
+/// all; a regression that lets the Receive fault through fails every run, and
+/// the test then reports each run's error. What a successful run returns is
+/// checked exactly.
+async fn assert_silent_command_completes(client: &WinrmClient, host: &str) {
+    const TRIES: usize = 3;
+    let mut errors = Vec::new();
+    let (out, elapsed) = loop {
+        let start = Instant::now();
+        match client.run_powershell(host, SILENT_SCRIPT).await {
+            Ok(out) => break (out, start.elapsed()),
+            Err(e) => {
+                eprintln!(
+                    "silent command failed (run {}/{TRIES}) after {:?}: {e}",
+                    errors.len() + 1,
+                    start.elapsed()
+                );
+                errors.push(format!("{e:?} after {:?}", start.elapsed()));
+                assert!(
+                    errors.len() < TRIES,
+                    "a silent command must survive TimedOut polls, but {TRIES} runs failed:\n{}",
+                    errors.join("\n")
+                );
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    };
+    eprintln!("silent command completed after {elapsed:?}");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("quiet-done"),
+        "expected 'quiet-done' in stdout, got: {stdout:?}"
+    );
+    assert_eq!(out.exit_code, 0);
+    assert!(
+        elapsed > Duration::from_secs(18),
+        "returned after {elapsed:?}, before the command could have finished"
+    );
+}
+
+/// A command silent for longer than `operation_timeout_secs` is not an error:
+/// the server's `TimedOut` fault on Receive is an empty poll and the call goes
+/// on until the command completes (Basic over HTTP).
+#[tokio::test]
+#[ignore]
+async fn silent_command_longer_than_operation_timeout_completes() {
+    let (client, host) = test_client_with(|c| c.operation_timeout_secs = SILENT_OP_SECS)
+        .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    assert_silent_command_completes(&client, &host).await;
+}
+
+/// Bytes one direction of one forwarded connection carried.
+type Recording = std::sync::Arc<std::sync::Mutex<Vec<u8>>>;
+
+/// A request as a [`RecordingForwarder`] saw it on the wire.
+struct RecordedRequest {
+    /// It carried an `Authorization` header (an NTLM handshake leg).
+    authorization: bool,
+    /// Its `Content-Type` was `multipart/encrypted` (NTLM-sealed).
+    sealed: bool,
+    /// Its `Content-Length`.
+    body_len: usize,
+    /// It announced `Transfer-Encoding: chunked`: its body length is not
+    /// known from the head, so the recorder stops parsing that connection
+    /// and the plaintext checks refuse to conclude (see
+    /// [`RecordingForwarder::plaintext_bodies`]).
+    chunked: bool,
+}
+
+/// A TCP forwarder to the bench's HTTP port that keeps a copy of the bytes
+/// each connection carries in each direction, so a test can read the
+/// plaintext HTTP framing (request headers, status lines) around
+/// NTLM-sealed bodies.
+struct RecordingForwarder {
+    addr: std::net::SocketAddr,
+    /// (towards the server, back to the client), one pair per connection.
+    connections: std::sync::Arc<std::sync::Mutex<Vec<(Recording, Recording)>>>,
+}
+
+impl RecordingForwarder {
+    async fn start(upstream: String) -> Self {
+        use std::sync::{Arc, Mutex};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind recording forwarder");
+        let addr = listener.local_addr().expect("forwarder address");
+        let connections = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&connections);
+        tokio::spawn(async move {
+            while let Ok((client, _)) = listener.accept().await {
+                let Ok(server) = tokio::net::TcpStream::connect(&upstream).await else {
+                    continue;
+                };
+                let up: Recording = Arc::default();
+                let down: Recording = Arc::default();
+                if let Ok(mut all) = recorded.lock() {
+                    all.push((Arc::clone(&up), Arc::clone(&down)));
+                }
+                let (client_rd, client_wr) = client.into_split();
+                let (server_rd, server_wr) = server.into_split();
+                tokio::spawn(Self::pump(client_rd, server_wr, up));
+                tokio::spawn(Self::pump(server_rd, client_wr, down));
+            }
+        });
+        Self { addr, connections }
+    }
+
+    /// Copy `rd` to `wr` until either side closes, recording what passes.
+    async fn pump(
+        mut rd: tokio::net::tcp::OwnedReadHalf,
+        mut wr: tokio::net::tcp::OwnedWriteHalf,
+        log: Recording,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            let n = match rd.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            let chunk = buf.get(..n).unwrap_or_default();
+            if let Ok(mut log) = log.lock() {
+                log.extend_from_slice(chunk);
+            }
+            if wr.write_all(chunk).await.is_err() {
+                break;
+            }
+        }
+    }
+
+    /// Copies of each connection's bytes in one direction.
+    fn streams(&self, to_server: bool) -> Vec<Vec<u8>> {
+        self.connections.lock().map_or_else(
+            |_| Vec::new(),
+            |all| {
+                all.iter()
+                    .map(|(up, down)| {
+                        let log = if to_server { up } else { down };
+                        log.lock().map(|b| b.clone()).unwrap_or_default()
+                    })
+                    .collect()
+            },
+        )
+    }
+
+    /// TCP connections the client opened.
+    fn connections(&self) -> usize {
+        self.connections.lock().map_or(0, |all| all.len())
+    }
+
+    /// Every request, parsed from each connection's stream.
+    fn requests(&self) -> Vec<RecordedRequest> {
+        let mut requests = Vec::new();
+        for stream in self.streams(true) {
+            let mut at = 0;
+            while let Some(end) = stream
+                .get(at..)
+                .and_then(|rest| rest.windows(4).position(|w| w == b"\r\n\r\n"))
+            {
+                let head = String::from_utf8_lossy(stream.get(at..at + end).unwrap_or_default())
+                    .to_ascii_lowercase();
+                let header = |name: &str| {
+                    head.lines()
+                        .find_map(|l| l.strip_prefix(name).map(|v| v.trim().to_string()))
+                };
+                let body_len = header("content-length:")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                let chunked = header("transfer-encoding:").is_some_and(|v| v.contains("chunked"));
+                requests.push(RecordedRequest {
+                    authorization: header("authorization:").is_some(),
+                    sealed: header("content-type:")
+                        .is_some_and(|ct| ct.starts_with("multipart/encrypted")),
+                    body_len,
+                    chunked,
+                });
+                if chunked {
+                    // The rest of this stream cannot be split into requests
+                    // without decoding the chunks.
+                    break;
+                }
+                at += end + 4 + body_len;
+            }
+        }
+        requests
+    }
+
+    /// Requests that carried a body without sealing it.
+    ///
+    /// Panics if a request was sent with `Transfer-Encoding: chunked`: its
+    /// body has no `Content-Length`, so counting it as empty would let a
+    /// plaintext body through this check unseen.
+    fn plaintext_bodies(&self) -> usize {
+        let requests = self.requests();
+        assert!(
+            !requests.iter().any(|r| r.chunked),
+            "a request body was sent chunked; the recorder cannot check it for plaintext"
+        );
+        requests
+            .iter()
+            .filter(|r| r.body_len > 0 && !r.sealed)
+            .count()
+    }
+
+    /// Occurrences of `needle` (ASCII, case-insensitive) in the bytes sent
+    /// towards the server.
+    fn count_to_server(&self, needle: &str) -> usize {
+        Self::count(self.streams(true), needle)
+    }
+
+    /// Occurrences of `needle` (ASCII, case-insensitive) in the bytes sent
+    /// back to the client.
+    fn count_to_client(&self, needle: &str) -> usize {
+        Self::count(self.streams(false), needle)
+    }
+
+    /// Size of the largest HTTP answer body sent back to the client, from
+    /// the `Content-Length` headers it carried.
+    fn largest_answer_to_client(&self) -> usize {
+        self.streams(false)
+            .iter()
+            .flat_map(|bytes| {
+                String::from_utf8_lossy(bytes)
+                    .to_ascii_lowercase()
+                    .split("content-length:")
+                    .skip(1)
+                    .filter_map(|rest| rest.split("\r\n").next()?.trim().parse::<usize>().ok())
+                    .collect::<Vec<_>>()
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn count(streams: Vec<Vec<u8>>, needle: &str) -> usize {
+        let needle = needle.to_ascii_lowercase().into_bytes();
+        streams
+            .iter()
+            .map(|bytes| {
+                bytes
+                    .to_ascii_lowercase()
+                    .windows(needle.len())
+                    .filter(|w| *w == needle.as_slice())
+                    .count()
+            })
+            .sum()
+    }
+}
+
+/// Host name the client uses to reach the bench through a
+/// [`RecordingForwarder`] (it listens on loopback).
+const SEALED_HOST: &str = "127.0.0.1";
+
+/// NTLM client on plain HTTP with the default `EncryptionMode::Auto` (every
+/// request after the handshake is NTLM-sealed), connected through a
+/// [`RecordingForwarder`] so the test can check the traffic. Reach the bench
+/// with [`SEALED_HOST`].
+async fn sealed_ntlm_client(
+    tweak: impl FnOnce(&mut WinrmConfig),
+) -> (WinrmClient, RecordingForwarder) {
+    // The default mode, which seals over plain HTTP.
+    assert_eq!(WinrmConfig::default().encryption, EncryptionMode::Auto);
+    let (_, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let port: u16 = std::env::var("WINRM_TEST_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(5985);
+    let forwarder = RecordingForwarder::start(format!("{host}:{port}")).await;
+    let (client, _) = test_client_with(|c| {
+        c.auth_method = AuthMethod::Ntlm;
+        c.port = forwarder.addr.port();
+        tweak(c);
+    })
+    .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    (client, forwarder)
+}
+
+/// Requests that went out NTLM-sealed, and `Authorization: Negotiate`
+/// requests (two per NTLM handshake: Type 1 and Type 3), as seen by
+/// `forwarder`. Also checks what holds for every sealed client: no request
+/// body ever crossed unsealed (the handshake legs carry none), and each
+/// connection ran exactly one handshake (one per sealed connection, no
+/// re-authentication on a connection).
+fn sealed_traffic(forwarder: &RecordingForwarder) -> (usize, usize) {
+    let requests = forwarder.requests();
+    let sealed = requests.iter().filter(|r| r.sealed).count();
+    let negotiate = forwarder.count_to_server("Authorization: Negotiate");
+    let connections = forwarder.connections();
+    let handshake_bodies: usize = requests
+        .iter()
+        .filter(|r| r.authorization)
+        .map(|r| r.body_len)
+        .sum();
+    eprintln!(
+        "connections: {connections}, requests: {}, sealed: {sealed}, Negotiate: {negotiate}, \
+         plaintext bodies: {}",
+        requests.len(),
+        forwarder.plaintext_bodies()
+    );
+    assert_eq!(
+        forwarder.plaintext_bodies(),
+        0,
+        "a request body crossed unsealed"
+    );
+    assert_eq!(handshake_bodies, 0, "a handshake leg carried a body");
+    assert_eq!(negotiate, 2 * connections, "one handshake per connection");
+    (sealed, negotiate)
+}
+
+/// Same over NTLM on plain HTTP with the default `EncryptionMode::Auto`, so
+/// every request after the first is NTLM-sealed and Windows seals the
+/// `TimedOut` fault (HTTP 500) too. The transport must unseal it and keep the
+/// session: it must not mistake it for an expired session, which would
+/// re-authenticate and replay the Receive in plaintext.
+///
+/// The client goes through a recording forwarder: the HTTP status lines and
+/// request headers stay readable around the sealed bodies, which shows the
+/// fault happened (a `500` status line) and that the NTLM handshake ran once
+/// (two `Authorization: Negotiate` requests, Type 1 and Type 3).
+#[tokio::test]
+#[ignore]
+async fn silent_command_completes_over_ntlm_sealed_http() {
+    let (client, forwarder) =
+        sealed_ntlm_client(|c| c.operation_timeout_secs = SILENT_OP_SECS).await;
+
+    assert_silent_command_completes(&client, SEALED_HOST).await;
+
+    let faults = forwarder.count_to_client("HTTP/1.1 500");
+    eprintln!("HTTP 500 answers: {faults}");
+    let (sealed, negotiate) = sealed_traffic(&forwarder);
+    assert!(
+        faults >= 1,
+        "the silent Receive should have hit at least one TimedOut fault (HTTP 500)"
+    );
+    assert_eq!(
+        negotiate, 2,
+        "one NTLM handshake (Type 1 + Type 3), no re-authentication"
+    );
+    assert!(
+        sealed >= 3,
+        "Execute, Receive and Delete should go out sealed"
+    );
+}
+
+// === Sealed NTLM over HTTP: gates ===
+//
+// The same features as the Basic tests further up, over NTLM on plain HTTP
+// with the default sealing, through a `RecordingForwarder` that confirms the
+// traffic was sealed and that no re-authentication (a plaintext replay)
+// happened.
+
+/// A large upload and download round-trip over sealed NTLM: about a hundred
+/// upload chunks (several sealed requests each) and a download whose base64
+/// response runs to some 270 KB across several sealed Receive answers.
+#[tokio::test]
+#[ignore]
+async fn ntlm_sealed_upload_and_download_large_file() {
+    let (client, forwarder) = sealed_ntlm_client(|_| {}).await;
+
+    // 200 001 bytes: 101 chunks of 2000 bytes; varied bytes so a misplaced
+    // chunk cannot go unnoticed.
+    let content: Vec<u8> = (0u32..200_001)
+        .map(|i| u8::try_from((i.wrapping_mul(2_654_435_761) >> 24) & 0xFF).unwrap_or(0))
+        .collect();
+    let local_upload = std::env::temp_dir().join("winrm_rs_sealed_upload.bin");
+    std::fs::write(&local_upload, &content).expect("write local file");
+    let remote_path = r"C:\Windows\Temp\winrm_rs_sealed_large_test.bin";
+
+    let start = Instant::now();
+    let bytes_up = client
+        .upload_file(SEALED_HOST, &local_upload, remote_path)
+        .await
+        .expect("upload over sealed NTLM");
+    let upload_elapsed = start.elapsed();
+    assert_eq!(bytes_up, content.len() as u64);
+
+    let local_download = std::env::temp_dir().join("winrm_rs_sealed_download.bin");
+    let start = Instant::now();
+    let bytes_down = client
+        .download_file(SEALED_HOST, remote_path, &local_download)
+        .await
+        .expect("download over sealed NTLM");
+    let download_elapsed = start.elapsed();
+    assert_eq!(bytes_down, content.len() as u64);
+    let downloaded = std::fs::read(&local_download).expect("read downloaded file");
+    assert!(downloaded == content, "sealed round-trip mismatch");
+
+    let largest_answer = forwarder.largest_answer_to_client();
+    eprintln!(
+        "upload {upload_elapsed:?}, download {download_elapsed:?}, largest HTTP answer {largest_answer} bytes"
+    );
+    let _ = client
+        .run_powershell(SEALED_HOST, &format!("Remove-Item '{remote_path}' -Force"))
+        .await;
+    let _ = std::fs::remove_file(&local_upload);
+    let _ = std::fs::remove_file(&local_download);
+
+    let (sealed, negotiate) = sealed_traffic(&forwarder);
+    assert_eq!(negotiate, 2, "one NTLM handshake, no re-authentication");
+    assert!(
+        sealed >= 300,
+        "expected hundreds of sealed requests, got {sealed}"
+    );
+}
+
+/// `run_command_with_cancel` over sealed NTLM: same outcome as
+/// `cancel_long_running_command`. Cancelling drops a sealed exchange in
+/// flight, so the same client must still work afterwards.
+#[tokio::test]
+#[ignore]
+async fn ntlm_sealed_cancel_long_running_command() {
+    let (client, forwarder) = sealed_ntlm_client(|_| {}).await;
+    let forwarder = std::sync::Arc::new(forwarder);
+    let cancel = CancellationToken::new();
+    let cancel2 = cancel.clone();
+    // Cancel once Execute and a first Receive went out sealed, so the cancel
+    // lands in a sealed exchange whatever the bench load (a fixed delay could
+    // fire during the handshake).
+    let watched = std::sync::Arc::clone(&forwarder);
+    tokio::spawn(async move {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while watched.count_to_server("Content-Type: multipart/encrypted") < 2
+            && Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        cancel2.cancel();
+    });
+
+    let start = Instant::now();
+    let result = client
+        .run_command_with_cancel(SEALED_HOST, "ping", &["-n", "30", "127.0.0.1"], cancel)
+        .await;
+    eprintln!("cancelled after {:?}: {result:?}", start.elapsed());
+    assert!(
+        matches!(result, Err(WinrmError::Cancelled)),
+        "expected Cancelled, got: {result:?}"
+    );
+    // The cancel dropped a sealed exchange in flight, so its connection was
+    // discarded; the terminate + Delete the cancel then sends open a new one
+    // (one more handshake, empty Type 3) and go out sealed.
+    let (sealed_before, negotiate_before) = sealed_traffic(&forwarder);
+    assert_eq!(
+        negotiate_before, 4,
+        "one new connection for the clean-up after the dropped exchange"
+    );
+    assert!(
+        sealed_before >= 4,
+        "Execute, Receive, terminate and Delete should go out sealed"
+    );
+
+    let out = client
+        .run_command(SEALED_HOST, "cmd.exe", &["/c", "echo", "after-cancel"])
+        .await
+        .expect("the client must still work after a cancelled sealed exchange");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("after-cancel"));
+    // The clean-up's connection is reused: no further handshake.
+    let (sealed_after, negotiate_after) = sealed_traffic(&forwarder);
+    assert_eq!(negotiate_after, 4, "the clean-up connection is reused");
+    assert!(
+        sealed_after >= sealed_before + 4,
+        "Create, Execute, Receive and Delete after the cancel should go out sealed"
+    );
+}
+
+/// Ctrl+C over sealed NTLM: same outcome as `shell_signal_ctrl_c`.
+#[tokio::test]
+#[ignore]
+async fn ntlm_sealed_shell_signal_ctrl_c() {
+    let (client, forwarder) = sealed_ntlm_client(|_| {}).await;
+    let shell = client.open_shell(SEALED_HOST).await.expect("open shell");
+    let cmd_id = shell
+        .start_command("ping", &["-n", "60", "127.0.0.1"])
+        .await
+        .expect("start long ping");
+    let first = shell.receive_next(&cmd_id).await.expect("first receive");
+    assert!(!first.done, "command should not be done yet");
+
+    shell.signal_ctrl_c(&cmd_id).await.expect("signal ctrl+c");
+    let result = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let chunk = shell
+                .receive_next(&cmd_id)
+                .await
+                .expect("receive after ctrl+c");
+            if chunk.done {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "command should finish within 15s after Ctrl+C"
+    );
+    shell.close().await.expect("close shell");
+
+    let (sealed, negotiate) = sealed_traffic(&forwarder);
+    assert_eq!(negotiate, 2, "one NTLM handshake, no re-authentication");
+    assert!(
+        sealed >= 4,
+        "Execute, Receive, Signal and Delete should go out sealed"
+    );
+}
+
+/// Two shells on one client, run concurrently (mirrors `concurrent_shells`),
+/// then a latency probe: shell 1 waits in a long Receive on a 10 s silent
+/// command while shell 2 runs a quick `echo`. Returns (time for the two
+/// echoes, time for the quick echo during the long Receive).
+async fn concurrent_shells_timings(client: &WinrmClient, host: &str) -> (Duration, Duration) {
+    let shell1 = client.open_shell(host).await.expect("open shell 1");
+    let shell2 = client.open_shell(host).await.expect("open shell 2");
+    assert_ne!(shell1.shell_id(), shell2.shell_id());
+
+    let start = Instant::now();
+    let (out1, out2) = tokio::join!(
+        shell1.run_command("cmd.exe", &["/c", "echo", "from-shell-1"]),
+        shell2.run_command("cmd.exe", &["/c", "echo", "from-shell-2"]),
+    );
+    let both = start.elapsed();
+    let (out1, out2) = (out1.expect("shell1 command"), out2.expect("shell2 command"));
+    assert!(String::from_utf8_lossy(&out1.stdout).contains("from-shell-1"));
+    assert!(String::from_utf8_lossy(&out2.stdout).contains("from-shell-2"));
+
+    // `-Command` (not `-EncodedCommand`) prints nothing before it ends, so
+    // shell 1's first Receive is held by the server for the whole 10 s.
+    let (slow, quick) = tokio::join!(
+        shell1.run_command(
+            "powershell.exe",
+            &["-Command", "Start-Sleep 10; 'slow-done'"]
+        ),
+        async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let start = Instant::now();
+            let out = shell2
+                .run_command("cmd.exe", &["/c", "echo", "quick"])
+                .await;
+            (out, start.elapsed())
+        },
+    );
+    let slow = slow.expect("slow command");
+    assert!(String::from_utf8_lossy(&slow.stdout).contains("slow-done"));
+    let (quick, quick_elapsed) = quick;
+    assert!(String::from_utf8_lossy(&quick.expect("quick command").stdout).contains("quick"));
+
+    shell1.close().await.expect("close shell 1");
+    shell2.close().await.expect("close shell 2");
+    eprintln!("two echoes: {both:?}; quick echo during a long Receive: {quick_elapsed:?}");
+    (both, quick_elapsed)
+}
+
+/// Concurrent shells over Basic: the reference timings for
+/// `ntlm_sealed_concurrent_shells`.
+#[tokio::test]
+#[ignore]
+async fn concurrent_shells_timings_basic() {
+    // Default operation timeout: the 10 s command ends its Receive anyway, and
+    // shell creation must not race a short window on a busy bench.
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    concurrent_shells_timings(&client, &host).await;
+}
+
+/// Concurrent shells on one client over sealed NTLM: all complete, and a
+/// quick request does not wait for another shell's long Receive. Each
+/// concurrent request uses its own authenticated connection (one handshake
+/// per connection); compare the timings with
+/// `concurrent_shells_timings_basic`.
+#[tokio::test]
+#[ignore]
+async fn ntlm_sealed_concurrent_shells() {
+    // Default operation timeout, as in `concurrent_shells_timings_basic`.
+    let (client, forwarder) = sealed_ntlm_client(|_| {}).await;
+    let (_, quick) = concurrent_shells_timings(&client, SEALED_HOST).await;
+    let (sealed, _) = sealed_traffic(&forwarder);
+    assert!(
+        quick < Duration::from_secs(3),
+        "the quick echo waited {quick:?} for the other shell's Receive"
+    );
+    assert!(
+        forwarder.connections() >= 2,
+        "concurrent requests need their own connections"
+    );
+    assert!(
+        sealed >= 10,
+        "expected the shell traffic sealed, got {sealed}"
+    );
+}
+
+/// Run a script printing 1.5 MB of output over sealed NTLM with the given
+/// `MaxEnvelopeSize` and check it all arrives; returns the largest single
+/// HTTP answer seen.
+async fn sealed_large_output(max_envelope_size: u32) -> usize {
+    const LEN: usize = 1_500_000;
+    let (client, forwarder) = sealed_ntlm_client(|c| c.max_envelope_size = max_envelope_size).await;
+    let out = client
+        .run_powershell(SEALED_HOST, &format!("[Console]::Out.Write('x' * {LEN})"))
+        .await
+        .expect("large output over sealed NTLM");
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(out.stdout.len(), LEN, "stdout length");
+    assert!(out.stdout.iter().all(|b| *b == b'x'));
+    let largest = forwarder.largest_answer_to_client();
+    eprintln!("MaxEnvelopeSize {max_envelope_size}: largest HTTP answer {largest} bytes");
+    sealed_traffic(&forwarder);
+    largest
+}
+
+/// More than 1 MiB of output over sealed NTLM with the default
+/// `MaxEnvelopeSize`: it arrives over several sealed Receive answers, each
+/// under the response cap (`4 * max(MaxEnvelopeSize, 512 KiB)`).
+#[tokio::test]
+#[ignore]
+async fn ntlm_sealed_large_output_default_envelope() {
+    let largest = sealed_large_output(153_600).await;
+    assert!(
+        largest > 100_000,
+        "expected full-size answers, largest {largest}"
+    );
+}
+
+/// Same with a 500 KB `MaxEnvelopeSize` (the Windows default limit). Server
+/// 2025 still answers a Receive with about 150 KB at most (measured 155 KB),
+/// well under the cap.
+#[tokio::test]
+#[ignore]
+async fn ntlm_sealed_large_output_500k_envelope() {
+    let largest = sealed_large_output(512_000).await;
+    assert!(
+        largest > 100_000,
+        "expected full-size answers, largest {largest}"
+    );
+}
+
+/// `EncryptionMode::Always` seals over HTTPS too (inside TLS, so the wire
+/// cannot be checked here; the server accepting the sealed requests is the
+/// evidence).
+#[tokio::test]
+#[ignore]
+async fn ntlm_encryption_always_over_https() {
+    if is_server_2012_r2().await {
+        eprintln!(
+            "SKIP ntlm_encryption_always_over_https: no TLS cipher suite shared with \
+             Server 2012 R2 (see ntlm_over_https_with_cbt)"
+        );
+        return;
+    }
+    let (client, host) = test_client_with(|c| {
+        c.auth_method = AuthMethod::Ntlm;
+        c.use_tls = true;
+        c.accept_invalid_certs = true; // self-signed listener certificate
+        c.port = https_test_port();
+        c.encryption = EncryptionMode::Always;
+    })
+    .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let out = client
+        .run_command(&host, "cmd.exe", &["/c", "echo", "sealed-in-tls"])
+        .await
+        .expect("NTLM sealed over HTTPS");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("sealed-in-tls"));
+}
+
+/// Same over Certificate authentication (HTTPS).
+#[tokio::test]
+#[ignore]
+async fn silent_command_completes_over_certificate_auth() {
+    if is_server_2012_r2().await {
+        eprintln!(
+            "SKIP silent_command_completes_over_certificate_auth: no TLS cipher suite shared with Server 2012 R2 (see basic_over_https_works)"
+        );
+        return;
+    }
+    let (client, host) =
+        cert_client_from_env("WINRM_TEST_CLIENT_CERT", "WINRM_TEST_CLIENT_KEY", |c| {
+            c.operation_timeout_secs = SILENT_OP_SECS
+        })
+        .expect("set WINRM_TEST_HOST, WINRM_TEST_PASS and eval tests/scripts/make-client-cert.sh");
+    assert_silent_command_completes(&client, &host).await;
+}
+
+/// Same over CredSSP (HTTPS).
+#[cfg(feature = "credssp")]
+#[tokio::test]
+#[ignore]
+async fn silent_command_completes_over_credssp() {
+    if is_server_2012_r2().await {
+        eprintln!(
+            "SKIP silent_command_completes_over_credssp: no TLS cipher suite shared \
+             with Server 2012 R2 (see credssp_run_command_whoami)"
+        );
+        return;
+    }
+    let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    let pass = std::env::var("WINRM_TEST_PASS").expect("WINRM_TEST_PASS");
+    let config = WinrmConfig {
+        auth_method: AuthMethod::CredSsp,
+        use_tls: true,
+        accept_invalid_certs: true,
+        port: https_test_port(),
+        operation_timeout_secs: SILENT_OP_SECS,
+        ..Default::default()
+    };
+    let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
+    assert_silent_command_completes(&client, &host).await;
+}
+
 // === Idle timeout ===
 
 #[tokio::test]
@@ -677,6 +2013,285 @@ async fn invalid_proxy_returns_http_error() {
     assert!(result.is_err(), "should fail with unreachable proxy");
 }
 
+// === Proxy: test doubles ===
+
+/// A minimal in-process proxy that forwards one client connection to one
+/// upstream connection (which keeps NTLM connection affinity intact) and counts
+/// what it carries.
+///
+/// Built on `tokio` only. Its tasks end with the test's runtime; I/O errors
+/// (a peer closing early, a refused upstream) simply end the connection.
+struct TestProxy {
+    addr: std::net::SocketAddr,
+    connections: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    connect_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Largest request header the HTTP test proxy will buffer.
+const PROXY_MAX_HEADER: usize = 64 * 1024;
+
+impl TestProxy {
+    /// HTTP proxy: handles `CONNECT host:port` and absolute-form requests.
+    async fn http() -> Self {
+        Self::start(false).await
+    }
+
+    /// SOCKS5 proxy (RFC 1928), no authentication, `CONNECT` command only.
+    async fn socks5() -> Self {
+        Self::start(true).await
+    }
+
+    async fn start(socks5: bool) -> Self {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test proxy");
+        let addr = listener.local_addr().expect("test proxy address");
+        let connections = Arc::new(AtomicUsize::new(0));
+        let connect_requests = Arc::new(AtomicUsize::new(0));
+
+        let accepted = Arc::clone(&connections);
+        let connects = Arc::clone(&connect_requests);
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                accepted.fetch_add(1, Ordering::SeqCst);
+                let connects = Arc::clone(&connects);
+                tokio::spawn(async move {
+                    let _ = if socks5 {
+                        serve_socks5(socket).await
+                    } else {
+                        serve_http_proxy(socket, &connects).await
+                    };
+                });
+            }
+        });
+
+        Self {
+            addr,
+            connections,
+            connect_requests,
+        }
+    }
+
+    /// Client connections accepted so far.
+    fn connections(&self) -> usize {
+        self.connections.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// HTTP `CONNECT` requests seen so far (always 0 for the SOCKS5 proxy).
+    fn connect_requests(&self) -> usize {
+        self.connect_requests
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Serve one HTTP proxy client connection.
+async fn serve_http_proxy(
+    mut client: tokio::net::TcpStream,
+    connects: &std::sync::atomic::AtomicUsize,
+) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Read up to the end of the request header. Anything read past it is body
+    // (or the start of the tunnelled stream) and is forwarded as-is.
+    let mut buf = Vec::new();
+    let header_end = loop {
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+        if buf.len() > PROXY_MAX_HEADER {
+            return Err(Error::new(ErrorKind::InvalidData, "header too large"));
+        }
+        let mut chunk = [0u8; 4096];
+        let n = client.read(&mut chunk).await?;
+        if n == 0 {
+            return Err(Error::from(ErrorKind::UnexpectedEof));
+        }
+        buf.extend_from_slice(chunk.get(..n).unwrap_or_default());
+    };
+
+    let head = String::from_utf8_lossy(buf.get(..header_end).unwrap_or_default()).into_owned();
+    let mut request_line = head.lines().next().unwrap_or_default().split(' ');
+    let method = request_line.next().unwrap_or_default();
+    let target = request_line.next().unwrap_or_default();
+
+    if method.eq_ignore_ascii_case("CONNECT") {
+        connects.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut upstream = tokio::net::TcpStream::connect(target).await?;
+        client
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await?;
+        // Bytes the client sent after the header belong to the tunnel.
+        upstream
+            .write_all(buf.get(header_end..).unwrap_or_default())
+            .await?;
+        tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+    } else {
+        // Absolute-form: `POST http://host:port/path HTTP/1.1`.
+        let authority = target
+            .split_once("://")
+            .map_or(target, |(_, rest)| rest)
+            .split('/')
+            .next()
+            .unwrap_or_default();
+        let upstream_addr = if authority.contains(':') {
+            authority.to_owned()
+        } else {
+            format!("{authority}:80")
+        };
+        let mut upstream = tokio::net::TcpStream::connect(upstream_addr).await?;
+        // Replay everything read so far verbatim (HTTP.sys accepts the
+        // absolute form), then relay the rest in both directions.
+        upstream.write_all(&buf).await?;
+        tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+    }
+    Ok(())
+}
+
+/// Serve one SOCKS5 client connection (no authentication, `CONNECT` only).
+async fn serve_socks5(mut client: tokio::net::TcpStream) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Method negotiation: `05 n methods...` -> `05 00` (no authentication).
+    let mut greeting = [0u8; 2];
+    client.read_exact(&mut greeting).await?;
+    if greeting.first() != Some(&5) {
+        return Err(Error::new(ErrorKind::InvalidData, "not SOCKS5"));
+    }
+    let mut methods = vec![0u8; usize::from(greeting.get(1).copied().unwrap_or(0))];
+    client.read_exact(&mut methods).await?;
+    client.write_all(&[5, 0]).await?;
+
+    // Request: `05 01 00 atyp addr port`.
+    let mut head = [0u8; 4];
+    client.read_exact(&mut head).await?;
+    let [ver, cmd, _rsv, atyp] = head;
+    if ver != 5 || cmd != 1 {
+        return Err(Error::new(ErrorKind::InvalidData, "only SOCKS5 CONNECT"));
+    }
+    let host = match atyp {
+        1 => {
+            let mut ip = [0u8; 4];
+            client.read_exact(&mut ip).await?;
+            std::net::Ipv4Addr::from(ip).to_string()
+        }
+        3 => {
+            let mut len = [0u8; 1];
+            client.read_exact(&mut len).await?;
+            let mut name = vec![0u8; usize::from(len[0])];
+            client.read_exact(&mut name).await?;
+            String::from_utf8_lossy(&name).into_owned()
+        }
+        _ => return Err(Error::new(ErrorKind::InvalidData, "unsupported atyp")),
+    };
+    let mut port = [0u8; 2];
+    client.read_exact(&mut port).await?;
+    let port = u16::from_be_bytes(port);
+
+    let mut upstream = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
+    // Success, bound address 0.0.0.0:0.
+    client.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
+    tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+    Ok(())
+}
+
+// === Proxy: successful traffic ===
+//
+// Each test runs the WinRM client through a local proxy that counts what it
+// carries. Asserting on the proxy's counters (not only on the command result)
+// is the point: reqwest could silently bypass a proxy for a loopback target and
+// the command would still succeed.
+
+/// The HTTPS port of the bench (same variable as the other HTTPS tests).
+fn https_test_port() -> u16 {
+    std::env::var("WINRM_TEST_HTTPS_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(55986)
+}
+
+#[tokio::test]
+#[ignore]
+async fn http_proxy_carries_ntlm_over_http() {
+    let proxy = TestProxy::http().await;
+    let proxy_url = format!("http://{}", proxy.addr);
+    let (client, host) = test_client_with(|c| {
+        c.auth_method = AuthMethod::Ntlm;
+        c.proxy = Some(proxy_url);
+    })
+    .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+
+    let out = client
+        .run_command(&host, "cmd.exe", &["/c", "echo via-proxy"])
+        .await
+        .expect("via proxy");
+
+    assert!(String::from_utf8_lossy(&out.stdout).contains("via-proxy"));
+    assert!(proxy.connections() > 0, "request bypassed the proxy");
+    assert_eq!(
+        proxy.connect_requests(),
+        0,
+        "plain HTTP must use absolute-form requests, not CONNECT"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn http_proxy_connect_carries_https() {
+    if is_server_2012_r2().await {
+        eprintln!(
+            "SKIP http_proxy_connect_carries_https: no TLS cipher suite shared with Server 2012 R2 (see basic_over_https_works)"
+        );
+        return;
+    }
+    let proxy = TestProxy::http().await;
+    let proxy_url = format!("http://{}", proxy.addr);
+    let (client, host) = test_client_with(|c| {
+        c.auth_method = AuthMethod::Basic;
+        c.use_tls = true;
+        c.accept_invalid_certs = true; // self-signed cert
+        c.port = https_test_port();
+        c.proxy = Some(proxy_url);
+    })
+    .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+
+    let out = client
+        .run_command(&host, "cmd.exe", &["/c", "echo via-proxy"])
+        .await
+        .expect("via proxy");
+
+    assert!(String::from_utf8_lossy(&out.stdout).contains("via-proxy"));
+    assert!(proxy.connections() > 0, "request bypassed the proxy");
+    assert!(
+        proxy.connect_requests() > 0,
+        "HTTPS through an HTTP proxy must tunnel with CONNECT"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn socks5_proxy_carries_ntlm() {
+    let proxy = TestProxy::socks5().await;
+    let proxy_url = format!("socks5://{}", proxy.addr);
+    let (client, host) = test_client_with(|c| {
+        c.auth_method = AuthMethod::Ntlm;
+        c.proxy = Some(proxy_url);
+    })
+    .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+
+    let out = client
+        .run_command(&host, "cmd.exe", &["/c", "echo via-proxy"])
+        .await
+        .expect("via proxy");
+
+    assert!(String::from_utf8_lossy(&out.stdout).contains("via-proxy"));
+    assert!(proxy.connections() > 0, "request bypassed the proxy");
+}
+
 // === HTTPS setup helper (run once to enable HTTPS tests) ===
 
 #[tokio::test]
@@ -752,10 +2367,7 @@ fn test_client_https_ntlm() -> Option<(WinrmClient, String)> {
     let host = std::env::var("WINRM_TEST_HOST").ok()?;
     let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
     let pass = std::env::var("WINRM_TEST_PASS").ok()?;
-    let port: u16 = std::env::var("WINRM_TEST_HTTPS_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(55986);
+    let port: u16 = https_test_port();
 
     let config = WinrmConfig {
         auth_method: AuthMethod::Ntlm,
@@ -894,10 +2506,7 @@ async fn basic_over_https_works() {
     let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
     let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
     let pass = std::env::var("WINRM_TEST_PASS").expect("WINRM_TEST_PASS");
-    let port: u16 = std::env::var("WINRM_TEST_HTTPS_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(55986);
+    let port: u16 = https_test_port();
 
     let config = WinrmConfig {
         auth_method: AuthMethod::Basic,
@@ -939,10 +2548,7 @@ async fn credssp_run_command_whoami() {
     let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
     let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
     let pass = std::env::var("WINRM_TEST_PASS").expect("WINRM_TEST_PASS");
-    let port: u16 = std::env::var("WINRM_TEST_HTTPS_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(55986);
+    let port: u16 = https_test_port();
 
     let config = WinrmConfig {
         auth_method: AuthMethod::CredSsp,
@@ -1431,4 +3037,1303 @@ async fn command_on_deleted_shell_returns_error() {
         result.is_err(),
         "executing command on deleted shell should return an error"
     );
+}
+
+// === Certificate authentication (TLS client certificate) ===
+//
+// Prepare the bench with `tests/scripts/make-client-cert.sh` (eval its output),
+// then run `setup_https_listener` and `setup_certificate_auth` once.
+
+/// Path of the `ca.pem` generated next to the client certificate by
+/// `make-client-cert.sh`.
+fn cert_auth_ca_path() -> Option<std::path::PathBuf> {
+    let cert = std::env::var("WINRM_TEST_CLIENT_CERT").ok()?;
+    Some(std::path::Path::new(&cert).with_file_name("ca.pem"))
+}
+
+/// Build a Certificate-auth client from the PEM paths held in two variables.
+///
+/// `None` when the bench host or either variable is missing; panics if the
+/// client cannot be built (a bad PEM file must not pass for a missing bench).
+/// The credentials are unused by the Certificate method but required by the
+/// constructor.
+fn cert_client_from_env(
+    cert_var: &str,
+    key_var: &str,
+    tweak: impl FnOnce(&mut WinrmConfig),
+) -> Option<(WinrmClient, String)> {
+    let host = std::env::var("WINRM_TEST_HOST").ok()?;
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    let pass = std::env::var("WINRM_TEST_PASS").ok()?;
+    let cert = std::env::var(cert_var).ok()?;
+    let key = std::env::var(key_var).ok()?;
+    let mut config = WinrmConfig {
+        auth_method: AuthMethod::Certificate,
+        use_tls: true,
+        accept_invalid_certs: true, // self-signed listener certificate
+        port: https_test_port(),
+        client_cert_pem: Some(cert),
+        client_key_pem: Some(key),
+        ..Default::default()
+    };
+    tweak(&mut config);
+    let client = match WinrmClient::new(config, WinrmCredentials::new(user, pass, "")) {
+        Ok(client) => client,
+        Err(e) => panic!("Certificate-auth client from {cert_var}/{key_var}: {e}"),
+    };
+    Some((client, host))
+}
+
+/// Client presenting the certificate the VM maps to `vagrant`.
+fn test_client_cert() -> Option<(WinrmClient, String)> {
+    cert_client_from_env("WINRM_TEST_CLIENT_CERT", "WINRM_TEST_CLIENT_KEY", |_| {})
+}
+
+/// Client presenting a certificate signed by a CA the VM does not trust.
+fn test_client_rogue_cert() -> Option<(WinrmClient, String)> {
+    cert_client_from_env("WINRM_TEST_ROGUE_CERT", "WINRM_TEST_ROGUE_KEY", |_| {})
+}
+
+/// Prepare the VM for TLS client-certificate authentication (idempotent, NTLM
+/// over plain HTTP): trust the test CA, enable the WSMan Certificate method,
+/// map the client certificate to `vagrant`, and make HTTP.sys negotiate the
+/// client certificate during the initial handshake (rustls cannot renegotiate).
+///
+/// BENCH ONLY: installs a root CA, maps it to an admin account and enables
+/// client-cert negotiation, with no teardown — never point WINRM_TEST_HOST at a
+/// real machine.
+#[tokio::test]
+#[ignore]
+async fn setup_certificate_auth() {
+    use base64::Engine as _;
+    if is_server_2012_r2().await {
+        eprintln!(
+            "SKIP setup_certificate_auth: Server 2012 R2 cannot do certificate \
+             authentication here: its HTTPS listener shares no TLS cipher suite with \
+             rustls (see basic_over_https_works) and `netsh http update sslcert ... \
+             clientcertnegotiation=enable` does not exist on that release"
+        );
+        return;
+    }
+    let (client, host) = test_client_ntlm().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let ca_path = cert_auth_ca_path().expect("set WINRM_TEST_CLIENT_CERT (make-client-cert.sh)");
+    let ca_pem = std::fs::read_to_string(&ca_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", ca_path.display()));
+    // PEM body == base64 of the DER certificate.
+    let ca_b64: String = ca_pem.lines().filter(|l| !l.starts_with("-----")).collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(&ca_b64)
+        .expect("ca.pem body is base64");
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    let pass = std::env::var("WINRM_TEST_PASS").expect("WINRM_TEST_PASS");
+    let ps_quote = |s: &str| s.replace('\'', "''");
+
+    // The script travels as -EncodedCommand (UTF-16 + base64), which cmd.exe
+    // caps at ~8 KB: one request per step keeps each under the limit.
+    // 1 + 2: trust the CA, enable the Certificate method on the WinRM service.
+    let step_trust = format!(
+        r#"
+$ErrorActionPreference = 'Stop'
+$ca = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 (,[Convert]::FromBase64String('{ca_b64}'))
+$thumb = $ca.Thumbprint
+Write-Output "STEP 0 CA thumbprint: $thumb  subject: $($ca.Subject)"
+foreach ($store in 'Root', 'TrustedPeople') {{
+    $path = "Cert:\LocalMachine\$store\$thumb"
+    if (Test-Path $path) {{ Write-Output "STEP 1 $store : CA already present"; continue }}
+    $s = New-Object System.Security.Cryptography.X509Certificates.X509Store $store, 'LocalMachine'
+    $s.Open('ReadWrite'); $s.Add($ca); $s.Close()
+    Write-Output "STEP 1 $store : CA imported (present now: $(Test-Path $path))"
+}}
+Set-Item WSMan:\localhost\Service\Auth\Certificate -Value $true
+Write-Output "STEP 2 Service\Auth\Certificate = $((Get-Item WSMan:\localhost\Service\Auth\Certificate).Value)"
+"#
+    );
+
+    // 3: map the client certificate (issuer = CA thumbprint, subject = UPN).
+    let step_map = format!(
+        r#"
+$ErrorActionPreference = 'Stop'
+$thumb = (New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 (,[Convert]::FromBase64String('{ca_b64}'))).Thumbprint
+if (-not (Test-Path "Cert:\LocalMachine\Root\$thumb")) {{ throw "test CA $thumb not in LocalMachine\Root" }}
+Write-Output "STEP 3 issuer thumbprint: $thumb"
+Get-ChildItem WSMan:\localhost\ClientCertificate -ErrorAction SilentlyContinue | ForEach-Object {{
+    $d = Get-ChildItem $_.PSPath
+    if (($d | Where-Object Name -eq Issuer).Value -eq $thumb) {{
+        Remove-Item $_.PSPath -Recurse -Force
+        Write-Output "STEP 3 removed stale mapping $($_.Name)"
+    }}
+}}
+$sec = ConvertTo-SecureString '{pass}' -AsPlainText -Force
+$cred = New-Object System.Management.Automation.PSCredential ('{user}', $sec)
+$m = New-Item -Path WSMan:\localhost\ClientCertificate -Subject 'vagrant@localhost' -URI * -Issuer $thumb -Credential $cred -Force
+Write-Output "STEP 3 mapping created: $($m.Name)"
+Get-ChildItem WSMan:\localhost\ClientCertificate | ForEach-Object {{
+    $d = Get-ChildItem $_.PSPath
+    Write-Output ("STEP 3   {{0}} subject={{1}} issuer={{2}} uri={{3}} enabled={{4}}" -f $_.Name,
+        ($d | Where-Object Name -eq Subject).Value, ($d | Where-Object Name -eq Issuer).Value,
+        ($d | Where-Object Name -eq URI).Value, ($d | Where-Object Name -eq Enabled).Value)
+}}
+"#,
+        pass = ps_quote(&pass),
+        user = ps_quote(&user),
+    );
+
+    // 4: HTTP.sys must request the client certificate in the initial handshake.
+    // Reuse the existing binding's certhash/appid; never guess them.
+    let step_netsh = r#"
+$ipport = '0.0.0.0:5986'
+$show = (netsh http show sslcert ipport=$ipport) -join "`n"
+if ($show -notmatch 'Certificate Hash\s*:\s*([0-9a-fA-F]{40})') {
+    Write-Output "STEP 4 FAIL: no SSL binding on ${ipport}:`n$show"; exit 3
+}
+$hash = $Matches[1]
+if ($show -notmatch 'Application ID\s*:\s*(\{[0-9a-fA-F-]+\})') {
+    Write-Output "STEP 4 FAIL: no Application ID in binding:`n$show"; exit 3
+}
+$appid = $Matches[1]
+Write-Output "STEP 4 current binding: certhash=$hash appid=$appid"
+$out = netsh http update sslcert ipport=$ipport certhash=$hash appid=$appid clientcertnegotiation=enable
+Write-Output "STEP 4 netsh update: $($out -join ' ')"
+$after = (netsh http show sslcert ipport=$ipport) -join "`n"
+if ($after -notmatch 'Negotiate Client Certificate\s*:\s*(\w+)') {
+    Write-Output "STEP 4 FAIL: cannot read back the setting:`n$after"; exit 3
+}
+Write-Output "STEP 4 Negotiate Client Certificate = $($Matches[1])"
+if ($Matches[1] -ne 'Enabled') { exit 3 }
+"#;
+
+    for (name, script) in [
+        ("trust CA + enable Certificate method", step_trust),
+        ("map client certificate", step_map),
+        ("clientcertnegotiation", step_netsh.to_string()),
+    ] {
+        let output = client
+            .run_powershell(&host, &script)
+            .await
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        eprintln!("--- {name} (exit {})", output.exit_code);
+        eprintln!("{}", String::from_utf8_lossy(&output.stdout).trim());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.trim().is_empty() {
+            eprintln!("stderr: {}", stderr.trim());
+        }
+        assert_eq!(output.exit_code, 0, "{name} failed");
+    }
+}
+
+/// A mapped client certificate authenticates a command as `vagrant`.
+///
+/// Needs both halves of Certificate auth: the certificate presented in the
+/// TLS handshake, and the `Authorization:
+/// http://schemas.dmtf.org/wbem/wsman/1/wsman/secprofile/https/mutual` header
+/// that makes WinRM map it to an account (without either, HTTP 401).
+#[tokio::test]
+#[ignore]
+async fn certificate_auth_whoami() {
+    if is_server_2012_r2().await {
+        eprintln!(
+            "SKIP certificate_auth_whoami: no TLS cipher suite shared with Server 2012 R2 (see basic_over_https_works)"
+        );
+        return;
+    }
+    let (client, host) = test_client_cert()
+        .expect("set WINRM_TEST_HOST, WINRM_TEST_PASS and eval tests/scripts/make-client-cert.sh");
+    let out = client
+        .run_command(&host, "whoami", &[])
+        .await
+        .expect("cert auth");
+    assert_eq!(out.exit_code, 0);
+    assert!(
+        String::from_utf8_lossy(&out.stdout)
+            .to_lowercase()
+            .contains("vagrant"),
+        "stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// A certificate signed by a CA the server does not trust is rejected by the
+/// server, promptly: an authentication failure (HTTP 401) or a TLS-level
+/// rejection, not a success, not a local configuration error, and not a hang
+/// (HTTP.sys may ask for the certificate by TLS renegotiation, which rustls
+/// does not support).
+///
+/// Positive control in the same test: the mapped certificate, sent through
+/// the same code path to the same host, authenticates. Without it, a client
+/// that never presents any certificate would pass the rejection check too.
+#[tokio::test]
+#[ignore]
+async fn certificate_auth_unmapped_cert_is_rejected() {
+    if is_server_2012_r2().await {
+        eprintln!(
+            "SKIP certificate_auth_unmapped_cert_is_rejected: no TLS cipher suite shared with Server 2012 R2 (see basic_over_https_works)"
+        );
+        return;
+    }
+    const BENCH: &str =
+        "set WINRM_TEST_HOST, WINRM_TEST_PASS and eval tests/scripts/make-client-cert.sh";
+    let (mapped, host) = test_client_cert().expect(BENCH);
+    let out = mapped
+        .run_command(&host, "whoami", &[])
+        .await
+        .expect("positive control: the mapped certificate must authenticate");
+    assert_eq!(out.exit_code, 0, "positive control: whoami exit code");
+
+    let (client, host) = test_client_rogue_cert().expect(BENCH);
+    let start = Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(30),
+        client.run_command(&host, "whoami", &[]),
+    )
+    .await;
+    let elapsed = start.elapsed();
+    eprintln!("rogue certificate outcome after {elapsed:?}: {result:?}");
+    let result = result.expect("rogue certificate request hung for 30 s");
+    match result {
+        Ok(out) => panic!("unmapped certificate authenticated: {out:?}"),
+        Err(WinrmError::AuthFailed(msg)) => {
+            assert!(msg.contains("HTTP 401"), "expected a 401 rejection: {msg}");
+        }
+        // A server may also refuse the certificate during the handshake.
+        Err(WinrmError::Http(e)) => {
+            assert!(!e.is_builder(), "local client configuration error: {e}");
+        }
+        Err(e) => panic!("expected a 401 or a TLS-level rejection, got: {e}"),
+    }
+    assert!(elapsed < Duration::from_secs(30), "took {elapsed:?}");
+}
+
+// === Kerberos (domain controller bench) ===
+//
+// These run against the separate `winrm.test` domain controller bench
+// (tests/vagrant/dc/README.md), not the 2025 workgroup bench:
+//
+//   eval "$(tests/scripts/vm-connect-dc.sh)"
+//   kinit vagrant@WINRM.TEST     # TGT in the private KRB5CCNAME
+//   cargo test --features kerberos --test integration_real kerberos -- --ignored
+//
+// The host must be `dc.winrm.test`, not an address: the client derives the
+// service principal `HTTP/<host>` from it.
+
+/// Kerberos client for the DC bench, from the variables `vm-connect-dc.sh`
+/// exports. Credentials come from the ticket cache (`kinit`), not from the
+/// user/password passed here.
+/// `WINRM_TEST_KRB_PASS` is read because the `vm-connect-dc.sh` contract
+/// exports it (it is the password to give `kinit`) and `WinrmCredentials`
+/// needs one, but the Kerberos path never uses it.
+#[cfg(feature = "kerberos")]
+fn kerberos_client_from_env(tweak: impl FnOnce(&mut WinrmConfig)) -> (WinrmClient, String) {
+    const HINT: &str = "eval \"$(tests/scripts/vm-connect-dc.sh)\" and kinit vagrant@WINRM.TEST";
+    let host = std::env::var("WINRM_TEST_KRB_HOST").expect(HINT);
+    let port: u16 = std::env::var("WINRM_TEST_KRB_PORT")
+        .expect(HINT)
+        .parse()
+        .expect("WINRM_TEST_KRB_PORT must be a port number");
+    let user = std::env::var("WINRM_TEST_KRB_USER").expect(HINT);
+    let pass = std::env::var("WINRM_TEST_KRB_PASS").expect(HINT);
+    let mut config = WinrmConfig {
+        auth_method: AuthMethod::Kerberos,
+        port,
+        ..Default::default()
+    };
+    tweak(&mut config);
+    let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, ""))
+        .expect("build Kerberos client");
+    (client, host)
+}
+
+/// `AuthMethod::Kerberos` end to end against a domain controller: the
+/// command runs as the domain user whose TGT is in the cache.
+#[cfg(feature = "kerberos")]
+#[tokio::test]
+#[ignore]
+async fn kerberos_run_command_whoami() {
+    let (client, host) = kerberos_client_from_env(|_| {});
+    let output = client
+        .run_command(&host, "whoami", &[])
+        .await
+        .expect("kerberos whoami");
+    assert_eq!(output.exit_code, 0);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
+    assert!(
+        stdout.contains("winrm\\vagrant"),
+        "expected WINRM\\vagrant, got: {stdout:?}"
+    );
+}
+
+/// The silent-command behaviour over Kerberos: the server's `TimedOut`
+/// fault on a silent Receive is an empty poll, as over the other methods.
+#[cfg(feature = "kerberos")]
+#[tokio::test]
+#[ignore]
+async fn silent_command_completes_over_kerberos() {
+    let (client, host) = kerberos_client_from_env(|c| c.operation_timeout_secs = SILENT_OP_SECS);
+    assert_silent_command_completes(&client, &host).await;
+}
+
+/// Two commands on the same client, over HTTP with the default
+/// `EncryptionMode::Auto`: requests are sealed, with one Kerberos context per
+/// sealed connection (built from the cached service ticket when the
+/// connection is authenticated, then reused by the requests on it, or a new
+/// connection and context when none is idle). The second command must not
+/// fail.
+#[cfg(feature = "kerberos")]
+#[tokio::test]
+#[ignore]
+async fn kerberos_two_commands_on_one_client() {
+    let (client, host) = kerberos_client_from_env(|_| {});
+    for round in 1..=2 {
+        let output = client
+            .run_powershell(&host, &format!("'round-{round}'"))
+            .await
+            .unwrap_or_else(|e| panic!("kerberos round {round}: {e}"));
+        assert_eq!(output.exit_code, 0);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(&format!("round-{round}")),
+            "round {round}: got {stdout:?}"
+        );
+    }
+}
+
+// === Kerberos over HTTPS (DC bench) ===
+//
+// Needs the DC's HTTPS listener (`setup_dc_https_listener`, once) and the
+// host port `WINRM_TEST_KRB_HTTPS_PORT` forwarded to the DC's 5986 (see
+// tests/vagrant/dc/README.md).
+
+/// BENCH ONLY. Create the DC's WinRM HTTPS listener (self-signed certificate
+/// for `dc.winrm.test`) and open 5986 in its firewall. Idempotent: an
+/// existing HTTPS listener is left as it is. Not undone.
+#[cfg(feature = "kerberos")]
+#[tokio::test]
+#[ignore]
+async fn setup_dc_https_listener() {
+    let (client, host) = kerberos_client_from_env(|_| {});
+    let script = r#"
+        $existing = Get-WSManInstance winrm/config/Listener -SelectorSet @{Address="*"; Transport="HTTPS"} -ErrorAction SilentlyContinue
+        if ($existing) {
+            Write-Output "HTTPS listener already exists"
+        } else {
+            $cert = New-SelfSignedCertificate -DnsName "dc.winrm.test","dc" -CertStoreLocation Cert:\LocalMachine\My
+            New-WSManInstance winrm/config/Listener -SelectorSet @{Address="*"; Transport="HTTPS"} -ValueSet @{CertificateThumbprint=$cert.Thumbprint} | Out-Null
+            Write-Output "HTTPS listener created: $($cert.Thumbprint)"
+        }
+        Remove-NetFirewallRule -DisplayName "WinRM DC HTTPS" -ErrorAction SilentlyContinue
+        New-NetFirewallRule -DisplayName "WinRM DC HTTPS" -Direction Inbound -LocalPort 5986 -Protocol TCP -Action Allow -Profile Any | Out-Null
+        Write-Output "firewall rule WinRM DC HTTPS: 5986/tcp allowed"
+    "#;
+    let output = client
+        .run_powershell(&host, script)
+        .await
+        .expect("set up the DC HTTPS listener");
+    eprintln!("{}", String::from_utf8_lossy(&output.stdout).trim());
+    assert_eq!(
+        output.exit_code,
+        0,
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Kerberos client for the DC's HTTPS listener (self-signed certificate, so
+/// `accept_invalid_certs`), on the host port `WINRM_TEST_KRB_HTTPS_PORT`.
+#[cfg(feature = "kerberos")]
+fn kerberos_https_client_from_env(tweak: impl FnOnce(&mut WinrmConfig)) -> (WinrmClient, String) {
+    let port: u16 = std::env::var("WINRM_TEST_KRB_HTTPS_PORT")
+        .expect(
+            "export WINRM_TEST_KRB_HTTPS_PORT (vm-connect-dc.sh) and run setup_dc_https_listener",
+        )
+        .parse()
+        .expect("WINRM_TEST_KRB_HTTPS_PORT must be a port number");
+    kerberos_client_from_env(|c| {
+        c.use_tls = true;
+        c.accept_invalid_certs = true;
+        c.port = port;
+        tweak(c);
+    })
+}
+
+/// `AuthMethod::Kerberos` over HTTPS: TLS protects the messages, the
+/// Kerberos token authenticates the request (SPN `HTTP/dc.winrm.test`, the
+/// same as over HTTP).
+#[cfg(feature = "kerberos")]
+#[tokio::test]
+#[ignore]
+async fn kerberos_over_https_whoami() {
+    let (client, host) = kerberos_https_client_from_env(|_| {});
+    let output = client
+        .run_command(&host, "whoami", &[])
+        .await
+        .expect("kerberos whoami over https");
+    assert_eq!(output.exit_code, 0);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
+    assert!(
+        stdout.contains("winrm\\vagrant"),
+        "expected WINRM\\vagrant, got: {stdout:?}"
+    );
+}
+
+// === Kerberos with `AllowUnencrypted = false` on the DC ===
+//
+// The DC bench runs with `AllowUnencrypted = true`. These tests flip it to
+// `false` for their own duration and restore it afterwards, even when they
+// fail. They change server state that the other Kerberos tests see, so run
+// them on their own:
+//
+//   cargo test --features kerberos --test integration_real allow_unencrypted_false -- --ignored --test-threads=1
+
+/// Read or set the DC's `AllowUnencrypted` through `client`; returns the
+/// value read after the optional change.
+#[cfg(feature = "kerberos")]
+async fn dc_allow_unencrypted(
+    client: &WinrmClient,
+    host: &str,
+    set: Option<bool>,
+) -> Result<bool, WinrmError> {
+    let script = match set {
+        Some(v) => format!(
+            "Set-Item WSMan:\\localhost\\Service\\AllowUnencrypted ${v}; \
+             (Get-Item WSMan:\\localhost\\Service\\AllowUnencrypted).Value"
+        ),
+        None => "(Get-Item WSMan:\\localhost\\Service\\AllowUnencrypted).Value".to_string(),
+    };
+    let out = client.run_powershell(host, &script).await?;
+    let text = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .to_ascii_lowercase();
+    match text.as_str() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(WinrmError::Transfer(format!(
+            "unexpected AllowUnencrypted output {other:?}, stderr {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        ))),
+    }
+}
+
+/// NTLM-sealed client to the DC over HTTP: independent of the Kerberos code
+/// under test, and it works whatever `AllowUnencrypted` says. Used to restore
+/// the bench.
+#[cfg(feature = "kerberos")]
+fn dc_ntlm_sealed_client() -> (WinrmClient, String) {
+    let (_, host) = kerberos_client_from_env(|_| {});
+    let port: u16 = std::env::var("WINRM_TEST_KRB_PORT")
+        .expect("WINRM_TEST_KRB_PORT")
+        .parse()
+        .expect("WINRM_TEST_KRB_PORT must be a port number");
+    let config = WinrmConfig {
+        auth_method: AuthMethod::Ntlm,
+        encryption: EncryptionMode::Always,
+        port,
+        ..Default::default()
+    };
+    let client = WinrmClient::new(config, WinrmCredentials::new("vagrant", "vagrant", "WINRM"))
+        .expect("build NTLM client");
+    (client, host)
+}
+
+/// Run `body` with `AllowUnencrypted = false` on the DC, then restore `true`
+/// whatever happened (a panic in `body` included), and re-raise `body`'s
+/// panic after the restore. The flip goes through an unencrypted Kerberos
+/// request, accepted while the server still allows it; the restore through
+/// an NTLM-sealed one, accepted either way.
+#[cfg(feature = "kerberos")]
+async fn with_dc_requiring_encryption<F, Fut>(body: F)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let (plain, host) = kerberos_client_from_env(|c| c.encryption = EncryptionMode::Never);
+    assert!(
+        dc_allow_unencrypted(&plain, &host, None)
+            .await
+            .expect("read AllowUnencrypted over unencrypted Kerberos"),
+        "the DC bench must start with AllowUnencrypted = true"
+    );
+    // The answer to the flip may already be refused: check through NTLM.
+    let flipped = dc_allow_unencrypted(&plain, &host, Some(false)).await;
+    eprintln!("flip to false over unencrypted Kerberos: {flipped:?}");
+    let (ntlm, ntlm_host) = dc_ntlm_sealed_client();
+    let now = dc_allow_unencrypted(&ntlm, &ntlm_host, None).await;
+    let outcome = if matches!(now, Ok(false)) {
+        tokio::spawn(body()).await
+    } else {
+        Ok(())
+    };
+    let restored = dc_allow_unencrypted(&ntlm, &ntlm_host, Some(true)).await;
+    eprintln!("restore AllowUnencrypted = true over NTLM sealing: {restored:?}");
+    assert!(
+        matches!(restored, Ok(true)),
+        "RESTORE FAILED: set AllowUnencrypted back to true by hand: {restored:?}"
+    );
+    assert!(
+        matches!(now, Ok(false)),
+        "AllowUnencrypted did not become false: {now:?}"
+    );
+    if let Err(e) = outcome {
+        std::panic::resume_unwind(e.into_panic());
+    }
+}
+
+/// Measured: with `AllowUnencrypted = false`, an unencrypted Kerberos
+/// request over HTTP gets an HTTP 500 with an empty body. The client reports
+/// it with a hint at the cause instead of an opaque `HTTP 500`.
+#[cfg(feature = "kerberos")]
+#[tokio::test]
+#[ignore]
+async fn kerberos_unsealed_with_allow_unencrypted_false_is_a_clear_error() {
+    with_dc_requiring_encryption(|| async {
+        let (client, host) = kerberos_client_from_env(|c| c.encryption = EncryptionMode::Never);
+        let err = client
+            .run_command(&host, "whoami", &[])
+            .await
+            .expect_err("an unencrypted Kerberos request must be refused");
+        let text = err.to_string();
+        eprintln!("unsealed Kerberos, AllowUnencrypted = false: {err:?}");
+        assert!(
+            text.contains("AllowUnencrypted"),
+            "error should point at AllowUnencrypted: {text}"
+        );
+    })
+    .await;
+}
+
+/// Kerberos client on plain HTTP with the default `EncryptionMode::Auto`
+/// (sealed), connected to the DC through a `RecordingForwarder`. The host
+/// string stays `dc.winrm.test` (it names the service principal); only the
+/// port points at the forwarder, which relays to the DC bench port.
+#[cfg(feature = "kerberos")]
+async fn sealed_kerberos_client(
+    tweak: impl FnOnce(&mut WinrmConfig),
+) -> (WinrmClient, RecordingForwarder, String) {
+    assert_eq!(WinrmConfig::default().encryption, EncryptionMode::Auto);
+    let dc_port = std::env::var("WINRM_TEST_KRB_PORT").expect("WINRM_TEST_KRB_PORT");
+    let forwarder = RecordingForwarder::start(format!("127.0.0.1:{dc_port}")).await;
+    let port = forwarder.addr.port();
+    let (client, host) = kerberos_client_from_env(|c| {
+        c.port = port;
+        tweak(c);
+    });
+    (client, forwarder, host)
+}
+
+/// Requests that went out sealed, as seen by `forwarder`, after checking
+/// what holds for a Kerberos-sealed client: no request body crossed
+/// unsealed, the authentication request carried no body, and each
+/// connection authenticated once (one `Negotiate` request per connection).
+#[cfg(feature = "kerberos")]
+fn kerberos_sealed_traffic(forwarder: &RecordingForwarder) -> usize {
+    let requests = forwarder.requests();
+    let sealed = requests.iter().filter(|r| r.sealed).count();
+    let negotiate = forwarder.count_to_server("Authorization: Negotiate");
+    let connections = forwarder.connections();
+    let handshake_bodies: usize = requests
+        .iter()
+        .filter(|r| r.authorization)
+        .map(|r| r.body_len)
+        .sum();
+    eprintln!(
+        "connections: {connections}, requests: {}, sealed: {sealed}, Negotiate: {negotiate}, \
+         plaintext bodies: {}",
+        requests.len(),
+        forwarder.plaintext_bodies()
+    );
+    assert_eq!(
+        forwarder.plaintext_bodies(),
+        0,
+        "a request body crossed unsealed"
+    );
+    assert_eq!(
+        handshake_bodies, 0,
+        "the authentication request carried a body"
+    );
+    assert_eq!(negotiate, connections, "one authentication per connection");
+    sealed
+}
+
+/// Kerberos message encryption against a server that requires it
+/// (`AllowUnencrypted = false`): a command, a 200 KB upload and download
+/// round trip, and a silent command whose `TimedOut` faults come back
+/// sealed. Every SOAP body crosses sealed, each connection authenticates once.
+#[cfg(feature = "kerberos")]
+#[tokio::test]
+#[ignore]
+async fn kerberos_sealed_with_allow_unencrypted_false() {
+    with_dc_requiring_encryption(|| async {
+        let (client, forwarder, host) = sealed_kerberos_client(|_| {}).await;
+        let output = client
+            .run_command(&host, "whoami", &[])
+            .await
+            .expect("sealed kerberos whoami");
+        assert_eq!(output.exit_code, 0);
+        let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
+        assert!(stdout.contains("winrm\\vagrant"), "got {stdout:?}");
+
+        // 200 001 varied bytes: about a hundred upload chunks, several
+        // sealed Receive answers for the download.
+        let content: Vec<u8> = (0u32..200_001)
+            .map(|i| u8::try_from((i.wrapping_mul(2_654_435_761) >> 24) & 0xFF).unwrap_or(0))
+            .collect();
+        let local_upload = std::env::temp_dir().join("winrm_rs_krb_sealed_upload.bin");
+        let local_download = std::env::temp_dir().join("winrm_rs_krb_sealed_download.bin");
+        std::fs::write(&local_upload, &content).expect("write local file");
+        let remote_path = r"C:\Windows\Temp\winrm_rs_krb_sealed_large_test.bin";
+        let up = client
+            .upload_file(&host, &local_upload, remote_path)
+            .await
+            .expect("upload over sealed Kerberos");
+        assert_eq!(up, content.len() as u64);
+        let down = client
+            .download_file(&host, remote_path, &local_download)
+            .await
+            .expect("download over sealed Kerberos");
+        assert_eq!(down, content.len() as u64);
+        let downloaded = std::fs::read(&local_download).expect("read downloaded file");
+        assert!(downloaded == content, "sealed round-trip mismatch");
+        let _ = client
+            .run_powershell(&host, &format!("Remove-Item '{remote_path}' -Force"))
+            .await;
+        let _ = std::fs::remove_file(&local_upload);
+        let _ = std::fs::remove_file(&local_download);
+        let sealed = kerberos_sealed_traffic(&forwarder);
+        assert!(
+            sealed >= 300,
+            "expected hundreds of sealed requests, got {sealed}"
+        );
+        assert_eq!(
+            forwarder.connections(),
+            1,
+            "the whole round trip should stay on one authenticated connection"
+        );
+
+        let (silent, silent_forwarder, host) =
+            sealed_kerberos_client(|c| c.operation_timeout_secs = SILENT_OP_SECS).await;
+        assert_silent_command_completes(&silent, &host).await;
+        kerberos_sealed_traffic(&silent_forwarder);
+        assert!(
+            silent_forwarder.count_to_client("HTTP/1.1 500") >= 1,
+            "expected sealed TimedOut faults (HTTP 500)"
+        );
+    })
+    .await;
+}
+
+/// `EncryptionMode::Always` seals Kerberos over HTTPS too, inside TLS (the
+/// server accepting the sealed requests is the evidence; the wire is TLS).
+#[cfg(feature = "kerberos")]
+#[tokio::test]
+#[ignore]
+async fn kerberos_encryption_always_over_https() {
+    let (client, host) = kerberos_https_client_from_env(|c| c.encryption = EncryptionMode::Always);
+    let output = client
+        .run_command(&host, "whoami", &[])
+        .await
+        .expect("kerberos whoami sealed inside https");
+    assert_eq!(output.exit_code, 0);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
+    assert!(stdout.contains("winrm\\vagrant"), "got {stdout:?}");
+}
+
+// === Channel binding and sealing inside TLS (DC bench, HTTPS) ===
+//
+// A TLS-terminating relay sits between the client and the DC's HTTPS
+// listener: it presents its own throwaway certificate, so the client's
+// channel binding names the relay's certificate, not the DC's, and it reads
+// every request in clear. The tests that change `CbtHardeningLevel` restore
+// `Relaxed` afterwards; run them on their own:
+//
+//   cargo test --features kerberos --test integration_real dc_cbt -- --ignored --test-threads=1
+
+/// Certificate verifier of the relay's upstream leg: accepts the DC's
+/// self-signed certificate (test only).
+#[cfg(feature = "kerberos")]
+#[derive(Debug)]
+struct AcceptAnyServerCert(std::sync::Arc<rustls::crypto::CryptoProvider>);
+
+#[cfg(feature = "kerberos")]
+impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// One request as the relay saw it, decrypted.
+#[cfg(feature = "kerberos")]
+#[derive(Debug, Clone)]
+struct RelayedRequest {
+    authorization: bool,
+    content_type: String,
+    body_len: usize,
+}
+
+/// TLS-terminating recording relay to the DC's HTTPS port (test only).
+#[cfg(feature = "kerberos")]
+struct TlsRecordingRelay {
+    port: u16,
+    requests: std::sync::Arc<std::sync::Mutex<Vec<RelayedRequest>>>,
+}
+
+/// One HTTP/1.1 message (head, body by `Content-Length`) read from `stream`,
+/// with `buf` holding what was read past the previous message.
+#[cfg(feature = "kerberos")]
+fn read_http_message(
+    stream: &mut impl std::io::Read,
+    buf: &mut Vec<u8>,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    let mut chunk = [0u8; 16 * 1024];
+    let head_end = loop {
+        if let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break at + 4;
+        }
+        let n = stream.read(&mut chunk).ok()?;
+        if n == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    };
+    let head: Vec<u8> = buf.drain(..head_end).collect();
+    let len = String::from_utf8_lossy(&head)
+        .lines()
+        .find_map(|l| {
+            l.to_ascii_lowercase()
+                .strip_prefix("content-length:")
+                .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+        })
+        .unwrap_or(0);
+    while buf.len() < len {
+        let n = stream.read(&mut chunk).ok()?;
+        if n == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    let body: Vec<u8> = buf.drain(..len).collect();
+    Some((head, body))
+}
+
+#[cfg(feature = "kerberos")]
+impl TlsRecordingRelay {
+    /// Start a relay to `127.0.0.1:<upstream_port>` (TLS, SNI
+    /// `dc.winrm.test`), presenting a certificate made for the run with the
+    /// `openssl` command.
+    fn start(upstream_port: u16) -> Self {
+        Self::start_with(upstream_port, false)
+    }
+
+    /// Like [`Self::start`], but when `pass_first` the first connection is
+    /// relayed as raw TCP, untouched (the client sees the DC's own
+    /// certificate on it), and only the later ones are terminated with the
+    /// relay's certificate: the split an attacker in the middle would use
+    /// against a binding computed on one connection and used on another.
+    fn start_with(upstream_port: u16, pass_first: bool) -> Self {
+        use rustls::pki_types::pem::PemObject;
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!(
+            "winrm_rs_tls_relay_{}_{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("relay temp dir");
+        let (cert_path, key_path) = (dir.join("cert.pem"), dir.join("key.pem"));
+        let status = std::process::Command::new("openssl")
+            .args([
+                "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+            ])
+            .args(["-subj", "/CN=winrm-rs-test-relay", "-keyout"])
+            .arg(&key_path)
+            .arg("-out")
+            .arg(&cert_path)
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("run openssl to make the relay certificate");
+        assert!(status.success(), "openssl req failed");
+        let cert = rustls::pki_types::CertificateDer::from_pem_file(&cert_path).expect("cert");
+        let key = rustls::pki_types::PrivateKeyDer::from_pem_file(&key_path).expect("key");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let server_config = Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert], key)
+                .expect("relay server config"),
+        );
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let client_config = Arc::new(
+            rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert(provider)))
+                .with_no_client_auth(),
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind relay");
+        let port = listener.local_addr().expect("relay addr").port();
+        let requests: Arc<Mutex<Vec<RelayedRequest>>> = Arc::default();
+        let recorded = Arc::clone(&requests);
+        std::thread::spawn(move || {
+            let mut passed = !pass_first;
+            for client in listener.incoming().flatten() {
+                if !passed {
+                    passed = true;
+                    let Ok(upstream) = std::net::TcpStream::connect(("127.0.0.1", upstream_port))
+                    else {
+                        continue;
+                    };
+                    let (Ok(mut c_read), Ok(mut u_read)) =
+                        (client.try_clone(), upstream.try_clone())
+                    else {
+                        continue;
+                    };
+                    let (mut c_write, mut u_write) = (client, upstream);
+                    std::thread::spawn(move || {
+                        let _ = std::io::copy(&mut c_read, &mut u_write);
+                        let _ = u_write.shutdown(std::net::Shutdown::Write);
+                    });
+                    std::thread::spawn(move || {
+                        let _ = std::io::copy(&mut u_read, &mut c_write);
+                        let _ = c_write.shutdown(std::net::Shutdown::Write);
+                    });
+                    continue;
+                }
+                let (server_config, client_config, recorded) = (
+                    Arc::clone(&server_config),
+                    Arc::clone(&client_config),
+                    Arc::clone(&recorded),
+                );
+                std::thread::spawn(move || {
+                    let Ok(conn) = rustls::ServerConnection::new(server_config) else {
+                        return;
+                    };
+                    let mut down = rustls::StreamOwned::new(conn, client);
+                    let Ok(upstream) = std::net::TcpStream::connect(("127.0.0.1", upstream_port))
+                    else {
+                        return;
+                    };
+                    let name = rustls::pki_types::ServerName::try_from("dc.winrm.test")
+                        .expect("server name");
+                    let Ok(conn) = rustls::ClientConnection::new(client_config, name) else {
+                        return;
+                    };
+                    let mut up = rustls::StreamOwned::new(conn, upstream);
+                    let (mut down_buf, mut up_buf) = (Vec::new(), Vec::new());
+                    while let Some((head, body)) = read_http_message(&mut down, &mut down_buf) {
+                        let text = String::from_utf8_lossy(&head).to_ascii_lowercase();
+                        let header = |name: &str| {
+                            text.lines()
+                                .find_map(|l| l.strip_prefix(name).map(|v| v.trim().to_string()))
+                        };
+                        if let Ok(mut r) = recorded.lock() {
+                            r.push(RelayedRequest {
+                                authorization: header("authorization:").is_some(),
+                                content_type: header("content-type:").unwrap_or_default(),
+                                body_len: body.len(),
+                            });
+                        }
+                        if up
+                            .write_all(&head)
+                            .and_then(|()| up.write_all(&body))
+                            .is_err()
+                            || up.flush().is_err()
+                        {
+                            return;
+                        }
+                        let Some((rhead, rbody)) = read_http_message(&mut up, &mut up_buf) else {
+                            return;
+                        };
+                        if down
+                            .write_all(&rhead)
+                            .and_then(|()| down.write_all(&rbody))
+                            .and_then(|()| down.flush())
+                            .is_err()
+                        {
+                            return;
+                        }
+                        if String::from_utf8_lossy(&rhead)
+                            .to_ascii_lowercase()
+                            .contains("connection: close")
+                        {
+                            down.conn.send_close_notify();
+                            let _ = down.flush();
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        Self { port, requests }
+    }
+
+    fn requests(&self) -> Vec<RelayedRequest> {
+        self.requests.lock().map(|r| r.clone()).unwrap_or_default()
+    }
+
+    /// (requests with a body, of which sealed `multipart/encrypted`).
+    fn bodies(&self) -> (usize, usize) {
+        let with_body: Vec<RelayedRequest> = self
+            .requests()
+            .into_iter()
+            .filter(|r| r.body_len > 0)
+            .collect();
+        let sealed = with_body
+            .iter()
+            .filter(|r| r.content_type.starts_with("multipart/encrypted"))
+            .count();
+        eprintln!(
+            "relay: {} requests, {} with a body, {sealed} sealed, {} with Authorization",
+            self.requests().len(),
+            with_body.len(),
+            self.requests().iter().filter(|r| r.authorization).count()
+        );
+        (with_body.len(), sealed)
+    }
+}
+
+/// Read or set the DC's `CbtHardeningLevel` through `client` (NTLM-sealed
+/// over HTTP, which channel binding does not concern).
+#[cfg(feature = "kerberos")]
+async fn dc_cbt_hardening(
+    client: &WinrmClient,
+    host: &str,
+    set: Option<&str>,
+) -> Result<String, WinrmError> {
+    const ITEM: &str = r"WSMan:\localhost\Service\Auth\CbtHardeningLevel";
+    let script = match set {
+        Some(v) => format!("Set-Item {ITEM} {v}; (Get-Item {ITEM}).Value"),
+        None => format!("(Get-Item {ITEM}).Value"),
+    };
+    let out = client.run_powershell(host, &script).await?;
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Run `body` with `CbtHardeningLevel = level` on the DC, then restore
+/// `Relaxed` whatever happened, and re-raise `body`'s panic after the
+/// restore. Both go through NTLM sealing over HTTP.
+#[cfg(feature = "kerberos")]
+async fn with_dc_cbt_hardening<F, Fut>(level: &str, body: F)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let (ntlm, host) = dc_ntlm_sealed_client();
+    let before = dc_cbt_hardening(&ntlm, &host, None).await;
+    assert_eq!(
+        before.as_deref().ok(),
+        Some("Relaxed"),
+        "the DC bench must start with CbtHardeningLevel = Relaxed"
+    );
+    let now = dc_cbt_hardening(&ntlm, &host, Some(level)).await;
+    eprintln!("CbtHardeningLevel set to {level}: {now:?}");
+    let outcome = if now.as_deref().ok() == Some(level) {
+        tokio::spawn(body()).await
+    } else {
+        Ok(())
+    };
+    let restored = dc_cbt_hardening(&ntlm, &host, Some("Relaxed")).await;
+    eprintln!("restore CbtHardeningLevel = Relaxed: {restored:?}");
+    assert_eq!(
+        restored.as_deref().ok(),
+        Some("Relaxed"),
+        "RESTORE FAILED: set CbtHardeningLevel back to Relaxed by hand: {restored:?}"
+    );
+    assert_eq!(
+        now.as_deref().ok(),
+        Some(level),
+        "CbtHardeningLevel not set"
+    );
+    if let Err(e) = outcome {
+        std::panic::resume_unwind(e.into_panic());
+    }
+}
+
+/// Kerberos client to the DC through a TLS-terminating relay.
+#[cfg(feature = "kerberos")]
+fn kerberos_client_through_relay(
+    relay: &TlsRecordingRelay,
+    encryption: EncryptionMode,
+) -> (WinrmClient, String) {
+    kerberos_https_client_from_env(|c| {
+        c.port = relay.port;
+        c.encryption = encryption;
+    })
+}
+
+/// The AP-REQ carries channel bindings for the certificate of the
+/// connection: through a TLS-terminating relay they name the relay's
+/// certificate, and the DC (`CbtHardeningLevel = Relaxed`, which checks
+/// bindings that are present) refuses the authentication. No SOAP body
+/// reaches the relay: the AP-REQ request has none.
+#[cfg(feature = "kerberos")]
+#[tokio::test]
+#[ignore]
+async fn kerberos_channel_binding_through_a_tls_relay_is_refused() {
+    let https_port: u16 = std::env::var("WINRM_TEST_KRB_HTTPS_PORT")
+        .expect("WINRM_TEST_KRB_HTTPS_PORT")
+        .parse()
+        .expect("port");
+    let relay = TlsRecordingRelay::start(https_port);
+    for mode in [EncryptionMode::Auto, EncryptionMode::Always] {
+        let (client, host) = kerberos_client_through_relay(&relay, mode.clone());
+        let err = client
+            .run_command(&host, "whoami", &[])
+            .await
+            .expect_err("a binding to the relay's certificate must be refused");
+        eprintln!("{mode:?} through the relay: {err}");
+        assert!(
+            err.to_string().contains("Kerberos authentication rejected"),
+            "{mode:?}: {err}"
+        );
+    }
+    let (with_body, _) = relay.bodies();
+    assert_eq!(with_body, 0, "a SOAP body reached the relay");
+    assert!(
+        relay.requests().iter().any(|r| r.authorization),
+        "no AP-REQ went through the relay"
+    );
+}
+
+/// The split case: the unauthenticated probe goes through untouched (the
+/// client learns the DC's real certificate and binds to it), but the next
+/// connection, which would carry the AP-REQ, is terminated by the relay with
+/// its own certificate. The dedicated client's verifier is pinned to the
+/// probe's certificate, so that handshake fails and nothing is sent on it:
+/// the relay records no request at all.
+#[cfg(feature = "kerberos")]
+async fn assert_split_relay_fails_at_the_handshake() {
+    let https_port: u16 = std::env::var("WINRM_TEST_KRB_HTTPS_PORT")
+        .expect("WINRM_TEST_KRB_HTTPS_PORT")
+        .parse()
+        .expect("port");
+    for mode in [EncryptionMode::Auto, EncryptionMode::Always] {
+        let relay = TlsRecordingRelay::start_with(https_port, true);
+        let (client, host) = kerberos_client_through_relay(&relay, mode.clone());
+        let err = client
+            .run_command(&host, "whoami", &[])
+            .await
+            .expect_err("the AP-REQ connection presents another certificate");
+        eprintln!("{mode:?} split relay: {err}");
+        assert!(
+            relay.requests().is_empty(),
+            "{mode:?}: the terminated connection carried requests: {:?}",
+            relay.requests()
+        );
+        assert!(
+            matches!(&err, WinrmError::AuthFailed(m) if m.contains("TLS handshake refused") && m.contains("pinned")),
+            "{mode:?}: expected the pinned verifier's refusal, got {err:?}"
+        );
+    }
+}
+
+/// The split case under the DC's default `CbtHardeningLevel = Relaxed`.
+#[cfg(feature = "kerberos")]
+#[tokio::test]
+#[ignore]
+async fn kerberos_channel_binding_split_relay_fails_at_the_handshake() {
+    assert_split_relay_fails_at_the_handshake().await;
+}
+
+/// With `CbtHardeningLevel = None` the DC ignores channel bindings, so the
+/// relay can watch the traffic inside TLS: `EncryptionMode::Always` sends
+/// every SOAP body sealed (Kerberos and NTLM), `Auto` sends them as is
+/// (TLS only), which shows the relay would see plaintext.
+#[cfg(feature = "kerberos")]
+#[tokio::test]
+#[ignore]
+async fn always_seals_inside_tls_seen_by_a_relay_with_dc_cbt_none() {
+    with_dc_cbt_hardening("None", || async {
+        let https_port: u16 = std::env::var("WINRM_TEST_KRB_HTTPS_PORT")
+            .expect("WINRM_TEST_KRB_HTTPS_PORT")
+            .parse()
+            .expect("port");
+
+        let relay = TlsRecordingRelay::start(https_port);
+        let (client, host) = kerberos_client_through_relay(&relay, EncryptionMode::Always);
+        let out = client
+            .run_command(&host, "whoami", &[])
+            .await
+            .expect("Kerberos Always through the relay");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("vagrant"));
+        let (with_body, sealed) = relay.bodies();
+        assert!(with_body >= 4, "expected the command's requests");
+        assert_eq!(sealed, with_body, "Kerberos Always: a body went unsealed");
+
+        let relay = TlsRecordingRelay::start(https_port);
+        let (client, host) = kerberos_client_through_relay(&relay, EncryptionMode::Auto);
+        client
+            .run_command(&host, "whoami", &[])
+            .await
+            .expect("Kerberos Auto through the relay");
+        let (with_body, sealed) = relay.bodies();
+        assert!(with_body >= 4, "expected the command's requests");
+        assert_eq!(sealed, 0, "Kerberos Auto over HTTPS does not seal");
+
+        let relay = TlsRecordingRelay::start(https_port);
+        let config = WinrmConfig {
+            auth_method: AuthMethod::Ntlm,
+            encryption: EncryptionMode::Always,
+            use_tls: true,
+            accept_invalid_certs: true,
+            port: relay.port,
+            ..Default::default()
+        };
+        let ntlm = WinrmClient::new(config, WinrmCredentials::new("vagrant", "vagrant", "WINRM"))
+            .expect("NTLM client");
+        let host = std::env::var("WINRM_TEST_KRB_HOST").expect("WINRM_TEST_KRB_HOST");
+        ntlm.run_command(&host, "whoami", &[])
+            .await
+            .expect("NTLM Always through the relay");
+        let (with_body, sealed) = relay.bodies();
+        assert!(with_body >= 4, "expected the command's requests");
+        assert_eq!(sealed, with_body, "NTLM Always: a body went unsealed");
+    })
+    .await;
+}
+
+/// `CbtHardeningLevel = Strict` requires channel bindings: Kerberos over
+/// HTTPS still works, unsealed (`Auto`) and sealed (`Always`), since the
+/// AP-REQ carries them; through the relay it is refused, and the split relay
+/// fails at the handshake as under `Relaxed`.
+#[cfg(feature = "kerberos")]
+#[tokio::test]
+#[ignore]
+async fn kerberos_over_https_with_dc_cbt_strict() {
+    with_dc_cbt_hardening("Strict", || async {
+        for mode in [EncryptionMode::Auto, EncryptionMode::Always] {
+            let (client, host) = kerberos_https_client_from_env(|c| c.encryption = mode.clone());
+            let out = client
+                .run_command(&host, "whoami", &[])
+                .await
+                .unwrap_or_else(|e| panic!("{mode:?} under Strict: {e}"));
+            assert!(String::from_utf8_lossy(&out.stdout).contains("vagrant"));
+        }
+        let https_port: u16 = std::env::var("WINRM_TEST_KRB_HTTPS_PORT")
+            .expect("WINRM_TEST_KRB_HTTPS_PORT")
+            .parse()
+            .expect("port");
+        let relay = TlsRecordingRelay::start(https_port);
+        let (client, host) = kerberos_client_through_relay(&relay, EncryptionMode::Auto);
+        let err = client
+            .run_command(&host, "whoami", &[])
+            .await
+            .expect_err("relay binding refused under Strict");
+        eprintln!("through the relay under Strict: {err}");
+        assert!(
+            err.to_string().contains("Kerberos authentication rejected"),
+            "{err}"
+        );
+        assert_split_relay_fails_at_the_handshake().await;
+    })
+    .await;
+}
+
+/// The pool race of dedicated connections, as measured: with
+/// `AllowUnencrypted = false` on the DC and a current-thread runtime (this
+/// test's), a 200 KB download right after a small upload sent a sealed
+/// request on a fresh, unauthenticated connection (HTTP 401) in 10 runs out
+/// of 10, for Kerberos and NTLM alike, before the dedicated exchange yielded
+/// to the runtime first. Three rounds per method must now pass on one
+/// connection each.
+#[cfg(feature = "kerberos")]
+#[tokio::test]
+#[ignore]
+async fn sealed_download_after_upload_stays_on_its_connection_allow_unencrypted_false() {
+    with_dc_requiring_encryption(|| async {
+        let dc_port = std::env::var("WINRM_TEST_KRB_PORT").expect("WINRM_TEST_KRB_PORT");
+        for method in ["kerberos", "ntlm"] {
+            for round in 1..=3 {
+                let (client, forwarder, host) = if method == "kerberos" {
+                    sealed_kerberos_client(|_| {}).await
+                } else {
+                    let forwarder = RecordingForwarder::start(format!("127.0.0.1:{dc_port}")).await;
+                    let config = WinrmConfig {
+                        auth_method: AuthMethod::Ntlm,
+                        port: forwarder.addr.port(),
+                        ..Default::default()
+                    };
+                    let client =
+                        WinrmClient::new(config, WinrmCredentials::new("vagrant", "vagrant", "WINRM"))
+                            .expect("NTLM client");
+                    (client, forwarder, "dc.winrm.test".to_string())
+                };
+                let tag = format!("{method}_{round}_{}", std::process::id());
+                let local_up = std::env::temp_dir().join(format!("winrm_rs_race_up_{tag}"));
+                let local_down = std::env::temp_dir().join(format!("winrm_rs_race_down_{tag}"));
+                std::fs::write(&local_up, vec![b'u'; 20_000]).expect("write local file");
+                let remote_up = format!(r"C:\Windows\Temp\winrm_rs_race_up_{tag}.bin");
+                let remote_big = format!(r"C:\Windows\Temp\winrm_rs_race_big_{tag}.bin");
+                client
+                    .upload_file(&host, &local_up, &remote_up)
+                    .await
+                    .unwrap_or_else(|e| panic!("{method} round {round}: upload: {e}"));
+                client
+                    .run_powershell(
+                        &host,
+                        &format!("[IO.File]::WriteAllBytes('{remote_big}', [byte[]](1..200001 | % {{ $_ % 251 }}))"),
+                    )
+                    .await
+                    .unwrap_or_else(|e| panic!("{method} round {round}: make file: {e}"));
+                let got = client
+                    .download_file(&host, &remote_big, &local_down)
+                    .await
+                    .unwrap_or_else(|e| panic!("{method} round {round}: download: {e}"));
+                assert_eq!(got, 200_001, "{method} round {round}");
+                let _ = client
+                    .run_powershell(
+                        &host,
+                        &format!("Remove-Item '{remote_up}','{remote_big}' -Force -ErrorAction SilentlyContinue"),
+                    )
+                    .await;
+                let _ = std::fs::remove_file(&local_up);
+                let _ = std::fs::remove_file(&local_down);
+                assert_eq!(
+                    forwarder.connections(),
+                    1,
+                    "{method} round {round}: a request left the authenticated connection"
+                );
+            }
+        }
+    })
+    .await;
 }

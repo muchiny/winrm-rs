@@ -16,17 +16,21 @@ use crate::error::WinrmError;
 /// in a [`SecretString`] so the buffer is zeroized on drop.
 pub(crate) struct BasicAuth {
     pub(crate) credentials_b64: SecretString,
+    /// Largest response body read (see `transport::max_response_bytes`).
+    pub(crate) max_response_bytes: usize,
 }
 
 impl BasicAuth {
-    /// Create a new `BasicAuth` from username and password.
-    pub(crate) fn new(username: &str, password: &str) -> Self {
+    /// Create a new `BasicAuth` from username and password, reading
+    /// response bodies up to `max_response_bytes`.
+    pub(crate) fn new(username: &str, password: &str, max_response_bytes: usize) -> Self {
         // Build "user:pass" inside a Zeroizing buffer so the cleartext
         // never lingers after we've base64-encoded it.
         let raw = Zeroizing::new(format!("{username}:{password}"));
         let encoded = B64.encode(raw.as_bytes());
         Self {
             credentials_b64: SecretString::from(encoded),
+            max_response_bytes,
         }
     }
 }
@@ -43,27 +47,26 @@ impl AuthTransport for BasicAuth {
             .header(CONTENT_TYPE, "application/soap+xml;charset=UTF-8")
             .header(
                 AUTHORIZATION,
-                format!("Basic {}", self.credentials_b64.expose_secret()),
+                crate::auth::authorization_value(&format!(
+                    "Basic {}",
+                    self.credentials_b64.expose_secret()
+                ))?,
             )
             .body(body)
             .send()
             .await
             .map_err(WinrmError::Http)?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            if status.as_u16() == 500
-                && let Err(soap_err) = crate::soap::parser::check_soap_fault(&body)
-            {
-                return Err(WinrmError::Soap(soap_err));
-            }
-            return Err(WinrmError::AuthFailed(format!(
-                "HTTP {status} from WinRM: {body}"
-            )));
+        let status = resp.status();
+        let body = crate::auth::read_text_capped(resp, self.max_response_bytes).await?;
+        if !status.is_success() {
+            return Err(crate::auth::error_for_status(
+                status.as_u16(),
+                &body,
+                || format!("HTTP {status} from WinRM: {}", crate::auth::excerpt(&body)),
+            ));
         }
-
-        resp.text().await.map_err(WinrmError::Http)
+        Ok(body)
     }
 }
 
@@ -75,7 +78,7 @@ mod tests {
 
     #[test]
     fn new_encodes_credentials_base64() {
-        let auth = BasicAuth::new("admin", "p@ss");
+        let auth = BasicAuth::new("admin", "p@ss", 1 << 20);
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(auth.credentials_b64.expose_secret())
             .unwrap();
@@ -92,7 +95,7 @@ mod tests {
             .await;
 
         let http = crate::transport::test_http_client();
-        let auth = BasicAuth::new("admin", "pass");
+        let auth = BasicAuth::new("admin", "pass", 1 << 20);
         let result = auth
             .send_authenticated(&http, &server.uri(), "<soap/>".into())
             .await;
@@ -108,7 +111,7 @@ mod tests {
             .await;
 
         let http = crate::transport::test_http_client();
-        let auth = BasicAuth::new("user", "wrong");
+        let auth = BasicAuth::new("user", "wrong", 1 << 20);
         let err = auth
             .send_authenticated(&http, &server.uri(), "<soap/>".into())
             .await
@@ -131,7 +134,7 @@ mod tests {
             .await;
 
         let http = crate::transport::test_http_client();
-        let auth = BasicAuth::new("user", "pass");
+        let auth = BasicAuth::new("user", "pass", 1 << 20);
         let err = auth
             .send_authenticated(&http, &server.uri(), "<soap/>".into())
             .await
@@ -151,7 +154,7 @@ mod tests {
             .await;
 
         let http = crate::transport::test_http_client();
-        let auth = BasicAuth::new("user", "pass");
+        let auth = BasicAuth::new("user", "pass", 1 << 20);
         let err = auth
             .send_authenticated(&http, &server.uri(), "<soap/>".into())
             .await
@@ -160,5 +163,39 @@ mod tests {
             matches!(err, WinrmError::AuthFailed(_)),
             "expected AuthFailed, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn send_refuses_a_body_over_the_cap() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("b".repeat(65)))
+            .mount(&server)
+            .await;
+        let http = crate::transport::test_http_client();
+        let err = BasicAuth::new("user", "pass", 64)
+            .send_authenticated(&http, &server.uri(), "<soap/>".into())
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("exceeds 64 bytes"), "{err}");
+    }
+
+    /// An error answer is quoted in part: the first 512 characters and the
+    /// size, not the whole body.
+    #[tokio::test]
+    async fn send_error_quotes_an_excerpt_of_the_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("d".repeat(2000)))
+            .mount(&server)
+            .await;
+        let http = crate::transport::test_http_client();
+        let err = BasicAuth::new("user", "pass", 1 << 20)
+            .send_authenticated(&http, &server.uri(), "<soap/>".into())
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("[2000 bytes in total]"), "{msg}");
+        assert!(!msg.contains(&"d".repeat(513)), "whole body quoted");
     }
 }

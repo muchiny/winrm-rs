@@ -87,6 +87,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "fuzz_ntlm_unseal_body"
+path = "fuzz_targets/fuzz_ntlm_unseal_body.rs"
+test = false
+doc = false
+bench = false
+
 # --- SOAP --------------------------------------------------------------------
 
 [[bin]]
@@ -113,6 +120,13 @@ bench = false
 [[bin]]
 name = "fuzz_xml_escape"
 path = "fuzz_targets/fuzz_xml_escape.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_clixml_stderr"
+path = "fuzz_targets/fuzz_clixml_stderr.rs"
 test = false
 doc = false
 bench = false
@@ -159,6 +173,13 @@ bench = false
 [[bin]]
 name = "fuzz_asn1_cert"
 path = "fuzz_targets/fuzz_asn1_cert.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_kerberos_sealed"
+path = "fuzz_targets/fuzz_kerberos_sealed.rs"
 test = false
 doc = false
 bench = false

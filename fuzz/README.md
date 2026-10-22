@@ -1,6 +1,6 @@
 # Fuzzing `winrm-rs`
 
-18 libFuzzer targets covering everything the crate parses off the network and
+21 libFuzzer targets covering everything the crate parses off the network and
 everything it splices into an outgoing request. Driven through
 [`scripts/fuzz.sh`](../scripts/fuzz.sh).
 
@@ -43,6 +43,8 @@ drives; "invariant" is what it asserts beyond *must not panic*.
 | `fuzz_ntlm_crypto` | NTOWFv1/v2, client blob, CBT, RC4, UTF-16 | blob framing is exact; RC4 self-inverse; UTF-16 roundtrips |
 | `fuzz_ntlm_seal` | `NtlmSession::seal`/`unseal` | seal prepends exactly 16 bytes |
 | `fuzz_ntlm_session` | multi-message seal/sign/unseal | signature version and sequence numbering across a conversation |
+| `fuzz_ntlm_unseal_body` | `auth/ntlm.rs::unseal_body` (MS-WSMV multipart/encrypted framing) | never panics; errors do not echo the body; a server-sealed frame round-trips exactly; a flipped bit is rejected or leaves the plaintext unchanged; any truncation is rejected |
+| `fuzz_kerberos_sealed` | `auth/sealed.rs::parse` with the Kerberos header rule, `auth/kerberos.rs` `check_acceptor_sealed` / `windows_layout`, `soap/parser.rs::check_relates_to` (no KDC needed) | never panics; errors stay short; a parsed token is a 16..=1024-byte header plus exactly `Length` bytes; the layout conversion keeps the data, writes RRC = trailer length and is a right rotation by it |
 
 ### SOAP
 
@@ -52,12 +54,13 @@ drives; "invariant" is what it asserts beyond *must not panic*.
 | `fuzz_soap_enumerate` | `parse_enumerate_response` | `EndOfSequence` clears the context; the context cannot inject into the next `Pull` |
 | `fuzz_soap_envelope` | all envelope builders | **no input can add XML markup** — tag counts match an empty-input baseline |
 | `fuzz_xml_escape` | `envelope::xml_escape` | complete (no raw markup survives) and reversible |
+| `fuzz_clixml_stderr` | `soap/clixml.rs::ClixmlDecoder` | output does not depend on how stderr is sliced; plain stderr passes through; output ≤ 3× input |
 
 ### Input validation
 
 | Target | Source | Invariant |
 |---|---|---|
-| `fuzz_transport_host` | `transport::sanitize_host` | no `/` or `@` survives; the rebuilt URL has one authority |
+| `fuzz_transport_host` | `transport::sanitize_host`, `transport::validate_host` | no `/` or `@` survives; the rebuilt URL has one authority; an accepted host has no `?`, `#`, `\`, whitespace or control character, and its endpoint URL (when the URL parser takes it) reads back with that host, the port, `/wsman`, and no userinfo, query or fragment |
 | `fuzz_transfer_path` | `validate_remote_path`, `escape_ps_single_quoted` | accepted paths are bounded and control-free; quote runs stay even-length |
 | `fuzz_powershell_encode` | `command::encode_powershell_command` | output is ASCII base64 and roundtrips |
 

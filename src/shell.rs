@@ -3,13 +3,16 @@
 // Wraps a shell ID and provides methods to run commands, send input,
 // and signal Ctrl+C within a persistent shell.
 
+use std::collections::HashMap;
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use tracing::debug;
 
-use crate::client::WinrmClient;
+use crate::client::{WinrmClient, empty_poll_on_timeout};
 use crate::command::CommandOutput;
 use crate::error::WinrmError;
+use crate::soap::clixml::ClixmlDecoder;
 use crate::soap::{self, ReceiveOutput};
 
 /// A reusable WinRM shell session.
@@ -29,6 +32,7 @@ pub struct Shell<'a> {
     /// Defaults to `RESOURCE_URI_CMD` for standard command shells;
     /// PSRP shells use `RESOURCE_URI_PSRP`.
     resource_uri: String,
+    stderr_decoders: Mutex<StderrDecoders>,
 }
 
 impl<'a> Shell<'a> {
@@ -39,6 +43,7 @@ impl<'a> Shell<'a> {
             shell_id,
             closed: false,
             resource_uri: crate::soap::namespaces::RESOURCE_URI_CMD.to_string(),
+            stderr_decoders: Mutex::default(),
         }
     }
 
@@ -54,6 +59,7 @@ impl<'a> Shell<'a> {
             shell_id,
             closed: false,
             resource_uri,
+            stderr_decoders: Mutex::default(),
         }
     }
 
@@ -83,18 +89,25 @@ impl<'a> Shell<'a> {
         let result = tokio::time::timeout(timeout_duration, async {
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
+            let mut stderr_decoder = ClixmlDecoder::new();
+            // Raw bytes received, so the cap also bounds stderr still
+            // buffered in the decoder.
+            let mut received = 0usize;
             let mut exit_code: Option<i32> = None;
 
             loop {
                 let output: ReceiveOutput = self
                     .client
-                    .receive_output(&self.host, &self.shell_id, &command_id)
+                    .receive_output_raw(&self.host, &self.shell_id, &command_id)
                     .await?;
+                received = received
+                    .saturating_add(output.stdout.len())
+                    .saturating_add(output.stderr.len());
                 stdout.extend_from_slice(&output.stdout);
-                stderr.extend_from_slice(&output.stderr);
+                stderr.extend(stderr_decoder.push(&output.stderr));
 
                 if let Some(cap) = max_output
-                    && stdout.len() + stderr.len() > cap
+                    && received > cap
                 {
                     return Err(WinrmError::Transfer(format!(
                         "command output exceeded max_output_bytes ({cap})"
@@ -107,6 +120,7 @@ impl<'a> Shell<'a> {
                     break;
                 }
             }
+            stderr.extend(stderr_decoder.finish());
 
             // Best-effort signal terminate
             self.client
@@ -133,8 +147,12 @@ impl<'a> Shell<'a> {
     /// Execute a command with cancellation support.
     ///
     /// Like [`run_command`](Self::run_command), but can be cancelled via a
-    /// [`CancellationToken`](crate::CancellationToken). When cancelled, a Ctrl+C signal is sent to the
-    /// running command and [`WinrmError::Cancelled`] is returned.
+    /// [`CancellationToken`](crate::CancellationToken). When cancelled the
+    /// call in flight is dropped and [`WinrmError::Cancelled`] is returned; no
+    /// signal is sent, so the command keeps running until
+    /// [`signal_ctrl_c`](Self::signal_ctrl_c) (via
+    /// [`start_command`](Self::start_command)) or the shell's deletion stops
+    /// it.
     pub async fn run_command_with_cancel(
         &self,
         command: &str,
@@ -307,6 +325,25 @@ impl<'a> Shell<'a> {
     /// Returns a single [`ReceiveOutput`] representing one poll cycle.
     /// Callers should accumulate stdout/stderr and stop when
     /// [`done`](ReceiveOutput::done) is `true`.
+    ///
+    /// PowerShell CLIXML on stderr is decoded across polls, as a
+    /// [`StderrDecoder`](crate::StderrDecoder) kept per command would: each
+    /// error, warning, verbose or debug record comes out on the poll that
+    /// delivers its last byte, even though `powershell.exe` only closes its
+    /// `<Objs>` document when it exits. Only a record split across Receive
+    /// responses is held back until its end arrives, so a poll may return an
+    /// empty `stderr` while bytes are buffered; anything left comes out on
+    /// the `done` poll. Note that `powershell.exe` buffers its own stderr:
+    /// measured on Server 2025, it sends stderr in blocks of a few KiB and
+    /// the rest at exit, so a few small errors still reach the client only
+    /// when the command ends. Decoders of commands never polled to `done` are
+    /// dropped, least recently polled first, when a 33rd would be tracked. A
+    /// decoder buffers at most one record of 16 MiB, so a `Shell` holds at most
+    /// 32 x 16 MiB of undecoded stderr in the worst case.
+    ///
+    /// A `TimedOut` fault (the command stayed silent for
+    /// `operation_timeout_secs`) is not an error: it is returned as an empty,
+    /// not-done poll, and the caller should poll again.
     pub async fn receive_next(&self, command_id: &str) -> Result<ReceiveOutput, WinrmError> {
         let endpoint = self.client.endpoint(&self.host);
         let config = self.client.config();
@@ -336,8 +373,19 @@ impl<'a> Shell<'a> {
                 &self.resource_uri,
             )
         };
-        let response = self.client.send_soap_raw(&self.host, envelope).await?;
-        soap::parse_receive_output(&response).map_err(WinrmError::Soap)
+        let polled = async {
+            let response = self.client.send_soap_raw(&self.host, envelope).await?;
+            soap::parse_receive_output_raw(&response).map_err(WinrmError::Soap)
+        }
+        .await;
+        let mut output = empty_poll_on_timeout(polled)?;
+
+        output.stderr = self
+            .stderr_decoders
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .decode(command_id, &output.stderr, output.done);
+        Ok(output)
     }
 
     /// Get the shell ID.
@@ -396,12 +444,163 @@ impl<'a> Shell<'a> {
     }
 }
 
+/// Commands tracked at once by [`StderrDecoders`]. WinRM caps a shell at 25
+/// concurrent processes (`MaxProcessesPerShell`), so past this the least
+/// recently polled entry belongs to a command the caller stopped polling.
+const MAX_STREAMED_COMMANDS: usize = 32;
+
+/// stderr decoders of the commands polled through [`Shell::receive_next`],
+/// keyed by command ID, so a CLIXML record split across polls is
+/// reassembled.
+#[derive(Default)]
+struct StderrDecoders {
+    /// Command ID to (sequence number of its last poll, decoder).
+    by_command: HashMap<String, (u64, ClixmlDecoder)>,
+    next_seq: u64,
+}
+
+impl StderrDecoders {
+    /// Decode one poll's stderr for `command_id`; `done` releases whatever
+    /// the command's decoder still buffers and forgets it.
+    fn decode(&mut self, command_id: &str, chunk: &[u8], done: bool) -> Vec<u8> {
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        if let Some((last_poll, decoder)) = self.by_command.get_mut(command_id) {
+            *last_poll = seq;
+            let mut out = decoder.push(chunk);
+            if done {
+                out.extend(decoder.finish());
+                self.by_command.remove(command_id);
+            }
+            return out;
+        }
+        if chunk.is_empty() {
+            // Nothing buffered and nothing to buffer: no entry needed.
+            return Vec::new();
+        }
+        let mut decoder = ClixmlDecoder::new();
+        let mut out = decoder.push(chunk);
+        if done {
+            out.extend(decoder.finish());
+            return out;
+        }
+        if self.by_command.len() >= MAX_STREAMED_COMMANDS {
+            self.evict_least_recently_polled();
+        }
+        self.by_command
+            .insert(command_id.to_string(), (seq, decoder));
+        out
+    }
+
+    fn evict_least_recently_polled(&mut self) {
+        let stale = self
+            .by_command
+            .iter()
+            .min_by_key(|(_, (last_poll, _))| *last_poll)
+            .map(|(id, _)| id.clone());
+        if let Some(id) = stale {
+            debug!(command_id = %id, "dropping stderr decoder of a command never polled to Done");
+            self.by_command.remove(&id);
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.by_command.len()
+    }
+}
+
 impl Drop for Shell<'_> {
     fn drop(&mut self) {
         if !self.closed {
             tracing::warn!(
                 shell_id = %self.shell_id,
                 "shell dropped without close -- resources may leak on server"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod stderr_decoder_tests {
+    use super::*;
+
+    #[test]
+    fn decoder_is_kept_across_polls_and_dropped_when_done() {
+        let mut decoders = StderrDecoders::default();
+        assert!(
+            decoders
+                .decode("c1", b"#< CLIXML\r\n<Objs><S S=\"Error\">a", false)
+                .is_empty()
+        );
+        assert_eq!(decoders.len(), 1);
+        assert_eq!(decoders.decode("c1", b"</S></Objs>", true), b"a");
+        assert_eq!(decoders.len(), 0);
+    }
+
+    #[test]
+    fn in_flight_command_survives_many_abandoned_ones() {
+        // The in-flight command started first but keeps being polled; the
+        // abandoned ones are polled once each. Least-recently-used eviction
+        // must drop those, not the oldest-inserted in-flight decoder.
+        let mut decoders = StderrDecoders::default();
+        assert!(
+            decoders
+                .decode("live", b"#< CLIXML\r\n<Objs><S S=\"Error\">kept", false)
+                .is_empty()
+        );
+        for i in 0..MAX_STREAMED_COMMANDS * 2 {
+            decoders.decode(&format!("gone{i}"), b"#< CLIXML\r\n<Objs>", false);
+            assert!(decoders.decode("live", b"", false).is_empty());
+        }
+        assert_eq!(decoders.len(), MAX_STREAMED_COMMANDS);
+        assert_eq!(
+            decoders.decode("live", b" text</S></Objs>", true),
+            b"kept text"
+        );
+    }
+
+    #[test]
+    fn empty_poll_of_an_unknown_command_tracks_nothing() {
+        let mut decoders = StderrDecoders::default();
+        assert!(decoders.decode("quiet", b"", false).is_empty());
+        assert_eq!(decoders.len(), 0);
+        // A one-shot done poll decodes without taking a slot either.
+        assert_eq!(
+            decoders.decode(
+                "once",
+                b"#< CLIXML\r\n<Objs><S S=\"Error\">x</S></Objs>",
+                true
+            ),
+            b"x"
+        );
+        assert_eq!(decoders.len(), 0);
+    }
+
+    #[test]
+    fn abandoned_commands_are_evicted_least_recently_polled_first() {
+        let mut decoders = StderrDecoders::default();
+        for i in 0..MAX_STREAMED_COMMANDS + 10 {
+            decoders.decode(&format!("c{i}"), b"#< CLIXML\r\n<Objs>", false);
+        }
+        assert_eq!(decoders.len(), MAX_STREAMED_COMMANDS);
+        // The 10 least recently polled (c0..c9) were evicted: with no decoder
+        // left, their next poll is plain text, not a decoded record.
+        let rest: &[u8] = b"<S S=\"Error\">z</S></Objs>";
+        for i in 0..10 {
+            assert_eq!(
+                decoders.decode(&format!("c{i}"), rest, true),
+                rest,
+                "c{i} should have been evicted"
+            );
+        }
+        // c10, the oldest survivor, and the newest are still tracked and
+        // decode normally.
+        for i in [10, MAX_STREAMED_COMMANDS + 9] {
+            assert_eq!(
+                decoders.decode(&format!("c{i}"), rest, true),
+                b"z",
+                "c{i} should still be tracked"
             );
         }
     }
@@ -1159,5 +1358,186 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, WinrmError::Cancelled), "got: {err}");
+    }
+
+    // --- TimedOut fault on Receive is an empty poll ---
+
+    const TIMED_OUT_FAULT: &str = r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><s:Fault>
+        <s:Code><s:Value>s:Receiver</s:Value><s:Subcode><s:Value>w:TimedOut</s:Value></s:Subcode></s:Code>
+        <s:Reason><s:Text xml:lang="en-US">The WS-Management service cannot complete the operation within the time specified in OperationTimeout.</s:Text></s:Reason>
+    </s:Fault></s:Body></s:Envelope>"#;
+
+    const DONE_OK: &str = r#"<s:Envelope><s:Body><rsp:ReceiveResponse>
+        <rsp:Stream Name="stdout" CommandId="TC">b2s=</rsp:Stream>
+        <rsp:CommandState CommandId="TC" State="http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Done">
+            <rsp:ExitCode>3</rsp:ExitCode>
+        </rsp:CommandState>
+    </rsp:ReceiveResponse></s:Body></s:Envelope>"#;
+
+    async fn mount_ok(server: &MockServer, body: &'static str, n: u64) {
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .up_to_n_times(n)
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_open_shell_and_command(server: &MockServer) {
+        mount_ok(
+            server,
+            "<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>TS</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
+            1,
+        )
+        .await;
+        mount_ok(
+            server,
+            "<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>TC</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
+            1,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn shell_run_command_keeps_polling_through_timed_out_faults() {
+        let server = MockServer::start().await;
+        mount_open_shell_and_command(&server).await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(TIMED_OUT_FAULT))
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        mount_ok(&server, DONE_OK, 1).await;
+        mount_ok(&server, "<s:Envelope><s:Body/></s:Envelope>", u64::MAX).await;
+
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        let shell = client.open_shell("127.0.0.1").await.unwrap();
+        let out = shell.run_command("slow", &[]).await.unwrap();
+        assert_eq!(out.stdout, b"ok");
+        assert_eq!(out.exit_code, 3);
+    }
+
+    #[tokio::test]
+    async fn shell_run_command_silent_forever_ends_in_the_outer_timeout() {
+        // Each Receive is answered with TimedOut after a short wait, as a real
+        // host does after OperationTimeout; the 2 x operation_timeout deadline
+        // is what ends the call.
+        let server = MockServer::start().await;
+        mount_open_shell_and_command(&server).await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_string(TIMED_OUT_FAULT)
+                    .set_delay(std::time::Duration::from_millis(250)),
+            )
+            .mount(&server)
+            .await;
+
+        let config = WinrmConfig {
+            operation_timeout_secs: 1,
+            ..basic_config(server.address().port())
+        };
+        let client = WinrmClient::new(config, test_creds()).unwrap();
+        let shell = client.open_shell("127.0.0.1").await.unwrap();
+        let err = shell.run_command("slow", &[]).await.unwrap_err();
+        assert!(matches!(err, WinrmError::Timeout(2)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn receive_next_timed_out_fault_is_an_empty_poll() {
+        let server = MockServer::start().await;
+        mount_ok(
+            &server,
+            "<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>TS</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
+            1,
+        )
+        .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(TIMED_OUT_FAULT))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        mount_ok(&server, DONE_OK, 1).await;
+
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        let shell = client.open_shell("127.0.0.1").await.unwrap();
+        let first = shell.receive_next("TC").await.unwrap();
+        assert!(first.stdout.is_empty() && first.stderr.is_empty() && !first.done);
+        assert_eq!(first.exit_code, None);
+        let second = shell.receive_next("TC").await.unwrap();
+        assert_eq!(second.stdout, b"ok");
+        assert!(second.done);
+    }
+
+    /// Mount Create, Execute, then three Receives: a `#< CLIXML` marker with the
+    /// start of a document cut mid-escape, a `TimedOut` fault, and the rest of
+    /// the document with `Done`; then a catch-all for Signal/Delete.
+    async fn mount_clixml_split_by_timed_out_fault(server: &MockServer) {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        mount_open_shell_and_command(server).await;
+        let part = |bytes: &[u8], state: &str| {
+            format!(
+                r#"<s:Envelope><s:Body><rsp:ReceiveResponse><rsp:Stream Name="stderr" CommandId="TC">{}</rsp:Stream>{state}</rsp:ReceiveResponse></s:Body></s:Envelope>"#,
+                b64.encode(bytes)
+            )
+        };
+        let running = r#"<rsp:CommandState CommandId="TC" State="http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Running"/>"#;
+        let done = r#"<rsp:CommandState CommandId="TC" State="http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Done"><rsp:ExitCode>1</rsp:ExitCode></rsp:CommandState>"#;
+        let first = part(
+            b"#< CLIXML\r\n<Objs><S S=\"Error\">denied_x000D__x000A",
+            running,
+        );
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(first))
+            .up_to_n_times(1)
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(TIMED_OUT_FAULT))
+            .up_to_n_times(1)
+            .mount(server)
+            .await;
+        let last = part(b"_</S></Objs>", done);
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(last))
+            .up_to_n_times(1)
+            .mount(server)
+            .await;
+        mount_ok(server, "<s:Envelope><s:Body/></s:Envelope>", u64::MAX).await;
+    }
+
+    #[tokio::test]
+    async fn shell_run_command_decodes_clixml_split_by_a_timed_out_poll() {
+        let server = MockServer::start().await;
+        mount_clixml_split_by_timed_out_fault(&server).await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        let shell = client.open_shell("127.0.0.1").await.unwrap();
+
+        let out = shell.run_command("powershell.exe", &[]).await.unwrap();
+        // Decoded exactly once, no raw XML, and the empty poll lost nothing.
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "denied\r\n");
+        assert_eq!(out.exit_code, 1);
+    }
+
+    #[tokio::test]
+    async fn receive_next_decodes_clixml_split_by_a_timed_out_poll() {
+        let server = MockServer::start().await;
+        mount_clixml_split_by_timed_out_fault(&server).await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        let shell = client.open_shell("127.0.0.1").await.unwrap();
+
+        let cmd_id = shell.start_command("powershell.exe", &[]).await.unwrap();
+        let mut stderr = Vec::new();
+        let mut polls = 0;
+        loop {
+            let chunk = shell.receive_next(&cmd_id).await.unwrap();
+            polls += 1;
+            stderr.extend(chunk.stderr);
+            if chunk.done {
+                break;
+            }
+        }
+        assert_eq!(polls, 3, "partial document, empty poll, then the rest");
+        assert_eq!(String::from_utf8_lossy(&stderr), "denied\r\n");
     }
 }

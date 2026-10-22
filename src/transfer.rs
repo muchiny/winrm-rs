@@ -8,6 +8,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 
 use crate::client::WinrmClient;
+use crate::command::CommandOutput;
 use crate::error::WinrmError;
 
 /// File transfer chunk size (raw bytes before encoding).
@@ -103,7 +104,7 @@ impl WinrmClient {
                 shell.close().await.ok();
                 return Err(WinrmError::Transfer(format!(
                     "upload chunk {i} failed: {}",
-                    String::from_utf8_lossy(&output.stderr)
+                    crate::auth::excerpt(&String::from_utf8_lossy(&output.stderr))
                 )));
             }
         }
@@ -115,6 +116,10 @@ impl WinrmClient {
     /// Download a file from a remote Windows host.
     ///
     /// Reads the file via PowerShell base64 encoding and decodes locally.
+    /// Built on [`run_powershell`](Self::run_powershell), it has no overall
+    /// time limit; use
+    /// [`download_file_with_timeout`](Self::download_file_with_timeout) to
+    /// bound it.
     ///
     /// Returns the number of bytes downloaded.
     pub async fn download_file(
@@ -124,33 +129,90 @@ impl WinrmClient {
         local_path: &Path,
     ) -> Result<u64, WinrmError> {
         validate_remote_path(remote_path)?;
-
-        let escaped = escape_ps_single_quoted(remote_path);
-        let script = format!("[Convert]::ToBase64String([IO.File]::ReadAllBytes('{escaped}'))");
-
+        let script = download_script(remote_path);
         let output = self.run_powershell(host, &script).await?;
-        if output.exit_code != 0 {
-            return Err(WinrmError::Transfer(format!(
-                "download failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )));
-        }
-
-        let b64 = String::from_utf8_lossy(&output.stdout);
-        let data = B64
-            .decode(b64.trim_ascii())
-            .map_err(|e| WinrmError::Transfer(format!("base64 decode of downloaded file: {e}")))?;
-
-        let total = data.len() as u64;
-        std::fs::write(local_path, &data).map_err(|e| {
-            WinrmError::Transfer(format!(
-                "failed to write local file {}: {e}",
-                local_path.display()
-            ))
-        })?;
-
-        Ok(total)
+        write_download(&output, local_path)
     }
+
+    /// Download a file from a remote Windows host, giving up after `timeout`.
+    ///
+    /// Like [`download_file`](Self::download_file), but the remote read must
+    /// finish within `timeout`, as for
+    /// [`run_powershell_with_timeout`](Self::run_powershell_with_timeout):
+    /// on expiry the shell is deleted and [`WinrmError::Timeout`] is returned
+    /// with `timeout` rounded up to whole seconds. The limit covers the
+    /// transfer from the host, not the local write that follows it. No local
+    /// file is created or modified on timeout.
+    ///
+    /// Returns the number of bytes downloaded.
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// # use std::{path::Path, time::Duration};
+    /// # use winrm_rs::{WinrmClient, WinrmConfig, WinrmCredentials, WinrmError};
+    /// # async fn example() -> Result<(), WinrmError> {
+    /// # let client = WinrmClient::new(WinrmConfig::default(), WinrmCredentials::new("u","p",""))?;
+    /// let bytes = client
+    ///     .download_file_with_timeout(
+    ///         "server",
+    ///         r"C:\logs\app.log",
+    ///         Path::new("app.log"),
+    ///         Duration::from_secs(60),
+    ///     )
+    ///     .await?;
+    /// println!("{bytes} bytes");
+    /// # Ok(()) }
+    /// ```
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, host),
+        fields(host = %crate::transport::redact_userinfo(host))
+    )]
+    pub async fn download_file_with_timeout(
+        &self,
+        host: &str,
+        remote_path: &str,
+        local_path: &Path,
+        timeout: std::time::Duration,
+    ) -> Result<u64, WinrmError> {
+        validate_remote_path(remote_path)?;
+        let script = download_script(remote_path);
+        let output = self
+            .run_powershell_with_timeout(host, &script, timeout)
+            .await?;
+        write_download(&output, local_path)
+    }
+}
+
+/// The remote script that prints `remote_path` as base64.
+fn download_script(remote_path: &str) -> String {
+    let escaped = escape_ps_single_quoted(remote_path);
+    format!("[Convert]::ToBase64String([IO.File]::ReadAllBytes('{escaped}'))")
+}
+
+/// Decode the base64 a download script printed and write it to `local_path`.
+fn write_download(output: &CommandOutput, local_path: &Path) -> Result<u64, WinrmError> {
+    if output.exit_code != 0 {
+        return Err(WinrmError::Transfer(format!(
+            "download failed: {}",
+            crate::auth::excerpt(&String::from_utf8_lossy(&output.stderr))
+        )));
+    }
+
+    let b64 = String::from_utf8_lossy(&output.stdout);
+    let data = B64
+        .decode(b64.trim_ascii())
+        .map_err(|e| WinrmError::Transfer(format!("base64 decode of downloaded file: {e}")))?;
+
+    let total = data.len() as u64;
+    std::fs::write(local_path, &data).map_err(|e| {
+        WinrmError::Transfer(format!(
+            "failed to write local file {}: {e}",
+            local_path.display()
+        ))
+    })?;
+
+    Ok(total)
 }
 
 #[cfg(test)]
@@ -217,5 +279,28 @@ mod tests {
             assert_eq!(run % 2, 0, "odd trailing quote run in {escaped:?}");
             assert_eq!(escaped.replace("''", "'"), input);
         }
+    }
+
+    /// The remote stderr quoted in a failed download is bounded.
+    #[test]
+    fn download_failure_quotes_a_bounded_stderr() {
+        let output = CommandOutput {
+            stdout: Vec::new(),
+            stderr: "E".repeat(100_000).into_bytes(),
+            exit_code: 1,
+        };
+        let path = std::env::temp_dir().join(format!(
+            "winrm-rs-download-failure-{}",
+            uuid::Uuid::new_v4()
+        ));
+        match write_download(&output, &path) {
+            Err(WinrmError::Transfer(msg)) => {
+                assert!(msg.len() < 1_000, "{} bytes", msg.len());
+                assert!(msg.starts_with("download failed: EEE"), "{msg}");
+                assert!(msg.ends_with("[100000 bytes in total]"), "{msg}");
+            }
+            other => panic!("expected a transfer error, got {other:?}"),
+        }
+        assert!(!path.exists());
     }
 }

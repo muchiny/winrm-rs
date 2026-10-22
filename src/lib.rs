@@ -27,8 +27,8 @@
 //! |--------|-------------|-------|
 //! | HTTP Basic | [`AuthMethod::Basic`] | Credentials sent base64-encoded per request. Use only over HTTPS. |
 //! | `NTLMv2` | [`AuthMethod::Ntlm`] | Three-step handshake (negotiate / challenge / authenticate). Default. |
-//! | Kerberos | [`AuthMethod::Kerberos`] | SPNEGO Negotiate via system Kerberos. Requires `kerberos` feature + `kinit`. |
-//! | Certificate | [`AuthMethod::Certificate`] | TLS client certificate. Set `client_cert_pem` and `client_key_pem` on config. |
+//! | Kerberos | [`AuthMethod::Kerberos`] | Raw Kerberos GSS-API tokens (not SPNEGO) under the `Negotiate` HTTP scheme, via the system Kerberos library. Messages sealed with the Kerberos context over HTTP (see [`EncryptionMode`]); over HTTPS, channel binding to the probe's certificate, pinned for the connection's life. Requires `kerberos` feature + `kinit`. Windows clients: SSPI path built by the `kerberos-windows` CI job, not tested live; `EncryptionMode::Never` is the way back. |
+//! | Certificate | [`AuthMethod::Certificate`] | TLS client certificate; requires `use_tls = true` (building the client fails with `AuthFailed` otherwise). Set `client_cert_pem` and `client_key_pem` on config. |
 //!
 //! # Error handling
 //!
@@ -92,6 +92,10 @@ mod error;
 mod ntlm;
 mod shell;
 mod soap;
+#[cfg(test)]
+mod test_ntlm_server;
+#[cfg(test)]
+mod test_pki;
 mod tls;
 mod transfer;
 mod transport;
@@ -107,7 +111,7 @@ pub use shell::Shell;
 pub use soap::namespaces::RESOURCE_URI_PSRP;
 pub use tokio_util::sync::CancellationToken;
 // Re-export soap types that are part of the public API
-pub use soap::ReceiveOutput;
+pub use soap::{ReceiveOutput, StderrDecoder};
 
 // Internal surface for the in-tree fuzz targets and property tests. NOT
 // part of the public API: anything in `__fuzz` may be removed or changed

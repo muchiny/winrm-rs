@@ -843,7 +843,7 @@ impl HttpTransport {
             match self.send_soap(host, body.clone()).await {
                 Ok(r) => return Ok(r),
                 Err(e) if attempt < max && Self::is_retryable(&e) => {
-                    let delay = std::time::Duration::from_millis(100 * 2u64.pow(attempt));
+                    let delay = retry_delay(attempt);
                     tracing::warn!(
                         attempt = attempt + 1,
                         max_retries = max,
@@ -872,6 +872,12 @@ impl HttpTransport {
     ) -> Result<String, WinrmError> {
         self.send_soap_with_retry(host, body).await
     }
+}
+
+/// Backoff before retry number `attempt + 1`: 100 ms doubled per attempt,
+/// saturating instead of overflowing for large `max_retries`.
+fn retry_delay(attempt: u32) -> Duration {
+    Duration::from_millis(100u64.saturating_mul(2u64.saturating_pow(attempt)))
 }
 
 /// `reqwest::Client` for unit tests that bypass [`HttpTransport::new`]:
@@ -2430,6 +2436,18 @@ mod tests {
     }
 
     // --- Response cap formula and sealing table ---
+
+    #[test]
+    fn retry_delay_doubles_from_100_ms_and_saturates() {
+        assert_eq!(retry_delay(0), Duration::from_millis(100));
+        assert_eq!(retry_delay(1), Duration::from_millis(200));
+        assert_eq!(retry_delay(3), Duration::from_millis(800));
+        // 100 * 2^58 overflows u64: saturates instead of panicking.
+        for attempt in [57, 58, 63, 64, u32::MAX] {
+            assert!(retry_delay(attempt) >= retry_delay(56), "{attempt}");
+        }
+        assert_eq!(retry_delay(u32::MAX), Duration::from_millis(u64::MAX));
+    }
 
     #[test]
     fn max_response_bytes_is_four_envelopes_with_a_512_kib_floor() {

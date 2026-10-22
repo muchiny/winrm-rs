@@ -30,7 +30,7 @@ async fn main() -> Result<(), winrm_rs::WinrmError> {
 
 - **NTLMv2 authentication** -- pure Rust, no OpenSSL or system SSPI required
 - **Basic authentication** -- for test environments or HTTPS-secured endpoints
-- **Kerberos authentication** -- via `cross-krb5`, feature-gated (`--features kerberos`)
+- **Kerberos authentication** -- via `cross-krb5`, feature-gated (`--features kerberos`); raw Kerberos GSS-API tokens under the `Negotiate` scheme, messages sealed with the Kerberos context over HTTP
 - **Certificate authentication** -- TLS client certificate auth
 - **PowerShell execution** -- scripts auto-encoded as UTF-16LE Base64 (`-EncodedCommand`)
 - **Raw command execution** -- `cmd.exe` or any executable with arbitrary arguments
@@ -89,7 +89,17 @@ let client = WinrmClient::new(
     },
     WinrmCredentials::new("user", "", ""),
 )?;
+// Connect by host name: the service principal is HTTP/<host>.
+let out = client.run_command("server.corp.example", "whoami", &[]).await?;
 ```
+
+Kerberos authenticates the client (and the server, through its answer
+token). Message confidentiality comes from HTTPS (`use_tls = true`) or, over
+HTTP, from Kerberos sealing, which `EncryptionMode::Auto` (the default)
+applies: each SOAP body is wrapped with the connection's Kerberos context
+(GSS-API wrap with confidentiality, AES enctypes), so the server can keep
+`AllowUnencrypted = false`. `EncryptionMode::Never` sends the bodies in
+plaintext over HTTP. Over HTTPS no channel binding token is sent.
 
 ### Certificate authentication
 
@@ -187,6 +197,7 @@ let bytes = client.download_file("win-server", "C:\\remote\\file.bin", Path::new
 | `client_cert_pem` | `None` | Path to client cert PEM (Certificate auth) |
 | `client_key_pem` | `None` | Path to client key PEM (Certificate auth) |
 | `proxy` | `None` | HTTP proxy URL (e.g. `http://proxy:8080`) |
+| `encryption` | `Auto` | Message sealing for NTLM and Kerberos: `Auto` (over HTTP only), `Always`, `Never` |
 
 ## Roadmap
 
@@ -208,7 +219,7 @@ let bytes = client.download_file("win-server", "C:\\remote\\file.bin", Path::new
 | NTLM | pure Rust (NTLMv2) | via requests-ntlm | built-in |
 | Kerberos | via cross-krb5 (v0.4) | via requests-kerberos | built-in |
 | Certificate | built-in (v0.4) | yes | yes |
-| Encryption | NTLM sealing (v0.3) | via pywinrm[credssp] | built-in |
+| Encryption | NTLM sealing (v0.3), Kerberos sealing | via pywinrm[credssp] | built-in |
 | TLS backend | rustls | OpenSSL | Go stdlib |
 | PowerShell encoding | built-in | built-in | built-in |
 | Shell reuse | yes (v0.2) | yes | yes |

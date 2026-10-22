@@ -9,7 +9,7 @@ live. It does not touch the Server 2025 workgroup bench (`winrm-rs-test`).
 | Box | `gusztavvargadr/windows-server-2025-standard` (same as the 2025 bench) |
 | Domain | `winrm.test`, NetBIOS `WINRM`, realm `WINRM.TEST`, host `dc` |
 | Vagrant dir (Windows) | `C:\winrm-rs-dc-vagrant` |
-| Host ports | WinRM HTTP `57985` → VM `5985`; KDC TCP `57088` → VM `88` |
+| Host ports | WinRM HTTP `57985` → VM `5985`; WinRM HTTPS `57986` → VM `5986`; KDC TCP `57088` → VM `88` |
 | Test account | `WINRM\vagrant` / `vagrant` (Domain Admins, password never expires) |
 
 All credentials are throwaway values for this lab VM only:
@@ -35,9 +35,16 @@ a startup scheduled task (`winrm-rs-ensure-vagrant`, script
 `C:\winrm-rs\ensure-vagrant.ps1`, log `C:\winrm-rs\ensure-vagrant.log`)
 recreates or repairs it at every boot in case it does not.
 
-WinRM on the DC: Basic, Negotiate and Kerberos on, `AllowUnencrypted = true`
-(winrm-rs sends the SOAP body of a Kerberos request in clear over HTTP; it has
-no Kerberos message encryption).
+WinRM on the DC: Basic, Negotiate and Kerberos on, `AllowUnencrypted = true`,
+`CbtHardeningLevel = Relaxed`. winrm-rs seals Kerberos messages over HTTP by
+default (`EncryptionMode::Auto`), so it does not need `AllowUnencrypted`; the
+bench keeps it `true` for the `EncryptionMode::Never` tests and as the
+starting state the `AllowUnencrypted = false` tests flip and restore (below).
+
+HTTPS listener (once, after the first `vm-connect-dc.sh`): the
+`setup_dc_https_listener` test creates a WinRM HTTPS listener with a
+self-signed certificate for `dc.winrm.test` and a DC firewall rule `WinRM DC
+HTTPS` for 5986. It is idempotent and not undone.
 
 If `vagrant up` runs detached (no console for gsudo), launch it on the
 Windows side and read the log:
@@ -78,8 +85,26 @@ eval "$(tests/scripts/vm-connect-dc.sh)"
 kinit vagrant@WINRM.TEST                  # password: vagrant
 klist                                      # krbtgt/WINRM.TEST@WINRM.TEST
 kvno HTTP/dc.winrm.test@WINRM.TEST         # service ticket for the SPN
-cargo test --features kerberos --test integration_real kerberos -- --ignored --nocapture
+cargo test --features kerberos --test integration_real setup_dc_https_listener -- --ignored   # once
+cargo test --features kerberos --test integration_real kerberos -- --ignored --nocapture --skip allow_unencrypted_false
+cargo test --features kerberos --test integration_real allow_unencrypted_false -- --ignored --nocapture --test-threads=1
 ```
+
+The `kerberos_*https*` tests use `WINRM_TEST_KRB_HTTPS_PORT` (exported by
+`vm-connect-dc.sh`) with `accept_invalid_certs` (self-signed certificate).
+
+The `*allow_unencrypted_false*` tests set `AllowUnencrypted = false` on the DC
+for their own duration: the flip goes through an unencrypted Kerberos request
+(`EncryptionMode::Never`, still accepted at that point), the test body runs in
+a spawned task, and `AllowUnencrypted = true` is then restored through an
+NTLM-sealed request (`WINRM\vagrant`), which the server accepts either way,
+even when the body panicked; the panic is re-raised after the restore. They
+change state the other Kerberos tests see, hence `--test-threads=1` and the
+`--skip` above. If a run is killed in between, restore by hand (NTLM sealing
+works whatever the setting), for instance with pypsrp:
+`Client("127.0.0.1", port=57985, username="WINRM\\vagrant", password="vagrant",
+ssl=False, auth="ntlm", encryption="always").execute_ps("Set-Item
+WSMan:\\localhost\\Service\\AllowUnencrypted $true")`.
 
 `KRB5_TRACE=/dev/stderr` shows the client-side Kerberos exchange. Kerberos
 tolerates 5 minutes of clock skew; the DC syncs its clock from the Hyper-V
@@ -89,17 +114,28 @@ host. On `Clock skew too great`, resync the DC (`w32tm /resync`), not WSL.
 
 `vm-connect-dc.sh` (through `gsudo`) creates, on the Windows host:
 
-- two `netsh` port proxies listening on `0.0.0.0`: `57985` → VM `5985`
-  (WinRM HTTP) and `57088` → VM `88` (KDC, TCP);
-- two inbound firewall rules, `WinRM DC HTTP` and `WinRM DC KDC`, with no
-  `RemoteAddress` restriction.
+- three `netsh` port proxies listening on `0.0.0.0`: `57985` → VM `5985`
+  (WinRM HTTP), `57986` → VM `5986` (WinRM HTTPS) and `57088` → VM `88`
+  (KDC, TCP);
+- three inbound firewall rules, `WinRM DC HTTP`, `WinRM DC HTTPS` and `WinRM
+  DC KDC`, with no `RemoteAddress` restriction.
+
+Without elevation (gsudo waiting on a UAC prompt nobody answers), the
+`57986` port proxy cannot be created. A stand-in that needs no elevation and
+listens on loopback only: a small PowerShell relay started as the user, for
+instance `C:\winrm-rs-dc-vagrant\https-forward.ps1` (a `TcpListener` on
+`127.0.0.1:57986` piping each connection to `<VM IP>:5986`), launched with
+`Start-Process powershell.exe -ArgumentList '-File',
+'C:\winrm-rs-dc-vagrant\https-forward.ps1','-Target','<VM IP>' -WindowStyle
+Hidden`. Under `networkingMode=Mirrored`, WSL reaches it on `127.0.0.1`. Stop
+it with `Stop-Process` when done.
 
 While the bench is up, any machine that can reach the host on those ports can
 talk to an unencrypted WinRM endpoint (`AllowUnencrypted = true`) and try the
 lab Domain Admin `vagrant` / `vagrant`. This mirrors what the Server 2025
 bench already does. Tear the bench down (below) when you are not testing. If
-you want to narrow it, restrict the two firewall rules to the WSL subnet or to
-localhost (`Set-NetFirewallRule -DisplayName 'WinRM DC HTTP','WinRM DC KDC'
+you want to narrow it, restrict the firewall rules to the WSL subnet or to
+localhost (`Set-NetFirewallRule -DisplayName 'WinRM DC HTTP','WinRM DC HTTPS','WinRM DC KDC'
 -RemoteAddress ...`); the scripts do not do this.
 
 ## Stop (keeps the VM)
@@ -123,8 +159,8 @@ G="/mnt/c/Program Files/gsudo/2.6.1/gsudo.exe"
 
 ```bash
 G="/mnt/c/Program Files/gsudo/2.6.1/gsudo.exe"
-"$G" cmd.exe /c "netsh interface portproxy delete v4tov4 listenaddress=0.0.0.0 listenport=57985 & netsh interface portproxy delete v4tov4 listenaddress=0.0.0.0 listenport=57088"
-"$G" powershell.exe -Command "Remove-NetFirewallRule -DisplayName 'WinRM DC HTTP','WinRM DC KDC'"
+"$G" cmd.exe /c "netsh interface portproxy delete v4tov4 listenaddress=0.0.0.0 listenport=57985 & netsh interface portproxy delete v4tov4 listenaddress=0.0.0.0 listenport=57986 & netsh interface portproxy delete v4tov4 listenaddress=0.0.0.0 listenport=57088"
+"$G" powershell.exe -Command "Remove-NetFirewallRule -DisplayName 'WinRM DC HTTP','WinRM DC HTTPS','WinRM DC KDC'"
 rm -rf target/winrm-krb5
 sudo sed -i '/^127\.0\.0\.1 dc\.winrm\.test$/d' /etc/hosts
 ```

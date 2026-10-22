@@ -9,7 +9,7 @@ déduit de la lecture du code.
 | Crate | Commit | Ce qui a été exécuté |
 |---|---|---|
 | `winrm-rs` | `d69030d` (branche `test/live-coverage`, dernier commit de code ou de test, après `3c6fdbf` qui ajoute les API `*_with_timeout` ; le commit de documentation qui le suit ne touche que le `CHANGELOG` et ce document ; les runs ci-dessous ont été faits sur cet arbre) | Suite live complète contre Server 2025 avec `--features credssp,__internal` (80 tests), les deux `eval` du banc faits : **80 passés, 0 échoué** (463 s) avec `--test-threads=1` ; en parallélisme par défaut, **80 passés, 0 échoué** (207 s ; `shell_run_command_times_out` reste sensible à la charge). Server 2012 R2 (VM reconstruite) : les tests NTLM et deux tests Basic seulement, voir « Limites connues ». Runs précédents : à `f30b7f3` et `92341f6`, 78 passés en série comme en parallèle ; à `4f229dc`, 78 passés en série, 77 passés et 1 échoué (`shell_run_command_times_out`) en parallèle ; à `4cbebfb`, 66 passés en série, 65 passés et 1 échoué en parallèle. Les tests à timeout court se lisent plus fiablement avec `--test-threads=1` (voir l'en-tête de `tests/integration_real.rs`). |
-| `winrm-rs` (Kerberos) | `f8a1272` (code de production identique à `c46f8c6`), plus les tests Kerberos ajoutés par le commit qui suit | Contre le contrôleur de domaine `winrm.test` (banc séparé, `tests/vagrant/dc/README.md`), avec `--features kerberos` et un TGT obtenu par `kinit vagrant@WINRM.TEST` : `cargo test --features kerberos --test integration_real kerberos -- --ignored` → **3 passés, 0 échoué** (22 s). |
+| `winrm-rs` (Kerberos) | `ac88145` (chiffrement des messages Kerberos, erreur claire, Kerberos sur HTTPS) avec les tests de `dc33bea` | Contre le contrôleur de domaine `winrm.test` (banc séparé, `tests/vagrant/dc/README.md`), avec `--features kerberos` et un TGT obtenu par `kinit vagrant@WINRM.TEST`, le 2026-10-22 : `cargo test --features kerberos --test integration_real kerberos -- --ignored --skip allow_unencrypted_false` → **5 passés, 0 échoué** (22 s), puis `... allow_unencrypted_false -- --ignored --test-threads=1` → **2 passés, 0 échoué** (198 s ; `AllowUnencrypted` remis à `true` à la fin de chacun). Run précédent : `f8a1272` (code de production identique à `c46f8c6`), 3 passés sur HTTP sans chiffrement. |
 | `psrp-rs` | `4a79189` (`origin/main`) | Suite live (8 tests) contre le `winrm-rs` local (`[patch.crates-io]`, worktree jetable) : **8 passés, 0 échoué** contre `winrm-rs` `4cbebfb` (Basic), puis contre `84f1898` en Basic et en NTLM sur HTTP. Contre `winrm-rs` `4f229dc`, `92341f6`, `f30b7f3` puis `d69030d` (scellement qui échoue fermé et sans renvoi, une connexion authentifiée par échange, CBT de la connexion) : **8 passés** avec Basic sur HTTP (réglage par défaut de la suite) et **8 passés** avec `PSRP_INTEGRATION_AUTH=ntlm` (NTLM scellé sur HTTP), à chaque commit. Ce run NTLM, à travers un relais TCP enregistreur qui garde chaque connexion à part : 8 connexions (une par client), 2 requêtes `Negotiate` par connexion, 72 requêtes et 72 réponses `multipart/encrypted`, aucun corps de requête en clair (les Type 1 et Type 3 n'en portent pas), aucun HTTP 400 ni 500. |
 | `bridge-mcp` | `f44a5fa` (v4.0.2, worktree jetable ; `origin/main` est maintenant `ec9310e`) | Smoke en ligne de commande par `winrm` puis par `psrp` (hôtes NTLM sur HTTP) : `hostname` renvoie `winrm-2025`, `Get-Date` renvoie la date du banc (2026-10-21), sur les deux protocoles. Fait contre `winrm-rs` `4cbebfb`, `84f1898`, `4f229dc`, `92341f6`, `f30b7f3`, puis `d69030d` (avec `psrp-rs` `4a79189`) : 4 appels sur 4 réussis à chaque fois (1,8 à 2,7 s chacun à `d69030d`), à travers le relais enregistreur : 4 connexions, 2 requêtes `Negotiate` par connexion, 26 requêtes scellées, aucun corps de requête en clair, aucun HTTP 400. Journal d'audit redirigé vers un fichier jetable. |
 
@@ -33,10 +33,14 @@ la référence Basic des shells concurrents), 1 avec `9c61ae8`
 `4f229dc` (1,5 Mo de sortie en NTLM scellé avec deux `MaxEnvelopeSize`,
 `EncryptionMode::Always` sur HTTPS). Les runs complets à `4f229dc` les
 exécutent tous.
-Trois tests Kerberos, sous `#[cfg(feature = "kerberos")]`, s'y ajoutent
+Les tests Kerberos, sous `#[cfg(feature = "kerberos")]`, s'y ajoutent
 (`kerberos_run_command_whoami`, `kerberos_two_commands_on_one_client`,
-`silent_command_completes_over_kerberos`) ; ils visent le contrôleur de
-domaine et ne font pas partie des runs complets contre Server 2025.
+`silent_command_completes_over_kerberos`, puis avec `dc33bea`
+`kerberos_over_https_whoami`, `kerberos_encryption_always_over_https`,
+`kerberos_sealed_with_allow_unencrypted_false`,
+`kerberos_unsealed_with_allow_unencrypted_false_is_a_clear_error` et la
+préparation `setup_dc_https_listener`) ; ils visent le contrôleur de domaine
+et ne font pas partie des runs complets contre Server 2025.
 
 ## Découvertes
 
@@ -212,7 +216,7 @@ Tests de `tests/integration_real.rs` sauf mention contraire.
 | Idem, NTLM sur HTTP avec scellement par défaut (après D1 et D3) | `silent_command_completes_over_ntlm_sealed_http` (relais enregistreur : 1 HTTP 500, 2 requêtes `Negotiate`, 6 requêtes scellées ; 21 à 25 s) | ✅ 2026-10-21 | ✅ 2026-10-21 (VM reconstruite) | — non applicable |
 | Idem, Certificate sur HTTPS (après D1 complété) | `silent_command_completes_over_certificate_auth` (24 s) | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
 | Idem, CredSSP sur HTTPS (`--features credssp`, après D1 complété) | `silent_command_completes_over_credssp` (22 s) | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite (test sauté sur 2012 R2) | — non applicable |
-| Idem, Kerberos sur HTTP (`--features kerberos`) | `silent_command_completes_over_kerberos` (22 s) | — non applicable (banc hors domaine) | ⏭ non mesuré : VM détruite | ✅ 2026-10-21 |
+| Idem, Kerberos sur HTTP (`--features kerberos`), scellé par défaut depuis `ac88145` | `silent_command_completes_over_kerberos` (22 s ; en clair le 2026-10-21, scellé le 2026-10-22) | — non applicable (banc hors domaine) | — non applicable (banc hors domaine) | ✅ 2026-10-22 |
 | Messages NTLM réellement scellés sur HTTP (après D3) | `silent_command_completes_over_ntlm_sealed_http` (requêtes `multipart/encrypted`, aucune réauthentification) | ✅ 2026-10-21 | ✅ 2026-10-21 (VM reconstruite) | — non applicable |
 | Transfert de 200 Ko aller-retour en NTLM scellé sur HTTP, contenu identique | `ntlm_sealed_upload_and_download_large_file` (101 morceaux ; 316 requêtes scellées, une seule poignée de main ; envoi 130 s, soit environ 1,3 s par morceau comme en Basic, réception 2,3 s, réponse la plus grosse 149 Ko) | ✅ 2026-10-21 | ✅ 2026-10-21 (VM reconstruite) | — non applicable |
 | Annulation (`run_command_with_cancel`) en NTLM scellé sur HTTP, puis le même client resservi | `ntlm_sealed_cancel_long_running_command` (annulation déclenchée une fois Execute et un premier Receive partis scellés : `Cancelled` ; la connexion de l'échange annulé est jetée, la commande suivante sur le même client ouvre une nouvelle connexion (4 requêtes `Negotiate` au total, 2 par connexion) et part scellée, aucun corps en clair) | ✅ 2026-10-21 | ✅ 2026-10-21 (VM reconstruite) | — non applicable |
@@ -227,7 +231,11 @@ Tests de `tests/integration_real.rs` sauf mention contraire.
 | `Shell::disconnect` réussi | psrp-rs : `live_disconnect_reconnect_pool` seul (la déconnexion a réellement eu lieu, sans le message « disconnect not supported ») | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
 | `reconnect_shell` | psrp-rs : `live_disconnect_reconnect_pool` seul | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
 | Chaîne complète `bridge-mcp` (`hostname`, `Get-Date`) par `winrm` et par `psrp` | smoke CLI `bridge-mcp` `f44a5fa` | ✅ 2026-10-21 | ⏭ non mesuré : VM détruite | — non applicable |
-| `AuthMethod::Kerberos` sur HTTP (`--features kerberos`, TGT de `kinit`) : la commande tourne sous le compte du domaine | `kerberos_run_command_whoami` (`winrm\vagrant`), `kerberos_two_commands_on_one_client` (deux commandes sur le même client) ; observé avec `KRB5_TRACE` (AP-REP vérifié), sans assertion nommée | — non applicable (banc hors domaine) | ⏭ non mesuré : VM détruite | ✅ 2026-10-21 |
+| `AuthMethod::Kerberos` sur HTTP (`--features kerberos`, TGT de `kinit`) : la commande tourne sous le compte du domaine ; messages scellés par défaut depuis `ac88145` | `kerberos_run_command_whoami` (`winrm\vagrant`), `kerberos_two_commands_on_one_client` (deux commandes sur le même client) ; AP-REP vérifié : le scellement exige le jeton du serveur pour établir le contexte | — non applicable (banc hors domaine) | — non applicable (banc hors domaine) | ✅ 2026-10-22 |
+| Kerberos sur HTTPS (écouteur HTTPS du contrôleur, certificat auto-signé, `accept_invalid_certs`) | `kerberos_over_https_whoami` (passé sans changement de code, mesuré à `82802f9` puis à `ac88145` ; aucun jeton CBT envoyé, banc en `CbtHardeningLevel = Relaxed`) | — non applicable (banc hors domaine) | — non applicable (banc hors domaine) | ✅ 2026-10-22 |
+| Chiffrement des messages Kerberos sur HTTP avec `AllowUnencrypted = false` (serveur qui l'exige) | `kerberos_sealed_with_allow_unencrypted_false` (relais enregistreur : `whoami` ; transfert de 200 Ko aller-retour identique, 323 requêtes dont 322 scellées, 1 connexion, 1 requête `Negotiate`, aucun corps en clair ; commande silencieuse de 21 s dont les fautes `TimedOut` reviennent scellées en HTTP 500) | — non applicable (banc hors domaine) | — non applicable (banc hors domaine) | ✅ 2026-10-22 |
+| `EncryptionMode::Always` : Kerberos scellé à l'intérieur de HTTPS | `kerberos_encryption_always_over_https` | — non applicable (banc hors domaine) | — non applicable (banc hors domaine) | ✅ 2026-10-22 |
+| Kerberos non chiffré (`EncryptionMode::Never`) refusé par `AllowUnencrypted = false` : erreur claire | `kerberos_unsealed_with_allow_unencrypted_false_is_a_clear_error` (HTTP 500 au corps vide ; le message nomme `AllowUnencrypted` et les remèdes ; avant `ac88145` : `AuthFailed("HTTP 500 Internal Server Error: ")`) | — non applicable (banc hors domaine) | — non applicable (banc hors domaine) | ✅ 2026-10-22 |
 | Doc de `AuthMethod::CredSsp` (disait « Not yet implemented ») | relue contre `credssp_run_command_whoami` | doc corrigée le 2026-10-21 (relecture ; le passage live est la ligne CredSSP plus bas) | ⏭ non mesuré : VM détruite | — non applicable |
 
 Couverture des API réservées aux crates aval : `open_psrp_shell` et
@@ -280,18 +288,27 @@ ne figurent pas dans la matrice.
 
 ## Limites connues
 
-- **Kerberos : validé sur HTTP seulement, et sans chiffrement des messages.**
-  Les trois tests Kerberos passent contre le contrôleur de domaine
-  `winrm.test`, mais le corps SOAP part en clair : le crate n'a pas de
-  chiffrement Kerberos des messages et `EncryptionMode` ne s'applique qu'à
-  NTLM. Le serveur doit donc autoriser le trafic non chiffré
-  (`AllowUnencrypted = true`, posé par le `Vagrantfile` du banc) ; avec
-  `AllowUnencrypted = false`, mesuré le 2026-10-21, chaque requête échoue en
-  `AuthFailed("HTTP 500 Internal Server Error: ")`, un message qui ne dit pas
-  pourquoi. Kerberos sur HTTPS n'a pas été mesuré (pas d'écouteur HTTPS sur le
-  contrôleur de domaine). L'hôte doit être le nom du serveur (le SPN
-  `HTTP/<hôte>` en est dérivé), pas une adresse ; le banc passe par une ligne
-  `127.0.0.1 dc.winrm.test` dans `/etc/hosts`.
+- **Kerberos : chiffrement des messages par `gss_wrap` (AES), mesuré sur un
+  seul contrôleur.** Depuis `ac88145`, `EncryptionMode::Auto` scelle
+  Kerberos sur HTTP (validé avec `AllowUnencrypted = false`) et `Always` le
+  scelle dans HTTPS. Limites : seules les clés AES (jetons RFC 4121) peuvent
+  sceller, un contexte RC4 échoue ; Windows envoie toutes ses réponses
+  Kerberos avec le numéro de séquence 0, la protection contre le rejeu passe
+  donc par `RelatesTo` (chaque réponse scellée doit nommer le `MessageID` de
+  sa requête) ; aucun jeton CBT n'est envoyé sur HTTPS et
+  `CbtHardeningLevel = Strict` n'a pas été mesuré ; la mise en page SSPI
+  (jeton Windows) n'est produite et validée que pour MIT krb5 sous Linux, la
+  branche Windows de `cross-krb5` n'est ni compilée ici ni testée. Une
+  requête scellée partie juste après une grosse réponse pouvait ouvrir une
+  nouvelle connexion TCP non authentifiée (HTTP 401) : mesuré 2 fois sur 2
+  sur le téléchargement scellé, corrigé en cédant la main au runtime avant
+  l'envoi (fenêtre réduite, pas fermée ; l'échec reste fermé, sans renvoi).
+  L'hôte doit être le nom du serveur (le SPN `HTTP/<hôte>` en est dérivé),
+  pas une adresse ; le banc passe par une ligne `127.0.0.1 dc.winrm.test`
+  dans `/etc/hosts`. Le port HTTPS `57986` du banc a été relayé le
+  2026-10-22 par un relais PowerShell non élevé sur la boucle locale (gsudo
+  bloqué sur l'invite UAC), pas par le `netsh portproxy` décrit dans le
+  README du banc.
 - **Server 2012 R2 n'est mesuré qu'en partie.** La VM a été reconstruite ; à
   `92341f6`, `f30b7f3` puis `d69030d` seuls les tests NTLM (scellés sur HTTP, modes de chiffrement,
   proxy) et `create_and_delete_shell` / `run_command_whoami` y ont tourné

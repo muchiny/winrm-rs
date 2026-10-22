@@ -3567,6 +3567,11 @@ async fn kerberos_sealed_with_allow_unencrypted_false() {
             sealed >= 300,
             "expected hundreds of sealed requests, got {sealed}"
         );
+        assert_eq!(
+            forwarder.connections(),
+            1,
+            "the whole round trip should stay on one authenticated connection"
+        );
 
         let (silent, silent_forwarder, host) =
             sealed_kerberos_client(|c| c.operation_timeout_secs = SILENT_OP_SECS).await;
@@ -3594,4 +3599,453 @@ async fn kerberos_encryption_always_over_https() {
     assert_eq!(output.exit_code, 0);
     let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
     assert!(stdout.contains("winrm\\vagrant"), "got {stdout:?}");
+}
+
+// === Channel binding and sealing inside TLS (DC bench, HTTPS) ===
+//
+// A TLS-terminating relay sits between the client and the DC's HTTPS
+// listener: it presents its own throwaway certificate, so the client's
+// channel binding names the relay's certificate, not the DC's, and it reads
+// every request in clear. The tests that change `CbtHardeningLevel` restore
+// `Relaxed` afterwards; run them on their own:
+//
+//   cargo test --features kerberos --test integration_real dc_cbt -- --ignored --test-threads=1
+
+/// Certificate verifier of the relay's upstream leg: accepts the DC's
+/// self-signed certificate (test only).
+#[cfg(feature = "kerberos")]
+#[derive(Debug)]
+struct AcceptAnyServerCert(std::sync::Arc<rustls::crypto::CryptoProvider>);
+
+#[cfg(feature = "kerberos")]
+impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// One request as the relay saw it, decrypted.
+#[cfg(feature = "kerberos")]
+#[derive(Debug, Clone)]
+struct RelayedRequest {
+    authorization: bool,
+    content_type: String,
+    body_len: usize,
+}
+
+/// TLS-terminating recording relay to the DC's HTTPS port (test only).
+#[cfg(feature = "kerberos")]
+struct TlsRecordingRelay {
+    port: u16,
+    requests: std::sync::Arc<std::sync::Mutex<Vec<RelayedRequest>>>,
+}
+
+/// One HTTP/1.1 message (head, body by `Content-Length`) read from `stream`,
+/// with `buf` holding what was read past the previous message.
+#[cfg(feature = "kerberos")]
+fn read_http_message(
+    stream: &mut impl std::io::Read,
+    buf: &mut Vec<u8>,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    let mut chunk = [0u8; 16 * 1024];
+    let head_end = loop {
+        if let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break at + 4;
+        }
+        let n = stream.read(&mut chunk).ok()?;
+        if n == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    };
+    let head: Vec<u8> = buf.drain(..head_end).collect();
+    let len = String::from_utf8_lossy(&head)
+        .lines()
+        .find_map(|l| {
+            l.to_ascii_lowercase()
+                .strip_prefix("content-length:")
+                .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+        })
+        .unwrap_or(0);
+    while buf.len() < len {
+        let n = stream.read(&mut chunk).ok()?;
+        if n == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    let body: Vec<u8> = buf.drain(..len).collect();
+    Some((head, body))
+}
+
+#[cfg(feature = "kerberos")]
+impl TlsRecordingRelay {
+    /// Start a relay to `127.0.0.1:<upstream_port>` (TLS, SNI
+    /// `dc.winrm.test`), presenting a certificate made for the run with the
+    /// `openssl` command.
+    fn start(upstream_port: u16) -> Self {
+        use rustls::pki_types::pem::PemObject;
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = std::env::temp_dir().join(format!("winrm_rs_tls_relay_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("relay temp dir");
+        let (cert_path, key_path) = (dir.join("cert.pem"), dir.join("key.pem"));
+        let status = std::process::Command::new("openssl")
+            .args([
+                "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+            ])
+            .args(["-subj", "/CN=winrm-rs-test-relay", "-keyout"])
+            .arg(&key_path)
+            .arg("-out")
+            .arg(&cert_path)
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("run openssl to make the relay certificate");
+        assert!(status.success(), "openssl req failed");
+        let cert = rustls::pki_types::CertificateDer::from_pem_file(&cert_path).expect("cert");
+        let key = rustls::pki_types::PrivateKeyDer::from_pem_file(&key_path).expect("key");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let server_config = Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert], key)
+                .expect("relay server config"),
+        );
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let client_config = Arc::new(
+            rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert(provider)))
+                .with_no_client_auth(),
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind relay");
+        let port = listener.local_addr().expect("relay addr").port();
+        let requests: Arc<Mutex<Vec<RelayedRequest>>> = Arc::default();
+        let recorded = Arc::clone(&requests);
+        std::thread::spawn(move || {
+            for client in listener.incoming().flatten() {
+                let (server_config, client_config, recorded) = (
+                    Arc::clone(&server_config),
+                    Arc::clone(&client_config),
+                    Arc::clone(&recorded),
+                );
+                std::thread::spawn(move || {
+                    let Ok(conn) = rustls::ServerConnection::new(server_config) else {
+                        return;
+                    };
+                    let mut down = rustls::StreamOwned::new(conn, client);
+                    let Ok(upstream) = std::net::TcpStream::connect(("127.0.0.1", upstream_port))
+                    else {
+                        return;
+                    };
+                    let name = rustls::pki_types::ServerName::try_from("dc.winrm.test")
+                        .expect("server name");
+                    let Ok(conn) = rustls::ClientConnection::new(client_config, name) else {
+                        return;
+                    };
+                    let mut up = rustls::StreamOwned::new(conn, upstream);
+                    let (mut down_buf, mut up_buf) = (Vec::new(), Vec::new());
+                    while let Some((head, body)) = read_http_message(&mut down, &mut down_buf) {
+                        let text = String::from_utf8_lossy(&head).to_ascii_lowercase();
+                        let header = |name: &str| {
+                            text.lines()
+                                .find_map(|l| l.strip_prefix(name).map(|v| v.trim().to_string()))
+                        };
+                        if let Ok(mut r) = recorded.lock() {
+                            r.push(RelayedRequest {
+                                authorization: header("authorization:").is_some(),
+                                content_type: header("content-type:").unwrap_or_default(),
+                                body_len: body.len(),
+                            });
+                        }
+                        if up
+                            .write_all(&head)
+                            .and_then(|()| up.write_all(&body))
+                            .is_err()
+                            || up.flush().is_err()
+                        {
+                            return;
+                        }
+                        let Some((rhead, rbody)) = read_http_message(&mut up, &mut up_buf) else {
+                            return;
+                        };
+                        if down
+                            .write_all(&rhead)
+                            .and_then(|()| down.write_all(&rbody))
+                            .and_then(|()| down.flush())
+                            .is_err()
+                        {
+                            return;
+                        }
+                        if String::from_utf8_lossy(&rhead)
+                            .to_ascii_lowercase()
+                            .contains("connection: close")
+                        {
+                            down.conn.send_close_notify();
+                            let _ = down.flush();
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        Self { port, requests }
+    }
+
+    fn requests(&self) -> Vec<RelayedRequest> {
+        self.requests.lock().map(|r| r.clone()).unwrap_or_default()
+    }
+
+    /// (requests with a body, of which sealed `multipart/encrypted`).
+    fn bodies(&self) -> (usize, usize) {
+        let with_body: Vec<RelayedRequest> = self
+            .requests()
+            .into_iter()
+            .filter(|r| r.body_len > 0)
+            .collect();
+        let sealed = with_body
+            .iter()
+            .filter(|r| r.content_type.starts_with("multipart/encrypted"))
+            .count();
+        eprintln!(
+            "relay: {} requests, {} with a body, {sealed} sealed, {} with Authorization",
+            self.requests().len(),
+            with_body.len(),
+            self.requests().iter().filter(|r| r.authorization).count()
+        );
+        (with_body.len(), sealed)
+    }
+}
+
+/// Read or set the DC's `CbtHardeningLevel` through `client` (NTLM-sealed
+/// over HTTP, which channel binding does not concern).
+#[cfg(feature = "kerberos")]
+async fn dc_cbt_hardening(
+    client: &WinrmClient,
+    host: &str,
+    set: Option<&str>,
+) -> Result<String, WinrmError> {
+    const ITEM: &str = r"WSMan:\localhost\Service\Auth\CbtHardeningLevel";
+    let script = match set {
+        Some(v) => format!("Set-Item {ITEM} {v}; (Get-Item {ITEM}).Value"),
+        None => format!("(Get-Item {ITEM}).Value"),
+    };
+    let out = client.run_powershell(host, &script).await?;
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Run `body` with `CbtHardeningLevel = level` on the DC, then restore
+/// `Relaxed` whatever happened, and re-raise `body`'s panic after the
+/// restore. Both go through NTLM sealing over HTTP.
+#[cfg(feature = "kerberos")]
+async fn with_dc_cbt_hardening<F, Fut>(level: &str, body: F)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let (ntlm, host) = dc_ntlm_sealed_client();
+    let before = dc_cbt_hardening(&ntlm, &host, None).await;
+    assert_eq!(
+        before.as_deref().ok(),
+        Some("Relaxed"),
+        "the DC bench must start with CbtHardeningLevel = Relaxed"
+    );
+    let now = dc_cbt_hardening(&ntlm, &host, Some(level)).await;
+    eprintln!("CbtHardeningLevel set to {level}: {now:?}");
+    let outcome = if now.as_deref().ok() == Some(level) {
+        tokio::spawn(body()).await
+    } else {
+        Ok(())
+    };
+    let restored = dc_cbt_hardening(&ntlm, &host, Some("Relaxed")).await;
+    eprintln!("restore CbtHardeningLevel = Relaxed: {restored:?}");
+    assert_eq!(
+        restored.as_deref().ok(),
+        Some("Relaxed"),
+        "RESTORE FAILED: set CbtHardeningLevel back to Relaxed by hand: {restored:?}"
+    );
+    assert_eq!(
+        now.as_deref().ok(),
+        Some(level),
+        "CbtHardeningLevel not set"
+    );
+    if let Err(e) = outcome {
+        std::panic::resume_unwind(e.into_panic());
+    }
+}
+
+/// Kerberos client to the DC through a TLS-terminating relay.
+#[cfg(feature = "kerberos")]
+fn kerberos_client_through_relay(
+    relay: &TlsRecordingRelay,
+    encryption: EncryptionMode,
+) -> (WinrmClient, String) {
+    kerberos_https_client_from_env(|c| {
+        c.port = relay.port;
+        c.encryption = encryption;
+    })
+}
+
+/// The AP-REQ carries channel bindings for the certificate of the
+/// connection: through a TLS-terminating relay they name the relay's
+/// certificate, and the DC (`CbtHardeningLevel = Relaxed`, which checks
+/// bindings that are present) refuses the authentication. No SOAP body
+/// reaches the relay: the AP-REQ request has none.
+#[cfg(feature = "kerberos")]
+#[tokio::test]
+#[ignore]
+async fn kerberos_channel_binding_through_a_tls_relay_is_refused() {
+    let https_port: u16 = std::env::var("WINRM_TEST_KRB_HTTPS_PORT")
+        .expect("WINRM_TEST_KRB_HTTPS_PORT")
+        .parse()
+        .expect("port");
+    let relay = TlsRecordingRelay::start(https_port);
+    for mode in [EncryptionMode::Auto, EncryptionMode::Always] {
+        let (client, host) = kerberos_client_through_relay(&relay, mode.clone());
+        let err = client
+            .run_command(&host, "whoami", &[])
+            .await
+            .expect_err("a binding to the relay's certificate must be refused");
+        eprintln!("{mode:?} through the relay: {err}");
+        assert!(
+            err.to_string().contains("Kerberos authentication rejected"),
+            "{mode:?}: {err}"
+        );
+    }
+    let (with_body, _) = relay.bodies();
+    assert_eq!(with_body, 0, "a SOAP body reached the relay");
+    assert!(
+        relay.requests().iter().any(|r| r.authorization),
+        "no AP-REQ went through the relay"
+    );
+}
+
+/// With `CbtHardeningLevel = None` the DC ignores channel bindings, so the
+/// relay can watch the traffic inside TLS: `EncryptionMode::Always` sends
+/// every SOAP body sealed (Kerberos and NTLM), `Auto` sends them as is
+/// (TLS only), which shows the relay would see plaintext.
+#[cfg(feature = "kerberos")]
+#[tokio::test]
+#[ignore]
+async fn always_seals_inside_tls_seen_by_a_relay_with_dc_cbt_none() {
+    with_dc_cbt_hardening("None", || async {
+        let https_port: u16 = std::env::var("WINRM_TEST_KRB_HTTPS_PORT")
+            .expect("WINRM_TEST_KRB_HTTPS_PORT")
+            .parse()
+            .expect("port");
+
+        let relay = TlsRecordingRelay::start(https_port);
+        let (client, host) = kerberos_client_through_relay(&relay, EncryptionMode::Always);
+        let out = client
+            .run_command(&host, "whoami", &[])
+            .await
+            .expect("Kerberos Always through the relay");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("vagrant"));
+        let (with_body, sealed) = relay.bodies();
+        assert!(with_body >= 4, "expected the command's requests");
+        assert_eq!(sealed, with_body, "Kerberos Always: a body went unsealed");
+
+        let relay = TlsRecordingRelay::start(https_port);
+        let (client, host) = kerberos_client_through_relay(&relay, EncryptionMode::Auto);
+        client
+            .run_command(&host, "whoami", &[])
+            .await
+            .expect("Kerberos Auto through the relay");
+        let (with_body, sealed) = relay.bodies();
+        assert!(with_body >= 4, "expected the command's requests");
+        assert_eq!(sealed, 0, "Kerberos Auto over HTTPS does not seal");
+
+        let relay = TlsRecordingRelay::start(https_port);
+        let config = WinrmConfig {
+            auth_method: AuthMethod::Ntlm,
+            encryption: EncryptionMode::Always,
+            use_tls: true,
+            accept_invalid_certs: true,
+            port: relay.port,
+            ..Default::default()
+        };
+        let ntlm = WinrmClient::new(config, WinrmCredentials::new("vagrant", "vagrant", "WINRM"))
+            .expect("NTLM client");
+        let host = std::env::var("WINRM_TEST_KRB_HOST").expect("WINRM_TEST_KRB_HOST");
+        ntlm.run_command(&host, "whoami", &[])
+            .await
+            .expect("NTLM Always through the relay");
+        let (with_body, sealed) = relay.bodies();
+        assert!(with_body >= 4, "expected the command's requests");
+        assert_eq!(sealed, with_body, "NTLM Always: a body went unsealed");
+    })
+    .await;
+}
+
+/// `CbtHardeningLevel = Strict` requires channel bindings: Kerberos over
+/// HTTPS still works, unsealed (`Auto`) and sealed (`Always`), since the
+/// AP-REQ carries them; through the relay it is refused.
+#[cfg(feature = "kerberos")]
+#[tokio::test]
+#[ignore]
+async fn kerberos_over_https_with_dc_cbt_strict() {
+    with_dc_cbt_hardening("Strict", || async {
+        for mode in [EncryptionMode::Auto, EncryptionMode::Always] {
+            let (client, host) = kerberos_https_client_from_env(|c| c.encryption = mode.clone());
+            let out = client
+                .run_command(&host, "whoami", &[])
+                .await
+                .unwrap_or_else(|e| panic!("{mode:?} under Strict: {e}"));
+            assert!(String::from_utf8_lossy(&out.stdout).contains("vagrant"));
+        }
+        let https_port: u16 = std::env::var("WINRM_TEST_KRB_HTTPS_PORT")
+            .expect("WINRM_TEST_KRB_HTTPS_PORT")
+            .parse()
+            .expect("port");
+        let relay = TlsRecordingRelay::start(https_port);
+        let (client, host) = kerberos_client_through_relay(&relay, EncryptionMode::Auto);
+        let err = client
+            .run_command(&host, "whoami", &[])
+            .await
+            .expect_err("relay binding refused under Strict");
+        eprintln!("through the relay under Strict: {err}");
+    })
+    .await;
 }

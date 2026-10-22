@@ -1481,6 +1481,77 @@ mod tests {
         assert_eq!(output.exit_code, -1);
     }
 
+    #[tokio::test]
+    async fn builder_before_send_refuses_before_any_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = WinrmClient::builder(basic_config(server.address().port()))
+            .credentials(test_creds())
+            .before_send(|| false)
+            .build()
+            .unwrap();
+        let result = client.create_shell("127.0.0.1").await;
+        assert!(matches!(result, Err(WinrmError::Cancelled)));
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    /// The budget runs out after Create and Execute: the first Receive is
+    /// refused and `run_command` reports it at once, neither polling nor
+    /// waiting on the (also refused) clean-up.
+    #[tokio::test]
+    async fn run_command_out_of_budget_mid_command_is_cancelled() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let server = MockServer::start().await;
+        let port = server.address().port();
+
+        // Shell create
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>S1</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
+            ))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Command execute
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>C1</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
+            ))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Anything else
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("<s:Envelope><s:Body/></s:Envelope>"),
+            )
+            .mount(&server)
+            .await;
+
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let c = std::sync::Arc::clone(&calls);
+        let client = WinrmClient::builder(basic_config(port))
+            .credentials(test_creds())
+            .before_send(move || c.fetch_add(1, Ordering::SeqCst) < 2)
+            .build()
+            .unwrap();
+        let r = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.run_command("127.0.0.1", "test", &[]),
+        )
+        .await
+        .expect("run_command must not hang once the budget is spent");
+        assert!(matches!(r, Err(WinrmError::Cancelled)));
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
     // --- Phase 2 tests ---
 
     #[tokio::test]

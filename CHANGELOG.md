@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`WinrmClientBuilder::before_send`**: a hook called before every SOAP
+  request the client sends, and before each retry, for every authentication
+  method. Returning `false` refuses the request: nothing is sent and the call
+  fails with `WinrmError::Cancelled`. Lets a caller meter or stop the
+  requests a high-level call issues. Based on a proposal by @mwd102 (#4).
+
 ## [1.3.0] - 2026-10-22
 
 Every public feature run against live Windows hosts (Server 2025, Server

@@ -4401,3 +4401,255 @@ async fn sealed_download_after_upload_stays_on_its_connection_allow_unencrypted_
     })
     .await;
 }
+
+// === `before_send` hook ===
+//
+// The hook gates every SOAP request. These tests run it against the bench:
+// a refusal in the middle of a command sends nothing, and the session (the
+// NTLM sealing state, the CredSSP channel) is still usable once the gate
+// reopens, with no new handshake.
+
+/// State behind a `before_send` hook: `calls` counts every call, the first
+/// `limit` of them are allowed, and `allowed` counts those that were.
+struct Gate {
+    calls: std::sync::atomic::AtomicUsize,
+    limit: std::sync::atomic::AtomicUsize,
+    allowed: std::sync::atomic::AtomicUsize,
+}
+
+impl Gate {
+    fn open() -> std::sync::Arc<Self> {
+        use std::sync::atomic::AtomicUsize;
+        std::sync::Arc::new(Self {
+            calls: AtomicUsize::new(0),
+            limit: AtomicUsize::new(usize::MAX),
+            allowed: AtomicUsize::new(0),
+        })
+    }
+
+    fn check(&self) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        let allow = self.calls.fetch_add(1, SeqCst) < self.limit.load(SeqCst);
+        if allow {
+            self.allowed.fetch_add(1, SeqCst);
+        }
+        allow
+    }
+
+    /// Refuse every call after the next `n`.
+    fn allow_next(&self, n: usize) {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.limit.store(self.calls.load(SeqCst) + n, SeqCst);
+    }
+
+    fn reopen(&self) {
+        self.limit
+            .store(usize::MAX, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn allowed(&self) -> usize {
+        self.allowed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// A client on the bench whose `before_send` hook is `gate`; `tweak` sets the
+/// auth method, port and TLS.
+fn gated_client(
+    gate: &std::sync::Arc<Gate>,
+    tweak: impl FnOnce(&mut WinrmConfig),
+) -> (WinrmClient, String) {
+    let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    let pass = std::env::var("WINRM_TEST_PASS").expect("WINRM_TEST_PASS");
+    let port: u16 = std::env::var("WINRM_TEST_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(5985);
+    let mut config = WinrmConfig {
+        auth_method: AuthMethod::Basic,
+        port,
+        ..Default::default()
+    };
+    tweak(&mut config);
+    let hook = std::sync::Arc::clone(gate);
+    let client = WinrmClient::builder(config)
+        .credentials(WinrmCredentials::new(user, pass, ""))
+        .before_send(move || hook.check())
+        .build()
+        .expect("build the gated client");
+    (client, host)
+}
+
+/// One shell, three commands: the first goes through, the second is cut after
+/// its Execute (the Receive is refused, so the call fails with `Cancelled`
+/// without waiting for the command), the third runs on the same shell once
+/// the gate has reopened. The shell is then closed normally.
+async fn assert_refusal_leaves_session_usable(
+    client: &WinrmClient,
+    host: &str,
+    gate: &std::sync::Arc<Gate>,
+) {
+    let shell = client.open_shell(host).await.expect("open shell");
+    let out = shell
+        .run_command("cmd.exe", &["/c", "echo", "before-refusal"])
+        .await
+        .expect("first command");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("before-refusal"));
+
+    gate.allow_next(1); // the Execute; the first Receive is refused
+    let start = Instant::now();
+    let cut = shell
+        .run_command("cmd.exe", &["/c", "echo", "cut-short"])
+        .await;
+    assert!(
+        matches!(cut, Err(WinrmError::Cancelled)),
+        "expected Cancelled, got: {cut:?}"
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "a refusal must not wait: {:?}",
+        start.elapsed()
+    );
+
+    gate.reopen();
+    let out = shell
+        .run_command("cmd.exe", &["/c", "echo", "after-refusal"])
+        .await
+        .expect("the session must survive a refusal");
+    assert_eq!(out.exit_code, 0);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("after-refusal"));
+    shell.close().await.expect("close shell");
+}
+
+/// The hook sees every request a `run_command` issues (Create, Execute, at
+/// least one Receive, Signal, Delete).
+#[tokio::test]
+#[ignore]
+async fn before_send_sees_every_request_of_a_run_command() {
+    let gate = Gate::open();
+    let (client, host) = gated_client(&gate, |_| {});
+    let out = client
+        .run_command(&host, "cmd.exe", &["/c", "echo", "counted"])
+        .await
+        .expect("run_command");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("counted"));
+    eprintln!("run_command issued {} requests", gate.calls());
+    assert!(gate.calls() >= 4, "calls: {}", gate.calls());
+}
+
+#[tokio::test]
+#[ignore]
+async fn before_send_refusal_leaves_a_basic_session_usable() {
+    let gate = Gate::open();
+    let (client, host) = gated_client(&gate, |_| {});
+    assert_refusal_leaves_session_usable(&client, &host, &gate).await;
+}
+
+/// Sealed NTLM over HTTP, through the recording forwarder: the refused
+/// requests never reach the wire, and the whole run costs one handshake. A
+/// refusal after the sealing would show as a sequence-number gap that the
+/// server rejects.
+#[tokio::test]
+#[ignore]
+async fn before_send_refusal_leaves_a_sealed_ntlm_session_usable() {
+    let gate = Gate::open();
+    let (_, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let port: u16 = std::env::var("WINRM_TEST_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(5985);
+    let forwarder = RecordingForwarder::start(format!("{host}:{port}")).await;
+    let (client, _) = gated_client(&gate, |c| {
+        c.auth_method = AuthMethod::Ntlm;
+        c.port = forwarder.addr.port();
+    });
+
+    assert_refusal_leaves_session_usable(&client, SEALED_HOST, &gate).await;
+
+    let (sealed, negotiate) = sealed_traffic(&forwarder);
+    eprintln!(
+        "hook calls: {}, allowed: {}, sealed on the wire: {sealed}",
+        gate.calls(),
+        gate.allowed()
+    );
+    assert!(gate.calls() > gate.allowed(), "a request was refused");
+    assert_eq!(negotiate, 2, "one handshake: the refusal cost none");
+    assert_eq!(
+        sealed,
+        gate.allowed(),
+        "every allowed request, and only those, went out sealed"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn before_send_refusal_leaves_an_ntlm_https_session_usable() {
+    if is_server_2012_r2().await {
+        eprintln!(
+            "SKIP before_send_refusal_leaves_an_ntlm_https_session_usable: HTTPS against a default Server 2012 R2 listener has no shared cipher suite with rustls"
+        );
+        return;
+    }
+    let gate = Gate::open();
+    let (client, host) = gated_client(&gate, |c| {
+        c.auth_method = AuthMethod::Ntlm;
+        c.use_tls = true;
+        c.accept_invalid_certs = true;
+        c.port = https_test_port();
+    });
+    assert_refusal_leaves_session_usable(&client, &host, &gate).await;
+}
+
+#[cfg(feature = "credssp")]
+#[tokio::test]
+#[ignore]
+async fn before_send_refusal_leaves_a_credssp_session_usable() {
+    if is_server_2012_r2().await {
+        eprintln!(
+            "SKIP before_send_refusal_leaves_a_credssp_session_usable: HTTPS against a default Server 2012 R2 listener has no shared cipher suite with rustls"
+        );
+        return;
+    }
+    let gate = Gate::open();
+    let (client, host) = gated_client(&gate, |c| {
+        c.auth_method = AuthMethod::CredSsp;
+        c.use_tls = true;
+        c.accept_invalid_certs = true;
+        c.port = https_test_port();
+    });
+    assert_refusal_leaves_session_usable(&client, &host, &gate).await;
+}
+
+/// Kerberos on the DC bench over plain HTTP, sealed by default: a refusal
+/// happens before the Kerberos context wraps anything, so the sealed session
+/// goes on afterwards. Needs `vm-connect-dc.sh` and `kinit`, like the other
+/// Kerberos tests.
+#[cfg(feature = "kerberos")]
+#[tokio::test]
+#[ignore]
+async fn before_send_refusal_leaves_a_kerberos_session_usable() {
+    const HINT: &str = "eval \"$(tests/scripts/vm-connect-dc.sh)\" and kinit vagrant@WINRM.TEST";
+    let host = std::env::var("WINRM_TEST_KRB_HOST").expect(HINT);
+    let port: u16 = std::env::var("WINRM_TEST_KRB_PORT")
+        .expect(HINT)
+        .parse()
+        .expect("WINRM_TEST_KRB_PORT must be a port number");
+    let user = std::env::var("WINRM_TEST_KRB_USER").expect(HINT);
+    let pass = std::env::var("WINRM_TEST_KRB_PASS").expect(HINT);
+    let gate = Gate::open();
+    let hook = std::sync::Arc::clone(&gate);
+    let client = WinrmClient::builder(WinrmConfig {
+        auth_method: AuthMethod::Kerberos,
+        port,
+        ..Default::default()
+    })
+    .credentials(WinrmCredentials::new(user, pass, ""))
+    .before_send(move || hook.check())
+    .build()
+    .expect("build Kerberos client");
+    assert_refusal_leaves_session_usable(&client, &host, &gate).await;
+}

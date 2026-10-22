@@ -213,6 +213,9 @@ enum SealedFailure {
     Error(WinrmError),
 }
 
+/// Gate checked before each request attempt: `true` sends, `false` refuses.
+pub(crate) type BeforeSend = Arc<dyn Fn() -> bool + Send + Sync>;
+
 /// HTTP transport for WinRM SOAP requests.
 ///
 /// Handles authentication dispatch, retry logic, and endpoint construction.
@@ -235,6 +238,9 @@ pub(crate) struct HttpTransport {
     /// `wsmv:SessionId` value stamped on every request (`uuid:<UPPERCASE>`),
     /// one per transport. See [`crate::soap::envelope::with_session_id`].
     session_id: String,
+    /// Called before each attempt of [`Self::send_soap_with_retry`]; `false`
+    /// refuses the request.
+    before_send: Option<BeforeSend>,
 }
 
 /// Largest response body read from the server: four times the envelope size
@@ -563,7 +569,13 @@ impl HttpTransport {
             conn_pool: Mutex::new(Vec::new()),
             conn_slots: tokio::sync::Semaphore::new(MAX_CONNS_IN_FLIGHT),
             session_id: format!("uuid:{}", uuid::Uuid::new_v4().to_string().to_uppercase()),
+            before_send: None,
         })
+    }
+
+    /// Install the gate checked before every request attempt.
+    pub(crate) fn set_before_send(&mut self, hook: BeforeSend) {
+        self.before_send = Some(hook);
     }
 
     /// Build the WinRM endpoint URL for a given host.
@@ -1175,6 +1187,10 @@ impl HttpTransport {
     /// ([`WinrmError::Http`] raised before anything was sent, see
     /// [`Self::is_retryable`]) are retried; any other error is returned
     /// immediately.
+    ///
+    /// The `before_send` hook, when set, runs at the start of every attempt,
+    /// before anything is authenticated, sealed or sent; a refusal returns
+    /// [`WinrmError::Cancelled`] and is never retried.
     pub(crate) async fn send_soap_with_retry(
         &self,
         host: &str,
@@ -1183,6 +1199,12 @@ impl HttpTransport {
         let body = crate::soap::envelope::with_session_id(&body, &self.session_id);
         let max = self.config.max_retries;
         for attempt in 0..=max {
+            if let Some(hook) = &self.before_send
+                && !hook()
+            {
+                debug!("request refused by the before_send hook");
+                return Err(WinrmError::Cancelled);
+            }
             match self.send_soap(host, body.clone()).await {
                 Ok(r) => return Ok(r),
                 Err(e) if attempt < max && Self::is_retryable(&e) => {
@@ -2342,6 +2364,169 @@ mod tests {
             matches!(err, WinrmError::Soap(crate::error::SoapError::Fault { code, .. }) if code == "w:TimedOut"),
             "expected Soap(Fault w:TimedOut), got: {err:?}"
         );
+    }
+
+    // --- `before_send` hook ---
+
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// A hook that lets the first `allow` calls through and counts every call.
+    fn counting_hook(allow: usize) -> (BeforeSend, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&calls);
+        (
+            Arc::new(move || c.fetch_add(1, Ordering::SeqCst) < allow),
+            calls,
+        )
+    }
+
+    /// A Basic transport on `port` with `max_retries` retries.
+    fn basic_transport_retrying(port: u16, max_retries: u32) -> HttpTransport {
+        let config = WinrmConfig {
+            auth_method: AuthMethod::Basic,
+            port,
+            use_tls: false,
+            max_retries,
+            ..Default::default()
+        };
+        HttpTransport::new(config, WinrmCredentials::new("admin", "pass", "")).unwrap()
+    }
+
+    /// A loopback port that refuses connections: bound but not listening.
+    /// The socket must stay alive for the whole test, or the port is freed.
+    fn refused_port() -> (tokio::net::TcpSocket, u16) {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let port = socket.local_addr().unwrap().port();
+        (socket, port)
+    }
+
+    async fn mount_ok_expecting(server: &MockServer, times: u64) {
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<ok/>"))
+            .expect(times)
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn before_send_refusal_sends_nothing() {
+        let server = MockServer::start().await;
+        mount_ok_expecting(&server, 0).await;
+        let mut transport = basic_transport(server.address().port());
+        transport.set_before_send(Arc::new(|| false));
+        let result = transport
+            .send_soap_with_retry("127.0.0.1", "<a/>".into())
+            .await;
+        assert!(matches!(result, Err(WinrmError::Cancelled)));
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn before_send_runs_before_every_attempt() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (_socket, port) = refused_port();
+        let mut transport = basic_transport_retrying(port, 2);
+        let (hook, calls) = counting_hook(usize::MAX);
+        transport.set_before_send(hook);
+        let result = transport
+            .send_soap_with_retry("127.0.0.1", "<a/>".into())
+            .await;
+        assert!(matches!(&result, Err(WinrmError::Http(e)) if e.is_connect()));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn before_send_refusal_stops_the_retries() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (_socket, port) = refused_port();
+        let mut transport = basic_transport_retrying(port, 2);
+        let (hook, calls) = counting_hook(1);
+        transport.set_before_send(hook);
+        let result = transport
+            .send_soap_with_retry("127.0.0.1", "<a/>".into())
+            .await;
+        assert!(matches!(result, Err(WinrmError::Cancelled)));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn before_send_budget_holds_under_concurrency() {
+        let server = MockServer::start().await;
+        mount_ok_expecting(&server, 3).await;
+        let mut transport = basic_transport(server.address().port());
+        let (hook, _calls) = counting_hook(3);
+        transport.set_before_send(hook);
+        let transport = Arc::new(transport);
+        let tasks: Vec<_> = (0..10)
+            .map(|_| {
+                let t = Arc::clone(&transport);
+                tokio::spawn(
+                    async move { t.send_soap_with_retry("127.0.0.1", "<a/>".into()).await },
+                )
+            })
+            .collect();
+        let (mut oks, mut cancelled) = (0, 0);
+        for task in tasks {
+            match task.await.unwrap() {
+                Ok(_) => oks += 1,
+                Err(WinrmError::Cancelled) => cancelled += 1,
+                Err(e) => panic!("unexpected error: {e:?}"),
+            }
+        }
+        assert_eq!(oks, 3);
+        assert_eq!(cancelled, 7);
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn before_send_panic_propagates_and_sends_nothing() {
+        let server = MockServer::start().await;
+        mount_ok_expecting(&server, 0).await;
+        let mut transport = basic_transport(server.address().port());
+        transport.set_before_send(Arc::new(|| -> bool { panic!("hook") }));
+        let join_handle = tokio::spawn(async move {
+            transport
+                .send_soap_with_retry("127.0.0.1", "<a/>".into())
+                .await
+        });
+        assert!(join_handle.await.unwrap_err().is_panic());
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    /// A refusal happens before anything is sealed, so the cached NTLM session
+    /// keeps its sequence number and RC4 stream: the next request goes through
+    /// it with no new handshake.
+    #[tokio::test]
+    async fn refused_sealed_request_leaves_the_session_usable() {
+        let (_server, fake, mut transport, host) = sealed_setup().await;
+        let refuse = Arc::new(AtomicBool::new(false));
+        let r = Arc::clone(&refuse);
+        transport.set_before_send(Arc::new(move || !r.load(Ordering::SeqCst)));
+
+        assert!(
+            transport
+                .send_soap_with_retry(&host, "<a/>".into())
+                .await
+                .is_ok()
+        );
+        refuse.store(true, Ordering::SeqCst);
+        let refused = transport
+            .send_soap_with_retry(&host, "<refused/>".into())
+            .await;
+        refuse.store(false, Ordering::SeqCst);
+        assert!(
+            transport
+                .send_soap_with_retry(&host, "<b/>".into())
+                .await
+                .is_ok()
+        );
+
+        assert!(matches!(refused, Err(WinrmError::Cancelled)));
+        assert_eq!(fake.handshakes(), 1, "log: {:?}", fake.log());
+        let sealed = fake.sealed();
+        assert_eq!(sealed.len(), 2, "log: {:?}", fake.log());
+        assert!(sealed.iter().all(|b| !b.contains("refused")));
     }
 
     /// Sanity check of the fake endpoint: two requests go through.

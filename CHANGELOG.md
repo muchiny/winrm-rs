@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-10-22
+
+Adds a hook to meter or refuse each request before it is sent.
+
 ### Added
 
 - **`WinrmClientBuilder::before_send`**: a hook called before every SOAP
@@ -967,7 +971,8 @@ considered stable and covered by SemVer guarantees.
 - Raw command execution (`cmd.exe` or any executable)
 - Full shell lifecycle: create, execute, receive, signal, delete
 
-[Unreleased]: https://github.com/muchiny/winrm-rs/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/muchiny/winrm-rs/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/muchiny/winrm-rs/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/muchiny/winrm-rs/compare/v1.2.2...v1.3.0
 [1.2.2]: https://github.com/muchiny/winrm-rs/compare/v1.2.1...v1.2.2
 [1.2.1]: https://github.com/muchiny/winrm-rs/compare/v1.2.0...v1.2.1

@@ -78,7 +78,11 @@ impl WinrmClient {
     /// The shell uses UTF-8 codepage (65001) and disables the user profile
     /// (`WINRS_NOPROFILE`). The caller must eventually call
     /// [`delete_shell`](Self::delete_shell) to release server resources.
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, host),
+        fields(host = %crate::transport::redact_userinfo(host))
+    )]
     pub async fn create_shell(&self, host: &str) -> Result<String, WinrmError> {
         let config = self.transport.config();
         let envelope = soap::create_shell_request(&self.transport.endpoint(host), config);
@@ -94,7 +98,11 @@ impl WinrmClient {
     ///
     /// Returns a [`Shell`] whose subsequent operations (Execute, Receive,
     /// Send, Signal, Delete) will use the PowerShell resource URI.
-    #[tracing::instrument(level = "debug", skip(self, creation_xml_b64))]
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, creation_xml_b64, host),
+        fields(host = %crate::transport::redact_userinfo(host))
+    )]
     pub async fn open_psrp_shell(
         &self,
         host: &str,
@@ -127,7 +135,11 @@ impl WinrmClient {
     ///
     /// The caller is responsible for subsequently calling
     /// [`receive_output`](Self::receive_output) to poll for results.
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, host),
+        fields(host = %crate::transport::redact_userinfo(host))
+    )]
     pub async fn execute_command(
         &self,
         host: &str,
@@ -167,7 +179,11 @@ impl WinrmClient {
     /// [`receive_output_raw`](Self::receive_output_raw) and feed its stderr
     /// to one [`StderrDecoder`](crate::StderrDecoder) per command, or use
     /// [`Shell::receive_next`](crate::Shell::receive_next), which does that.
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, host),
+        fields(host = %crate::transport::redact_userinfo(host))
+    )]
     pub async fn receive_output(
         &self,
         host: &str,
@@ -189,7 +205,11 @@ impl WinrmClient {
     /// [`StderrDecoder`](crate::StderrDecoder) per command to decode CLIXML
     /// that spans several responses; its documentation has an example. A
     /// `TimedOut` fault is an empty, not-done poll here too.
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, host),
+        fields(host = %crate::transport::redact_userinfo(host))
+    )]
     pub async fn receive_output_raw(
         &self,
         host: &str,
@@ -226,7 +246,11 @@ impl WinrmClient {
     ///
     /// This is a best-effort operation -- errors are typically non-fatal
     /// since the shell will be deleted shortly after.
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, host),
+        fields(host = %crate::transport::redact_userinfo(host))
+    )]
     pub async fn signal_terminate(
         &self,
         host: &str,
@@ -251,7 +275,11 @@ impl WinrmClient {
     /// an error occurred. The high-level [`run_command`](Self::run_command)
     /// and [`run_powershell`](Self::run_powershell) methods handle this
     /// automatically.
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, host),
+        fields(host = %crate::transport::redact_userinfo(host))
+    )]
     pub async fn delete_shell(&self, host: &str, shell_id: &str) -> Result<(), WinrmError> {
         self.delete_shell_with_resource_uri(
             host,
@@ -285,7 +313,11 @@ impl WinrmClient {
     /// shell, which the server then reaps after its idle timeout.
     /// [`Shell::run_command`] has a total deadline of
     /// `2 * operation_timeout_secs`.
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, host),
+        fields(host = %crate::transport::redact_userinfo(host))
+    )]
     pub async fn run_command(
         &self,
         host: &str,
@@ -347,7 +379,11 @@ impl WinrmClient {
     /// }
     /// # Ok(()) }
     /// ```
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, host),
+        fields(host = %crate::transport::redact_userinfo(host))
+    )]
     pub async fn run_command_with_timeout(
         &self,
         host: &str,
@@ -535,7 +571,11 @@ impl WinrmClient {
     /// with [`run_powershell_with_timeout`](Self::run_powershell_with_timeout)
     /// (which also deletes the shell on expiry) or stop it from elsewhere
     /// with [`run_powershell_with_cancel`](Self::run_powershell_with_cancel).
-    #[tracing::instrument(level = "debug", skip(self, script))]
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, script, host),
+        fields(host = %crate::transport::redact_userinfo(host))
+    )]
     pub async fn run_powershell(
         &self,
         host: &str,
@@ -568,7 +608,11 @@ impl WinrmClient {
     /// assert!(matches!(err, WinrmError::Timeout(10)));
     /// # Ok(()) }
     /// ```
-    #[tracing::instrument(level = "debug", skip(self, script))]
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, script, host),
+        fields(host = %crate::transport::redact_userinfo(host))
+    )]
     pub async fn run_powershell_with_timeout(
         &self,
         host: &str,
@@ -656,7 +700,11 @@ impl WinrmClient {
     /// println!("{xml}");
     /// # Ok(()) }
     /// ```
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, host),
+        fields(host = %crate::transport::redact_userinfo(host))
+    )]
     pub async fn run_wql(
         &self,
         host: &str,
@@ -716,7 +764,11 @@ impl WinrmClient {
     ///
     /// The shell should be explicitly closed via [`Shell::close`] when done.
     /// If dropped without closing, a warning is logged.
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, host),
+        fields(host = %crate::transport::redact_userinfo(host))
+    )]
     pub async fn open_shell(&self, host: &str) -> Result<Shell<'_>, WinrmError> {
         let shell_id = self.create_shell(host).await?;
         debug!(shell_id = %shell_id, "WinRM shell opened for reuse");
@@ -752,7 +804,11 @@ impl WinrmClient {
     /// Sends a WS-Man `Reconnect` SOAP request to validate that the
     /// server-side shell identified by `shell_id` is still alive and
     /// returns a [`Shell`] handle that resumes operations on it.
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, host),
+        fields(host = %crate::transport::redact_userinfo(host))
+    )]
     pub async fn reconnect_shell(
         &self,
         host: &str,

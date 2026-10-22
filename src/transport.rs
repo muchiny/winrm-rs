@@ -296,6 +296,23 @@ pub(crate) fn sanitize_host(input: &str) -> String {
     s.to_string()
 }
 
+/// `host` as it may be logged: anything [`sanitize_host`] would strip as
+/// userinfo (up to the last `@` after an optional scheme) is replaced by
+/// `<redacted>`, so a `user:password@host` string never reaches a log.
+pub(crate) fn redact_userinfo(host: &str) -> std::borrow::Cow<'_, str> {
+    let (scheme, rest) = match host.split_once("://") {
+        Some((scheme, rest)) => (Some(scheme), rest),
+        None => (None, host),
+    };
+    match rest.rsplit_once('@') {
+        None => std::borrow::Cow::Borrowed(host),
+        Some((_, after)) => std::borrow::Cow::Owned(match scheme {
+            Some(scheme) => format!("{scheme}://<redacted>@{after}"),
+            None => format!("<redacted>@{after}"),
+        }),
+    }
+}
+
 /// Refuse a host that, once [`sanitize_host`] has stripped the scheme,
 /// userinfo, path and port, is still not a host name or address.
 ///
@@ -505,7 +522,7 @@ impl HttpTransport {
         let sanitized = sanitize_host(host);
         if sanitized != host {
             tracing::warn!(
-                original = host,
+                original = %redact_userinfo(host),
                 sanitized = %sanitized,
                 "host string contained scheme/path/userinfo; using sanitized form"
             );
@@ -535,7 +552,11 @@ impl HttpTransport {
     /// Dispatches to Basic or NTLM transport depending on the configured
     /// [`AuthMethod`]. The response is checked for SOAP faults before
     /// returning.
-    #[tracing::instrument(level = "debug", skip(self, body))]
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, host, body),
+        fields(host = %redact_userinfo(host))
+    )]
     async fn send_soap(&self, host: &str, body: String) -> Result<String, WinrmError> {
         let url = self.checked_endpoint(host)?;
         debug!(url = %url, "sending WinRM SOAP request");
@@ -2037,6 +2058,51 @@ mod tests {
         let creds = WinrmCredentials::new("u", "p", "");
         let result = HttpTransport::new(config, creds);
         assert!(result.is_err(), "expected error for invalid proxy URL");
+    }
+
+    #[test]
+    fn redact_userinfo_hides_everything_sanitize_strips_as_userinfo() {
+        assert_eq!(redact_userinfo("win01"), "win01");
+        assert_eq!(redact_userinfo("http://win01/x"), "http://win01/x");
+        assert_eq!(redact_userinfo("admin:hunter2@win01"), "<redacted>@win01");
+        assert_eq!(
+            redact_userinfo("https://admin:hunter2@win01:5986/wsman"),
+            "https://<redacted>@win01:5986/wsman"
+        );
+        assert_eq!(redact_userinfo("a@b:c@win01"), "<redacted>@win01");
+    }
+
+    /// The WARN about a polluted host string, and the span of the request,
+    /// never carry the userinfo.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn logs_of_a_host_with_userinfo_do_not_carry_the_password() {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let transport = HttpTransport::new(
+            WinrmConfig {
+                auth_method: AuthMethod::Basic,
+                port,
+                use_tls: false,
+                max_retries: 0,
+                connect_timeout_secs: 2,
+                ..Default::default()
+            },
+            WinrmCredentials::new("admin", "pass", ""),
+        )
+        .unwrap();
+        let host = "admin:hunter2@127.0.0.1";
+        assert_eq!(
+            transport.endpoint(host),
+            format!("http://127.0.0.1:{port}/wsman")
+        );
+        let sent = transport.send_soap(host, "<s:Envelope/>".into()).await;
+        assert!(sent.is_err(), "nothing listens on port {port}");
+        assert!(logs_contain("<redacted>@127.0.0.1"));
+        assert!(logs_contain("sending WinRM SOAP request"));
+        assert!(!logs_contain("hunter2"));
     }
 
     #[test]

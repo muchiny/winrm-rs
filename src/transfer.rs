@@ -163,7 +163,11 @@ impl WinrmClient {
     /// println!("{bytes} bytes");
     /// # Ok(()) }
     /// ```
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, host),
+        fields(host = %crate::transport::redact_userinfo(host))
+    )]
     pub async fn download_file_with_timeout(
         &self,
         host: &str,

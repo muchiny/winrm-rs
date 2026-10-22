@@ -1,5 +1,6 @@
 //! Response parsers for shell IDs, command IDs, and output streams.
 
+use super::clixml::ClixmlDecoder;
 use super::namespaces::COMMAND_STATE_DONE;
 use crate::error::SoapError;
 
@@ -45,8 +46,23 @@ pub fn parse_command_id(xml: &str) -> Result<String, SoapError> {
 /// `CommandState` for the `Done` URI, and extracts the `ExitCode` if present.
 /// Returns [`SoapError::ParseError`] if a stream contains invalid base64, or
 /// a [`SoapError::Fault`] if the response body contains a SOAP fault.
+///
+/// PowerShell CLIXML on stderr is decoded within this one response. A
+/// document split across Receive responses is only reassembled by callers
+/// that keep a [`ClixmlDecoder`] per command over
+/// [`parse_receive_output_raw`].
 #[allow(unreachable_pub)] // re-exported under the `__internal` feature for fuzz targets
 pub fn parse_receive_output(xml: &str) -> Result<ReceiveOutput, SoapError> {
+    let mut output = parse_receive_output_raw(xml)?;
+    let mut decoder = ClixmlDecoder::new();
+    let mut stderr = decoder.push(&output.stderr);
+    stderr.extend(decoder.finish());
+    output.stderr = stderr;
+    Ok(output)
+}
+
+/// [`parse_receive_output`] with stderr returned exactly as the server sent it.
+pub(crate) fn parse_receive_output_raw(xml: &str) -> Result<ReceiveOutput, SoapError> {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD as B64;
 
@@ -63,13 +79,7 @@ pub fn parse_receive_output(xml: &str) -> Result<ReceiveOutput, SoapError> {
             .map_err(|e| SoapError::ParseError(format!("base64 decode: {e}")))?;
         match name.as_str() {
             "stdout" => stdout.extend_from_slice(&decoded),
-            "stderr" => {
-                if decoded.starts_with(b"#< CLIXML") {
-                    stderr.extend_from_slice(&parse_clixml(&decoded));
-                } else {
-                    stderr.extend_from_slice(&decoded);
-                }
-            }
+            "stderr" => stderr.extend_from_slice(&decoded),
             _ => {}
         }
     }
@@ -141,41 +151,6 @@ pub fn check_soap_fault(xml: &str) -> Result<(), SoapError> {
         return Err(fault);
     }
     Ok(())
-}
-
-/// Parse PowerShell CLIXML stderr into human-readable text.
-///
-/// PowerShell wraps errors in CLIXML format (`#< CLIXML\r\n<Objs>...`).
-/// This function extracts the text from `<S S="Error">` tags and decodes
-/// CLIXML escape sequences like `_x000D_` (CR) and `_x000A_` (LF).
-fn parse_clixml(data: &[u8]) -> Vec<u8> {
-    let text = String::from_utf8_lossy(data);
-    let mut result = String::new();
-
-    // Extract content from <S S="Error">...</S> tags
-    let error_tag = "<S S=\"Error\">";
-    let close_tag = "</S>";
-    let mut search_from = 0;
-
-    while let Some(start) = text[search_from..].find(error_tag) {
-        let content_start = search_from + start + error_tag.len();
-        if let Some(end) = text[content_start..].find(close_tag) {
-            let fragment = &text[content_start..content_start + end];
-            result.push_str(fragment);
-            search_from = content_start + end + close_tag.len();
-        } else {
-            break;
-        }
-    }
-
-    // Decode CLIXML escape sequences
-    let result = result
-        .replace("_x000D_", "\r")
-        .replace("_x000A_", "\n")
-        .replace("_x0009_", "\t")
-        .replace("_x001B_", "\x1b");
-
-    result.into_bytes()
 }
 
 // --- Helpers ---
@@ -740,35 +715,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_clixml_basic_error() {
-        let input = b"#< CLIXML\r\n<Objs Version=\"1.1.0.1\" xmlns=\"http://schemas.microsoft.com/powershell/2004/04\"><S S=\"Error\">Something went wrong</S></Objs>";
-        let result = parse_clixml(input);
-        assert_eq!(String::from_utf8_lossy(&result), "Something went wrong");
-    }
-
-    #[test]
-    fn parse_clixml_escaped_newlines() {
-        let input = b"#< CLIXML\r\n<Objs><S S=\"Error\">line1_x000D__x000A_line2</S></Objs>";
-        let result = parse_clixml(input);
-        assert_eq!(String::from_utf8_lossy(&result), "line1\r\nline2");
-    }
-
-    #[test]
-    fn parse_clixml_multiple_errors() {
-        let input = b"#< CLIXML\r\n<Objs><S S=\"Error\">err1</S><S S=\"Error\">err2</S></Objs>";
-        let result = parse_clixml(input);
-        assert_eq!(String::from_utf8_lossy(&result), "err1err2");
-    }
-
-    #[test]
-    fn parse_clixml_not_clixml_passthrough() {
-        // Non-CLIXML data should return empty (no <S S="Error"> tags)
-        let input = b"plain error text without CLIXML";
-        let result = parse_clixml(input);
-        assert!(result.is_empty());
-    }
-
-    #[test]
     fn parse_receive_output_clixml_stderr() {
         use base64::Engine;
         use base64::engine::general_purpose::STANDARD as B64;
@@ -784,6 +730,23 @@ mod tests {
             "PowerShell error\r\n"
         );
         assert_eq!(output.exit_code, Some(1));
+    }
+
+    #[test]
+    fn parse_receive_output_clixml_split_across_streams_of_one_response() {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD as B64;
+
+        let first = B64.encode(b"#< CLIXML\r\n<Objs><S S=\"Er");
+        let second = B64.encode(b"ror\">denied</S><S S=\"warning\">w</S></Objs>");
+        let xml = format!(
+            r#"<rsp:ReceiveResponse><rsp:Stream Name="stderr">{first}</rsp:Stream><rsp:Stream Name="stderr">{second}</rsp:Stream></rsp:ReceiveResponse>"#
+        );
+        let output = parse_receive_output(&xml).unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            "deniedWARNING: w\r\n"
+        );
     }
 
     // Kills extract_subcode_value returning None
@@ -839,14 +802,6 @@ mod tests {
         let (items, context) = parse_enumerate_response(xml).unwrap();
         assert!(items.contains("page1"));
         assert_eq!(context.as_deref(), Some("ctx-123"));
-    }
-
-    // parse_clixml with multiple error fragments to test offset arithmetic
-    #[test]
-    fn parse_clixml_consecutive_error_fragments() {
-        let clixml = b"#< CLIXML\r\n<Objs><S S=\"Error\">aaa</S><S S=\"Error\">bbb</S></Objs>";
-        let result = parse_clixml(clixml);
-        assert_eq!(String::from_utf8_lossy(&result), "aaabbb");
     }
 
     #[test]

@@ -1280,6 +1280,11 @@ struct RecordedRequest {
     sealed: bool,
     /// Its `Content-Length`.
     body_len: usize,
+    /// It announced `Transfer-Encoding: chunked`: its body length is not
+    /// known from the head, so the recorder stops parsing that connection
+    /// and the plaintext checks refuse to conclude (see
+    /// [`RecordingForwarder::plaintext_bodies`]).
+    chunked: bool,
 }
 
 /// A TCP forwarder to the bench's HTTP port that keeps a copy of the bytes
@@ -1382,12 +1387,19 @@ impl RecordingForwarder {
                 let body_len = header("content-length:")
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(0);
+                let chunked = header("transfer-encoding:").is_some_and(|v| v.contains("chunked"));
                 requests.push(RecordedRequest {
                     authorization: header("authorization:").is_some(),
                     sealed: header("content-type:")
                         .is_some_and(|ct| ct.starts_with("multipart/encrypted")),
                     body_len,
+                    chunked,
                 });
+                if chunked {
+                    // The rest of this stream cannot be split into requests
+                    // without decoding the chunks.
+                    break;
+                }
                 at += end + 4 + body_len;
             }
         }
@@ -1395,8 +1407,17 @@ impl RecordingForwarder {
     }
 
     /// Requests that carried a body without sealing it.
+    ///
+    /// Panics if a request was sent with `Transfer-Encoding: chunked`: its
+    /// body has no `Content-Length`, so counting it as empty would let a
+    /// plaintext body through this check unseen.
     fn plaintext_bodies(&self) -> usize {
-        self.requests()
+        let requests = self.requests();
+        assert!(
+            !requests.iter().any(|r| r.chunked),
+            "a request body was sent chunked; the recorder cannot check it for plaintext"
+        );
+        requests
             .iter()
             .filter(|r| r.body_len > 0 && !r.sealed)
             .count()
@@ -3307,8 +3328,12 @@ async fn silent_command_completes_over_kerberos() {
     assert_silent_command_completes(&client, &host).await;
 }
 
-/// Two commands on the same client: each request builds a fresh Kerberos
-/// context from the cached service ticket, and the second must not fail.
+/// Two commands on the same client, over HTTP with the default
+/// `EncryptionMode::Auto`: requests are sealed, with one Kerberos context per
+/// sealed connection (built from the cached service ticket when the
+/// connection is authenticated, then reused by the requests on it, or a new
+/// connection and context when none is idle). The second command must not
+/// fail.
 #[cfg(feature = "kerberos")]
 #[tokio::test]
 #[ignore]

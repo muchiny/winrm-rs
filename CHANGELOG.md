@@ -103,6 +103,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **A host such as `win01?x`, `win01\x`, `win 01` or `win01#x` was accepted
+  and mis-routed.** The endpoint URL is `scheme://HOST:PORT/wsman`, so the
+  host ended the authority early: the configured port landed in the query
+  and the request went to the scheme's default port. Every request now
+  refuses a host that is still not a host name once the scheme, userinfo,
+  path and port have been stripped (as before) with `WinrmError::AuthFailed`
+  ("invalid host ..."), before anything is sent. Accepted: ASCII letters,
+  digits, `-`, `_` and `.`, non-ASCII names (punycode), and bracketed IPv6
+  literals. A port after a bracketed literal (`[::1]:5985`) is now stripped
+  like any other instead of producing a broken URL. (No dedicated error
+  variant: `WinrmError` is not `#[non_exhaustive]`.)
 - **An unencrypted Kerberos request refused for lack of encryption gave an
   opaque `AuthFailed("HTTP 500 Internal Server Error: ")`.** Windows answers
   an HTTP 500 with an empty body when it requires encrypted messages

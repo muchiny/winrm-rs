@@ -268,7 +268,11 @@ fn url_server_name(url: &str) -> Option<rustls::pki_types::ServerName<'static>> 
 /// Defensive: callers are supposed to pass `"hostname"` or `"10.0.0.1"`,
 /// but if they accidentally pass `"http://evil.com/path"` we keep just
 /// `"evil.com"` and log the deviation. IPv6 literals (`[::1]`) are
-/// preserved as-is because `:` inside brackets is part of the address.
+/// preserved as-is because `:` inside brackets is part of the address; a
+/// port after the closing bracket (`[::1]:5985`) is dropped like any other.
+///
+/// This only strips: what is left may still not be a host name (`win01?x`).
+/// [`validate_host`] refuses those.
 pub(crate) fn sanitize_host(input: &str) -> String {
     let mut s = input;
     if let Some(rest) = s.split_once("://") {
@@ -280,13 +284,60 @@ pub(crate) fn sanitize_host(input: &str) -> String {
     if let Some((host_part, _)) = s.split_once('/') {
         s = host_part;
     }
-    // For non-bracketed IPv6 / hostnames, drop a trailing :port.
-    if !s.starts_with('[')
-        && let Some((host_part, _)) = s.rsplit_once(':')
-    {
+    if s.starts_with('[') {
+        // Bracketed IPv6: drop a port after the closing bracket.
+        if let Some((literal, _)) = s.split_once("]:") {
+            return format!("{literal}]");
+        }
+    } else if let Some((host_part, _)) = s.rsplit_once(':') {
+        // For hostnames and IPv4 literals, drop a trailing :port.
         s = host_part;
     }
     s.to_string()
+}
+
+/// Refuse a host that, once [`sanitize_host`] has stripped the scheme,
+/// userinfo, path and port, is still not a host name or address.
+///
+/// The endpoint URL is built by formatting the host into
+/// `scheme://HOST:PORT/wsman`, so a host such as `win01?x` or `win01\x`
+/// would end the authority early: the configured port would land in the
+/// query and the request would go to the scheme's default port. Accepted:
+/// a bracketed IPv6 literal (hex digits, `:` and `.` inside `[...]`), or a
+/// name made of ASCII letters, digits, `-`, `_` and `.` and of any non-ASCII
+/// character that is not whitespace or a control character (internationalised
+/// names, converted to punycode by the URL parser).
+pub(crate) fn validate_host(host: &str) -> Result<(), WinrmError> {
+    let sanitized = sanitize_host(host);
+    let valid = if let Some(inner) = sanitized
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    {
+        !inner.is_empty()
+            && inner
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.')
+    } else {
+        !sanitized.is_empty()
+            && sanitized.chars().all(|c| {
+                if c.is_ascii() {
+                    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')
+                } else {
+                    !c.is_whitespace() && !c.is_control()
+                }
+            })
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(WinrmError::AuthFailed(format!(
+            // Debug form: shows whitespace and control characters. Userinfo
+            // is already stripped.
+            "invalid host {:?}: expected a host name, an IPv4 address or a bracketed IPv6 \
+             literal (letters, digits, '-', '_' and '.')",
+            crate::error::excerpt_chars(&sanitized, 64)
+        )))
+    }
 }
 
 /// Build the `reqwest` client for `config`: timeouts, redirects off, user
@@ -445,6 +496,10 @@ impl HttpTransport {
     /// detected they are stripped and a WARN is logged so the call still
     /// produces a syntactically valid URL but the operator notices the
     /// misuse instead of silently sending credentials to a forged host.
+    ///
+    /// Infallible, so that envelopes can embed it; every request goes
+    /// through [`Self::checked_endpoint`], which refuses a host that is not
+    /// a host name (see [`validate_host`]) before anything is sent.
     pub(crate) fn endpoint(&self, host: &str) -> String {
         let scheme = if self.config.use_tls { "https" } else { "http" };
         let sanitized = sanitize_host(host);
@@ -456,6 +511,13 @@ impl HttpTransport {
             );
         }
         format!("{scheme}://{sanitized}:{}/wsman", self.config.port)
+    }
+
+    /// [`Self::endpoint`] for a host that [`validate_host`] accepts, else
+    /// the error that says why not.
+    fn checked_endpoint(&self, host: &str) -> Result<String, WinrmError> {
+        validate_host(host)?;
+        Ok(self.endpoint(host))
     }
 
     /// Access the transport configuration.
@@ -475,7 +537,7 @@ impl HttpTransport {
     /// returning.
     #[tracing::instrument(level = "debug", skip(self, body))]
     async fn send_soap(&self, host: &str, body: String) -> Result<String, WinrmError> {
-        let url = self.endpoint(host);
+        let url = self.checked_endpoint(host)?;
         debug!(url = %url, "sending WinRM SOAP request");
         trace!(body = %body, "SOAP request body");
 
@@ -828,10 +890,11 @@ impl HttpTransport {
                     method,
                     format!(
                         "HTTP 401 to a {kind}{name} request on an authenticated connection: the \
-                         request did not reach the {name} session (the server closed an idle \
-                         connection, or the client's pool sent it on a fresh, unauthenticated \
-                         connection right after a large answer); the request was NOT resent, as \
-                         it may already have run: retry the call if it is safe to run again"
+                         connection no longer carries the {name} session (usually the server \
+                         closed an idle connection, or the client's pool sent the request on a \
+                         fresh, unauthenticated connection right after a large answer), but a \
+                         401 does not prove the request did not run; it was NOT resent: retry \
+                         the call if it is safe to run again"
                     ),
                 ))
             }
@@ -1122,6 +1185,109 @@ mod tests {
     #[test]
     fn sanitize_host_preserves_ipv6_literal() {
         assert_eq!(sanitize_host("[fe80::1]"), "[fe80::1]");
+    }
+
+    #[test]
+    fn sanitize_host_drops_a_port_after_a_bracketed_ipv6_literal() {
+        assert_eq!(sanitize_host("[fe80::1]:5985"), "[fe80::1]");
+        assert_eq!(sanitize_host("http://[::1]:5986/wsman"), "[::1]");
+        assert_eq!(sanitize_host("win01:5985"), "win01");
+    }
+
+    #[test]
+    fn validate_host_accepts_names_addresses_and_the_forms_sanitize_strips() {
+        for host in [
+            "win01",
+            "win-01.corp.local",
+            "WIN_01",
+            "10.0.0.5",
+            "10.1",
+            "[::1]",
+            "[fe80::1]",
+            "[::ffff:10.0.0.1]",
+            "bücher.example",
+            // Stripped by sanitize_host, so what is left is a valid name.
+            "win01:5985",
+            "http://win01/wsman",
+            "https://user:pw@win01:5986/wsman",
+            "[fe80::1]:5985",
+        ] {
+            assert!(validate_host(host).is_ok(), "{host:?} should be accepted");
+        }
+    }
+
+    #[test]
+    fn validate_host_rejects_what_would_mis_route_the_endpoint() {
+        for host in [
+            "",
+            "win01?x",
+            "win01\\x",
+            "win01#frag",
+            "win 01",
+            "win01\t",
+            "win01\r\nHost: evil",
+            "win01\0",
+            "win01%2f",
+            "win01;evil",
+            "win01,evil",
+            "win01<",
+            "wiń\u{a0}01",
+            "http://win01?x/wsman",
+            "user@",
+            "fe80::1",
+            "[::1",
+            "[]",
+            "[zz::1]",
+            "[::1]x",
+            "[fe80::1%eth0]",
+        ] {
+            let err = validate_host(host).unwrap_err();
+            assert!(
+                matches!(&err, WinrmError::AuthFailed(m) if m.contains("invalid host")),
+                "{host:?}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_host_error_quotes_the_stripped_host_only() {
+        // Userinfo is stripped before the host is quoted: no password leaks.
+        let err = validate_host("user:s3cret@win01?x")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("win01?x"), "{err}");
+        assert!(!err.contains("s3cret"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_host_that_is_not_a_host_name_is_refused_before_anything_is_sent() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<ok/>"))
+            .mount(&server)
+            .await;
+        let transport = basic_transport(server.address().port());
+        for host in ["win01?x", "win01\\x", "win 01", "win01#x", ""] {
+            let err = transport
+                .send_soap_raw(host, "<env/>".into())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, WinrmError::AuthFailed(m) if m.contains("invalid host")),
+                "{host:?}: {err:?}"
+            );
+        }
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert!(requests.is_empty(), "{} request(s) sent", requests.len());
+        // A well-formed host with the port glued on still reaches the server.
+        let host = format!("127.0.0.1:{}", server.address().port());
+        assert_eq!(
+            transport
+                .send_soap_raw(&host, "<env/>".into())
+                .await
+                .unwrap(),
+            "<ok/>"
+        );
     }
 
     #[test]

@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Upgrading from 1.2.x
+
+The public API only grows (no item removed or changed in signature), but
+behaviour changes in ways callers can see, so this release needs a minor
+version bump (1.3.0), not a patch. One line each; the sections below give
+the details.
+
+- A `w:TimedOut` fault on Receive is now an empty poll, not
+  `WinrmError::Soap`: silent commands keep running instead of failing.
+- `WinrmClient::run_command`, `run_powershell` and `download_file` have no
+  overall time limit any more; bound them with `run_command_with_timeout`,
+  `run_powershell_with_timeout`, `download_file_with_timeout`, or stop them
+  with `run_command_with_cancel` / `run_powershell_with_cancel`.
+- `Shell::run_command` on a silent command ends in
+  `WinrmError::Timeout(2 * operation_timeout_secs)` (it used to fail with the
+  `TimedOut` fault after one `operation_timeout_secs`).
+- An HTTP 500 carrying a SOAP fault is `WinrmError::Soap` for Certificate,
+  Kerberos and CredSSP too (it was `AuthFailed`).
+- NTLM over HTTP now really seals (`EncryptionMode::Auto`): one handshake
+  per connection, at most 32 exchanges in flight per client, up to 8 idle
+  connections kept 60 s; it fails closed and never re-sends a request, and
+  several failures that were `AuthFailed` are now `WinrmError::Ntlm`.
+- NTLM over HTTPS runs on dedicated connections (TLS session resumption
+  off; more than 32 at once wait, then `Timeout(operation_timeout_secs +
+  10)`); its channel binding follows RFC 5929, so a server certificate
+  signed with Ed25519 or an unknown algorithm is now refused.
+- Kerberos (`--features kerberos`): `Auto` seals over HTTP (an RC4-only
+  realm needs `EncryptionMode::Never`), `Always` seals inside HTTPS too;
+  over HTTPS each connection is authenticated once after an unauthenticated
+  probe, with the server's AP-REP required, the certificate pinned and a
+  channel binding; a sealed answer must name its request in `RelatesTo`.
+- `AuthMethod::Certificate` really authenticates now; `use_tls = false` is
+  `AuthFailed` at construction, and a bad certificate or key file (not a
+  regular file, over 1 MiB, bad PEM, mismatched key) is `AuthFailed` there
+  too (it was `Http`, or no error).
+- `max_retries` retries connection errors only (before anything was sent),
+  for every method.
+- Response bodies are capped at `4 * max(max_envelope_size, 512 KiB)`
+  (2 MiB by default); a larger one is `SoapError::ParseError`.
+- A host that is not a host name (`win01?x`, `win 01`, `win01\x`) is
+  refused with `AuthFailed("invalid host ...")` before anything is sent.
+- PowerShell stderr: warning, verbose and debug records now come through
+  (`WARNING: `, `VERBOSE: `, `DEBUG: `), every XML entity and `_xHHHH_`
+  escape is decoded (control characters included), records stream as they
+  complete, and `max_output_bytes` counts stderr bytes as received, before
+  decoding.
+- `run_command_with_cancel` / `run_powershell_with_cancel` now terminate
+  the command and delete the shell on cancellation.
+- `WinrmConfig`'s `Debug` output redacts the proxy userinfo and the
+  `env_vars` values.
+- New public API: `StderrDecoder`, `WinrmClient::receive_output_raw`,
+  `WinrmClient::run_command_with_timeout`, `run_powershell_with_timeout`,
+  `download_file_with_timeout`.
+
 ### Added
 
 - **`StderrDecoder`**, re-exported from the crate root: the stateful
@@ -69,8 +123,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `always_seals_inside_tls_seen_by_a_relay_with_dc_cbt_none` sees every SOAP
   body sealed (5 of 5, Kerberos and NTLM), and none under `Auto`.
   Windows clients: the SSPI branch of cross-krb5 (`cfg(windows)`) is not
-  compiled here nor tested live (a CI job, not yet run, builds and lints
-  it); a Windows client using `--features kerberos` with `Auto` now
+  compiled locally nor tested live; the `kerberos-windows` CI job builds and
+  lints it on Windows; a Windows client using `--features kerberos` with `Auto` now
   seals over HTTP, and `EncryptionMode::Never` is the way back if that fails.
 - **Kerberos channel binding over HTTPS** (RFC 5929 `tls-server-end-point`).
   Kerberos over HTTPS now runs on dedicated connections authenticated once:

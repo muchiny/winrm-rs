@@ -337,7 +337,9 @@ impl<'a> Shell<'a> {
     /// measured on Server 2025, it sends stderr in blocks of a few KiB and
     /// the rest at exit, so a few small errors still reach the client only
     /// when the command ends. Decoders of commands never polled to `done` are
-    /// dropped, least recently polled first, once more than 32 are tracked.
+    /// dropped, least recently polled first, when a 33rd would be tracked. A
+    /// decoder buffers at most one record of 16 MiB, so a `Shell` holds at most
+    /// 32 x 16 MiB of undecoded stderr in the worst case.
     ///
     /// A `TimedOut` fault (the command stayed silent for
     /// `operation_timeout_secs`) is not an error: it is returned as an empty,
@@ -582,12 +584,25 @@ mod stderr_decoder_tests {
             decoders.decode(&format!("c{i}"), b"#< CLIXML\r\n<Objs>", false);
         }
         assert_eq!(decoders.len(), MAX_STREAMED_COMMANDS);
-        // The newest command is still tracked and decodes normally.
-        let newest = format!("c{}", MAX_STREAMED_COMMANDS + 9);
-        assert_eq!(
-            decoders.decode(&newest, b"<S S=\"Error\">z</S></Objs>", true),
-            b"z"
-        );
+        // The 10 least recently polled (c0..c9) were evicted: with no decoder
+        // left, their next poll is plain text, not a decoded record.
+        let rest: &[u8] = b"<S S=\"Error\">z</S></Objs>";
+        for i in 0..10 {
+            assert_eq!(
+                decoders.decode(&format!("c{i}"), rest, true),
+                rest,
+                "c{i} should have been evicted"
+            );
+        }
+        // c10, the oldest survivor, and the newest are still tracked and
+        // decode normally.
+        for i in [10, MAX_STREAMED_COMMANDS + 9] {
+            assert_eq!(
+                decoders.decode(&format!("c{i}"), rest, true),
+                b"z",
+                "c{i} should still be tracked"
+            );
+        }
     }
 }
 

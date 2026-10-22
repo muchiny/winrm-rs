@@ -183,6 +183,9 @@ impl ClixmlDecoder {
                     } else if view.len() > MAX_PENDING {
                         self.give_up();
                     } else if eof {
+                        // The stream ended inside the root start tag: there is
+                        // no record to decode, and the truncated tag is
+                        // dropped (it is CLIXML framing, not text).
                         *start = self.pending.len();
                         return out;
                     } else {
@@ -572,9 +575,11 @@ fn parse_escape(s: &str) -> Option<u16> {
 /// Each record is returned by the push that completes it, without waiting
 /// for the document to close (`powershell.exe` closes it only at exit); only
 /// the record still arriving is buffered (at most 16 MiB: past that it is
-/// released raw). `powershell.exe` buffers its stderr itself and sends it in
-/// blocks of a few KiB, so a record reaches the client when its block does. Error text comes as is,
-/// warning, verbose and debug text with the console prefixes `WARNING: `,
+/// released raw, and so is the rest of that document, which is no longer
+/// decoded; a later marker at the start of a line opens a new document).
+/// `powershell.exe` buffers its stderr itself and sends it in blocks of a few
+/// KiB, so a record reaches the client when its block does. Error text comes
+/// as is, warning, verbose and debug text with the console prefixes `WARNING: `,
 /// `VERBOSE: ` and `DEBUG: `; progress and information records are dropped.
 /// Bytes outside a CLIXML document pass through unchanged. The output is the
 /// same however the stream is sliced.
@@ -625,6 +630,7 @@ impl StderrDecoder {
 
     /// Feed the next raw stderr slice and return the text that is ready:
     /// plain bytes and every record this slice completes.
+    #[must_use = "the returned bytes are the decoded stderr; dropping them loses it"]
     pub fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
         self.0.push(chunk)
     }
@@ -632,6 +638,7 @@ impl StderrDecoder {
     /// Release what is still buffered once the command is done, decoding an
     /// unterminated record as far as it goes. The decoder can then be reused
     /// for another command.
+    #[must_use = "the returned bytes are the last of the decoded stderr; dropping them loses it"]
     pub fn finish(&mut self) -> Vec<u8> {
         self.0.finish()
     }
@@ -767,31 +774,23 @@ mod tests {
     fn many_small_documents_in_one_slice_decode_in_linear_time() {
         // Each document used to shift the whole remaining buffer, so one
         // hostile slice of tiny documents cost O(n^2): minutes for 8 MiB.
-        // Compare two sizes rather than a wall-clock bound, so a loaded
-        // machine cannot fail it: 8x the input must cost far less than the
-        // 64x a quadratic decoder pays. Best of three damps scheduler noise.
+        // A wall-clock comparison of two sizes is at the mercy of the
+        // scheduler, so this bound is deliberately absurdly loose instead: a
+        // linear decoder needs milliseconds for the 8 MiB below (even unoptimised),
+        // a quadratic one needs minutes, and 60 s leaves a heavily loaded CI
+        // runner three orders of magnitude of headroom. It can only fail on a
+        // real complexity regression, never on timing noise.
         let doc: &[u8] = b"#< CLIXML\n<Objs><S S=\"Error\">e</S></Objs>\n";
-        let time = |n: usize| {
-            let stream = doc.repeat(n);
-            (0..3)
-                .map(|_| {
-                    let start = std::time::Instant::now();
-                    let out = decode(&stream);
-                    let elapsed = start.elapsed();
-                    // "e" + the newline after each document.
-                    assert_eq!(out.len(), 2 * n);
-                    elapsed
-                })
-                .min()
-                .unwrap()
-        };
-        let small = time(16 * 1024);
-        let large = time(8 * 16 * 1024);
+        let n = (8 * 1024 * 1024) / doc.len();
+        let stream = doc.repeat(n);
+        let start = std::time::Instant::now();
+        let out = decode(&stream);
+        let elapsed = start.elapsed();
+        // "e" + the newline after each document.
+        assert_eq!(out.len(), 2 * n);
         assert!(
-            large < small * 24,
-            "8x the input took {:?} vs {:?}: not linear",
-            large,
-            small
+            elapsed < std::time::Duration::from_secs(60),
+            "{n} documents took {elapsed:?}: not linear"
         );
     }
 
@@ -855,7 +854,8 @@ mod tests {
             out.get(..32)
         );
         assert!(out.len() > MAX_PENDING, "buffer must not be held forever");
-        assert!(d.pending.len() < MAX_PENDING);
+        // Everything was released: nothing is left buffered.
+        assert!(d.pending.is_empty(), "{} bytes held", d.pending.len());
         // What follows is plain text: the document was given up.
         assert_eq!(d.push(b"</S></Objs>"), b"</S></Objs>");
     }

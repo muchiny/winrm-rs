@@ -200,8 +200,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   returns records while the command runs, although powershell.exe closes its
   `<Objs>` document only when it exits. powershell.exe buffers its stderr
   itself (measured on Server 2025: blocks of about 6 KiB, the rest at exit),
-  so a few small errors still arrive only when the command ends. A single record longer than 16 MiB is given
-  up on and released raw. Several documents after one marker, and a marker
+  so a few small errors still arrive only when the command ends. A single
+  record longer than 16 MiB is given up on and released raw, and so is the
+  rest of that document (it is no longer decoded; a later marker at the
+  start of a line opens a new one). `Shell::receive_next` keeps at most 32
+  such decoders, so a `Shell` holds at most 32 x 16 MiB of undecoded stderr
+  in the worst case. Several documents after one marker, and a marker
   doubled by nested PowerShell, all decode. `WinrmClient::receive_output`
   decodes each response on its own; use `receive_output_raw` with a
   `StderrDecoder` to decode across polls. Reported in #1.

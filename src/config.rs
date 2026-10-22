@@ -245,7 +245,10 @@ pub enum AuthMethod {
     /// connection that carries the AP-REQ, and every later one, presents that
     /// same certificate or fails at its TLS handshake before any HTTP byte is
     /// written (validated against `CbtHardeningLevel = Relaxed` and
-    /// `Strict`). With `accept_invalid_certs`, binding and pin are what keep
+    /// `Strict`). The pin applies to the server name `reqwest` uses, the host
+    /// of the parsed endpoint URL; once pinned, a handshake for another name
+    /// is refused (the `https://` proxy's own leg aside), and a host that is
+    /// no valid TLS server name is refused before the AP-REQ. With `accept_invalid_certs`, binding and pin are what keep
     /// an attacker in the middle from using the authentication on the real
     /// server; a certificate whose signature algorithm defines no binding
     /// hash (Ed25519, unknown) is refused. With [`EncryptionMode::Never`] over

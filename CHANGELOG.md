@@ -80,7 +80,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   pinned in the dedicated client's verifier for the client's whole life:
   the connection that carries the AP-REQ, and every later one, must present
   that same certificate or its TLS handshake fails before any HTTP byte is
-  written. Every answer on such a connection is also checked against it.
+  written; once pinned, a handshake for any other server name is refused
+  too, except the configured `https://` proxy's own leg. The pin applies to
+  the server name `reqwest` actually uses: the host of the parsed endpoint
+  URL (IDN as punycode, `10.1` as `10.0.0.1`, `win01?x` as `win01`); a host
+  that yields no valid TLS server name cannot be pinned and is refused
+  before the AP-REQ. Every answer on such a connection is also checked
+  against the pinned certificate.
   The server's AP-REP is required; later requests on the connection carry
   no `Authorization` header. A server whose certificate defines no channel
   binding hash (Ed25519, unknown signature algorithm) is refused (fail
@@ -363,7 +369,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   certificate, to the server. The bound certificate is now pinned in the
   dedicated client's verifier before the AP-REQ (see `### Added`); measured
   live with a split relay before (the AP-REQ reached the relay) and after
-  (handshake refused, no request).
+  (handshake refused, no request). A second review found the pin could
+  still be skipped when the verifier's target name differed from the name
+  the handshake carried (raw caller host versus parsed URL host: IDN,
+  short or octal IPv4, `win01?x`): the target now comes from the parsed
+  URL, a pin without a target is refused, and a pinned verifier refuses
+  any other server name except the proxy's own leg.
 - **NTLM message sealing no longer falls back to plaintext, and the client
   sends each sealed request once.** With `EncryptionMode::Auto` over HTTP or
   `Always`: the handshake that sets up sealing ends with an empty Type 3

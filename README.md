@@ -106,7 +106,9 @@ the AP-REQ carries a channel binding (RFC 5929 `tls-server-end-point`)
 computed for the certificate learnt on an unauthenticated probe request;
 that certificate is then pinned in the connection's verifier, so the
 AP-REQ's connection, and every later one, presents that same certificate or
-fails at its TLS handshake. Accepted by `CbtHardeningLevel = Strict`; a
+fails at its TLS handshake (any other server name than the endpoint's, the
+`https://` proxy's own leg aside, is refused too; a host that is no valid
+TLS server name once the URL is parsed is refused before the AP-REQ). Accepted by `CbtHardeningLevel = Strict`; a
 server certificate with no binding hash (Ed25519, unknown algorithm) is
 refused. `EncryptionMode::Never` over plain HTTP has none of this.
 

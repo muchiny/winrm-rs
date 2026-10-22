@@ -39,7 +39,7 @@ impl WinrmClient {
     /// Builds the underlying HTTP client with the configured timeouts and TLS
     /// settings. Returns [`WinrmError::Http`] if the HTTP client cannot be
     /// constructed (e.g. invalid TLS configuration).
-    #[tracing::instrument(level = "debug", skip(credentials))]
+    #[tracing::instrument(level = "debug", skip(config, credentials))]
     pub fn new(config: WinrmConfig, credentials: WinrmCredentials) -> Result<Self, WinrmError> {
         Ok(Self {
             transport: HttpTransport::new(config, credentials)?,

@@ -455,6 +455,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   is bound to; the client now authenticates a new connection (once, then
   reports `WinrmError::Ntlm`) instead of sending the first sealed request
   on a socket without a session.
+- **Secrets kept out of logs.** The WARN about a host string that carried
+  `user:password@` logged the original string, and the debug spans of
+  `WinrmClient` and of the transport recorded the raw `host` argument: both
+  now show `<redacted>@host`. `WinrmClient::new` no longer records the
+  configuration in its span, and `WinrmConfig`'s `Debug` (hand-written,
+  every field still listed) redacts the proxy URL's userinfo and shows only
+  the names of `env_vars`. Not changed: the debug spans of `run_command`,
+  `run_command_with_timeout`, `execute_command` and the other command
+  methods record the command and its arguments, and `trace!` logs SOAP
+  bodies, so command text (an encoded `run_powershell` script included)
+  reaches logs at `debug` level and below; keep `winrm_rs` at `info` where
+  commands carry secrets.
 
 ### Documentation
 

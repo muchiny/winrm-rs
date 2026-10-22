@@ -9,7 +9,11 @@ use secrecy::SecretString;
 /// Controls the transport (HTTP vs HTTPS), timeouts, and authentication
 /// method. Use [`Default::default()`] for sensible defaults (HTTP on port
 /// 5985, NTLM auth, 30 s connect / 60 s operation timeouts).
-#[derive(Debug, Clone)]
+///
+/// Its `Debug` output lists every field but redacts the userinfo of
+/// [`proxy`](Self::proxy) (`http://<redacted>@proxy:8080`) and shows only the
+/// names of [`env_vars`](Self::env_vars), so it can be logged.
+#[derive(Clone)]
 pub struct WinrmConfig {
     /// TCP port of the WinRM listener (default: 5985 for HTTP, 5986 for HTTPS).
     pub port: u16,
@@ -151,6 +155,69 @@ impl Default for WinrmConfig {
             idle_timeout_secs: None,
             max_output_bytes: Some(64 * 1024 * 1024),
         }
+    }
+}
+
+impl std::fmt::Debug for WinrmConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Destructured so that a new field cannot be left out silently.
+        let Self {
+            port,
+            use_tls,
+            accept_invalid_certs,
+            connect_timeout_secs,
+            operation_timeout_secs,
+            auth_method,
+            max_envelope_size,
+            max_retries,
+            client_cert_pem,
+            client_key_pem,
+            proxy,
+            codepage,
+            working_directory,
+            env_vars,
+            encryption,
+            user_agent,
+            idle_timeout_secs,
+            max_output_bytes,
+        } = self;
+        let proxy = proxy.as_deref().map(crate::transport::redact_userinfo);
+        f.debug_struct("WinrmConfig")
+            .field("port", port)
+            .field("use_tls", use_tls)
+            .field("accept_invalid_certs", accept_invalid_certs)
+            .field("connect_timeout_secs", connect_timeout_secs)
+            .field("operation_timeout_secs", operation_timeout_secs)
+            .field("auth_method", auth_method)
+            .field("max_envelope_size", max_envelope_size)
+            .field("max_retries", max_retries)
+            .field("client_cert_pem", client_cert_pem)
+            .field("client_key_pem", client_key_pem)
+            .field("proxy", &proxy)
+            .field("codepage", codepage)
+            .field("working_directory", working_directory)
+            .field("env_vars", &EnvVarNames(env_vars))
+            .field("encryption", encryption)
+            .field("user_agent", user_agent)
+            .field("idle_timeout_secs", idle_timeout_secs)
+            .field("max_output_bytes", max_output_bytes)
+            .finish()
+    }
+}
+
+/// `env_vars` in [`WinrmConfig`]'s `Debug`: the names, each value replaced
+/// by `<redacted>`.
+struct EnvVarNames<'a>(&'a [(String, String)]);
+
+impl std::fmt::Debug for EnvVarNames<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map()
+            .entries(
+                self.0
+                    .iter()
+                    .map(|(name, _)| (name, format_args!("<redacted>"))),
+            )
+            .finish()
     }
 }
 
@@ -392,6 +459,50 @@ mod tests {
         assert_eq!(creds.username, "admin");
         assert_eq!(creds.password.expose_secret(), "s3cret");
         assert_eq!(creds.domain, "DOMAIN");
+    }
+
+    /// `Debug` keeps every field visible but not the proxy password nor the
+    /// environment variable values.
+    #[test]
+    fn config_debug_redacts_proxy_userinfo_and_env_values() {
+        let config = WinrmConfig {
+            proxy: Some("http://proxyuser:proxy-secret@proxy.corp:8080".into()),
+            env_vars: vec![("API_TOKEN".into(), "env-secret".into())],
+            ..Default::default()
+        };
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("proxy-secret"), "{debug}");
+        assert!(!debug.contains("proxyuser"), "{debug}");
+        assert!(!debug.contains("env-secret"), "{debug}");
+        assert!(
+            debug.contains("http://<redacted>@proxy.corp:8080"),
+            "{debug}"
+        );
+        assert!(debug.contains("\"API_TOKEN\": <redacted>"), "{debug}");
+        for field in [
+            "port",
+            "use_tls",
+            "accept_invalid_certs",
+            "connect_timeout_secs",
+            "operation_timeout_secs",
+            "auth_method",
+            "max_envelope_size",
+            "max_retries",
+            "client_cert_pem",
+            "client_key_pem",
+            "proxy",
+            "codepage",
+            "working_directory",
+            "env_vars",
+            "encryption",
+            "user_agent",
+            "idle_timeout_secs",
+            "max_output_bytes",
+        ] {
+            assert!(debug.contains(&format!("{field}: ")), "{field} in {debug}");
+        }
+        let plain = format!("{:?}", WinrmConfig::default());
+        assert!(plain.contains("proxy: None"), "{plain}");
     }
 
     #[test]

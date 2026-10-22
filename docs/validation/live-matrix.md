@@ -360,8 +360,16 @@ ne figurent pas dans la matrice.
   `silent_command_longer_than_operation_timeout_completes` et les trois
   `silent_command_completes_over_*`) font aussi passer la
   création du shell dans cette fenêtre : sous un run entièrement parallèle sur un
-  serveur chargé, elle peut la dépasser et échouer par `TimedOut`.
-  `--test-threads=1` les rend les plus fiables.
+  serveur chargé, elle peut la dépasser et échouer par `TimedOut` (reproduit
+  avec 24 sessions PowerShell liées au CPU lancées en parallèle sur l'hôte :
+  `Err(Soap(TimedOut))` de `open_shell` après environ 15 s). Depuis T19,
+  `shell_run_command_times_out` et les tests de commande silencieuse
+  réessayent une création ou un démarrage de commande échoué (6 créations et
+  3 exécutions au plus pour le premier, 3 exécutions pour les autres) et
+  signalent chaque échec s'ils n'obtiennent jamais de verdict ; l'assertion
+  `Timeout(2 * 15)` et la borne de durée restent exactes. Sous une charge
+  extrême, ils peuvent tout de même échouer. `--test-threads=1` les rend les
+  plus fiables.
 - **Les clés clientes chiffrées ne sont pas gérées.** `client_key_pem` doit être
   non chiffrée (`PRIVATE KEY`, `RSA PRIVATE KEY` ou `EC PRIVATE KEY`) ; une clé
   chiffrée est une `AuthFailed` à la construction.

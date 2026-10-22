@@ -40,8 +40,11 @@
 //! A few tests run with a short `operation_timeout_secs` (15 s) to exercise
 //! the Receive timeout path. Under a busy bench, a request sent with such a
 //! window (for instance shell creation while dozens of other tests hit the
-//! same host) can exceed it and fail with a `TimedOut` fault. They need a
-//! quiet bench and are most reliable with `-- --ignored --test-threads=1`.
+//! same host) can exceed it and fail with a `TimedOut` fault. The tests that
+//! create the shell or start the command inside that window
+//! (`shell_run_command_times_out` and the silent-command tests) retry such a
+//! failure a few times and report every one if they never get a verdict; they
+//! are still most reliable with `-- --ignored --test-threads=1`.
 
 use std::time::{Duration, Instant};
 use winrm_rs::{
@@ -1121,33 +1124,81 @@ async fn connect_timeout_is_honoured() {
 /// The command stays silent far beyond that deadline. The server answers each
 /// silent Receive with a `TimedOut` fault after `OP` seconds; the shell treats
 /// those as empty polls and keeps waiting, so it is the 2 x `OP` deadline that
-/// ends the call. `OP` is 15 s so that shell creation, which runs inside the
-/// same window, survives a busy bench.
+/// ends the call. `OP` is 15 s so that a quiet bench creates the shell and
+/// starts the command inside that window.
+///
+/// A `Shell` is bound to the client that opened it, so the
+/// shell creation and the Execute request that starts the command run under
+/// the same short window as the Receive loop. On a busy bench either can
+/// exceed it and fail with a `TimedOut` fault (seen as `Err(Soap(TimedOut))`
+/// from `open_shell` after about 15 s, with 20 concurrent CPU-bound sessions
+/// on the host), which says nothing about the deadline under test. Each such
+/// failure is therefore retried on a fresh shell (up to `SETUP_TRIES` shell
+/// creations and `RUN_TRIES` started commands), and the test fails with every
+/// failure's text if none reaches the deadline.
+/// Any run that does reach a verdict is judged exactly: `Ok`, a `Timeout` of
+/// another length or an overlong elapsed time fail at once, never retried. A
+/// regression that surfaces the Receive `TimedOut` fault again fails every
+/// attempt, so it still turns the test red.
 #[tokio::test]
 #[ignore]
 async fn shell_run_command_times_out() {
     const OP: u64 = 15;
+    const SETUP_TRIES: usize = 6;
+    const RUN_TRIES: usize = 3;
     let (client, host) = test_client_with(|c| c.operation_timeout_secs = OP)
         .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
-    let shell = client.open_shell(&host).await.expect("open shell");
 
-    let start = Instant::now();
-    let result = shell
-        .run_command("powershell.exe", &["-Command", "Start-Sleep 600"])
-        .await;
-    let elapsed = start.elapsed();
+    let mut failures = Vec::new();
+    let (mut setups, mut runs) = (0, 0);
+    while setups < SETUP_TRIES && runs < RUN_TRIES {
+        let shell = match client.open_shell(&host).await {
+            Ok(shell) => shell,
+            Err(e) => {
+                setups += 1;
+                eprintln!("open_shell failed (setup {setups}/{SETUP_TRIES}): {e}");
+                failures.push(format!("open_shell failed (setup {setups}): {e}"));
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+        };
 
-    // Close regardless of the outcome, so a failing run leaves no shell behind.
-    let _ = shell.close().await;
+        let start = Instant::now();
+        let result = shell
+            .run_command("powershell.exe", &["-Command", "Start-Sleep 600"])
+            .await;
+        let elapsed = start.elapsed();
 
-    assert!(
-        matches!(&result, Err(WinrmError::Timeout(secs)) if *secs == 2 * OP),
-        "expected Err(Timeout({})), got {result:?} after {elapsed:?}",
-        2 * OP
-    );
-    assert!(
-        elapsed < Duration::from_secs(3 * OP),
-        "timeout took {elapsed:?}"
+        // Close regardless of the outcome, so a failing run leaves no shell behind.
+        let _ = shell.close().await;
+
+        match &result {
+            Err(WinrmError::Timeout(secs)) if *secs == 2 * OP => {
+                assert!(
+                    elapsed < Duration::from_secs(3 * OP),
+                    "timeout took {elapsed:?}"
+                );
+                return;
+            }
+            // Execute (or a Receive) failed on the wire: not a verdict on the
+            // deadline, try again on a fresh shell.
+            Err(e) if !matches!(e, WinrmError::Timeout(_)) => {
+                runs += 1;
+                eprintln!("run_command failed (run {runs}/{RUN_TRIES}): {e} after {elapsed:?}");
+                failures.push(format!(
+                    "run_command failed (run {runs}) after {elapsed:?}: {e:?}"
+                ));
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            _ => panic!(
+                "expected Err(Timeout({})), got {result:?} after {elapsed:?}",
+                2 * OP
+            ),
+        }
+    }
+    panic!(
+        "the 2 x {OP} s deadline was never reached:\n{}",
+        failures.join("\n")
     );
 }
 
@@ -1162,13 +1213,37 @@ const SILENT_SCRIPT: &str = "Start-Sleep 20; 'quiet-done'";
 /// Run [`SILENT_SCRIPT`] with `client` (built with [`SILENT_OP_SECS`]) and
 /// check that it completes: the server's `TimedOut` fault on the silent
 /// Receive must be an empty poll, whatever the auth method that carried it.
+///
+/// Shell creation and the Execute request run under the same short window, so
+/// on a busy bench one of them can fail with its own `TimedOut` fault after
+/// about 15 s (seen with 24 concurrent CPU-bound sessions on the host), which
+/// is not what is under test. A failed run is retried, up to `TRIES` runs in
+/// all; a regression that lets the Receive fault through fails every run, and
+/// the test then reports each run's error. What a successful run returns is
+/// checked exactly.
 async fn assert_silent_command_completes(client: &WinrmClient, host: &str) {
-    let start = Instant::now();
-    let out = client
-        .run_powershell(host, SILENT_SCRIPT)
-        .await
-        .expect("a silent command must survive TimedOut polls");
-    let elapsed = start.elapsed();
+    const TRIES: usize = 3;
+    let mut errors = Vec::new();
+    let (out, elapsed) = loop {
+        let start = Instant::now();
+        match client.run_powershell(host, SILENT_SCRIPT).await {
+            Ok(out) => break (out, start.elapsed()),
+            Err(e) => {
+                eprintln!(
+                    "silent command failed (run {}/{TRIES}) after {:?}: {e}",
+                    errors.len() + 1,
+                    start.elapsed()
+                );
+                errors.push(format!("{e:?} after {:?}", start.elapsed()));
+                assert!(
+                    errors.len() < TRIES,
+                    "a silent command must survive TimedOut polls, but {TRIES} runs failed:\n{}",
+                    errors.join("\n")
+                );
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    };
     eprintln!("silent command completed after {elapsed:?}");
 
     let stdout = String::from_utf8_lossy(&out.stdout);

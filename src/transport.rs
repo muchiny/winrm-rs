@@ -342,9 +342,16 @@ pub(crate) fn endpoint_url(use_tls: bool, sanitized_host: &str, port: u16) -> St
 /// userinfo (up to the last `@` after an optional scheme) is replaced by
 /// `<redacted>`, so a `user:password@host` string never reaches a log.
 pub(crate) fn redact_userinfo(host: &str) -> std::borrow::Cow<'_, str> {
+    // Only a real URL scheme may precede `://`: in `user:pa://ss@host` the
+    // text before it is userinfo and must not be printed.
+    let is_scheme = |s: &str| {
+        s.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    };
     let (scheme, rest) = match host.split_once("://") {
-        Some((scheme, rest)) => (Some(scheme), rest),
-        None => (None, host),
+        Some((scheme, rest)) if is_scheme(scheme) => (Some(scheme), rest),
+        _ => (None, host),
     };
     match rest.rsplit_once('@') {
         None => std::borrow::Cow::Borrowed(host),
@@ -2189,6 +2196,12 @@ mod tests {
             "https://<redacted>@win01:5986/wsman"
         );
         assert_eq!(redact_userinfo("a@b:c@win01"), "<redacted>@win01");
+        // `://` inside the userinfo is not a scheme separator.
+        assert_eq!(redact_userinfo("admin:pa://ss@win01"), "<redacted>@win01");
+        assert_eq!(
+            redact_userinfo("https://admin:pa://ss@win01:5986/wsman"),
+            "https://<redacted>@win01:5986/wsman"
+        );
     }
 
     /// The WARN about a polluted host string, and the span of the request,

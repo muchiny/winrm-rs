@@ -162,16 +162,9 @@ impl NtlmAuth {
         // of the very connection that carried the challenge (the Type 3 goes
         // on the same one). Read it now, before the response is consumed.
         let over_tls = url.starts_with("https://");
-        let peer_certificate = resp
-            .extensions()
-            .get::<reqwest::tls::TlsInfo>()
-            .and_then(|info| info.peer_certificate())
-            .map(<[u8]>::to_vec);
-        let peer_certificate = match (peer_certificate, cert.map(crate::tls::CertHandle::captured))
-        {
-            (Some(der), _) => Some(der),
-            (None, Some(crate::tls::Captured::One(der))) => Some(der),
-            (None, Some(crate::tls::Captured::Several)) if over_tls => {
+        let peer_certificate = match crate::auth::peer_certificate(&resp, cert) {
+            crate::auth::PeerCertificate::Known(der) => Some(der),
+            crate::auth::PeerCertificate::Ambiguous if over_tls => {
                 return Err(WinrmError::Ntlm(NtlmError::InvalidMessage(
                     "NTLM over TLS: this client has seen several server certificates and cannot \
                      tell which one its connection uses; refusing to authenticate without a \
@@ -179,7 +172,7 @@ impl NtlmAuth {
                         .into(),
                 )));
             }
-            (None, _) => None,
+            crate::auth::PeerCertificate::Ambiguous | crate::auth::PeerCertificate::Unknown => None,
         };
 
         // Consume the response body to release the connection back to the pool

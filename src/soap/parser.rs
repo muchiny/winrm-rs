@@ -326,15 +326,18 @@ fn extract_subcode_value(xml: &str) -> Option<String> {
     Some(inner)
 }
 
-/// Check that `response` answers `request`: when the request carries a
-/// `wsa:MessageID`, the response must carry a `RelatesTo` with the same
-/// value (compared without regard to case: Windows may change the case of
-/// the UUID). A request without a `MessageID` binds nothing. Returns what is
-/// wrong otherwise.
-#[cfg(any(feature = "kerberos", test))]
+/// The `wsa:MessageID` of a request, if it has one.
+pub(crate) fn message_id(request: &str) -> Option<String> {
+    extract_element_text(request, "MessageID")
+}
+
+/// Check that `response` answers `request`: the request must carry a
+/// `wsa:MessageID` and the response a `RelatesTo` with the same value
+/// (compared without regard to case: Windows may change the case of the
+/// UUID). Returns what is wrong otherwise.
 pub(crate) fn check_relates_to(request: &str, response: &str) -> Result<(), String> {
-    let Some(message_id) = extract_element_text(request, "MessageID") else {
-        return Ok(());
+    let Some(message_id) = message_id(request) else {
+        return Err("the request carries no MessageID".into());
     };
     match extract_element_text(response, "RelatesTo") {
         Some(relates_to) if relates_to.eq_ignore_ascii_case(&message_id) => Ok(()),
@@ -345,6 +348,8 @@ pub(crate) fn check_relates_to(request: &str, response: &str) -> Result<(), Stri
 
 #[cfg(test)]
 mod tests {
+
+    use super::*;
 
     // --- RelatesTo binding of a response to its request ---
 
@@ -370,11 +375,38 @@ mod tests {
     }
 
     #[test]
-    fn a_request_without_message_id_binds_nothing() {
-        assert_eq!(check_relates_to("<s:Envelope/>", "<s:Envelope/>"), Ok(()));
+    fn a_request_without_message_id_binds_nothing_and_is_refused() {
+        let err = check_relates_to("<s:Envelope/>", "<s:Envelope/>").unwrap_err();
+        assert!(err.contains("MessageID"), "{err}");
+        assert_eq!(message_id("<s:Envelope/>"), None);
+        assert_eq!(
+            message_id(REQ).as_deref(),
+            Some("uuid:0a1B2c3D-0000-4000-8000-00000000abcd")
+        );
     }
 
-    use super::*;
+    /// Every request the crate builds carries a `MessageID` (the Kerberos
+    /// sealed path refuses one without).
+    #[test]
+    fn built_requests_carry_a_message_id() {
+        let config = crate::config::WinrmConfig::default();
+        let ep = "http://h:5985/wsman";
+        for request in [
+            crate::soap::envelope::create_shell_request(ep, &config),
+            crate::soap::envelope::execute_command_request(ep, "S", "cmd", &[], 60, 153_600),
+            crate::soap::envelope::receive_output_request(ep, "S", "C", 60, 153_600),
+            crate::soap::envelope::signal_terminate_request(ep, "S", "C", 60, 153_600),
+            crate::soap::envelope::delete_shell_request_for(
+                ep,
+                "S",
+                crate::soap::namespaces::RESOURCE_URI_CMD,
+                60,
+                153_600,
+            ),
+        ] {
+            assert!(message_id(&request).is_some(), "{request}");
+        }
+    }
 
     #[test]
     fn parse_shell_id_from_response() {

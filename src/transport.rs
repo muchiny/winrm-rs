@@ -99,22 +99,27 @@ enum Sealer {
 }
 
 impl Sealer {
-    /// Name of the method, for error messages.
-    fn method(&self) -> &'static str {
+    /// The auth method this session belongs to.
+    fn auth_method(&self) -> AuthMethod {
         match self {
-            Self::Ntlm(_) => "NTLM",
+            Self::Ntlm(_) => AuthMethod::Ntlm,
             #[cfg(feature = "kerberos")]
-            Self::Kerberos(_) => "Kerberos",
+            Self::Kerberos(_) => AuthMethod::Kerberos,
         }
     }
 
-    /// Error for a sealing protocol failure: [`WinrmError::Ntlm`] for NTLM (as
-    /// before), [`WinrmError::AuthFailed`] for Kerberos (no dedicated variant).
-    fn error(&self, msg: String) -> WinrmError {
+    /// Whether a sealed answer must name its request in `RelatesTo`.
+    ///
+    /// NTLM refuses a replayed answer by its sequence number. WinRM sends
+    /// Kerberos answers with sequence number 0, so a Kerberos answer is bound
+    /// to its request instead: it must carry the request's `MessageID` as
+    /// `RelatesTo` (an earlier answer of the session, replayed, names another
+    /// request). A Kerberos request without a `MessageID` is not sent.
+    fn binds_answers_by_relates_to(&self) -> bool {
         match self {
-            Self::Ntlm(_) => WinrmError::Ntlm(crate::error::NtlmError::InvalidMessage(msg)),
+            Self::Ntlm(_) => false,
             #[cfg(feature = "kerberos")]
-            Self::Kerberos(_) => WinrmError::AuthFailed(msg),
+            Self::Kerberos(_) => true,
         }
     }
 
@@ -127,32 +132,52 @@ impl Sealer {
         }
     }
 
-    /// Unseal the sealed answer to `request`, failing on anything not exactly
-    /// framed and authenticated by this session.
-    ///
-    /// NTLM refuses a replayed answer by its sequence number. WinRM sends
-    /// Kerberos answers with sequence number 0, so a Kerberos answer is bound
-    /// to its request instead: it must carry the request's `MessageID` as
-    /// `RelatesTo` (an earlier answer of the session, replayed, names another
-    /// request).
-    fn unseal_answer(&mut self, request: &str, data: &[u8]) -> Result<String, WinrmError> {
+    /// Unseal a sealed answer, failing on anything not exactly framed and
+    /// authenticated by this session.
+    fn unseal(&mut self, data: &[u8]) -> Result<String, WinrmError> {
         match self {
-            Self::Ntlm(session) => {
-                let _ = request;
-                ntlm_auth::unseal_body(session, data)
-            }
+            Self::Ntlm(session) => ntlm_auth::unseal_body(session, data),
             #[cfg(feature = "kerberos")]
-            Self::Kerberos(session) => {
-                let text = session.unseal_body(data)?;
-                crate::soap::parser::check_relates_to(request, &text).map_err(|e| {
-                    WinrmError::AuthFailed(format!(
-                        "Kerberos message encryption: the sealed answer does not answer this \
-                         request: {e}"
-                    ))
-                })?;
-                Ok(text)
-            }
+            Self::Kerberos(session) => session.unseal_body(data),
         }
+    }
+}
+
+/// Name of an auth method in error messages.
+fn method_name(method: &AuthMethod) -> &'static str {
+    match method {
+        AuthMethod::Ntlm => "NTLM",
+        AuthMethod::Kerberos => "Kerberos",
+        AuthMethod::Basic => "Basic",
+        AuthMethod::Certificate => "Certificate",
+        AuthMethod::CredSsp => "CredSSP",
+    }
+}
+
+/// Error for a failure of a sealed or dedicated-connection exchange:
+/// [`WinrmError::Ntlm`] for NTLM (as before), [`WinrmError::AuthFailed`]
+/// otherwise (Kerberos has no dedicated variant).
+fn method_error(method: &AuthMethod, msg: String) -> WinrmError {
+    match method {
+        AuthMethod::Ntlm => WinrmError::Ntlm(crate::error::NtlmError::InvalidMessage(msg)),
+        _ => WinrmError::AuthFailed(msg),
+    }
+}
+
+/// Give `hyper` the chance to hand a dedicated client's connection back to
+/// that client's pool before the next request on it.
+///
+/// `hyper` returns a connection to the pool from a task of its own once the
+/// previous answer is fully read; a request sent before that task runs opens
+/// a new TCP connection, which carries no session and gets a 401 (see the
+/// measurements in `docs/validation/live-matrix.md`). Yielding first lets
+/// that task run; [`POOL_RETURN_YIELDS`] is empirical. This narrows the
+/// window, it does not close it: the request then still fails closed (401
+/// error, not resent). Pinning one `hyper` connection per [`AuthConn`]
+/// would close it.
+async fn let_pool_take_back_connection() {
+    for _ in 0..POOL_RETURN_YIELDS {
+        tokio::task::yield_now().await;
     }
 }
 
@@ -448,16 +473,7 @@ impl HttpTransport {
                         .await?
                 }
             }
-            AuthMethod::Kerberos => {
-                // Without the feature, the stub's error says it is needed.
-                if cfg!(feature = "kerberos") && self.seals() {
-                    self.send_sealed(host, &url, &body).await?
-                } else {
-                    self.kerberos_auth(host)
-                        .send_authenticated(&self.http, &url, body)
-                        .await?
-                }
-            }
+            AuthMethod::Kerberos => self.send_kerberos(host, &url, body).await?,
             AuthMethod::Certificate => {
                 let auth = CertificateAuth {
                     max_response_bytes: self.max_response_bytes(),
@@ -488,6 +504,41 @@ impl HttpTransport {
         Ok(response_text)
     }
 
+    /// Kerberos dispatch: sealed ([`Self::seals`]); unsealed over HTTPS on an
+    /// authenticated dedicated connection; unsealed over HTTP
+    /// (`EncryptionMode::Never`) with a context per request.
+    #[cfg(feature = "kerberos")]
+    async fn send_kerberos(
+        &self,
+        host: &str,
+        url: &str,
+        body: String,
+    ) -> Result<String, WinrmError> {
+        if self.seals() {
+            self.send_sealed(host, url, &body).await
+        } else if self.config.use_tls {
+            self.send_kerberos_over_tls(host, url, &body).await
+        } else {
+            self.kerberos_auth(url)
+                .send_authenticated(&self.http, url, body)
+                .await
+        }
+    }
+
+    /// Without the feature, the stub's error says it is needed (nothing is
+    /// sent, sealed or not).
+    #[cfg(not(feature = "kerberos"))]
+    async fn send_kerberos(
+        &self,
+        _host: &str,
+        url: &str,
+        body: String,
+    ) -> Result<String, WinrmError> {
+        self.kerberos_auth(url)
+            .send_authenticated(&self.http, url, body)
+            .await
+    }
+
     /// Whether requests are sealed (NTLM and Kerberos only):
     /// `EncryptionMode::Auto` seals over plain HTTP only, `Always` over HTTPS
     /// too, `Never` never.
@@ -502,11 +553,20 @@ impl HttpTransport {
         }
     }
 
-    /// Kerberos authenticator for `host` (service principal `HTTP/<host>`).
-    fn kerberos_auth(&self, host: &str) -> KerberosAuth {
-        let host_part = host.split(':').next().unwrap_or(host);
+    /// Kerberos authenticator for the endpoint `url` (service principal
+    /// `HTTP/<host>`, the host of the URL without its port).
+    fn kerberos_auth(&self, url: &str) -> KerberosAuth {
+        let authority = url
+            .split_once("://")
+            .map_or(url, |(_, rest)| rest)
+            .split('/')
+            .next()
+            .unwrap_or_default();
+        let host = authority
+            .rsplit_once(':')
+            .map_or(authority, |(host, _)| host);
         KerberosAuth {
-            service_principal: format!("HTTP/{host_part}"),
+            service_principal: format!("HTTP/{host}"),
             max_response_bytes: self.max_response_bytes(),
         }
     }
@@ -605,15 +665,20 @@ impl HttpTransport {
     /// session is bound to before any sealed request: that connection is
     /// dropped and a new one authenticated, once; a server that closes again
     /// cannot carry sealed messages and gets an error.
-    async fn open_sealed_conn(&self, host: &str, url: &str) -> Result<Box<AuthConn>, WinrmError> {
+    async fn open_authenticated_conn(
+        &self,
+        host: &str,
+        url: &str,
+    ) -> Result<Box<AuthConn>, WinrmError> {
+        let method = &self.config.auth_method;
         for _ in 0..2 {
             let mut conn = self.new_conn(host)?;
             let (session, closing) = self
-                .sealing_handshake(&conn.http, conn.cert.as_ref(), host, url)
+                .sealing_handshake(&conn.http, conn.cert.as_ref(), url)
                 .await?;
             if closing {
                 debug!(
-                    method = session.method(),
+                    method = method_name(method),
                     "server closed the connection after authentication; authenticating a new one"
                 );
                 continue;
@@ -621,19 +686,17 @@ impl HttpTransport {
             conn.session = Some(session);
             return Ok(conn);
         }
-        let (method, wrap): (&str, fn(String) -> WinrmError) = match self.config.auth_method {
-            AuthMethod::Ntlm => ("NTLM", |m| {
-                WinrmError::Ntlm(crate::error::NtlmError::InvalidMessage(m))
-            }),
-            _ => ("Kerberos", WinrmError::AuthFailed),
-        };
-        Err(wrap(format!(
-            "the server closes the connection right after {method} authentication, so no \
-             sealed message can use the session bound to it"
-        )))
+        Err(method_error(
+            method,
+            format!(
+                "the server closes the connection right after {} authentication, so no \
+                 message can use the session bound to it",
+                method_name(method)
+            ),
+        ))
     }
 
-    /// The handshake of [`Self::open_sealed_conn`] on the dedicated client
+    /// The handshake of [`Self::open_authenticated_conn`] on the dedicated client
     /// `http` (with `cert`, its verifier's record): the sealing session, and
     /// whether the server announced `Connection: close`. (Takes the fields,
     /// not the connection: a Kerberos context is `Send` but not `Sync`.)
@@ -641,7 +704,6 @@ impl HttpTransport {
         &self,
         http: &reqwest::Client,
         cert: Option<&CertHandle>,
-        host: &str,
         url: &str,
     ) -> Result<(Sealer, bool), WinrmError> {
         match self.config.auth_method {
@@ -654,36 +716,73 @@ impl HttpTransport {
             }
             #[cfg(feature = "kerberos")]
             AuthMethod::Kerberos => {
-                let (session, closing) = self.kerberos_auth(host).establish(http, url).await?;
+                let (session, closing) = self.kerberos_auth(url).establish(http, cert, url).await?;
                 Ok((Sealer::Kerberos(session), closing))
             }
-            _ => {
-                let _ = host;
-                Err(WinrmError::AuthFailed(
-                    "internal: message encryption requested for an auth method without it".into(),
-                ))
-            }
+            _ => Err(WinrmError::AuthFailed(
+                "internal: message encryption requested for an auth method without it".into(),
+            )),
         }
     }
 
     /// Send a request sealed (NTLM or Kerberos), failing closed: no request
-    /// body is ever sent unsealed, and no request is ever sent twice.
-    ///
-    /// The request goes out on an idle authenticated connection to `host`, or
-    /// a new one. A SOAP fault (sealed by the server) is returned as
-    /// [`WinrmError::Soap`] and the connection kept. Any other failure
-    /// discards the connection and is returned, a 401 included: it means the
-    /// connection no longer carries its session, which a connection the
-    /// server closed explains, but an active attacker can also forward the
-    /// request to the server and answer 401 itself, so the request may have
-    /// run and is not resent.
+    /// body is ever sent unsealed, and no request is ever sent twice (see
+    /// [`Self::send_on_dedicated`]).
     async fn send_sealed(&self, host: &str, url: &str, body: &str) -> Result<String, WinrmError> {
+        self.send_on_dedicated(host, url, body, true).await
+    }
+
+    /// Send a request with Kerberos over HTTPS, unsealed (TLS protects it),
+    /// on a dedicated connection authenticated once with channel binding and
+    /// the server's AP-REP (see [`KerberosAuth::establish`]); later requests
+    /// on that connection carry no `Authorization` header.
+    #[cfg(feature = "kerberos")]
+    async fn send_kerberos_over_tls(
+        &self,
+        host: &str,
+        url: &str,
+        body: &str,
+    ) -> Result<String, WinrmError> {
+        self.send_on_dedicated(host, url, body, false).await
+    }
+
+    /// Run one exchange on a dedicated authenticated connection to `host`:
+    /// an idle one, or a new one ([`Self::open_authenticated_conn`]; its
+    /// sealing session is kept only when `sealed`). The body is sealed when
+    /// `sealed`, sent as is inside TLS otherwise (Kerberos over HTTPS).
+    ///
+    /// A SOAP fault (sealed by the server when sealing) is returned as
+    /// [`WinrmError::Soap`] and the connection kept. Any other failure
+    /// discards the connection and is returned, a 401 included: the
+    /// connection no longer carries its session, which a connection the
+    /// server closed or a fresh one opened by the client's pool explains, but
+    /// an active attacker can also forward the request to the server and
+    /// answer 401 itself, so the request may have run and is not resent.
+    async fn send_on_dedicated(
+        &self,
+        host: &str,
+        url: &str,
+        body: &str,
+        sealed: bool,
+    ) -> Result<String, WinrmError> {
         let _slot = self.conn_slot().await?;
-        let mut conn = match self.take_conn(host, true) {
+        let mut conn = match self.take_conn(host, sealed) {
             Some(conn) => conn,
-            None => self.open_sealed_conn(host, url).await?,
+            None => {
+                let mut conn = self.open_authenticated_conn(host, url).await?;
+                if !sealed {
+                    conn.session = None;
+                }
+                conn
+            }
         };
-        match Self::send_sealed_body(&mut conn, url, body, self.max_response_bytes()).await {
+        let cap = self.max_response_bytes();
+        let outcome = if sealed {
+            Self::send_sealed_body(&mut conn, url, body, cap).await
+        } else {
+            Self::send_plain_body(&mut conn, url, body, cap).await
+        };
+        match outcome {
             Ok(text) => {
                 self.return_conn(conn);
                 Ok(text)
@@ -693,25 +792,26 @@ impl HttpTransport {
                 Err(WinrmError::Soap(fault))
             }
             Err(SealedFailure::Unauthorized) => {
-                let session = conn.session.as_ref();
-                let method = session.map_or("sealing", Sealer::method);
-                let msg = format!(
-                    "HTTP 401 to a sealed {method} request: the connection's {method} session is \
-                     no longer valid (usually the server closed an idle connection); the \
-                     request was NOT resent, as it may already have run: retry the call if it \
-                     is safe to run again"
-                );
-                Err(match session {
-                    Some(session) => session.error(msg),
-                    None => WinrmError::AuthFailed(msg),
-                })
+                let method = &self.config.auth_method;
+                let name = method_name(method);
+                let kind = if sealed { "sealed " } else { "" };
+                Err(method_error(
+                    method,
+                    format!(
+                        "HTTP 401 to a {kind}{name} request on an authenticated connection: the \
+                         request did not reach the {name} session (the server closed an idle \
+                         connection, or the client's pool sent it on a fresh, unauthenticated \
+                         connection right after a large answer); the request was NOT resent, as \
+                         it may already have run: retry the call if it is safe to run again"
+                    ),
+                ))
             }
             Err(SealedFailure::Error(e)) => Err(e),
         }
     }
 
     /// One sealed exchange on `conn`. Only the outcome decides what happens
-    /// to the connection (see [`Self::send_sealed`]).
+    /// to the connection (see [`Self::send_on_dedicated`]).
     async fn send_sealed_body(
         conn: &mut AuthConn,
         url: &str,
@@ -723,17 +823,20 @@ impl HttpTransport {
                 "internal: sealed exchange on a connection without a sealing session".into(),
             )));
         };
-        let (content_type, sealed) = session.seal(body).map_err(SealedFailure::Error)?;
-        // `hyper` hands a connection back to the client's pool from a task of
-        // its own once the previous answer is fully read; a request sent
-        // before that task runs opens a new TCP connection, which carries no
-        // session and gets a 401 (measured: Kerberos-sealed downloads after
-        // ~150 KB answers, on a current-thread runtime). Yielding first lets
-        // that task run. This narrows the window, it does not close it: the
-        // request still fails closed (401 error, not resent) if it happens.
-        for _ in 0..POOL_RETURN_YIELDS {
-            tokio::task::yield_now().await;
+        let method = session.auth_method();
+        let name = method_name(&method);
+        if session.binds_answers_by_relates_to() && crate::soap::parser::message_id(body).is_none()
+        {
+            return Err(SealedFailure::Error(method_error(
+                &method,
+                format!(
+                    "{name} message encryption: the request carries no wsa:MessageID, so its \
+                     sealed answer could not be bound to it; not sent"
+                ),
+            )));
         }
+        let (content_type, sealed) = session.seal(body).map_err(SealedFailure::Error)?;
+        let_pool_take_back_connection().await;
         let resp = conn
             .http
             .post(url)
@@ -761,25 +864,34 @@ impl HttpTransport {
             .await
             .map_err(SealedFailure::Error)?;
 
-        if status.is_success() {
-            return session
-                .unseal_answer(body, &bytes)
-                .map_err(SealedFailure::Error);
-        }
         // Windows seals the answer to a sealed request, a SOAP fault (HTTP
         // 500) included. An error answer that is not sealed is not trusted:
         // its body is neither parsed nor quoted.
-        if !labelled_sealed {
-            let method = session.method();
-            return Err(SealedFailure::Error(session.error(format!(
-                "server answered a sealed {method} request without sealing: HTTP {status} \
-                 ({} bytes)",
-                bytes.len()
-            ))));
+        if !status.is_success() && !labelled_sealed {
+            return Err(SealedFailure::Error(method_error(
+                &method,
+                format!(
+                    "server answered a sealed {name} request without sealing: HTTP {status} \
+                     ({} bytes)",
+                    bytes.len()
+                ),
+            )));
         }
-        let text = session
-            .unseal_answer(body, &bytes)
-            .map_err(SealedFailure::Error)?;
+        let text = session.unseal(&bytes).map_err(SealedFailure::Error)?;
+        if session.binds_answers_by_relates_to() {
+            crate::soap::parser::check_relates_to(body, &text).map_err(|e| {
+                SealedFailure::Error(method_error(
+                    &method,
+                    format!(
+                        "{name} message encryption: the sealed answer does not answer this \
+                         request: {e}"
+                    ),
+                ))
+            })?;
+        }
+        if status.is_success() {
+            return Ok(text);
+        }
         if status.as_u16() == 500
             && let Err(fault) = crate::soap::parser::check_soap_fault(&text)
         {
@@ -789,6 +901,56 @@ impl HttpTransport {
             "HTTP {status}: {}",
             crate::auth::excerpt(&text)
         ))))
+    }
+
+    /// One exchange on an authenticated dedicated connection without sealing
+    /// (Kerberos over HTTPS): the body inside TLS, no `Authorization` header.
+    #[cfg(feature = "kerberos")]
+    async fn send_plain_body(
+        conn: &mut AuthConn,
+        url: &str,
+        body: &str,
+        max_response_bytes: usize,
+    ) -> Result<String, SealedFailure> {
+        let_pool_take_back_connection().await;
+        let resp = conn
+            .http
+            .post(url)
+            .header(CONTENT_TYPE, "application/soap+xml;charset=UTF-8")
+            .body(body.to_string())
+            .send()
+            .await
+            .map_err(|e| SealedFailure::Error(WinrmError::Http(e)))?;
+        let status = resp.status();
+        if status.as_u16() == 401 {
+            return Err(SealedFailure::Unauthorized);
+        }
+        conn.closing = crate::auth::announces_close(resp.headers());
+        let text = crate::auth::read_text_capped(resp, max_response_bytes)
+            .await
+            .map_err(SealedFailure::Error)?;
+        if status.is_success() {
+            return Ok(text);
+        }
+        match crate::auth::error_for_status(status.as_u16(), &text, || {
+            format!("HTTP {status}: {}", crate::auth::excerpt(&text))
+        }) {
+            WinrmError::Soap(fault) => Err(SealedFailure::Fault(fault)),
+            other => Err(SealedFailure::Error(other)),
+        }
+    }
+
+    /// Without the `kerberos` feature there is no unsealed dedicated path.
+    #[cfg(not(feature = "kerberos"))]
+    async fn send_plain_body(
+        _conn: &mut AuthConn,
+        _url: &str,
+        _body: &str,
+        _max_response_bytes: usize,
+    ) -> Result<String, SealedFailure> {
+        Err(SealedFailure::Error(WinrmError::AuthFailed(
+            "internal: unsealed exchange on a dedicated connection".into(),
+        )))
     }
 
     /// Send a request with NTLM over HTTPS, unsealed (TLS protects it): a
@@ -2436,6 +2598,61 @@ mod tests {
     }
 
     // --- Response cap formula and sealing table ---
+
+    /// Without the `kerberos` feature, Kerberos under every mode (sealing
+    /// included) returns the feature error and sends nothing: no sealed
+    /// connection is attempted.
+    #[cfg(not(feature = "kerberos"))]
+    #[tokio::test]
+    async fn kerberos_without_the_feature_sends_nothing_in_any_mode() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::any};
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let port = server.address().port();
+        for encryption in [
+            EncryptionMode::Auto,
+            EncryptionMode::Always,
+            EncryptionMode::Never,
+        ] {
+            let transport = HttpTransport::new(
+                WinrmConfig {
+                    auth_method: AuthMethod::Kerberos,
+                    encryption: encryption.clone(),
+                    port,
+                    ..Default::default()
+                },
+                WinrmCredentials::new("u", "p", ""),
+            )
+            .unwrap();
+            assert!(transport.seals() == (encryption != EncryptionMode::Never));
+            let err = transport
+                .send_soap_raw("127.0.0.1", "<s:Envelope/>".into())
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("'kerberos' feature"),
+                "{encryption:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn kerberos_spn_comes_from_the_endpoint_host() {
+        let transport = basic_transport(5985);
+        for (url, spn) in [
+            ("http://dc.winrm.test:5985/wsman", "HTTP/dc.winrm.test"),
+            (
+                "https://srv.corp.example:5986/wsman",
+                "HTTP/srv.corp.example",
+            ),
+        ] {
+            assert_eq!(transport.kerberos_auth(url).service_principal, spn);
+        }
+    }
 
     #[test]
     fn retry_delay_doubles_from_100_ms_and_saturates() {

@@ -67,6 +67,42 @@ pub(crate) fn announces_close(headers: &reqwest::header::HeaderMap) -> bool {
         .any(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("close")))
 }
 
+/// The server certificate of the connection that carried a response.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PeerCertificate {
+    /// Known: from the response's TLS details, or the only certificate the
+    /// client's own verifier saw.
+    Known(Vec<u8>),
+    /// The client's verifier saw several certificates and the response gives
+    /// none: which one this connection used cannot be told.
+    Ambiguous,
+    /// No certificate (plain HTTP, or nothing recorded).
+    Unknown,
+}
+
+/// The server certificate of the connection that carried `resp`: the one its
+/// TLS details report (`reqwest` `tls_info`, direct connections), else the
+/// one `cert` captured, which is that connection's only when the client keeps
+/// a single connection with TLS resumption off (a dedicated connection) and
+/// its verifier saw only that certificate.
+pub(crate) fn peer_certificate(
+    resp: &reqwest::Response,
+    cert: Option<&crate::tls::CertHandle>,
+) -> PeerCertificate {
+    let reported = resp
+        .extensions()
+        .get::<reqwest::tls::TlsInfo>()
+        .and_then(|info| info.peer_certificate())
+        .map(<[u8]>::to_vec);
+    match (reported, cert.map(crate::tls::CertHandle::captured)) {
+        (Some(der), _) | (None, Some(crate::tls::Captured::One(der))) => {
+            PeerCertificate::Known(der)
+        }
+        (None, Some(crate::tls::Captured::Several)) => PeerCertificate::Ambiguous,
+        (None, _) => PeerCertificate::Unknown,
+    }
+}
+
 /// Error for a response body larger than `cap` bytes.
 pub(crate) fn body_too_large(cap: usize) -> WinrmError {
     WinrmError::Soap(crate::error::SoapError::ParseError(format!(

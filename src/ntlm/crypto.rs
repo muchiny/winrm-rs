@@ -325,18 +325,40 @@ fn pss_hash(params: &[u8]) -> Option<CbtHash> {
 pub(crate) fn compute_channel_bindings(
     cert_der: &[u8],
 ) -> Result<[u8; 16], crate::error::NtlmError> {
-    let hash = cbt_hash(cert_der).ok_or_else(|| {
+    Ok(channel_bindings_with(
+        required_cbt_hash(cert_der)?,
+        cert_der,
+    ))
+}
+
+/// [`cbt_hash`], or the error for a certificate without channel binding.
+fn required_cbt_hash(cert_der: &[u8]) -> Result<CbtHash, crate::error::NtlmError> {
+    cbt_hash(cert_der).ok_or_else(|| {
         crate::error::NtlmError::InvalidMessage(
             "server certificate: unreadable, or its signature algorithm defines no channel \
              binding hash (RFC 5929)"
                 .into(),
         )
-    })?;
-    Ok(channel_bindings_with(hash, cert_der))
+    })
 }
 
-/// The CBT of `cert_der` hashed with `hash` (steps 1 to 4 above).
-fn channel_bindings_with(hash: CbtHash, cert_der: &[u8]) -> [u8; 16] {
+/// The `tls-server-end-point` channel binding application data of a
+/// DER-encoded server certificate (RFC 5929 section 4): the prefix
+/// `tls-server-end-point:` and the certificate hash (steps 1 and 2 above).
+/// This is what a GSS-API mechanism (Kerberos) takes as the
+/// `application_data` of its channel bindings.
+///
+/// # Errors
+///
+/// As [`compute_channel_bindings`]: no channel binding is defined for the
+/// certificate.
+#[cfg(any(feature = "kerberos", test))]
+pub(crate) fn tls_server_end_point(cert_der: &[u8]) -> Result<Vec<u8>, crate::error::NtlmError> {
+    Ok(end_point_app_data(required_cbt_hash(cert_der)?, cert_der))
+}
+
+/// Steps 1 and 2: `tls-server-end-point:` and the certificate's hash.
+fn end_point_app_data(hash: CbtHash, cert_der: &[u8]) -> Vec<u8> {
     use sha2::{Digest as Sha2Digest, Sha224, Sha256, Sha384, Sha512};
 
     // Step 1: hash of the DER-encoded server certificate
@@ -350,6 +372,12 @@ fn channel_bindings_with(hash: CbtHash, cert_der: &[u8]) -> [u8; 16] {
     // Step 2: Build channel binding application data per RFC 5929 §4
     let mut app_data = b"tls-server-end-point:".to_vec();
     app_data.extend_from_slice(&cert_hash);
+    app_data
+}
+
+/// The CBT of `cert_der` hashed with `hash` (steps 1 to 4 above).
+fn channel_bindings_with(hash: CbtHash, cert_der: &[u8]) -> [u8; 16] {
+    let app_data = end_point_app_data(hash, cert_der);
 
     // Step 3: Build gss_channel_bindings_struct per RFC 2744 §3.11
     // Format (as used by SSPI/pyspnego, NOT the Windows SEC_CHANNEL_BINDINGS struct):
@@ -636,6 +664,24 @@ mod tests {
             .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
             .collect();
         v.try_into().unwrap()
+    }
+
+    /// The GSS-API application data is the RFC 5929 prefix and the
+    /// certificate hash (SHA-256 here, SHA-384 for a SHA-384 signature), the
+    /// input whose MD5 structure is the NTLM CBT.
+    #[test]
+    fn tls_server_end_point_is_prefix_and_signature_hash() {
+        use crate::test_pki as pki;
+        use sha2::{Digest as _, Sha256, Sha384};
+        let rsa = der(pki::RSA_CERT_PEM);
+        let mut expected = b"tls-server-end-point:".to_vec();
+        expected.extend_from_slice(&Sha256::digest(&rsa));
+        assert_eq!(tls_server_end_point(&rsa).unwrap(), expected);
+        let ec384 = der(pki::CBT_EC384_SHA384_PEM);
+        let mut expected = b"tls-server-end-point:".to_vec();
+        expected.extend_from_slice(&Sha384::digest(&ec384));
+        assert_eq!(tls_server_end_point(&ec384).unwrap(), expected);
+        assert!(tls_server_end_point(b"not a certificate").is_err());
     }
 
     /// Each fixture's CBT, as computed independently with Python

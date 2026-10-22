@@ -261,7 +261,14 @@ impl KerberosSession {
 impl KerberosAuth {
     /// The first Kerberos token for the service principal, and the pending
     /// context it starts.
-    fn initiate(&self) -> Result<(cross_krb5::PendingClientCtx, String), WinrmError> {
+    ///
+    /// `channel_bindings` is the application data of the GSS-API channel
+    /// bindings (`tls-server-end-point:` and the certificate hash over
+    /// HTTPS), carried in the AP-REQ authenticator.
+    fn initiate(
+        &self,
+        channel_bindings: Option<&[u8]>,
+    ) -> Result<(cross_krb5::PendingClientCtx, String), WinrmError> {
         use base64::Engine;
         use base64::engine::general_purpose::STANDARD as B64;
         use cross_krb5::{ClientCtx, InitiateFlags};
@@ -271,7 +278,7 @@ impl KerberosAuth {
             InitiateFlags::empty(),
             None, // use default credentials (from kinit)
             &self.service_principal,
-            None,
+            channel_bindings,
         )
         .map_err(|e| WinrmError::AuthFailed(format!("Kerberos init: {e}")))?;
         Ok((ctx, format!("Negotiate {}", B64.encode(&*token))))
@@ -294,21 +301,71 @@ impl KerberosAuth {
         })
     }
 
-    /// Establish a Kerberos context for message encryption on the connection
-    /// of `http`: a request with an empty body (as pypsrp does) carrying the
+    /// The server certificate of an HTTPS endpoint, learnt before the AP-REQ
+    /// (whose channel bindings depend on it) from an unauthenticated request
+    /// with an empty body on the dedicated client `http` (Windows answers it
+    /// with a 401 and closes that connection).
+    async fn endpoint_certificate(
+        &self,
+        http: &reqwest::Client,
+        cert: Option<&crate::tls::CertHandle>,
+        url: &str,
+    ) -> Result<Vec<u8>, WinrmError> {
+        use reqwest::header::CONTENT_TYPE;
+        let resp = http
+            .post(url)
+            .header(CONTENT_TYPE, "application/soap+xml;charset=UTF-8")
+            .header("Content-Length", "0")
+            .send()
+            .await
+            .map_err(WinrmError::Http)?;
+        let peer = crate::auth::peer_certificate(&resp, cert);
+        let _ = crate::auth::read_body_capped(resp, self.max_response_bytes).await;
+        match peer {
+            crate::auth::PeerCertificate::Known(der) => Ok(der),
+            crate::auth::PeerCertificate::Ambiguous | crate::auth::PeerCertificate::Unknown => {
+                Err(WinrmError::AuthFailed(
+                    "Kerberos over TLS: the server certificate of the connection is unknown or \
+                     ambiguous; refusing to authenticate without a certain channel binding"
+                        .into(),
+                ))
+            }
+        }
+    }
+
+    /// Establish a Kerberos context on the connection of the dedicated client
+    /// `http`: a request with an empty body (as pypsrp does) carrying the
     /// AP-REQ, whose answer must carry the server's AP-REP (mutual
     /// authentication), which completes the context. No SOAP body crosses
     /// before the context exists. The flag is set when the server answered
     /// with `Connection: close`: that connection, and the context bound to
     /// it, is then gone.
+    ///
+    /// Over HTTPS the AP-REQ carries channel bindings (RFC 5929
+    /// `tls-server-end-point`) for the certificate the endpoint presented
+    /// (see [`Self::endpoint_certificate`]), and the connection that carried
+    /// the AP-REQ must have presented that same certificate (its TLS details,
+    /// or `cert`, the record of `http`'s own verifier); otherwise the
+    /// context is refused before any SOAP body is sent.
     pub(crate) async fn establish(
         &self,
         http: &reqwest::Client,
+        cert: Option<&crate::tls::CertHandle>,
         url: &str,
     ) -> Result<(KerberosSession, bool), WinrmError> {
         use cross_krb5::Step;
         use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
-        let (pending, auth_header) = self.initiate()?;
+        let bound = if url.starts_with("https://") {
+            Some(self.endpoint_certificate(http, cert, url).await?)
+        } else {
+            None
+        };
+        let bindings = bound
+            .as_deref()
+            .map(crate::ntlm::crypto::tls_server_end_point)
+            .transpose()
+            .map_err(|e| WinrmError::AuthFailed(format!("Kerberos channel binding: {e}")))?;
+        let (pending, auth_header) = self.initiate(bindings.as_deref())?;
         let resp = http
             .post(url)
             .header(CONTENT_TYPE, "application/soap+xml;charset=UTF-8")
@@ -317,10 +374,20 @@ impl KerberosAuth {
             .send()
             .await
             .map_err(WinrmError::Http)?;
+        if let Some(bound) = &bound
+            && crate::auth::peer_certificate(&resp, cert)
+                != crate::auth::PeerCertificate::Known(bound.clone())
+        {
+            return Err(WinrmError::AuthFailed(
+                "Kerberos over TLS: the connection that carried the AP-REQ did not present the \
+                 certificate its channel binding was computed for; refusing the context"
+                    .into(),
+            ));
+        }
         let status = resp.status();
         if status.as_u16() == 401 {
             return Err(WinrmError::AuthFailed(
-                "Kerberos authentication rejected".into(),
+                "Kerberos authentication rejected (or, over HTTPS, its channel binding)".into(),
             ));
         }
         let closing = crate::auth::announces_close(resp.headers());
@@ -366,9 +433,12 @@ impl KerberosAuth {
 
 #[cfg(feature = "kerberos")]
 impl AuthTransport for KerberosAuth {
-    /// Unsealed request (HTTPS, or `EncryptionMode::Never`): a new context
-    /// per request, its token authenticating the request that carries the
-    /// body in plaintext (TLS protects it over HTTPS).
+    /// Unsealed request over plain HTTP (`EncryptionMode::Never`): a new
+    /// context per request, its token authenticating the request that
+    /// carries the body in plaintext. The server's AP-REP is verified when
+    /// the answer carries one, but not required: nothing on this path is
+    /// protected, the answer included. (HTTPS and sealing run on dedicated
+    /// connections through [`Self::establish`], which requires it.)
     async fn send_authenticated(
         &self,
         http: &reqwest::Client,
@@ -377,7 +447,7 @@ impl AuthTransport for KerberosAuth {
     ) -> Result<String, WinrmError> {
         use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 
-        let (ctx, auth_header) = self.initiate()?;
+        let (ctx, auth_header) = self.initiate(None)?;
         let resp = http
             .post(url)
             .header(CONTENT_TYPE, "application/soap+xml;charset=UTF-8")

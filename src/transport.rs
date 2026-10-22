@@ -574,10 +574,6 @@ impl HttpTransport {
     }
 
     /// Install the gate checked before every request attempt.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "called by the builder in the next commit")
-    )]
     pub(crate) fn set_before_send(&mut self, hook: BeforeSend) {
         self.before_send = Some(hook);
     }

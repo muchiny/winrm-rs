@@ -36,7 +36,9 @@ pub enum WinrmError {
     /// File transfer error (upload or download failure).
     #[error("file transfer error: {0}")]
     Transfer(String),
-    /// The operation was cancelled via a [`CancellationToken`](tokio_util::sync::CancellationToken).
+    /// The operation was cancelled via a [`CancellationToken`](tokio_util::sync::CancellationToken),
+    /// or a request was refused by the hook set with
+    /// [`WinrmClientBuilder::before_send`](crate::WinrmClientBuilder::before_send).
     #[error("operation cancelled")]
     Cancelled,
     /// CredSSP protocol error.

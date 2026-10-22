@@ -28,6 +28,7 @@ pub struct Ready;
 pub struct WinrmClientBuilder<S = NeedsCredentials> {
     config: WinrmConfig,
     credentials: Option<WinrmCredentials>,
+    before_send: Option<crate::transport::BeforeSend>,
     _state: std::marker::PhantomData<S>,
 }
 
@@ -37,6 +38,7 @@ impl WinrmClientBuilder<NeedsCredentials> {
         Self {
             config,
             credentials: None,
+            before_send: None,
             _state: std::marker::PhantomData,
         }
     }
@@ -46,12 +48,47 @@ impl WinrmClientBuilder<NeedsCredentials> {
         WinrmClientBuilder {
             config: self.config,
             credentials: Some(creds),
+            before_send: self.before_send,
             _state: std::marker::PhantomData,
         }
     }
 }
 
 impl WinrmClientBuilder<Ready> {
+    /// Install a hook that runs before every SOAP request this client sends,
+    /// and before each retry of one. Return `true` to send, `false` to refuse:
+    /// a refused request sends nothing and fails with [`WinrmError::Cancelled`].
+    ///
+    /// It runs for every authentication method, before anything is sealed or
+    /// put on the wire, so a refusal never disturbs an NTLM or Kerberos session.
+    /// One high-level call issues several requests (`run_command`: Create,
+    /// Execute, one Receive per poll, Signal, Delete) and the hook sees each of
+    /// them. A refusal also blocks the clean-up requests; the remote shell then
+    /// stays open until the server drops it.
+    ///
+    /// The hook is called from async code, possibly from several tasks at once:
+    /// keep it short and never block in it (no blocking lock, no I/O). A panic
+    /// in the hook reaches the caller.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use std::sync::Arc;
+    /// use std::sync::atomic::{AtomicU32, Ordering};
+    /// use winrm_rs::{WinrmClient, WinrmConfig, WinrmCredentials};
+    ///
+    /// // Send at most 100 requests.
+    /// let sent = Arc::new(AtomicU32::new(0));
+    /// let client = WinrmClient::builder(WinrmConfig::default())
+    ///     .credentials(WinrmCredentials::new("admin", "pass", ""))
+    ///     .before_send(move || sent.fetch_add(1, Ordering::Relaxed) < 100)
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    pub fn before_send(mut self, hook: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        self.before_send = Some(std::sync::Arc::new(hook));
+        self
+    }
+
     /// Build the [`WinrmClient`].
     ///
     /// Returns [`WinrmError::Http`] if the underlying HTTP client cannot be
@@ -59,11 +96,15 @@ impl WinrmClientBuilder<Ready> {
     pub fn build(self) -> Result<WinrmClient, WinrmError> {
         // SAFETY: The typestate pattern guarantees that `credentials` is
         // `Some` when `build()` is callable (state = Ready).
-        WinrmClient::new(
+        let mut client = WinrmClient::new(
             self.config,
             self.credentials
                 .expect("typestate guarantees credentials are set"),
-        )
+        )?;
+        if let Some(hook) = self.before_send {
+            client.transport.set_before_send(hook);
+        }
+        Ok(client)
     }
 }
 

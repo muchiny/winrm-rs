@@ -4049,3 +4049,73 @@ async fn kerberos_over_https_with_dc_cbt_strict() {
     })
     .await;
 }
+
+/// The pool race of dedicated connections, as measured: with
+/// `AllowUnencrypted = false` on the DC and a current-thread runtime (this
+/// test's), a 200 KB download right after a small upload sent a sealed
+/// request on a fresh, unauthenticated connection (HTTP 401) in 10 runs out
+/// of 10, for Kerberos and NTLM alike, before the dedicated exchange yielded
+/// to the runtime first. Three rounds per method must now pass on one
+/// connection each.
+#[cfg(feature = "kerberos")]
+#[tokio::test]
+#[ignore]
+async fn sealed_download_after_upload_stays_on_its_connection_allow_unencrypted_false() {
+    with_dc_requiring_encryption(|| async {
+        let dc_port = std::env::var("WINRM_TEST_KRB_PORT").expect("WINRM_TEST_KRB_PORT");
+        for method in ["kerberos", "ntlm"] {
+            for round in 1..=3 {
+                let (client, forwarder, host) = if method == "kerberos" {
+                    sealed_kerberos_client(|_| {}).await
+                } else {
+                    let forwarder = RecordingForwarder::start(format!("127.0.0.1:{dc_port}")).await;
+                    let config = WinrmConfig {
+                        auth_method: AuthMethod::Ntlm,
+                        port: forwarder.addr.port(),
+                        ..Default::default()
+                    };
+                    let client =
+                        WinrmClient::new(config, WinrmCredentials::new("vagrant", "vagrant", "WINRM"))
+                            .expect("NTLM client");
+                    (client, forwarder, "dc.winrm.test".to_string())
+                };
+                let tag = format!("{method}_{round}_{}", std::process::id());
+                let local_up = std::env::temp_dir().join(format!("winrm_rs_race_up_{tag}"));
+                let local_down = std::env::temp_dir().join(format!("winrm_rs_race_down_{tag}"));
+                std::fs::write(&local_up, vec![b'u'; 20_000]).expect("write local file");
+                let remote_up = format!(r"C:\Windows\Temp\winrm_rs_race_up_{tag}.bin");
+                let remote_big = format!(r"C:\Windows\Temp\winrm_rs_race_big_{tag}.bin");
+                client
+                    .upload_file(&host, &local_up, &remote_up)
+                    .await
+                    .unwrap_or_else(|e| panic!("{method} round {round}: upload: {e}"));
+                client
+                    .run_powershell(
+                        &host,
+                        &format!("[IO.File]::WriteAllBytes('{remote_big}', [byte[]](1..200001 | % {{ $_ % 251 }}))"),
+                    )
+                    .await
+                    .unwrap_or_else(|e| panic!("{method} round {round}: make file: {e}"));
+                let got = client
+                    .download_file(&host, &remote_big, &local_down)
+                    .await
+                    .unwrap_or_else(|e| panic!("{method} round {round}: download: {e}"));
+                assert_eq!(got, 200_001, "{method} round {round}");
+                let _ = client
+                    .run_powershell(
+                        &host,
+                        &format!("Remove-Item '{remote_up}','{remote_big}' -Force -ErrorAction SilentlyContinue"),
+                    )
+                    .await;
+                let _ = std::fs::remove_file(&local_up);
+                let _ = std::fs::remove_file(&local_down);
+                assert_eq!(
+                    forwarder.connections(),
+                    1,
+                    "{method} round {round}: a request left the authenticated connection"
+                );
+            }
+        }
+    })
+    .await;
+}

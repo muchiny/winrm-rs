@@ -26,122 +26,147 @@ pub(crate) struct KerberosAuth {
     pub(crate) max_response_bytes: usize,
 }
 
-/// MIME protocol of a Kerberos-sealed body. The tokens go under the
-/// `Negotiate` HTTP scheme, so Windows expects the SPNEGO protocol name even
-/// though the context is a raw Kerberos one; `HTTP-Kerberos-session-encrypted`
-/// gets HTTP 415 (measured on Server 2025). pypsrp likewise sends the Kerberos
-/// name only after the `Kerberos` scheme.
-#[cfg(feature = "kerberos")]
-const SEALING_PROTOCOL: &str = crate::auth::sealed::SPNEGO_PROTOCOL;
+/// The pure parts of Kerberos message encryption (no GSS-API call): wrap
+/// token checks, the Windows layout, the sealed-answer framing. Built with
+/// the `kerberos` feature, and for tests and the fuzz targets (`__internal`)
+/// without it.
+#[cfg(any(feature = "kerberos", feature = "__internal", test))]
+mod wire {
+    use crate::auth::sealed;
+    use crate::error::WinrmError;
 
-// --- RFC 4121 wrap tokens (section 4.2.6.2) ---
+    /// MIME protocol of a Kerberos-sealed body. The tokens go under the
+    /// `Negotiate` HTTP scheme, so Windows expects the SPNEGO protocol name even
+    /// though the context is a raw Kerberos one; `HTTP-Kerberos-session-encrypted`
+    /// gets HTTP 415 (measured on Server 2025). pypsrp likewise sends the Kerberos
+    /// name only after the `Kerberos` scheme.
+    pub(super) const SEALING_PROTOCOL: &str = sealed::SPNEGO_PROTOCOL;
 
-/// Token identifier of a wrap token.
-#[cfg(any(feature = "kerberos", test))]
-const TOK_ID_WRAP: [u8; 2] = [0x05, 0x04];
-/// Flags (octet 2): sent by the context acceptor.
-#[cfg(any(feature = "kerberos", test))]
-const FLAG_SENT_BY_ACCEPTOR: u8 = 0x01;
-/// Flags (octet 2): the data is encrypted.
-#[cfg(any(feature = "kerberos", test))]
-const FLAG_SEALED: u8 = 0x02;
-/// Length of the wrap token header (`TOK_ID` .. `SND_SEQ`).
-#[cfg(any(feature = "kerberos", test))]
-const TOKEN_HEADER_LEN: usize = 16;
-/// Largest security header accepted in a sealed answer: an AES wrap token
-/// header is 60 bytes (16-byte token header, 16-byte confounder, 16-byte
-/// encrypted header copy, 12-byte checksum).
-#[cfg(feature = "kerberos")]
-const MAX_SEALED_HEADER_LEN: usize = 1024;
+    // --- RFC 4121 wrap tokens (section 4.2.6.2) ---
 
-/// Error for a Kerberos message-encryption failure.
-#[cfg(any(feature = "kerberos", test))]
-fn sealing_error(what: impl std::fmt::Display) -> WinrmError {
-    WinrmError::AuthFailed(format!("Kerberos message encryption: {what}"))
-}
+    /// Token identifier of a wrap token.
+    pub(super) const TOK_ID_WRAP: [u8; 2] = [0x05, 0x04];
+    /// Flags (octet 2): sent by the context acceptor.
+    pub(super) const FLAG_SENT_BY_ACCEPTOR: u8 = 0x01;
+    /// Flags (octet 2): the data is encrypted.
+    pub(super) const FLAG_SEALED: u8 = 0x02;
+    /// Length of the wrap token header (`TOK_ID` .. `SND_SEQ`).
+    pub(super) const TOKEN_HEADER_LEN: usize = 16;
+    /// Largest security header accepted in a sealed answer: an AES wrap token
+    /// header is 60 bytes (16-byte token header, 16-byte confounder, 16-byte
+    /// encrypted header copy, 12-byte checksum).
+    pub(super) const MAX_SEALED_HEADER_LEN: usize = 1024;
 
-/// Turn a wrap token produced by `gss_wrap_iov` with separate header, data,
-/// padding and trailer buffers (rotation count 0) into the layout Windows
-/// SSPI produces and expects: security header = token header with RRC set
-/// to the trailer length, then the trailer, then the rest of the header
-/// (RFC 4121 4.2.5 "right rotation"); data = encrypted data then padding.
-/// This is byte for byte what MIT `gss_wrap_iov` gives without a trailer
-/// buffer, the buffers pyspnego sends to WinRM.
-///
-/// A header that is not an RFC 4121 sealed wrap token from the initiator,
-/// or already rotated, is refused (RC4 contexts use another token format).
-/// With no trailer (SSPI on Windows), the header is already in that layout.
-#[cfg(any(feature = "kerberos", test))]
-fn windows_layout(
-    header: &[u8],
-    data: &[u8],
-    padding: &[u8],
-    trailer: &[u8],
-) -> Result<(Vec<u8>, Vec<u8>), WinrmError> {
-    let mut out_data = Vec::with_capacity(data.len().saturating_add(padding.len()));
-    out_data.extend_from_slice(data);
-    out_data.extend_from_slice(padding);
-    if trailer.is_empty() {
-        // SSPI's header is already rotated. An empty or foreign header means
-        // the library emulated the IOV call (whole token in `data`): refuse.
-        if header.len() < TOKEN_HEADER_LEN || header.get(..2) != Some(&TOK_ID_WRAP[..]) {
+    /// Error for a Kerberos message-encryption failure.
+    pub(super) fn sealing_error(what: impl std::fmt::Display) -> WinrmError {
+        WinrmError::AuthFailed(format!("Kerberos message encryption: {what}"))
+    }
+
+    /// Turn a wrap token produced by `gss_wrap_iov` with separate header, data,
+    /// padding and trailer buffers (rotation count 0) into the layout Windows
+    /// SSPI produces and expects: security header = token header with RRC set
+    /// to the trailer length, then the trailer, then the rest of the header
+    /// (RFC 4121 4.2.5 "right rotation"); data = encrypted data then padding.
+    /// This is byte for byte what MIT `gss_wrap_iov` gives without a trailer
+    /// buffer, the buffers pyspnego sends to WinRM.
+    ///
+    /// A header that is not an RFC 4121 sealed wrap token from the initiator,
+    /// or already rotated, is refused (RC4 contexts use another token format).
+    /// With no trailer (SSPI on Windows), the header is already in that layout.
+    pub(crate) fn windows_layout(
+        header: &[u8],
+        data: &[u8],
+        padding: &[u8],
+        trailer: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>), WinrmError> {
+        let mut out_data = Vec::with_capacity(data.len().saturating_add(padding.len()));
+        out_data.extend_from_slice(data);
+        out_data.extend_from_slice(padding);
+        if trailer.is_empty() {
+            // SSPI's header is already rotated. An empty or foreign header means
+            // the library emulated the IOV call (whole token in `data`): refuse.
+            if header.len() < TOKEN_HEADER_LEN || header.get(..2) != Some(&TOK_ID_WRAP[..]) {
+                return Err(sealing_error(
+                    "the Kerberos library returned no separate wrap token header",
+                ));
+            }
+            return Ok((header.to_vec(), out_data));
+        }
+        let (token_header, confounder) = header
+            .split_at_checked(TOKEN_HEADER_LEN)
+            .ok_or_else(|| sealing_error("wrap token header too short"))?;
+        let flags = token_header.get(2).copied().unwrap_or_default();
+        if token_header.get(..2) != Some(&TOK_ID_WRAP[..])
+            || flags & FLAG_SEALED == 0
+            || flags & FLAG_SENT_BY_ACCEPTOR != 0
+        {
             return Err(sealing_error(
-                "the Kerberos library returned no separate wrap token header",
+                "the session key does not produce RFC 4121 sealed wrap tokens (AES enctypes \
+                 are required)",
             ));
         }
-        return Ok((header.to_vec(), out_data));
+        if token_header.get(6..8) != Some(&[0, 0][..]) {
+            return Err(sealing_error("wrap token already rotated"));
+        }
+        let rrc =
+            u16::try_from(trailer.len()).map_err(|_| sealing_error("wrap trailer too long"))?;
+        let mut out_header = Vec::with_capacity(header.len().saturating_add(trailer.len()));
+        out_header.extend_from_slice(token_header.get(..6).unwrap_or_default());
+        out_header.extend_from_slice(&rrc.to_be_bytes());
+        out_header.extend_from_slice(token_header.get(8..).unwrap_or_default());
+        out_header.extend_from_slice(trailer);
+        out_header.extend_from_slice(confounder);
+        Ok((out_header, out_data))
     }
-    let (token_header, confounder) = header
-        .split_at_checked(TOKEN_HEADER_LEN)
-        .ok_or_else(|| sealing_error("wrap token header too short"))?;
-    let flags = token_header.get(2).copied().unwrap_or_default();
-    if token_header.get(..2) != Some(&TOK_ID_WRAP[..])
-        || flags & FLAG_SEALED == 0
-        || flags & FLAG_SENT_BY_ACCEPTOR != 0
-    {
-        return Err(sealing_error(
-            "the session key does not produce RFC 4121 sealed wrap tokens (AES enctypes \
-             are required)",
-        ));
+
+    /// Check that `token` (security header then data of a sealed answer) is an
+    /// RFC 4121 wrap token sent by the acceptor with its data encrypted. The
+    /// token's integrity is checked by unwrap.
+    ///
+    /// Its sequence number is not checked: WinRM sends `SND_SEQ` 0 in every
+    /// answer (measured on Server 2025), so it cannot detect a replay. The
+    /// transport binds each sealed answer to its request through `RelatesTo`
+    /// instead (see `soap::parser::check_relates_to`).
+    pub(crate) fn check_acceptor_sealed(token: &[u8]) -> Result<(), WinrmError> {
+        let header = token
+            .get(..TOKEN_HEADER_LEN)
+            .ok_or_else(|| sealing_error("sealed answer shorter than a wrap token header"))?;
+        let flags = header.get(2).copied().unwrap_or_default();
+        if header.get(..2) != Some(&TOK_ID_WRAP[..]) {
+            return Err(sealing_error("sealed answer is not an RFC 4121 wrap token"));
+        }
+        if flags & FLAG_SENT_BY_ACCEPTOR == 0 {
+            return Err(sealing_error("sealed answer was not sent by the server"));
+        }
+        if flags & FLAG_SEALED == 0 {
+            return Err(sealing_error("answer is signed but not encrypted"));
+        }
+        Ok(())
     }
-    if token_header.get(6..8) != Some(&[0, 0][..]) {
-        return Err(sealing_error("wrap token already rotated"));
+
+    /// Parse a sealed answer: the exact MS-WSMV framing ([`sealed::parse`]) with
+    /// the SPNEGO protocol and a Kerberos security header of
+    /// `TOKEN_HEADER_LEN..=MAX_SEALED_HEADER_LEN` bytes.
+    pub(crate) fn parse_sealed_answer(data: &[u8]) -> Result<sealed::Frame<'_>, WinrmError> {
+        sealed::parse(
+            data,
+            SEALING_PROTOCOL,
+            |len| {
+                if (TOKEN_HEADER_LEN..=MAX_SEALED_HEADER_LEN).contains(&len) {
+                    Ok(())
+                } else {
+                    Err("Kerberos header length out of range")
+                }
+            },
+            |what| sealing_error(format!("sealed answer: {what} ({} bytes)", data.len())),
+        )
     }
-    let rrc = u16::try_from(trailer.len()).map_err(|_| sealing_error("wrap trailer too long"))?;
-    let mut out_header = Vec::with_capacity(header.len().saturating_add(trailer.len()));
-    out_header.extend_from_slice(token_header.get(..6).unwrap_or_default());
-    out_header.extend_from_slice(&rrc.to_be_bytes());
-    out_header.extend_from_slice(token_header.get(8..).unwrap_or_default());
-    out_header.extend_from_slice(trailer);
-    out_header.extend_from_slice(confounder);
-    Ok((out_header, out_data))
 }
 
-/// Check that `token` (security header then data of a sealed answer) is an
-/// RFC 4121 wrap token sent by the acceptor with its data encrypted. The
-/// token's integrity is checked by unwrap.
-///
-/// Its sequence number is not checked: WinRM sends `SND_SEQ` 0 in every
-/// answer (measured on Server 2025), so it cannot detect a replay. The
-/// transport binds each sealed answer to its request through `RelatesTo`
-/// instead (see `soap::parser::check_relates_to`).
-#[cfg(any(feature = "kerberos", test))]
-fn check_acceptor_sealed(token: &[u8]) -> Result<(), WinrmError> {
-    let header = token
-        .get(..TOKEN_HEADER_LEN)
-        .ok_or_else(|| sealing_error("sealed answer shorter than a wrap token header"))?;
-    let flags = header.get(2).copied().unwrap_or_default();
-    if header.get(..2) != Some(&TOK_ID_WRAP[..]) {
-        return Err(sealing_error("sealed answer is not an RFC 4121 wrap token"));
-    }
-    if flags & FLAG_SENT_BY_ACCEPTOR == 0 {
-        return Err(sealing_error("sealed answer was not sent by the server"));
-    }
-    if flags & FLAG_SEALED == 0 {
-        return Err(sealing_error("answer is signed but not encrypted"));
-    }
-    Ok(())
-}
+#[cfg(feature = "kerberos")]
+use wire::{SEALING_PROTOCOL, sealing_error};
+#[cfg(any(feature = "kerberos", feature = "__internal", test))]
+pub(crate) use wire::{check_acceptor_sealed, parse_sealed_answer, windows_layout};
 
 /// Error for a non-2xx answer to an unsealed Kerberos request. Over plain
 /// HTTP, a bare HTTP 500 (no SOAP fault, empty body) is what Windows answers
@@ -231,18 +256,7 @@ impl KerberosSession {
         use cross_krb5::K5Ctx;
         let bad =
             |what: &str| sealing_error(format!("sealed answer: {what} ({} bytes)", data.len()));
-        let frame = crate::auth::sealed::parse(
-            data,
-            SEALING_PROTOCOL,
-            |len| {
-                if (TOKEN_HEADER_LEN..=MAX_SEALED_HEADER_LEN).contains(&len) {
-                    Ok(())
-                } else {
-                    Err("Kerberos header length out of range")
-                }
-            },
-            bad,
-        )?;
+        let frame = parse_sealed_answer(data)?;
         // The rotated header followed by the data is a complete RFC 4121
         // token; the library undoes the rotation (RRC).
         check_acceptor_sealed(frame.sealed)?;
@@ -501,6 +515,7 @@ impl AuthTransport for KerberosAuth {
 
 #[cfg(test)]
 mod layout_tests {
+    use super::wire::{FLAG_SEALED, FLAG_SENT_BY_ACCEPTOR};
     use super::*;
 
     /// A wrap token as MIT `gss_wrap_iov` returns it with a trailer buffer:
@@ -624,6 +639,34 @@ mod layout_tests {
             }),
         ] {
             assert!(check_acceptor_sealed(&token).is_err(), "{name}");
+        }
+    }
+
+    /// A sealed answer framed as Windows sends it (60-byte header) parses to
+    /// the header and data; a header shorter than a token header, or longer
+    /// than 1024 bytes, is refused.
+    #[test]
+    fn parse_sealed_answer_applies_the_kerberos_header_rule() {
+        let frame = |header: &[u8], data: &[u8]| {
+            crate::auth::sealed::frame(
+                crate::auth::sealed::SPNEGO_PROTOCOL,
+                data.len(),
+                header,
+                data,
+            )
+            .1
+        };
+        let token = acceptor_token(0x07, 0);
+        let body = frame(&token[..60], b"ciphertext");
+        let parsed = parse_sealed_answer(&body).unwrap();
+        assert_eq!(parsed.length, 10);
+        assert_eq!(parsed.sealed.len(), 70);
+        for len in [15, 1025] {
+            let err = parse_sealed_answer(&frame(&vec![0x05; len], b"x")).unwrap_err();
+            assert!(
+                err.to_string().contains("header length out of range"),
+                "{len}: {err}"
+            );
         }
     }
 

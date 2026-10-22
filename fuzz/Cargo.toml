@@ -176,3 +176,10 @@ path = "fuzz_targets/fuzz_asn1_cert.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_kerberos_sealed"
+path = "fuzz_targets/fuzz_kerberos_sealed.rs"
+test = false
+doc = false
+bench = false

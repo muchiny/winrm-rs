@@ -48,6 +48,7 @@ TARGETS=(
   "fuzz_ntlm_seal:ntlm"
   "fuzz_ntlm_session:ntlm"
   "fuzz_ntlm_unseal_body:ntlm"
+  "fuzz_kerberos_sealed:soap"
   "fuzz_soap_parse:soap"
   "fuzz_soap_enumerate:soap"
   "fuzz_soap_envelope:soap"

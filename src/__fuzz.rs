@@ -161,6 +161,40 @@ pub fn seal_body_as_server(key: &[u8; 16], plaintext: &str) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
+// Kerberos message encryption, pure parts (`src/auth/kerberos.rs`,
+// `src/auth/sealed.rs`, `src/soap/parser.rs`): no GSS-API, no KDC
+// ---------------------------------------------------------------------------
+
+/// Parse a Kerberos-sealed answer (`kerberos::parse_sealed_answer`): the
+/// token (security header then data) and the announced plaintext length.
+pub fn kerberos_parse_sealed(data: &[u8]) -> Result<(Vec<u8>, usize), WinrmError> {
+    crate::auth::kerberos::parse_sealed_answer(data).map(|f| (f.sealed.to_vec(), f.length))
+}
+
+/// RFC 4121 checks of a sealed answer's token
+/// (`kerberos::check_acceptor_sealed`).
+pub fn kerberos_check_acceptor_sealed(token: &[u8]) -> Result<(), WinrmError> {
+    crate::auth::kerberos::check_acceptor_sealed(token)
+}
+
+/// `gss_wrap_iov` buffers to the Windows SSPI layout
+/// (`kerberos::windows_layout`).
+pub fn kerberos_windows_layout(
+    header: &[u8],
+    data: &[u8],
+    padding: &[u8],
+    trailer: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>), WinrmError> {
+    crate::auth::kerberos::windows_layout(header, data, padding, trailer)
+}
+
+/// `RelatesTo` binding of an answer to its request
+/// (`soap::parser::check_relates_to`).
+pub fn check_relates_to(request: &str, response: &str) -> Result<(), String> {
+    crate::soap::parser::check_relates_to(request, response)
+}
+
+// ---------------------------------------------------------------------------
 // SOAP — response parsing (`src/soap/parser.rs`)
 // ---------------------------------------------------------------------------
 

@@ -89,3 +89,13 @@ clixml_surrogates="_xD83D__xDE00_"
 clixml_escaped_underscore="_x005F_"
 xml_gt="&gt;"
 xml_numeric="&#x1B;"
+
+# MS-WSMV sealed bodies (fuzz_ntlm_unseal_body, fuzz_kerberos_sealed)
+"--Encrypted Boundary\x0d\x0a"
+"--Encrypted Boundary--"
+"\x09Content-Type: application/HTTP-SPNEGO-session-encrypted\x0d\x0a"
+"\x09Content-Type: application/octet-stream\x0d\x0a"
+"\x09OriginalContent: type=application/soap+xml;charset=UTF-8;Length="
+"\x05\x04\x07\xff\x00\x00\x00\x1c"
+"RelatesTo>uuid:"
+"MessageID>uuid:"

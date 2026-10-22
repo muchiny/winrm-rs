@@ -1,6 +1,6 @@
 # Fuzzing `winrm-rs`
 
-20 libFuzzer targets covering everything the crate parses off the network and
+21 libFuzzer targets covering everything the crate parses off the network and
 everything it splices into an outgoing request. Driven through
 [`scripts/fuzz.sh`](../scripts/fuzz.sh).
 
@@ -44,6 +44,7 @@ drives; "invariant" is what it asserts beyond *must not panic*.
 | `fuzz_ntlm_seal` | `NtlmSession::seal`/`unseal` | seal prepends exactly 16 bytes |
 | `fuzz_ntlm_session` | multi-message seal/sign/unseal | signature version and sequence numbering across a conversation |
 | `fuzz_ntlm_unseal_body` | `auth/ntlm.rs::unseal_body` (MS-WSMV multipart/encrypted framing) | never panics; errors do not echo the body; a server-sealed frame round-trips exactly; a flipped bit is rejected or leaves the plaintext unchanged; any truncation is rejected |
+| `fuzz_kerberos_sealed` | `auth/sealed.rs::parse` with the Kerberos header rule, `auth/kerberos.rs` `check_acceptor_sealed` / `windows_layout`, `soap/parser.rs::check_relates_to` (no KDC needed) | never panics; errors stay short; a parsed token is a 16..=1024-byte header plus exactly `Length` bytes; the layout conversion keeps the data, writes RRC = trailer length and is a right rotation by it |
 
 ### SOAP
 

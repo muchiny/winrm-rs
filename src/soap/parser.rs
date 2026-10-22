@@ -158,50 +158,129 @@ pub fn check_soap_fault(xml: &str) -> Result<(), SoapError> {
 /// Simple element text extraction by local name (namespace-agnostic).
 ///
 /// Finds elements like `<prefix:Element>text</prefix:Element>` or `<Element>text</Element>`
-/// regardless of namespace prefix.
+/// regardless of namespace prefix. Prefixed elements are tried first, in
+/// document order; bare `<Element>` tags are tried only after the last
+/// `:Element>` occurrence. An opening tag whose content is empty (after
+/// trimming) is skipped. A `:Element>` with no `<` anywhere before it ends the
+/// search (`None`), and so does a match whose "prefix" contains `>` (it cannot
+/// be part of a tag) — that one is skipped.
+///
+/// Linear in the size of `xml`: one pass indexes where each closing tag last
+/// occurs, so an opening tag with no closing tag after it is skipped without
+/// rescanning the rest of the document.
 fn extract_element_text(xml: &str, element: &str) -> Option<String> {
-    // Search for ":Element>" or "<Element>" to handle any namespace prefix
     let suffixed = format!(":{element}>");
     let bare_open = format!("<{element}>");
+    let bare_close = format!("</{element}>");
 
-    let mut search_from = 0;
-    while search_from < xml.len() {
-        let region = &xml[search_from..];
-
-        // Find next occurrence of the element (with or without prefix)
-        let (tag_content_start, ns_prefix) = if let Some(pos) = region.find(&suffixed) {
-            // Found ":Element>" -- walk back to find the '<'
-            let abs_pos = search_from + pos;
-            let before = &xml[..abs_pos];
-            let lt = before.rfind('<')?;
-            // Make sure this is an opening tag, not a closing tag
-            if xml[lt..].starts_with("</") {
-                search_from = abs_pos + suffixed.len();
-                continue;
-            }
-            let prefix = &xml[lt + 1..abs_pos];
-            (abs_pos + suffixed.len(), Some(prefix.to_string()))
-        } else {
-            let pos = region.find(&bare_open)?;
-            (search_from + pos + bare_open.len(), None)
-        };
-
-        // Build closing tag pattern
-        let close_tag = match &ns_prefix {
-            Some(p) => format!("</{p}:{element}>"),
-            None => format!("</{element}>"),
-        };
-
-        if let Some(end) = xml[tag_content_start..].find(&close_tag) {
-            let text = xml[tag_content_start..tag_content_start + end].trim();
-            if !text.is_empty() {
-                return Some(text.to_string());
-            }
+    // Start of the last `</prefix:Element>` for every prefix that has one.
+    let mut last_close: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for tag in prefixed_tags(xml, &suffixed) {
+        if let PrefixedTag::Closing { lt, prefix, .. } = tag {
+            last_close.insert(prefix, lt);
         }
+    }
 
-        search_from = tag_content_start;
+    let mut bare_from = 0;
+    for tag in prefixed_tags(xml, &suffixed) {
+        let at = match tag {
+            PrefixedTag::NoOpeningBracket => return None,
+            PrefixedTag::Closing { at, .. } | PrefixedTag::NotATag { at } => at,
+            PrefixedTag::Opening { at, prefix } => {
+                let content_start = at + suffixed.len();
+                if last_close
+                    .get(prefix)
+                    .is_some_and(|&close| close >= content_start)
+                {
+                    let close_tag = format!("</{prefix}:{element}>");
+                    if let Some(text) = text_up_to(xml, content_start, &close_tag) {
+                        return Some(text);
+                    }
+                }
+                at
+            }
+        };
+        bare_from = at + suffixed.len();
+    }
+
+    let last_bare_close = xml.rfind(&bare_close);
+    let mut search_from = bare_from;
+    while search_from < xml.len() {
+        let pos = xml[search_from..].find(&bare_open)?;
+        let content_start = search_from + pos + bare_open.len();
+        if last_bare_close.is_some_and(|close| close >= content_start)
+            && let Some(text) = text_up_to(xml, content_start, &bare_close)
+        {
+            return Some(text);
+        }
+        search_from = content_start;
     }
     None
+}
+
+/// The trimmed text between `content_start` and the first `close_tag` after
+/// it, or `None` when that text is empty or no such closing tag exists.
+fn text_up_to(xml: &str, content_start: usize, close_tag: &str) -> Option<String> {
+    let end = xml[content_start..].find(close_tag)?;
+    let text = xml[content_start..content_start + end].trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+/// One `:Element>` occurrence, classified by the nearest `<` before it.
+enum PrefixedTag<'a> {
+    /// No `<` anywhere before this occurrence.
+    NoOpeningBracket,
+    /// `</prefix:Element>`; `lt` is the position of its `<`.
+    Closing {
+        at: usize,
+        lt: usize,
+        prefix: &'a str,
+    },
+    /// `<prefix:Element>`; `at` is the position of `:Element>`.
+    Opening { at: usize, prefix: &'a str },
+    /// A `>` lies between the nearest `<` and the occurrence.
+    NotATag { at: usize },
+}
+
+/// Every `:Element>` occurrence of `xml` in document order. The nearest `<`
+/// and `>` before each occurrence are tracked incrementally, so the whole
+/// walk reads `xml` once (a prefix without `>` cannot span two occurrences,
+/// so prefixes do not overlap either).
+fn prefixed_tags<'a>(xml: &'a str, suffixed: &'a str) -> impl Iterator<Item = PrefixedTag<'a>> {
+    let mut from = 0;
+    let mut scanned = 0;
+    let mut last_lt: Option<usize> = None;
+    let mut last_gt: Option<usize> = None;
+    std::iter::from_fn(move || {
+        let at = from + xml.get(from..)?.find(suffixed)?;
+        let fresh = &xml[scanned..at];
+        if let Some(i) = fresh.rfind('<') {
+            last_lt = Some(scanned + i);
+        }
+        if let Some(i) = fresh.rfind('>') {
+            last_gt = Some(scanned + i);
+        }
+        scanned = at;
+        from = at + suffixed.len();
+        let Some(lt) = last_lt else {
+            return Some(PrefixedTag::NoOpeningBracket);
+        };
+        let tag = if last_gt.is_some_and(|gt| gt > lt) {
+            PrefixedTag::NotATag { at }
+        } else if xml[lt..].starts_with("</") {
+            PrefixedTag::Closing {
+                at,
+                lt,
+                prefix: &xml[lt + 2..at],
+            }
+        } else {
+            PrefixedTag::Opening {
+                at,
+                prefix: &xml[lt + 1..at],
+            }
+        };
+        Some(tag)
+    })
 }
 
 /// Extract all Stream elements with their Name attribute and base64 content.
@@ -1037,5 +1116,157 @@ mod tests {
             }
             other => panic!("expected a fault, got {other:?}"),
         }
+    }
+
+    // --- extract_element_text stays linear on unclosed tags ---
+
+    /// Pads `unit` repeated `count` times to about 1 MiB with filler text
+    /// between the tags.
+    fn one_mib_of(count: usize, unit: impl Fn(usize) -> String) -> String {
+        const MIB: usize = 1 << 20;
+        let mut xml = String::with_capacity(MIB + 64);
+        for i in 0..count {
+            let tag = unit(i);
+            xml.push_str(&tag);
+            let pad = (MIB / count).saturating_sub(tag.len());
+            xml.extend(std::iter::repeat_n('x', pad));
+        }
+        xml
+    }
+
+    /// 20 000 opening tags without a closing tag in 1 MiB: every shape that
+    /// used to rescan the rest of the document per tag (distinct prefixes,
+    /// one prefix, bare tags, many `:ShellId>` behind a single `<`) finishes
+    /// in linear time. The bound is loose on purpose (the quadratic version
+    /// took over 20 s in a debug build); a linear scan takes milliseconds.
+    #[test]
+    fn extract_element_text_is_linear_on_unclosed_tags() {
+        let shapes: [(&str, String); 4] = [
+            (
+                "distinct prefixes",
+                one_mib_of(20_000, |i| format!("<p{i}:ShellId>")),
+            ),
+            (
+                "one prefix",
+                one_mib_of(20_000, |_| "<rsp:ShellId>".to_string()),
+            ),
+            ("bare tags", one_mib_of(20_000, |_| "<ShellId>".to_string())),
+            (
+                "one '<' for every tag",
+                format!("<{}", one_mib_of(20_000, |_| "a:ShellId>".to_string())),
+            ),
+        ];
+        for (shape, xml) in &shapes {
+            let started = std::time::Instant::now();
+            assert_eq!(extract_element_text(xml, "ShellId"), None, "{shape}");
+            let took = started.elapsed();
+            assert!(
+                took < std::time::Duration::from_secs(5),
+                "{shape}: {took:?} for {} bytes",
+                xml.len()
+            );
+        }
+    }
+
+    /// The quadratic implementation this module used before, kept verbatim
+    /// as the reference for the differential test below.
+    fn reference_extract_element_text(xml: &str, element: &str) -> Option<String> {
+        let suffixed = format!(":{element}>");
+        let bare_open = format!("<{element}>");
+        let mut search_from = 0;
+        while search_from < xml.len() {
+            let region = &xml[search_from..];
+            let (tag_content_start, ns_prefix) = if let Some(pos) = region.find(&suffixed) {
+                let abs_pos = search_from + pos;
+                let before = &xml[..abs_pos];
+                let lt = before.rfind('<')?;
+                if xml[lt..].starts_with("</") {
+                    search_from = abs_pos + suffixed.len();
+                    continue;
+                }
+                let prefix = &xml[lt + 1..abs_pos];
+                (abs_pos + suffixed.len(), Some(prefix.to_string()))
+            } else {
+                let pos = region.find(&bare_open)?;
+                (search_from + pos + bare_open.len(), None)
+            };
+            let close_tag = match &ns_prefix {
+                Some(p) => format!("</{p}:{element}>"),
+                None => format!("</{element}>"),
+            };
+            if let Some(end) = xml[tag_content_start..].find(&close_tag) {
+                let text = xml[tag_content_start..tag_content_start + end].trim();
+                if !text.is_empty() {
+                    return Some(text.to_string());
+                }
+            }
+            search_from = tag_content_start;
+        }
+        None
+    }
+
+    /// Whether some `:X>` has a `>` between it and the nearest `<` before
+    /// it: the one shape where the linear version deliberately differs (it
+    /// skips such a match instead of looking for a closing tag that
+    /// contains `>` in its prefix).
+    fn has_gt_inside_a_prefix(xml: &str) -> bool {
+        let mut from = 0;
+        while let Some(pos) = xml[from..].find(":X>") {
+            let at = from + pos;
+            if let Some(lt) = xml[..at].rfind('<')
+                && xml[lt..at].contains('>')
+            {
+                return true;
+            }
+            from = at + 3;
+        }
+        false
+    }
+
+    proptest::proptest! {
+        /// The linear version returns what the quadratic one returned on
+        /// every document built from tag-shaped fragments.
+        #[test]
+        fn extract_element_text_matches_the_reference(
+            parts in proptest::collection::vec(
+                proptest::sample::select(vec![
+                    "<a:X>", "</a:X>", "<b:X>", "</b:X>", "<:X>", "</:X>", "<X>",
+                    "</X>", "<a:Y>", "</a:Y>", "<", "</", "a", "v", " ", "\n",
+                    ":X", ">", "x:X>", "é",
+                ]),
+                0..24,
+            )
+        ) {
+            let xml: String = parts.concat();
+            let linear = extract_element_text(&xml, "X");
+            if has_gt_inside_a_prefix(&xml) {
+                return Ok(());
+            }
+            proptest::prop_assert_eq!(
+                linear,
+                reference_extract_element_text(&xml, "X"),
+                "{:?}", xml
+            );
+        }
+    }
+
+    /// The same documents with one real element at the very end still
+    /// yield its text.
+    #[test]
+    fn extract_element_text_finds_the_element_after_many_unclosed_tags() {
+        let mut xml = one_mib_of(20_000, |i| format!("<p{i}:ShellId>"));
+        xml.push_str("<rsp:ShellId>LAST</rsp:ShellId>");
+        assert_eq!(
+            extract_element_text(&xml, "ShellId").as_deref(),
+            Some("LAST")
+        );
+        let mut bare = one_mib_of(20_000, |_| "<ShellId>".to_string());
+        bare.push_str("</ShellId>");
+        // The last bare opening tag is closed but empty, the previous ones
+        // enclose filler text up to that closing tag.
+        assert!(
+            extract_element_text(&bare, "ShellId").is_some_and(|t| t.starts_with('x')),
+            "bare"
+        );
     }
 }

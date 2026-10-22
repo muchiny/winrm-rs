@@ -21,10 +21,16 @@ pub enum WinrmError {
     /// SOAP-level fault or XML parsing error returned by the WinRM service.
     #[error("WinRM SOAP error: {0}")]
     Soap(SoapError),
-    /// The operation exceeded its total deadline, which the payload gives in
-    /// seconds. The value depends on the API: `Shell::run_command` reports
-    /// `2 * operation_timeout_secs`; the `WinrmClient::*_with_timeout` methods
-    /// report the caller's `timeout` rounded up to whole seconds (at least 1).
+    /// The operation exceeded a deadline, which the payload gives in
+    /// seconds. The value depends on where it was raised:
+    /// - `Shell::run_command` reports `2 * operation_timeout_secs` (its
+    ///   total deadline);
+    /// - the `WinrmClient::*_with_timeout` methods report the caller's
+    ///   `timeout` rounded up to whole seconds (at least 1);
+    /// - a request that needs a dedicated connection (NTLM or Kerberos
+    ///   sealing, NTLM over HTTPS, Kerberos over HTTPS) and waited for one of
+    ///   the 32 connection slots of the client longer than one request may
+    ///   take reports `operation_timeout_secs + 10`; nothing was sent.
     #[error("WinRM operation timed out after {0}s")]
     Timeout(u64),
     /// File transfer error (upload or download failure).
@@ -88,8 +94,21 @@ pub enum SoapError {
 /// Errors from the NTLM authentication protocol layer.
 #[derive(Debug, thiserror::Error)]
 pub enum NtlmError {
-    /// The NTLM message is structurally invalid: too short, bad signature,
-    /// wrong message type, or corrupt base64.
+    /// An NTLM exchange failed. The message says which case:
+    /// - an NTLM message is structurally invalid: too short, bad signature,
+    ///   wrong message type, corrupt base64, a MIC of the wrong size;
+    /// - a sealed answer does not unseal: bad framing, signature, sequence
+    ///   number or checksum;
+    /// - the server answered a sealed request without sealing (any error
+    ///   status, a 503 for instance; its body is not trusted, so not quoted);
+    /// - HTTP 401 to a sealed request on an already authenticated
+    ///   connection: the request is not re-sent, since it may have run;
+    /// - the server closes the connection right after authentication, so no
+    ///   request can use the session;
+    /// - NTLM over HTTPS cannot compute the channel binding: no server
+    ///   certificate reported, several certificates seen, or a certificate
+    ///   whose signature algorithm defines no binding hash (Ed25519, unknown
+    ///   algorithms).
     #[error("NTLM error: {0}")]
     InvalidMessage(String),
 }

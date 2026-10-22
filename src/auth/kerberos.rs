@@ -356,11 +356,13 @@ impl KerberosAuth {
     /// it, is then gone.
     ///
     /// Over HTTPS the AP-REQ carries channel bindings (RFC 5929
-    /// `tls-server-end-point`) for the certificate the endpoint presented
-    /// (see [`Self::endpoint_certificate`]), and the connection that carried
-    /// the AP-REQ must have presented that same certificate (its TLS details,
-    /// or `cert`, the record of `http`'s own verifier); otherwise the
-    /// context is refused before any SOAP body is sent.
+    /// `tls-server-end-point`) for the certificate the endpoint presented on
+    /// the unauthenticated probe (see [`Self::endpoint_certificate`]). That
+    /// certificate is then pinned in `cert`, the dedicated client's own
+    /// verifier, for the client's whole life: any later connection of the
+    /// client (the AP-REQ's, and every one after) whose handshake presents
+    /// another certificate fails before a byte of HTTP is written. The
+    /// answer's certificate is also compared with it (defence in depth).
     pub(crate) async fn establish(
         &self,
         http: &reqwest::Client,
@@ -370,7 +372,18 @@ impl KerberosAuth {
         use cross_krb5::Step;
         use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
         let bound = if url.starts_with("https://") {
-            Some(self.endpoint_certificate(http, cert, url).await?)
+            let der = self.endpoint_certificate(http, cert, url).await?;
+            // Pin it before the AP-REQ: Windows closed the probe's
+            // connection, so the AP-REQ goes on a new one, whose handshake
+            // must present this very certificate or fail before any byte of
+            // the request is written.
+            let handle = cert.ok_or_else(|| {
+                WinrmError::AuthFailed(
+                    "Kerberos over TLS: internal: no verifier to pin the bound certificate".into(),
+                )
+            })?;
+            handle.pin(der.clone());
+            Some(der)
         } else {
             None
         };
@@ -387,7 +400,7 @@ impl KerberosAuth {
             .header("Content-Length", "0")
             .send()
             .await
-            .map_err(WinrmError::Http)?;
+            .map_err(crate::auth::send_error)?;
         if let Some(bound) = &bound
             && crate::auth::peer_certificate(&resp, cert)
                 != crate::auth::PeerCertificate::Known(bound.clone())

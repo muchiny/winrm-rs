@@ -103,6 +103,23 @@ pub(crate) fn peer_certificate(
     }
 }
 
+/// [`WinrmError::Http`] for a request that failed to go out, unless the
+/// failure is the pinned verifier refusing the connection's certificate
+/// (see [`crate::tls::CertHandle::pin`]): that one is reported as such, as
+/// an authentication failure, nothing having been sent.
+pub(crate) fn send_error(e: reqwest::Error) -> WinrmError {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(&e);
+    while let Some(cause) = source {
+        if cause.to_string().contains("(pinned)") {
+            return WinrmError::AuthFailed(format!(
+                "TLS handshake refused: {cause}; nothing was sent on that connection"
+            ));
+        }
+        source = cause.source();
+    }
+    WinrmError::Http(e)
+}
+
 /// Error for a response body larger than `cap` bytes.
 pub(crate) fn body_too_large(cap: usize) -> WinrmError {
     WinrmError::Soap(crate::error::SoapError::ParseError(format!(

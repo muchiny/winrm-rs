@@ -164,6 +164,28 @@ fn method_error(method: &AuthMethod, msg: String) -> WinrmError {
     }
 }
 
+/// Check that an answer on a dedicated connection came over a connection
+/// presenting the certificate pinned in its verifier (Kerberos over TLS),
+/// if one is pinned. The pinned verifier already refuses any other
+/// certificate at the handshake; this re-checks it on the answer.
+fn check_pinned_certificate(
+    resp: &reqwest::Response,
+    cert: Option<&CertHandle>,
+) -> Result<(), WinrmError> {
+    let Some(pin) = cert.and_then(CertHandle::pinned) else {
+        return Ok(());
+    };
+    if crate::auth::peer_certificate(resp, cert) == crate::auth::PeerCertificate::Known(pin) {
+        Ok(())
+    } else {
+        Err(WinrmError::AuthFailed(
+            "Kerberos over TLS: the answer did not come over a connection presenting the \
+             certificate the authentication was bound to; refusing it"
+                .into(),
+        ))
+    }
+}
+
 /// Give `hyper` the chance to hand a dedicated client's connection back to
 /// that client's pool before the next request on it.
 ///
@@ -844,7 +866,8 @@ impl HttpTransport {
             .body(sealed)
             .send()
             .await
-            .map_err(|e| SealedFailure::Error(WinrmError::Http(e)))?;
+            .map_err(|e| SealedFailure::Error(crate::auth::send_error(e)))?;
+        check_pinned_certificate(&resp, conn.cert.as_ref()).map_err(SealedFailure::Error)?;
 
         let status = resp.status();
         if status.as_u16() == 401 {
@@ -920,7 +943,8 @@ impl HttpTransport {
             .body(body.to_string())
             .send()
             .await
-            .map_err(|e| SealedFailure::Error(WinrmError::Http(e)))?;
+            .map_err(|e| SealedFailure::Error(crate::auth::send_error(e)))?;
+        check_pinned_certificate(&resp, conn.cert.as_ref()).map_err(SealedFailure::Error)?;
         let status = resp.status();
         if status.as_u16() == 401 {
             return Err(SealedFailure::Unauthorized);

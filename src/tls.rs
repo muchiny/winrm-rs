@@ -28,11 +28,17 @@ use crate::error::WinrmError;
 /// certificate only when all the target connections it verified presented
 /// the same one; otherwise the certificate of a given connection cannot be
 /// told.
+///
+/// It can also be pinned ([`CertHandle::pin`]): from then on a handshake with
+/// `target` that presents any other end-entity certificate is refused, so no
+/// HTTP byte goes out on that connection. Kerberos over TLS pins the
+/// certificate its channel binding was computed for.
 #[derive(Debug)]
 pub(crate) struct CertCapturingVerifier {
     inner: Arc<dyn ServerCertVerifier>,
     target: Option<ServerName<'static>>,
     captured: Arc<Mutex<Captured>>,
+    pinned: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
 /// Certificates a [`CertCapturingVerifier`] has accepted.
@@ -58,13 +64,15 @@ impl CertCapturingVerifier {
             inner,
             target,
             captured: Arc::new(Mutex::new(Captured::None)),
+            pinned: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// Return a clone-able handle to read what was recorded.
+    /// Return a clone-able handle to read what was recorded and to pin.
     pub(crate) fn cert_handle(&self) -> CertHandle {
         CertHandle {
             captured: Arc::clone(&self.captured),
+            pinned: Arc::clone(&self.pinned),
         }
     }
 }
@@ -87,6 +95,19 @@ impl ServerCertVerifier for CertCapturingVerifier {
         )?;
         if self.target.as_ref() != Some(server_name) {
             return Ok(verified);
+        }
+        if let Some(pin) = self
+            .pinned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_deref()
+            && pin != end_entity.as_ref()
+        {
+            return Err(Error::General(
+                "server certificate differs from the one this connection's channel binding was \
+                 computed for (pinned); refusing the handshake"
+                    .into(),
+            ));
         }
         // A panic while the lock was held would leave it poisoned. The writer
         // takes the guard back (`PoisonError::into_inner`) and applies the
@@ -132,6 +153,7 @@ impl ServerCertVerifier for CertCapturingVerifier {
 #[derive(Clone, Debug)]
 pub(crate) struct CertHandle {
     captured: Arc<Mutex<Captured>>,
+    pinned: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
 impl CertHandle {
@@ -142,11 +164,33 @@ impl CertHandle {
             .map_or(Captured::Several, |captured| captured.clone())
     }
 
+    /// Pin the verifier to `cert_der`: later handshakes with the target
+    /// that present another end-entity certificate fail.
+    // Only Kerberos pins (and the tests); `expect` would be unfulfilled in
+    // test builds without the feature.
+    #[cfg_attr(not(feature = "kerberos"), allow(dead_code))]
+    pub(crate) fn pin(&self, cert_der: Vec<u8>) {
+        // A poisoned lock still holds a consistent value: set it anyway.
+        *self
+            .pinned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cert_der);
+    }
+
+    /// The pinned certificate, if any.
+    pub(crate) fn pinned(&self) -> Option<Vec<u8>> {
+        self.pinned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     /// A handle holding `captured`, for tests.
     #[cfg(test)]
     pub(crate) fn with(captured: Captured) -> Self {
         Self {
             captured: Arc::new(Mutex::new(captured)),
+            pinned: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -428,6 +472,37 @@ mod tests {
             UnixTime::now(),
         );
         assert_eq!(handle.captured(), Captured::One(vec![2, 2]));
+    }
+
+    /// Once pinned, a handshake with the target presenting another
+    /// certificate fails (and is not recorded); the pinned one passes; a
+    /// proxy handshake is not concerned.
+    #[test]
+    fn pinned_verifier_refuses_another_certificate_of_the_target() {
+        let verifier =
+            CertCapturingVerifier::new(Arc::new(AcceptAllVerifier), Some(target("winrm.host")));
+        let handle = verifier.cert_handle();
+        let (bound, other) = (
+            CertificateDer::from(vec![7, 7]),
+            CertificateDer::from(vec![9]),
+        );
+        let check = |cert: &CertificateDer<'_>, name: &str| {
+            verifier
+                .verify_server_cert(cert, &[], &target(name), &[], UnixTime::now())
+                .is_ok()
+        };
+        assert!(check(&other, "winrm.host"), "nothing pinned yet");
+        handle.pin(bound.to_vec());
+        assert_eq!(handle.pinned(), Some(vec![7, 7]));
+        assert!(check(&bound, "winrm.host"));
+        assert!(
+            !check(&other, "winrm.host"),
+            "another certificate is refused"
+        );
+        assert!(
+            check(&other, "proxy.host"),
+            "the proxy's handshake is not pinned"
+        );
     }
 
     #[test]

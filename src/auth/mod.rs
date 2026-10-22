@@ -48,6 +48,18 @@ pub(crate) fn error_for_status(
     WinrmError::AuthFailed(describe())
 }
 
+/// An `Authorization` header value marked sensitive, so that `http`/`hyper`
+/// never index it in an HTTP/2 header table and its `Debug` form (in a
+/// request logged by a dependency, for instance) shows `Sensitive` instead of
+/// the credentials or the authentication token.
+pub(crate) fn authorization_value(value: &str) -> Result<reqwest::header::HeaderValue, WinrmError> {
+    let mut header = reqwest::header::HeaderValue::from_str(value).map_err(|_| {
+        WinrmError::AuthFailed("Authorization header value is not valid in HTTP".into())
+    })?;
+    header.set_sensitive(true);
+    Ok(header)
+}
+
 /// Largest part of a server body quoted in an error message, in characters.
 const EXCERPT_CHARS: usize = 512;
 
@@ -208,6 +220,15 @@ mod tests {
     }
 
     // --- Error excerpts ---
+
+    #[test]
+    fn authorization_value_is_sensitive_and_keeps_the_value() {
+        let value = authorization_value("Basic YWRtaW46cGFzcw==").unwrap();
+        assert!(value.is_sensitive());
+        assert_eq!(value.to_str().unwrap(), "Basic YWRtaW46cGFzcw==");
+        assert_eq!(format!("{value:?}"), "Sensitive");
+        assert!(authorization_value("Basic a\nb").is_err());
+    }
 
     #[test]
     fn excerpt_keeps_a_short_body_whole() {

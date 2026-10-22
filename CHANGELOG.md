@@ -467,6 +467,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   bodies, so command text (an encoded `run_powershell` script included)
   reaches logs at `debug` level and below; keep `winrm_rs` at `info` where
   commands carry secrets.
+- **`Authorization` headers are marked sensitive.** The Basic, NTLM
+  (Type 1 and Type 3) and Kerberos (`Negotiate`) header values are built
+  with `HeaderValue::set_sensitive(true)`, so their `Debug` form shows
+  `Sensitive` and HTTP/2 never indexes them. CredSSP writes its own HTTP
+  request inside its TLS tunnel and never logs the header; Certificate auth
+  sends a fixed, public value.
 
 ### Documentation
 

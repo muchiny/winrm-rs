@@ -47,7 +47,10 @@ impl AuthTransport for BasicAuth {
             .header(CONTENT_TYPE, "application/soap+xml;charset=UTF-8")
             .header(
                 AUTHORIZATION,
-                format!("Basic {}", self.credentials_b64.expose_secret()),
+                crate::auth::authorization_value(&format!(
+                    "Basic {}",
+                    self.credentials_b64.expose_secret()
+                ))?,
             )
             .body(body)
             .send()

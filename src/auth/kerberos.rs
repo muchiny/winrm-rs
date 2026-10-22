@@ -396,7 +396,10 @@ impl KerberosAuth {
         let resp = http
             .post(url)
             .header(CONTENT_TYPE, "application/soap+xml;charset=UTF-8")
-            .header(AUTHORIZATION, &auth_header)
+            .header(
+                AUTHORIZATION,
+                crate::auth::authorization_value(&auth_header)?,
+            )
             .header("Content-Length", "0")
             .send()
             .await
@@ -478,7 +481,10 @@ impl AuthTransport for KerberosAuth {
         let resp = http
             .post(url)
             .header(CONTENT_TYPE, "application/soap+xml;charset=UTF-8")
-            .header(AUTHORIZATION, &auth_header)
+            .header(
+                AUTHORIZATION,
+                crate::auth::authorization_value(&auth_header)?,
+            )
             .body(body)
             .send()
             .await

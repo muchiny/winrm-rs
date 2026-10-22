@@ -132,12 +132,12 @@ impl NtlmAuth {
     ) -> Result<(String, Box<Zeroizing<[u8; 16]>>, bool), WinrmError> {
         // Step 1: Send Type 1 (Negotiate) with empty body
         let type1 = ntlm::create_negotiate_message();
-        let auth_header = ntlm::encode_authorization(&type1);
+        let auth_header = crate::auth::authorization_value(&ntlm::encode_authorization(&type1))?;
 
         let resp = http
             .post(url)
             .header(CONTENT_TYPE, "application/soap+xml;charset=UTF-8")
-            .header(AUTHORIZATION, &auth_header)
+            .header(AUTHORIZATION, auth_header)
             .header("Content-Length", "0")
             .send()
             .await
@@ -247,9 +247,9 @@ impl NtlmAuth {
         boxed_key.copy_from_slice(&*session_key);
         zeroize::Zeroize::zeroize(&mut *session_key);
         let session_key = boxed_key;
-        let auth_header = ntlm::encode_authorization(&type3);
+        let auth_header = crate::auth::authorization_value(&ntlm::encode_authorization(&type3))?;
 
-        let request = http.post(url).header(AUTHORIZATION, &auth_header);
+        let request = http.post(url).header(AUTHORIZATION, auth_header);
         let request = match body {
             Some(body) => request
                 .header(CONTENT_TYPE, "application/soap+xml;charset=UTF-8")

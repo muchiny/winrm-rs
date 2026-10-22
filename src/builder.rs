@@ -3,6 +3,8 @@
 // Provides a compile-time-safe builder pattern that requires credentials
 // to be set before building the client.
 
+use std::panic::AssertUnwindSafe;
+
 use crate::client::WinrmClient;
 use crate::config::{WinrmConfig, WinrmCredentials};
 use crate::error::WinrmError;
@@ -28,7 +30,9 @@ pub struct Ready;
 pub struct WinrmClientBuilder<S = NeedsCredentials> {
     config: WinrmConfig,
     credentials: Option<WinrmCredentials>,
-    before_send: Option<crate::transport::BeforeSend>,
+    // `AssertUnwindSafe` keeps the builder `UnwindSafe` and `RefUnwindSafe`
+    // as it was before the hook existed; the hook is never called here.
+    before_send: Option<AssertUnwindSafe<crate::transport::BeforeSend>>,
     _state: std::marker::PhantomData<S>,
 }
 
@@ -85,7 +89,7 @@ impl WinrmClientBuilder<Ready> {
     ///     .unwrap();
     /// ```
     pub fn before_send(mut self, hook: impl Fn() -> bool + Send + Sync + 'static) -> Self {
-        self.before_send = Some(std::sync::Arc::new(hook));
+        self.before_send = Some(AssertUnwindSafe(std::sync::Arc::new(hook)));
         self
     }
 
@@ -102,7 +106,7 @@ impl WinrmClientBuilder<Ready> {
                 .expect("typestate guarantees credentials are set"),
         )?;
         if let Some(hook) = self.before_send {
-            client.transport.set_before_send(hook);
+            client.transport.set_before_send(hook.0);
         }
         Ok(client)
     }
@@ -111,6 +115,15 @@ impl WinrmClientBuilder<Ready> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Holding a hook must not cost the builder its auto traits: losing them
+    /// is a breaking change.
+    #[test]
+    fn builder_stays_unwind_safe() {
+        fn assert_unwind_safe<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+        assert_unwind_safe::<WinrmClientBuilder<NeedsCredentials>>();
+        assert_unwind_safe::<WinrmClientBuilder<Ready>>();
+    }
 
     #[test]
     fn builder_creates_client() {

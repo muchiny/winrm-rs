@@ -727,9 +727,54 @@ pub(crate) fn signal_ctrl_c_request(
     timeout_secs: u64,
     max_envelope_size: u32,
 ) -> String {
-    let header = build_header(
+    signal_request(
+        endpoint,
+        shell_id,
+        command_id,
+        SIGNAL_CTRL_C,
+        RESOURCE_URI_CMD,
+        timeout_secs,
+        max_envelope_size,
+    )
+}
+
+/// Build the Signal envelope that stops a **PSRP** pipeline.
+///
+/// A PSRP shell lives under the PowerShell `ResourceURI`, not under `cmd`
+/// (a Signal addressed to `cmd` finds no such `ShellId`), and the code is the
+/// PSRP one (MS-PSRP 3.1.5.3.9).
+pub(crate) fn signal_psrp_ctrl_c_request(
+    endpoint: &str,
+    shell_id: &str,
+    command_id: &str,
+    resource_uri: &str,
+    timeout_secs: u64,
+    max_envelope_size: u32,
+) -> String {
+    signal_request(
+        endpoint,
+        shell_id,
+        command_id,
+        SIGNAL_PSRP_CTRL_C,
+        resource_uri,
+        timeout_secs,
+        max_envelope_size,
+    )
+}
+
+fn signal_request(
+    endpoint: &str,
+    shell_id: &str,
+    command_id: &str,
+    code: &str,
+    resource_uri: &str,
+    timeout_secs: u64,
+    max_envelope_size: u32,
+) -> String {
+    let header = build_header_for(
         endpoint,
         ACTION_SIGNAL,
+        resource_uri,
         Some(shell_id),
         timeout_secs,
         max_envelope_size,
@@ -740,7 +785,7 @@ pub(crate) fn signal_ctrl_c_request(
 {header}
   <s:Body>
     <rsp:Signal CommandId="{escaped_command_id}">
-      <rsp:Code>{SIGNAL_CTRL_C}</rsp:Code>
+      <rsp:Code>{code}</rsp:Code>
     </rsp:Signal>
   </s:Body>
 </s:Envelope>"#
@@ -1041,6 +1086,55 @@ mod tests {
         assert!(xml.contains("C1"));
         assert!(xml.contains("signal/ctrl_c"));
         assert!(xml.contains("153600"));
+    }
+
+    /// MS-PSRP 3.1.5.3.9: the Signal that stops a PSRP pipeline goes to the
+    /// PowerShell `ResourceURI` with the PSRP code (spelled `crtl_c`). Under
+    /// the `cmd` URI a PSRP shell is not found, and PowerShell's plugin only
+    /// stops a command for this code.
+    #[test]
+    fn psrp_signal_uses_the_powershell_resource_uri_and_code() {
+        let xml = signal_psrp_ctrl_c_request(
+            "http://host:5985/wsman",
+            "S1",
+            "C1",
+            RESOURCE_URI_PSRP,
+            60,
+            153_600,
+        );
+        assert!(xml.contains(&format!(
+            r#"<wsman:ResourceURI s:mustUnderstand="true">{RESOURCE_URI_PSRP}</wsman:ResourceURI>"#
+        )));
+        assert!(xml.contains(
+            "<rsp:Code>http://schemas.microsoft.com/powershell/signal/crtl_c</rsp:Code>"
+        ));
+        assert!(xml.contains(r#"<rsp:Signal CommandId="C1">"#));
+        assert!(xml.contains(">S1</wsman:Selector>"));
+        assert!(!xml.contains(RESOURCE_URI_CMD));
+        assert!(!xml.contains("signal/ctrl_c"));
+    }
+
+    #[test]
+    fn psrp_signal_escapes_what_it_interpolates() {
+        let xml = signal_psrp_ctrl_c_request(
+            "http://host:5985/wsman",
+            "S<1>",
+            "C\"1",
+            "http://x/<y>",
+            60,
+            153_600,
+        );
+        assert!(!xml.contains("S<1>") && !xml.contains("<y>"));
+        assert!(
+            xml.contains("S&lt;1&gt;") && xml.contains("C&quot;1") && xml.contains("&lt;y&gt;")
+        );
+    }
+
+    #[test]
+    fn cmd_signal_is_unchanged() {
+        let xml = signal_ctrl_c_request("http://host:5985/wsman", "S1", "C1", 60, 153_600);
+        assert!(xml.contains(RESOURCE_URI_CMD));
+        assert!(xml.contains("<rsp:Code>http://schemas.microsoft.com/wbem/wsman/1/windows/shell/signal/ctrl_c</rsp:Code>"));
     }
 
     #[test]

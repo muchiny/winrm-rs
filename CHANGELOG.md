@@ -55,6 +55,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   not authenticate the server and its handshake can be relayed or guessed
   offline; sealing protects only the SOAP bodies. Nothing is refused. To
   silence it alone, add `winrm_rs::ntlm_over_http=error` to the filter.
+- **`upload_file` and `download_file` start Windows PowerShell by its full
+  path.** They run `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe
+  -NoProfile -NonInteractive`: profile scripts no longer run before each
+  chunk, and their output no longer breaks downloads. Only the crate's own
+  transfer scripts are affected; they never relied on a profile. A profile
+  that customises the remote session no longer applies to `upload_file` or
+  `download_file`.
 
 ### Added
 

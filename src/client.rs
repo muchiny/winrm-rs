@@ -2379,6 +2379,96 @@ mod tests {
         std::fs::remove_file(&local_path).ok();
     }
 
+    /// Assert that the one Command request starts Windows PowerShell by its
+    /// full path, then the three arguments in order.
+    fn assert_full_path_launch(requests: &[wiremock::Request]) {
+        let commands: Vec<String> = requests
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .filter(|b| b.contains("windows/shell/Command"))
+            .collect();
+        assert_eq!(commands.len(), 1, "exactly one Command request");
+        let body = &commands[0];
+        let exe = body
+            .find(
+                r"<rsp:Command>%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe</rsp:Command>",
+            )
+            .expect("full-path command");
+        let profile = body
+            .find("<rsp:Arguments>-NoProfile</rsp:Arguments>")
+            .expect("-NoProfile");
+        let interactive = body
+            .find("<rsp:Arguments>-NonInteractive</rsp:Arguments>")
+            .expect("-NonInteractive");
+        let encoded = body
+            .find("<rsp:Arguments>-EncodedCommand</rsp:Arguments>")
+            .expect("-EncodedCommand");
+        assert!(exe < profile && profile < interactive && interactive < encoded);
+    }
+
+    #[tokio::test]
+    async fn download_file_launches_powershell_by_full_path() {
+        let server = MockServer::start().await;
+        let port = server.address().port();
+
+        // "hello file content" base64 = aGVsbG8gZmlsZSBjb250ZW50
+        let ps_output_b64 = base64::engine::general_purpose::STANDARD.encode(b"hello file content");
+        let stdout_b64 = B64.encode(ps_output_b64.as_bytes());
+
+        // Shell create
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>DL-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
+            ))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Command execute
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>DL-CMD</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
+            ))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Receive (the PS script outputs the base64-encoded file content)
+        let receive_body = format!(
+            r#"<s:Envelope><s:Body><rsp:ReceiveResponse>
+                <rsp:Stream Name="stdout" CommandId="DL-CMD">{stdout_b64}</rsp:Stream>
+                <rsp:CommandState CommandId="DL-CMD" State="http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Done">
+                    <rsp:ExitCode>0</rsp:ExitCode>
+                </rsp:CommandState>
+            </rsp:ReceiveResponse></s:Body></s:Envelope>"#
+        );
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(receive_body))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Cleanup (signal + delete)
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r"<s:Envelope><s:Body/></s:Envelope>"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = WinrmClient::new(basic_config(port), test_creds()).unwrap();
+        let local_path = unique_temp_path("winrm-rs-test-download-fullpath.bin");
+        let result = client
+            .download_file("127.0.0.1", "C:\\remote\\file.txt", &local_path)
+            .await;
+        assert!(result.is_ok(), "download_file failed: {result:?}");
+        let requests = server.received_requests().await.unwrap();
+        assert_full_path_launch(&requests);
+
+        // Cleanup
+        std::fs::remove_file(&local_path).ok();
+    }
+
     // Valid self-signed test PEM for Certificate auth tests.
     const TEST_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
         MIIBXjCCAQWgAwIBAgIUMMmMPCKhqsfVxxq36Hmd4IHUTNgwCgYIKoZIzj0EAwIw\n\
@@ -3479,6 +3569,63 @@ mod tests {
             !found_append,
             "single-chunk upload must NOT use Append (that's for subsequent chunks)"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn upload_file_launches_powershell_by_full_path() {
+        let server = MockServer::start().await;
+        let port = server.address().port();
+
+        let dir = unique_temp_path("winrm-rs-test-upload-fullpath");
+        std::fs::create_dir_all(&dir).unwrap();
+        let local_file = dir.join("small.txt");
+        std::fs::write(&local_file, b"test-data").unwrap();
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>WB-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
+            ))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>WB-CMD</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
+            ))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<s:Envelope><s:Body><rsp:ReceiveResponse>
+                    <rsp:CommandState CommandId="WB-CMD" State="http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Done">
+                        <rsp:ExitCode>0</rsp:ExitCode>
+                    </rsp:CommandState>
+                </rsp:ReceiveResponse></s:Body></s:Envelope>"#,
+            ))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("<s:Envelope><s:Body/></s:Envelope>"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = WinrmClient::new(basic_config(port), test_creds()).unwrap();
+        let result = client
+            .upload_file("127.0.0.1", &local_file, "C:\\dest.txt")
+            .await;
+        assert!(result.is_ok(), "upload failed: {result:?}");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_full_path_launch(&requests);
 
         std::fs::remove_dir_all(&dir).ok();
     }

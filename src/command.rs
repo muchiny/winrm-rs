@@ -22,6 +22,19 @@ pub struct CommandOutput {
     pub exit_code: i32,
 }
 
+/// Windows PowerShell addressed by its full path.
+///
+/// WinRS runs the command line through `cmd.exe /C`, which expands
+/// `%SystemRoot%`, so a `powershell.exe` placed in the working directory or
+/// found through a `PATH` set by the caller does not decide which
+/// interpreter runs.
+pub(crate) const POWERSHELL_EXE: &str =
+    r"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe";
+
+/// Flags that keep profile scripts from running and turn a prompt into an
+/// error instead of a wait.
+pub(crate) const NON_INTERACTIVE_FLAGS: [&str; 2] = ["-NoProfile", "-NonInteractive"];
+
 /// Encode a PowerShell script as UTF-16LE base64 for use with `-EncodedCommand`.
 ///
 /// This is the encoding format expected by `powershell.exe -EncodedCommand`.

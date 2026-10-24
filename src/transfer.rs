@@ -8,7 +8,9 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 
 use crate::client::WinrmClient;
-use crate::command::CommandOutput;
+use crate::command::{
+    CommandOutput, NON_INTERACTIVE_FLAGS, POWERSHELL_EXE, encode_powershell_command,
+};
 use crate::error::WinrmError;
 
 /// File transfer chunk size (raw bytes before encoding).
@@ -84,6 +86,10 @@ impl WinrmClient {
     /// The small chunk size is dictated by the WinRS command-line limit
     /// (~8191 chars) after triple encoding (base64 → UTF-16LE → base64).
     ///
+    /// The transfer scripts run
+    /// `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -NonInteractive`:
+    /// profile scripts do not run, and a prompt fails instead of waiting.
+    ///
     /// Returns the number of bytes uploaded.
     pub async fn upload_file(
         &self,
@@ -107,20 +113,11 @@ impl WinrmClient {
         for (i, chunk) in data.chunks(CHUNK_SIZE).enumerate() {
             let b64 = B64.encode(chunk);
 
-            let script = if i == 0 {
-                format!(
-                    "$bytes = [Convert]::FromBase64String('{b64}'); \
-                     [IO.File]::WriteAllBytes('{escaped_path}', $bytes)"
-                )
-            } else {
-                format!(
-                    "$bytes = [Convert]::FromBase64String('{b64}'); \
-                     $f = [IO.File]::Open('{escaped_path}', 'Append'); \
-                     $f.Write($bytes, 0, $bytes.Length); $f.Close()"
-                )
-            };
-
-            let output = shell.run_powershell(&script).await?;
+            let script = upload_script(&escaped_path, &b64, i == 0);
+            let encoded = encode_powershell_command(&script);
+            let output = shell
+                .run_command(POWERSHELL_EXE, &transfer_args(&encoded))
+                .await?;
             if output.exit_code != 0 {
                 shell.close().await.ok();
                 return Err(WinrmError::Transfer(format!(
@@ -137,10 +134,14 @@ impl WinrmClient {
     /// Download a file from a remote Windows host.
     ///
     /// Reads the file via PowerShell base64 encoding and decodes locally.
-    /// Built on [`run_powershell`](Self::run_powershell), it has no overall
+    /// Built on [`run_command`](Self::run_command), it has no overall
     /// time limit; use
     /// [`download_file_with_timeout`](Self::download_file_with_timeout) to
     /// bound it.
+    ///
+    /// The transfer script runs
+    /// `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -NonInteractive`:
+    /// profile scripts do not run, and a prompt fails instead of waiting.
     ///
     /// Returns the number of bytes downloaded.
     pub async fn download_file(
@@ -150,8 +151,10 @@ impl WinrmClient {
         local_path: &Path,
     ) -> Result<u64, WinrmError> {
         validate_remote_path(remote_path)?;
-        let script = download_script(remote_path);
-        let output = self.run_powershell(host, &script).await?;
+        let encoded = encode_powershell_command(&download_script(remote_path));
+        let output = self
+            .run_command(host, POWERSHELL_EXE, &transfer_args(&encoded))
+            .await?;
         write_download(&output, local_path)
     }
 
@@ -197,11 +200,35 @@ impl WinrmClient {
         timeout: std::time::Duration,
     ) -> Result<u64, WinrmError> {
         validate_remote_path(remote_path)?;
-        let script = download_script(remote_path);
+        let encoded = encode_powershell_command(&download_script(remote_path));
         let output = self
-            .run_powershell_with_timeout(host, &script, timeout)
+            .run_command_with_timeout(host, POWERSHELL_EXE, &transfer_args(&encoded), timeout)
             .await?;
         write_download(&output, local_path)
+    }
+}
+
+/// The arguments that run `encoded` (an `-EncodedCommand` payload) without
+/// profile scripts or prompts.
+fn transfer_args(encoded: &str) -> [&str; 4] {
+    let [no_profile, non_interactive] = NON_INTERACTIVE_FLAGS;
+    [no_profile, non_interactive, "-EncodedCommand", encoded]
+}
+
+/// The remote script for one upload chunk: the first chunk creates the file,
+/// later chunks append to it.
+fn upload_script(escaped_path: &str, b64: &str, first: bool) -> String {
+    if first {
+        format!(
+            "$bytes = [Convert]::FromBase64String('{b64}'); \
+             [IO.File]::WriteAllBytes('{escaped_path}', $bytes)"
+        )
+    } else {
+        format!(
+            "$bytes = [Convert]::FromBase64String('{b64}'); \
+             $f = [IO.File]::Open('{escaped_path}', 'Append'); \
+             $f.Write($bytes, 0, $bytes.Length); $f.Close()"
+        )
     }
 }
 
@@ -239,6 +266,29 @@ fn write_download(output: &CommandOutput, local_path: &Path) -> Result<u64, Winr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transfer_launch_is_the_full_path_without_profile_or_prompts() {
+        assert_eq!(
+            crate::command::POWERSHELL_EXE,
+            r"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
+        );
+        assert_eq!(
+            transfer_args("QQBB"),
+            ["-NoProfile", "-NonInteractive", "-EncodedCommand", "QQBB"]
+        );
+    }
+
+    #[test]
+    fn upload_script_keeps_both_chunk_forms() {
+        assert_eq!(
+            upload_script("C:\\a''b", "QUJD", true),
+            "$bytes = [Convert]::FromBase64String('QUJD'); [IO.File]::WriteAllBytes('C:\\a''b', $bytes)"
+        );
+        assert!(
+            upload_script("C:\\a", "QUJD", false).contains("[IO.File]::Open('C:\\a', 'Append')")
+        );
+    }
 
     #[test]
     fn validate_remote_path_ok() {

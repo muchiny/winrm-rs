@@ -337,20 +337,25 @@ pub(crate) fn max_response_bytes(config: &WinrmConfig) -> usize {
         .saturating_mul(4)
 }
 
-/// The TLS server name `reqwest` hands the certificate verifier for `url`:
-/// the host of the URL once parsed (`url` normalises it: IDN to punycode,
+/// The host of `url` once parsed (`url` normalises it: IDN to punycode,
 /// short or octal IPv4 forms to dotted quads, `?` or `\\` ending the host),
-/// without IPv6 brackets, as hyper-rustls's default resolver takes it from
-/// the request URI that `reqwest` builds from the same parsed URL. `None`
-/// when the URL has no host that is a valid TLS server name.
-fn url_server_name(url: &str) -> Option<rustls::pki_types::ServerName<'static>> {
+/// without IPv6 brackets. `None` when the URL has no host.
+pub(crate) fn url_host(url: &str) -> Option<String> {
     let parsed = reqwest::Url::parse(url).ok()?;
     let host = parsed.host_str()?;
     let host = host
         .strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(host);
-    rustls::pki_types::ServerName::try_from(host.to_string()).ok()
+    Some(host.to_string())
+}
+
+/// The TLS server name `reqwest` hands the certificate verifier for `url`:
+/// [`url_host`], as hyper-rustls's default resolver takes it from the
+/// request URI that `reqwest` builds from the same parsed URL. `None` when
+/// the URL has no host that is a valid TLS server name.
+pub(crate) fn url_server_name(url: &str) -> Option<rustls::pki_types::ServerName<'static>> {
+    rustls::pki_types::ServerName::try_from(url_host(url)?).ok()
 }
 
 /// Server names of the `https://` proxies a client built from `config` may
@@ -3182,6 +3187,69 @@ mod tests {
         use rustls::pki_types::pem::PemObject;
         let der = CertificateDer::from_pem_slice(cert_pem.as_bytes()).unwrap();
         crate::ntlm::crypto::compute_channel_bindings(&der).unwrap()
+    }
+
+    /// Config for a CredSSP transport aimed at a loopback test server on `port`.
+    #[cfg(feature = "credssp")]
+    fn credssp_test_config(port: u16) -> WinrmConfig {
+        WinrmConfig {
+            auth_method: AuthMethod::CredSsp,
+            use_tls: true,
+            accept_invalid_certs: true,
+            port,
+            connect_timeout_secs: 1,
+            operation_timeout_secs: 5,
+            ..Default::default()
+        }
+    }
+
+    /// CredSSP transport aimed at a loopback test server on `port`.
+    #[cfg(feature = "credssp")]
+    fn credssp_test_transport(port: u16) -> HttpTransport {
+        HttpTransport::new(
+            credssp_test_config(port),
+            WinrmCredentials::new(USER, PASS, ""),
+        )
+        .unwrap()
+    }
+
+    /// A CredSSP request to a bracketed IPv6 host reaches the TLS handshake.
+    #[cfg(feature = "credssp")]
+    #[tokio::test]
+    async fn credssp_reaches_a_bracketed_ipv6_endpoint() {
+        let Ok(listener) = std::net::TcpListener::bind("[::1]:0") else {
+            eprintln!("SKIP credssp_reaches_a_bracketed_ipv6_endpoint: no IPv6 loopback");
+            return;
+        };
+        let port = listener.local_addr().unwrap().port();
+        // Accept once and close: the client's TLS handshake then fails.
+        let accepted =
+            std::thread::spawn(move || accept_with_deadline(&listener).map(drop).is_ok());
+        let transport = credssp_test_transport(port);
+        let err = tokio::time::timeout(
+            Duration::from_secs(20),
+            transport.send_soap_raw("[::1]", "<a/>".into()),
+        )
+        .await
+        .expect("bounded")
+        .unwrap_err();
+        assert!(err.to_string().contains("CredSSP outer TLS"), "{err}");
+        assert!(accepted.join().unwrap(), "no TCP connection reached [::1]");
+    }
+
+    #[test]
+    fn url_host_is_the_bracket_free_host_of_the_parsed_url() {
+        assert_eq!(url_host("https://[::1]:5986/wsman").as_deref(), Some("::1"));
+        assert_eq!(
+            url_host("https://bücher.example:5986/wsman").as_deref(),
+            Some("xn--bcher-kva.example")
+        );
+        assert_eq!(
+            url_host("https://Host.Example/x").as_deref(),
+            Some("host.example")
+        );
+        assert_eq!(url_host("not a url"), None);
+        assert_eq!(url_host("mailto:a@b"), None);
     }
 
     fn ntlm_tls_transport(port: u16, proxy_port: u16) -> HttpTransport {

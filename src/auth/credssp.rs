@@ -315,8 +315,8 @@ fn build_inner_openssl_tls() -> Result<OpenSslMemTls, WinrmError> {
 #[cfg(feature = "credssp")]
 struct CredSspConnection {
     stream: tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
-    host: String,
-    port: u16,
+    /// `Host` header value (see [`CredSspEndpoint::host_header`]).
+    host_header: String,
     path: String,
     /// Largest response body accepted (see `transport::max_response_bytes`).
     max_response_bytes: usize,
@@ -324,16 +324,14 @@ struct CredSspConnection {
 
 #[cfg(feature = "credssp")]
 impl CredSspConnection {
-    /// Open a TCP+TLS connection to (host:port). The returned object owns
+    /// Open a TCP+TLS connection to `endpoint`. The returned object owns
     /// the underlying socket; drop to close.
     ///
     /// `accept_invalid_certs = true` disables outer TLS verification (test
     /// use only). Nothing inside CredSSP replaces it: the inner TLS is not
     /// verified (MS-CSSP 1.3) and `pubKeyAuth` binds only the inner TLS key.
     async fn connect(
-        host: &str,
-        port: u16,
-        path: &str,
+        endpoint: &CredSspEndpoint,
         accept_invalid_certs: bool,
         max_response_bytes: usize,
     ) -> Result<Self, WinrmError> {
@@ -364,24 +362,20 @@ impl CredSspConnection {
         apply_debug_key_log(&mut outer_config);
         let connector = TlsConnector::from(Arc::new(outer_config));
 
-        let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
-            .map_err(|_| WinrmError::AuthFailed(format!("CredSSP: invalid SNI: {host}")))?;
-
-        let tcp = TcpStream::connect((host, port))
+        let tcp = TcpStream::connect((endpoint.host.as_str(), endpoint.port))
             .await
             .map_err(|e| WinrmError::AuthFailed(format!("CredSSP TCP connect: {e}")))?;
         tcp.set_nodelay(true).ok();
 
         let stream = connector
-            .connect(server_name, tcp)
+            .connect(endpoint.server_name.clone(), tcp)
             .await
             .map_err(|e| WinrmError::AuthFailed(format!("CredSSP outer TLS: {e}")))?;
 
         Ok(Self {
             stream,
-            host: host.to_string(),
-            port,
-            path: path.to_string(),
+            host_header: endpoint.host_header.clone(),
+            path: endpoint.path.clone(),
             max_response_bytes,
         })
     }
@@ -401,7 +395,7 @@ impl CredSspConnection {
         // pywinrm/urllib3 puts Authorization BEFORE Content-Type/Content-Length.
         // Microsoft HTTPAPI may rely on this ordering for CredSSP context tracking.
         write!(req, "POST {} HTTP/1.1\r\n", self.path).unwrap();
-        write!(req, "Host: {}:{}\r\n", self.host, self.port).unwrap();
+        write!(req, "Host: {}\r\n", self.host_header).unwrap();
         write!(req, "User-Agent: Python WinRM client\r\n").unwrap();
         write!(req, "Accept-Encoding: gzip, deflate, zstd\r\n").unwrap();
         write!(req, "Accept: */*\r\n").unwrap();
@@ -555,27 +549,60 @@ fn extract_credssp_token_str(www_auth: &str) -> Option<String> {
     if token.is_empty() { None } else { Some(token) }
 }
 
-/// Parse `https://host:port/path` into (host, port, path) for CredSspConnection.
+/// Where a CredSSP request goes: the endpoint URL parsed as reqwest parses it.
 #[cfg(feature = "credssp")]
-fn parse_url(url: &str) -> Result<(String, u16, String), WinrmError> {
-    let after_scheme = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .ok_or_else(|| WinrmError::AuthFailed(format!("CredSSP: bad URL {url}")))?;
-    let (authority, path) = match after_scheme.find('/') {
-        Some(i) => (&after_scheme[..i], &after_scheme[i..]),
-        None => (after_scheme, "/"),
-    };
-    let (host, port) = match authority.rfind(':') {
-        Some(i) => {
-            let p: u16 = authority[i + 1..]
-                .parse()
-                .map_err(|_| WinrmError::AuthFailed(format!("CredSSP: bad port in {url}")))?;
-            (authority[..i].to_string(), p)
+pub(crate) struct CredSspEndpoint {
+    /// Host to connect to and to name in the SPN: punycode, IPv6 without brackets.
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    /// Request target: path, plus `?query` when there is one.
+    pub(crate) path: String,
+    /// `Host` header value: `host:port`, IPv6 in brackets.
+    pub(crate) host_header: String,
+    pub(crate) server_name: rustls::pki_types::ServerName<'static>,
+}
+
+#[cfg(feature = "credssp")]
+impl CredSspEndpoint {
+    /// Parse `url` (scheme `https` or `http`) the way reqwest does for the
+    /// other authentication methods.
+    pub(crate) fn parse(url: &str) -> Result<Self, WinrmError> {
+        let bad_url = || WinrmError::AuthFailed(format!("CredSSP: bad URL {url}"));
+        let parsed = reqwest::Url::parse(url).map_err(|_| bad_url())?;
+        if !matches!(parsed.scheme(), "https" | "http") {
+            return Err(bad_url());
         }
-        None => (authority.to_string(), 5986),
-    };
-    Ok((host, port, path.to_string()))
+        let port = parsed.port_or_known_default().ok_or_else(bad_url)?;
+        let invalid_sni = || {
+            WinrmError::AuthFailed(format!(
+                "CredSSP: invalid SNI: {}",
+                parsed.host_str().unwrap_or_default()
+            ))
+        };
+        let host = crate::transport::url_host(url).ok_or_else(invalid_sni)?;
+        let server_name = crate::transport::url_server_name(url).ok_or_else(invalid_sni)?;
+        let path = match parsed.query() {
+            Some(query) => format!("{}?{query}", parsed.path()),
+            None => parsed.path().to_string(),
+        };
+        let host_header = if host.contains(':') {
+            format!("[{host}]:{port}")
+        } else {
+            format!("{host}:{port}")
+        };
+        Ok(Self {
+            host,
+            port,
+            path,
+            host_header,
+            server_name,
+        })
+    }
+
+    /// `HTTP/<host>`, the NTLM target name.
+    pub(crate) fn spn(&self) -> String {
+        format!("HTTP/{}", self.host.to_ascii_lowercase())
+    }
 }
 
 /// CredSSP authentication transport.
@@ -606,11 +633,9 @@ impl AuthTransport for CredSspAuth {
         // the server's inner-TLS state is bound to the socket. We bypass
         // reqwest entirely and drive raw HTTP/1.1 over a single tokio_rustls
         // TlsStream. See CredSspConnection above.
-        let (host, port, path) = parse_url(url)?;
+        let endpoint = CredSspEndpoint::parse(url)?;
         let mut conn = CredSspConnection::connect(
-            &host,
-            port,
-            &path,
+            &endpoint,
             self.accept_invalid_certs,
             self.max_response_bytes,
         )
@@ -749,14 +774,8 @@ impl AuthTransport for CredSspAuth {
         // CONFIRMED via forensic hash analysis: pywinrm uses username.upper()+empty
         // for NTOWFv2 (NTProofStr matches when computed this way). Empty domain.
         let domain = self.domain.clone();
-        // Compute SPN from URL hostname
-        let host = url
-            .strip_prefix("https://")
-            .or_else(|| url.strip_prefix("http://"))
-            .unwrap_or(url);
-        let host_part = host.split('/').next().unwrap_or(host);
-        let host_only = host_part.split(':').next().unwrap_or(host_part);
-        let spn = format!("HTTP/{host_only}");
+        // SPN from the endpoint host (punycode, lowercase, IPv6 without brackets).
+        let spn = endpoint.spn();
 
         // No `.await` inside this block: the exported session key never becomes
         // part of the future's state, and `Zeroizing` wipes it when the block
@@ -1051,42 +1070,75 @@ mod tests {
         assert!(advertises_credssp(&h));
     }
 
+    use rustls::pki_types::ServerName;
+
     #[test]
-    fn parse_url_https_with_port_and_path() {
-        let (h, p, path) = parse_url("https://host.example:5986/wsman").unwrap();
-        assert_eq!(h, "host.example");
-        assert_eq!(p, 5986);
-        assert_eq!(path, "/wsman");
+    fn credssp_endpoint_strips_ipv6_brackets_for_connect_sni_and_spn() {
+        let e = CredSspEndpoint::parse("https://[::1]:5986/wsman").unwrap();
+        assert_eq!(
+            (e.host.as_str(), e.port, e.path.as_str()),
+            ("::1", 5986, "/wsman")
+        );
+        assert_eq!(e.host_header, "[::1]:5986");
+        assert_eq!(e.server_name, ServerName::try_from("::1").unwrap());
+        assert_eq!(e.spn(), "HTTP/::1");
     }
 
     #[test]
-    fn parse_url_http_scheme_also_accepted() {
-        let (h, p, path) = parse_url("http://h:80/x").unwrap();
-        assert_eq!((h.as_str(), p, path.as_str()), ("h", 80, "/x"));
+    fn credssp_endpoint_punycodes_an_idn_host() {
+        let e = CredSspEndpoint::parse("https://bücher.example:5986/wsman").unwrap();
+        assert_eq!(e.host, "xn--bcher-kva.example");
+        assert_eq!(e.host_header, "xn--bcher-kva.example:5986");
+        assert_eq!(
+            e.server_name,
+            ServerName::try_from("xn--bcher-kva.example").unwrap()
+        );
+        assert_eq!(e.spn(), "HTTP/xn--bcher-kva.example");
     }
 
     #[test]
-    fn parse_url_defaults_port_5986_when_missing() {
-        let (h, p, path) = parse_url("https://host/wsman").unwrap();
-        assert_eq!(h, "host");
-        assert_eq!(p, 5986);
-        assert_eq!(path, "/wsman");
+    fn credssp_endpoint_keeps_todays_results_for_plain_hosts() {
+        let e = CredSspEndpoint::parse("https://host.example:5986/wsman").unwrap();
+        assert_eq!(
+            (e.host.as_str(), e.port, e.path.as_str()),
+            ("host.example", 5986, "/wsman")
+        );
+        assert_eq!(e.host_header, "host.example:5986");
+        assert_eq!(
+            CredSspEndpoint::parse("https://10.0.0.5:5986/wsman")
+                .unwrap()
+                .spn(),
+            "HTTP/10.0.0.5"
+        );
+        assert_eq!(
+            CredSspEndpoint::parse("https://host:5986").unwrap().path,
+            "/"
+        );
+        assert_eq!(CredSspEndpoint::parse("http://h:80/x").unwrap().port, 80);
+        // The URL parser drops a default port; the transport always writes one.
+        assert_eq!(
+            CredSspEndpoint::parse("https://host:443/wsman")
+                .unwrap()
+                .port,
+            443
+        );
     }
 
     #[test]
-    fn parse_url_defaults_path_when_missing() {
-        let (h, p, path) = parse_url("https://host:5986").unwrap();
-        assert_eq!((h.as_str(), p, path.as_str()), ("host", 5986, "/"));
+    fn credssp_endpoint_spn_host_is_lowercase_like_pyspnego() {
+        assert_eq!(
+            CredSspEndpoint::parse("https://WIN01.Corp:5986/wsman")
+                .unwrap()
+                .spn(),
+            "HTTP/win01.corp"
+        );
     }
 
     #[test]
-    fn parse_url_rejects_bad_scheme() {
-        assert!(parse_url("ftp://host/path").is_err());
-    }
-
-    #[test]
-    fn parse_url_rejects_bad_port() {
-        assert!(parse_url("https://host:notaport/x").is_err());
+    fn credssp_endpoint_rejects_bad_scheme_and_port() {
+        assert!(CredSspEndpoint::parse("ftp://host/path").is_err());
+        assert!(CredSspEndpoint::parse("https://host:notaport/x").is_err());
+        assert!(CredSspEndpoint::parse("https://host:99999/x").is_err());
     }
 
     #[test]
@@ -1212,7 +1264,9 @@ mod tests {
         ] {
             let (port, _read) =
                 crate::test_pki::spawn_tls_sink(crate::test_pki::impostor_server_config(versions));
-            match CredSspConnection::connect("127.0.0.1", port, "/wsman", true, 1 << 20).await {
+            let endpoint =
+                CredSspEndpoint::parse(&format!("https://127.0.0.1:{port}/wsman")).unwrap();
+            match CredSspConnection::connect(&endpoint, true, 1 << 20).await {
                 Err(WinrmError::AuthFailed(m)) => {
                     assert!(m.starts_with("CredSSP outer TLS:"), "{label}: {m}");
                 }

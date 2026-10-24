@@ -71,6 +71,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   client has sent one. Windows sends both on every version after Server 2003.
   A malformed `negoTokens` field is now an error instead of being read as
   absent.
+- CredSSP works with a host given as a bracketed IPv6 literal or an
+  internationalised name: the TLS server name, the TCP connection and the SPN
+  now come from the endpoint URL, parsed as for the other methods.
 
 ## [1.4.1] - 2026-10-24
 

@@ -105,6 +105,12 @@ impl NtlmSession {
         server_seal_handle: Rc4State::INERT,
     };
 
+    /// Test-only setter used to drive the client sequence counter to its limit.
+    #[cfg(test)]
+    fn set_client_seq_num(&mut self, n: u32) {
+        self.client_seq_num = n;
+    }
+
     /// Derive the four session keys (client/server seal/sign) from the
     /// exported session key per MS-NLMP section 3.4.4, reset the sequence
     /// numbers, and initialise the RC4 handles, all in place.
@@ -190,7 +196,9 @@ impl NtlmSession {
         result.extend_from_slice(&checksum_8);
         result.extend_from_slice(&self.client_seq_num.to_le_bytes());
 
-        self.client_seq_num += 1;
+        // A wrap is harmless: the RC4 stream is continuous, so a replayed frame
+        // fails the HMAC at a different keystream offset.
+        self.client_seq_num = self.client_seq_num.wrapping_add(1);
 
         result.extend_from_slice(&ciphertext);
         result
@@ -214,7 +222,9 @@ impl NtlmSession {
         sig[0..4].copy_from_slice(&1u32.to_le_bytes());
         sig[4..12].copy_from_slice(&checksum_8);
         sig[12..16].copy_from_slice(&self.client_seq_num.to_le_bytes());
-        self.client_seq_num += 1;
+        // A wrap is harmless: the RC4 stream is continuous, so a replayed frame
+        // fails the HMAC at a different keystream offset.
+        self.client_seq_num = self.client_seq_num.wrapping_add(1);
         sig
     }
 
@@ -292,7 +302,9 @@ impl NtlmSession {
             ));
         }
 
-        self.server_seq_num += 1;
+        // A wrap is harmless: the RC4 stream is continuous, so a replayed frame
+        // fails the HMAC at a different keystream offset.
+        self.server_seq_num = self.server_seq_num.wrapping_add(1);
         self.server_seal_handle.reinit(&self.server_seal_key);
         Ok(())
     }
@@ -354,7 +366,9 @@ impl NtlmSession {
             return Err(NtlmError::InvalidMessage("checksum mismatch".into()));
         }
 
-        self.server_seq_num += 1;
+        // A wrap is harmless: the RC4 stream is continuous, so a replayed frame
+        // fails the HMAC at a different keystream offset.
+        self.server_seq_num = self.server_seq_num.wrapping_add(1);
         Ok(plaintext)
     }
 }
@@ -603,6 +617,19 @@ mod tests {
         assert_eq!(seq_num, 0);
 
         assert_ne!(&sealed[16..], &plaintext[..]);
+    }
+
+    #[test]
+    fn seq_num_wraps_without_panic() {
+        let mut s = NtlmSession::from_auth(&[0x42; 16]);
+        s.set_client_seq_num(u32::MAX);
+        let a = s.seal(b"x"); // SeqNum field 0xFFFFFFFF
+        let b = s.seal(b"y"); // SeqNum field 0x00000000, no panic
+        assert_eq!(
+            u32::from_le_bytes(a[12..16].try_into().unwrap()),
+            0xFFFF_FFFF
+        );
+        assert_eq!(u32::from_le_bytes(b[12..16].try_into().unwrap()), 0);
     }
 
     #[test]

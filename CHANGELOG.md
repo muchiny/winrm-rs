@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-10-24
+
+PSRP callers can now stop a running pipeline.
+
 ### Fixed
 
 - **`Shell::signal_ctrl_c` stops a PSRP pipeline.** On a PSRP shell the Signal

@@ -143,6 +143,12 @@ let client = WinrmClient::new(
 )?;
 ```
 
+The private key stays in process memory for the client's lifetime, inside
+`rustls` and `ring`, which do not wipe it on drop. The crate wipes the PEM text
+it reads; the decoded key it hands to `rustls`, and the copies made while
+decoding it, are not wiped. Protect core dumps, swap and hibernation files on
+hosts that hold the key.
+
 ### PowerShell execution
 
 ```rust

@@ -91,6 +91,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   of being misread. CredSSP requests send `Accept-Encoding: identity`, and
   send `WinrmConfig::user_agent` (default `winrm-rs/<version>`) like the
   other methods.
+- **`client_cert_pem` / `client_key_pem` values that look like key material
+  are never printed.** These fields take file paths. A value holding PEM text
+  or a long base64 string was echoed in full by `WinrmConfig`'s `Debug` output
+  and by the construction error. Both now show a placeholder. Real paths are
+  still shown.
 
 ### Documentation
 

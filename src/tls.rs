@@ -370,11 +370,15 @@ const MAX_PEM_FILE_BYTES: u64 = 1024 * 1024;
 /// copy rustls keeps, are not.
 ///
 /// Every failure is a [`WinrmError::AuthFailed`] naming the file; the message
-/// never quotes the file contents, so no key material can leak through it.
+/// never quotes the file contents, and a path argument that looks like key
+/// material is replaced by a placeholder, so no key material can leak through
+/// it.
 pub(crate) fn load_client_auth_cert(
     cert_path: &str,
     key_path: &str,
 ) -> Result<ClientAuthCert, WinrmError> {
+    let cert_shown = shown_path(cert_path);
+    let key_shown = shown_path(key_path);
     // A combined cert+key file may be passed as `cert_path`: wipe both.
     let cert_pem = read_pem_file(cert_path, "client cert")?;
     let key_pem = read_pem_file(key_path, "client key")?;
@@ -383,19 +387,19 @@ pub(crate) fn load_client_auth_cert(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| {
             WinrmError::AuthFailed(format!(
-                "invalid PEM in client cert {cert_path}: {}",
+                "invalid PEM in client cert {cert_shown}: {}",
                 describe_pem_error(&e)
             ))
         })?;
     if chain.is_empty() {
         return Err(WinrmError::AuthFailed(format!(
-            "client cert {cert_path} contains no certificate (expected a CERTIFICATE PEM section)"
+            "client cert {cert_shown} contains no certificate (expected a CERTIFICATE PEM section)"
         )));
     }
 
     if is_encrypted_key_pem(&key_pem) {
         return Err(WinrmError::AuthFailed(format!(
-            "client key {key_path}: encrypted private keys are not supported \
+            "client key {key_shown}: encrypted private keys are not supported \
              (decrypt it, e.g. `openssl pkey -in <key> -out <unencrypted key>`)"
         )));
     }
@@ -404,13 +408,13 @@ pub(crate) fn load_client_auth_cert(
         Ok(key) => key,
         Err(pem::Error::NoItemsFound) => {
             return Err(WinrmError::AuthFailed(format!(
-                "client key {key_path} contains no private key (expected a PRIVATE KEY, \
+                "client key {key_shown} contains no private key (expected a PRIVATE KEY, \
                  RSA PRIVATE KEY or EC PRIVATE KEY PEM section)"
             )));
         }
         Err(e) => {
             return Err(WinrmError::AuthFailed(format!(
-                "invalid PEM in client key {key_path}: {}",
+                "invalid PEM in client key {key_shown}: {}",
                 describe_pem_error(&e)
             )));
         }
@@ -425,9 +429,10 @@ pub(crate) fn load_client_auth_cert(
 fn read_pem_file(path: &str, what: &str) -> Result<Zeroizing<Vec<u8>>, WinrmError> {
     use std::io::Read;
 
+    let shown = shown_path(path);
     let read_err =
-        |e: std::io::Error| WinrmError::AuthFailed(format!("failed to read {what} {path}: {e}"));
-    let not_regular = || WinrmError::AuthFailed(format!("{what} {path} is not a regular file"));
+        |e: std::io::Error| WinrmError::AuthFailed(format!("failed to read {what} {shown}: {e}"));
+    let not_regular = || WinrmError::AuthFailed(format!("{what} {shown} is not a regular file"));
     // Checked before opening too: opening a FIFO for reading would block.
     if !std::fs::metadata(path).map_err(read_err)?.is_file() {
         return Err(not_regular());
@@ -446,7 +451,7 @@ fn read_pem_file(path: &str, what: &str) -> Result<Zeroizing<Vec<u8>>, WinrmErro
         .map_err(read_err)?;
     if u64::try_from(buf.len()).map_or(true, |n| n > MAX_PEM_FILE_BYTES) {
         return Err(WinrmError::AuthFailed(format!(
-            "{what} {path} is larger than {MAX_PEM_FILE_BYTES} bytes"
+            "{what} {shown} is larger than {MAX_PEM_FILE_BYTES} bytes"
         )));
     }
     Ok(buf)
@@ -473,6 +478,70 @@ fn describe_pem_error(e: &pem::Error) -> &'static str {
         pem::Error::NoItemsFound => "no PEM section found",
         pem::Error::SectionTooLarge => "PEM section too large",
         _ => "malformed PEM",
+    }
+}
+
+/// Placeholder shown in place of a `client_cert_pem` / `client_key_pem` value
+/// that looks like key material, in errors that would otherwise name the path.
+pub(crate) const KEY_MATERIAL_NOT_SHOWN: &str =
+    "<not shown: looks like key material, and this field takes a file path>";
+
+/// Longest path component any common file system accepts (`NAME_MAX`).
+const MAX_PATH_COMPONENT_BYTES: usize = 255;
+
+/// Shortest value that the base64 rule of [`looks_like_key_material`] looks at.
+const MIN_ENCODED_KEY_BYTES: usize = 64;
+
+/// Whether a `client_cert_pem` / `client_key_pem` value is probably key
+/// material pasted where a file path belongs, so that it must never be printed.
+///
+/// True when the value contains `-----BEGIN` or a line break, when a path
+/// component (split on `/` and `\`) is longer than 255 bytes (no such path
+/// can exist), or when it is at least 64 bytes of the base64 alphabet whose
+/// start decodes to a PEM armor line (a whole PEM encoded once more) or to a
+/// DER `SEQUENCE` (a bare key). A long dotless path of letters, digits and `/`
+/// is still a path. Only the first 16 characters are ever decoded.
+pub(crate) fn looks_like_key_material(value: &str) -> bool {
+    value.contains("-----BEGIN")
+        || value.contains(['\n', '\r'])
+        || value
+            .split(['/', '\\'])
+            .any(|component| component.len() > MAX_PATH_COMPONENT_BYTES)
+        || starts_like_encoded_key(value)
+}
+
+/// Rule (4) of [`looks_like_key_material`].
+fn starts_like_encoded_key(value: &str) -> bool {
+    use base64::Engine as _;
+
+    if value.len() < MIN_ENCODED_KEY_BYTES
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+    {
+        return false;
+    }
+    // The value is ASCII here, so `get` cannot split a character.
+    let Some(head) = value.get(..16) else {
+        return false;
+    };
+    let mut decoded = Zeroizing::new(Vec::with_capacity(16));
+    if base64::engine::general_purpose::STANDARD
+        .decode_vec(head, &mut decoded)
+        .is_err()
+    {
+        return false;
+    }
+    decoded.starts_with(b"-----BEGIN") || decoded.first() == Some(&0x30)
+}
+
+/// `value` for a message that names a file, or [`KEY_MATERIAL_NOT_SHOWN`] when
+/// it looks like key material.
+fn shown_path(value: &str) -> &str {
+    if looks_like_key_material(value) {
+        KEY_MATERIAL_NOT_SHOWN
+    } else {
+        value
     }
 }
 
@@ -874,5 +943,89 @@ mod tests {
                 .verify_tls13_signature(b"message", &cert, &dss)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn looks_like_key_material_separates_paths_from_keys() {
+        use crate::test_pki::EC_KEY_PKCS8_PEM;
+        for (value, expected) in [
+            ("/etc/winrm/client.pem", false),
+            (r"C:\certs\client.key", false),
+            ("client.pem", false),
+            ("/opt/winrm/keys/clientkey", false),
+            ("-----BEGIN PRIVATE KEY-----", true),
+            ("a\nb", true),
+            (EC_KEY_PKCS8_PEM, true),
+        ] {
+            assert_eq!(looks_like_key_material(value), expected, "{value:?}");
+        }
+        let one_line: String = EC_KEY_PKCS8_PEM
+            .lines()
+            .filter(|l| !l.starts_with("-----"))
+            .collect();
+        assert!(looks_like_key_material(&one_line));
+        // A 256-byte component is key material, a 255-byte one is a path.
+        assert!(looks_like_key_material(&format!(
+            "/var/lib/winrm/{}.pem",
+            "k".repeat(252)
+        )));
+        assert!(!looks_like_key_material(&format!(
+            "/var/lib/winrm/{}.pem",
+            "k".repeat(251)
+        )));
+        assert!(!looks_like_key_material(&"A".repeat(63)));
+        // Decodes to 0x00..: neither an armor line nor a DER tag.
+        assert!(!looks_like_key_material(&"A".repeat(64)));
+        // 0x30 0x82 0x01 0x00: a DER SEQUENCE.
+        assert!(looks_like_key_material(&format!("MIIB{}", "A".repeat(60))));
+        // Long dotless paths made only of base64-alphabet characters stay paths.
+        assert!(!looks_like_key_material(
+            "/opt/winrm/keys/abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        ));
+        assert!(!looks_like_key_material(
+            "/opt/winrm/keys/abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZab"
+        ));
+        let whole = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(EC_KEY_PKCS8_PEM)
+        };
+        assert!(looks_like_key_material(&whole));
+    }
+
+    #[test]
+    fn looks_like_key_material_handles_non_ascii_and_extremes() {
+        assert!(!looks_like_key_material(""));
+        assert!(!looks_like_key_material("/etc/winrm/clé-client.pem"));
+        assert!(!looks_like_key_material(&"é".repeat(40)));
+        // Multi-byte characters straddling the 16-byte mark of a long value.
+        assert!(!looks_like_key_material(&format!(
+            "{}é{}",
+            "A".repeat(15),
+            "A".repeat(60)
+        )));
+        assert!(looks_like_key_material(&"é".repeat(200)));
+        // A very long value is a component over 255 bytes: key material.
+        assert!(looks_like_key_material(&"A".repeat(1_000_000)));
+        assert!(!looks_like_key_material(&"/a".repeat(100_000)));
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn looks_like_key_material_never_panics(value in "\\PC{0,300}") {
+            let _ = looks_like_key_material(&value);
+        }
+
+        #[test]
+        fn looks_like_key_material_never_panics_on_base64_alphabet(
+            value in "[A-Za-z0-9+/=]{0,200}"
+        ) {
+            let _ = looks_like_key_material(&value);
+        }
+    }
+
+    #[test]
+    fn shown_path_keeps_paths_and_hides_key_material() {
+        assert_eq!(shown_path("/etc/winrm/client.pem"), "/etc/winrm/client.pem");
+        assert_eq!(shown_path("a\nb"), KEY_MATERIAL_NOT_SHOWN);
     }
 }

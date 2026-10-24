@@ -11,8 +11,11 @@ use secrecy::SecretString;
 /// 5985, NTLM auth, 30 s connect / 60 s operation timeouts).
 ///
 /// Its `Debug` output lists every field but redacts the userinfo of
-/// [`proxy`](Self::proxy) (`http://<redacted>@proxy:8080`) and shows only the
-/// names of [`env_vars`](Self::env_vars), so it can be logged.
+/// [`proxy`](Self::proxy) (`http://<redacted>@proxy:8080`), shows only the
+/// names of [`env_vars`](Self::env_vars), and replaces a
+/// [`client_cert_pem`](Self::client_cert_pem) /
+/// [`client_key_pem`](Self::client_key_pem) value that looks like key material
+/// rather than a path, so it can be logged.
 #[derive(Clone)]
 pub struct WinrmConfig {
     /// TCP port of the WinRM listener (default: 5985). It does not follow [`use_tls`](Self::use_tls): with `use_tls = true`, set the HTTPS listener's port (5986 on a stock Windows host).
@@ -114,10 +117,18 @@ pub struct WinrmConfig {
     pub max_retries: u32,
     /// Path to the client certificate PEM file (for `AuthMethod::Certificate`).
     ///
+    /// A file path, not the PEM text itself: a value that looks like key
+    /// material (PEM text, a long base64 string) is never printed; `Debug` and
+    /// construction errors show a placeholder instead.
+    ///
     /// Holds one or more `CERTIFICATE` sections: the end-entity certificate
     /// first, then any intermediates. Read when the client is built.
     pub client_cert_pem: Option<String>,
     /// Path to the client private key PEM file (for `AuthMethod::Certificate`).
+    ///
+    /// A file path, not the PEM text itself: a value that looks like key
+    /// material (PEM text, a long base64 string) is never printed; `Debug` and
+    /// construction errors show a placeholder instead.
     ///
     /// Accepted encodings: `PRIVATE KEY` (PKCS#8), `RSA PRIVATE KEY` (PKCS#1)
     /// and `EC PRIVATE KEY` (SEC1), unencrypted. It must match the end-entity
@@ -282,8 +293,8 @@ impl std::fmt::Debug for WinrmConfig {
             .field("auth_method", auth_method)
             .field("max_envelope_size", max_envelope_size)
             .field("max_retries", max_retries)
-            .field("client_cert_pem", client_cert_pem)
-            .field("client_key_pem", client_key_pem)
+            .field("client_cert_pem", &client_cert_pem.as_deref().map(PemPath))
+            .field("client_key_pem", &client_key_pem.as_deref().map(PemPath))
             .field("proxy", &proxy)
             .field("codepage", codepage)
             .field("working_directory", working_directory)
@@ -293,6 +304,20 @@ impl std::fmt::Debug for WinrmConfig {
             .field("idle_timeout_secs", idle_timeout_secs)
             .field("max_output_bytes", max_output_bytes)
             .finish()
+    }
+}
+
+/// `client_cert_pem` / `client_key_pem` in [`WinrmConfig`]'s `Debug`: the path
+/// as a string, or a placeholder when the value looks like key material.
+struct PemPath<'a>(&'a str);
+
+impl std::fmt::Debug for PemPath<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if crate::tls::looks_like_key_material(self.0) {
+            f.write_str("<redacted: looks like key material, not a file path>")
+        } else {
+            std::fmt::Debug::fmt(self.0, f)
+        }
     }
 }
 
@@ -460,6 +485,12 @@ pub enum AuthMethod {
     /// in), and when a file is missing, not a regular file, over 1 MiB, holds
     /// no certificate or no key, holds an encrypted key (unencrypted keys
     /// only), or holds a key that does not match the certificate.
+    ///
+    /// The private key stays in process memory for the client's lifetime,
+    /// inside `rustls` and `ring`, which do not wipe it on drop. The crate
+    /// wipes the PEM text it reads; the decoded key it hands to `rustls`, and
+    /// the copies made while decoding it, are not wiped. Protect core dumps,
+    /// swap and hibernation files on hosts that hold the key.
     ///
     /// Like credentials, the certificate belongs to the client: the same one
     /// is presented to every host passed to the client's methods. See
@@ -697,5 +728,58 @@ mod tests {
         let method = AuthMethod::Certificate;
         let debug = format!("{method:?}");
         assert!(debug.contains("Certificate"));
+    }
+
+    #[test]
+    fn debug_redacts_key_material_in_cert_and_key_fields() {
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
+        let config = WinrmConfig {
+            client_cert_pem: Some(format!("{EC_CERT_PEM}{EC_KEY_PKCS8_PEM}")),
+            client_key_pem: Some(EC_KEY_PKCS8_PEM.to_string()),
+            ..Default::default()
+        };
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("BEGIN"), "{debug}");
+        assert!(!debug.contains("IvSE2eFVFQPSvWUFhXFxIaP6"), "{debug}");
+        assert_eq!(
+            debug
+                .matches("<redacted: looks like key material, not a file path>")
+                .count(),
+            2
+        );
+        let paths = WinrmConfig {
+            client_cert_pem: Some("/etc/winrm/client.pem".into()),
+            client_key_pem: Some(r"C:\certs\client.key".into()),
+            ..Default::default()
+        };
+        let debug = format!("{paths:?}");
+        assert!(
+            debug.contains(r#"client_cert_pem: Some("/etc/winrm/client.pem")"#),
+            "{debug}"
+        );
+        assert!(
+            debug.contains(r#"client_key_pem: Some("C:\\certs\\client.key")"#),
+            "{debug}"
+        );
+    }
+
+    #[test]
+    fn debug_redacts_a_one_line_base64_key() {
+        use crate::test_pki::EC_KEY_PKCS8_PEM;
+        use base64::Engine as _;
+        let body: String = EC_KEY_PKCS8_PEM
+            .lines()
+            .filter(|l| !l.starts_with("-----"))
+            .collect();
+        let whole = base64::engine::general_purpose::STANDARD.encode(EC_KEY_PKCS8_PEM);
+        for value in [body, whole] {
+            let config = WinrmConfig {
+                client_key_pem: Some(value.clone()),
+                ..Default::default()
+            };
+            let debug = format!("{config:?}");
+            assert!(!debug.contains(&value[..24]), "{debug}");
+            assert!(debug.contains("<redacted: looks like key material, not a file path>"));
+        }
     }
 }

@@ -1801,6 +1801,62 @@ mod tests {
         assert!(msg.contains(&files.key), "names the file: {msg}");
     }
 
+    /// The private key of `EC_KEY_PKCS8_PEM` as one base64 line, without armor.
+    fn one_line_key_body() -> String {
+        crate::test_pki::EC_KEY_PKCS8_PEM
+            .lines()
+            .filter(|l| !l.starts_with("-----"))
+            .collect()
+    }
+
+    fn assert_key_material_not_echoed(msg: &str, value: &str) {
+        assert!(!msg.contains("BEGIN"), "{msg}");
+        assert!(!msg.contains(&value[..24]), "{msg}");
+        assert!(!msg.contains("IvSE2eFVFQPSvWUFhXFxIaP6"), "{msg}");
+        assert!(msg.contains("this field takes a file path"), "{msg}");
+    }
+
+    #[test]
+    fn certificate_auth_key_material_in_key_path_is_never_echoed() {
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
+        let files = pem_files("redactkey", EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        for value in [EC_KEY_PKCS8_PEM.to_string(), one_line_key_body()] {
+            let msg = cert_auth_failed(WinrmConfig {
+                client_key_pem: Some(value.clone()),
+                ..cert_tls_config(&files)
+            });
+            assert_key_material_not_echoed(&msg, &value);
+        }
+    }
+
+    #[test]
+    fn certificate_auth_key_material_in_cert_path_is_never_echoed() {
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
+        let files = pem_files("redactcert", EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        for value in [
+            format!("{EC_CERT_PEM}{EC_KEY_PKCS8_PEM}"),
+            one_line_key_body(),
+        ] {
+            // The cert file is read first, so that read fails.
+            let msg = cert_auth_failed(WinrmConfig {
+                client_cert_pem: Some(value.clone()),
+                ..cert_tls_config(&files)
+            });
+            assert_key_material_not_echoed(&msg, &value);
+        }
+    }
+
+    #[test]
+    fn certificate_auth_missing_path_is_still_named() {
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
+        let files = pem_files("namedpath", EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let msg = cert_auth_failed(WinrmConfig {
+            client_key_pem: Some("/nonexistent/winrm-rs/client.key".into()),
+            ..cert_tls_config(&files)
+        });
+        assert!(msg.contains("/nonexistent/winrm-rs/client.key"), "{msg}");
+    }
+
     #[test]
     fn certificate_auth_garbled_key_pem_is_rejected_without_echoing_it() {
         let garbled = "-----BEGIN PRIVATE KEY-----\nTOPSECRET*&^%$#\n-----END PRIVATE KEY-----\n";

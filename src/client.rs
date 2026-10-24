@@ -762,8 +762,8 @@ impl WinrmClient {
     /// Returns a [`Shell`] that can execute multiple commands without the
     /// overhead of creating and deleting a shell each time.
     ///
-    /// The shell should be explicitly closed via [`Shell::close`] when done.
-    /// If dropped without closing, a warning is logged.
+    /// Close it with [`Shell::close`] when done: dropping it only logs a
+    /// warning, and the server keeps the shell until its idle timeout.
     #[tracing::instrument(
         level = "debug",
         skip(self, host),

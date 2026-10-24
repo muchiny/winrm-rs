@@ -21,8 +21,10 @@ use crate::soap::{self, ReceiveOutput};
 /// multiple command executions, avoiding the overhead of creating and
 /// deleting a shell per command.
 ///
-/// The shell is automatically closed when dropped (best-effort).
-/// For reliable cleanup, call [`close`](Self::close) explicitly.
+/// Dropping a `Shell` without calling [`close`](Self::close) does not
+/// delete it: a warning is logged and the server keeps the shell until its
+/// idle timeout ([`WinrmConfig::idle_timeout_secs`](crate::WinrmConfig::idle_timeout_secs),
+/// or the server's default). Call [`close`](Self::close) when done.
 pub struct Shell<'a> {
     client: &'a WinrmClient,
     host: String,

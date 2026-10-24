@@ -33,6 +33,8 @@ PSRP callers can now stop a running pipeline.
   running command, how long an approval may precede its request, and that one
   hook covers every host of the client. Its example quota no longer re-opens
   after 2^32 refused calls, and is now a tested doctest.
+- `Shell` rustdoc says that dropping a shell does not delete it on the server;
+  call `Shell::close`.
 
 ## [1.4.0] - 2026-10-22
 

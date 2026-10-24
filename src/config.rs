@@ -468,7 +468,9 @@ pub enum AuthMethod {
     /// (see that field). Until a listener certificate can be pinned, keep
     /// `accept_invalid_certs = false` with a certificate the default roots
     /// trust, or use [`AuthMethod::Ntlm`] or [`AuthMethod::Kerberos`], whose
-    /// channel binding still protects them in that mode.
+    /// channel binding keeps the authentication from being used on the real
+    /// server even in that mode; it does not protect the traffic (see that
+    /// field).
     ///
     /// Anyone who controls the target, now or while your logon session lives
     /// there, can read the delegated password. Use CredSSP only toward hosts

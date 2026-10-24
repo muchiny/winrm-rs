@@ -111,6 +111,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   or a long base64 string was echoed in full by `WinrmConfig`'s `Debug` output
   and by the construction error. Both now show a placeholder. Real paths are
   still shown.
+- Host strings are escaped in log fields. A control character in a host passed
+  to the client (a line break, an ANSI sequence) can no longer start a new log
+  line or recolour one.
 
 ### Documentation
 

@@ -84,7 +84,7 @@ impl WinrmClient {
     #[tracing::instrument(
         level = "debug",
         skip(self, host),
-        fields(host = %crate::transport::redact_userinfo(host))
+        fields(host = %crate::transport::log_host(host))
     )]
     pub async fn create_shell(&self, host: &str) -> Result<String, WinrmError> {
         let config = self.transport.config();
@@ -104,7 +104,7 @@ impl WinrmClient {
     #[tracing::instrument(
         level = "debug",
         skip(self, creation_xml_b64, host),
-        fields(host = %crate::transport::redact_userinfo(host))
+        fields(host = %crate::transport::log_host(host))
     )]
     pub async fn open_psrp_shell(
         &self,
@@ -141,7 +141,7 @@ impl WinrmClient {
     #[tracing::instrument(
         level = "debug",
         skip(self, host, command, args),
-        fields(host = %crate::transport::redact_userinfo(host), args_len = args.len())
+        fields(host = %crate::transport::log_host(host), args_len = args.len())
     )]
     pub async fn execute_command(
         &self,
@@ -185,7 +185,7 @@ impl WinrmClient {
     #[tracing::instrument(
         level = "debug",
         skip(self, host),
-        fields(host = %crate::transport::redact_userinfo(host))
+        fields(host = %crate::transport::log_host(host))
     )]
     pub async fn receive_output(
         &self,
@@ -211,7 +211,7 @@ impl WinrmClient {
     #[tracing::instrument(
         level = "debug",
         skip(self, host),
-        fields(host = %crate::transport::redact_userinfo(host))
+        fields(host = %crate::transport::log_host(host))
     )]
     pub async fn receive_output_raw(
         &self,
@@ -252,7 +252,7 @@ impl WinrmClient {
     #[tracing::instrument(
         level = "debug",
         skip(self, host),
-        fields(host = %crate::transport::redact_userinfo(host))
+        fields(host = %crate::transport::log_host(host))
     )]
     pub async fn signal_terminate(
         &self,
@@ -281,7 +281,7 @@ impl WinrmClient {
     #[tracing::instrument(
         level = "debug",
         skip(self, host),
-        fields(host = %crate::transport::redact_userinfo(host))
+        fields(host = %crate::transport::log_host(host))
     )]
     pub async fn delete_shell(&self, host: &str, shell_id: &str) -> Result<(), WinrmError> {
         self.delete_shell_with_resource_uri(
@@ -319,7 +319,7 @@ impl WinrmClient {
     #[tracing::instrument(
         level = "debug",
         skip(self, host, command, args),
-        fields(host = %crate::transport::redact_userinfo(host), args_len = args.len())
+        fields(host = %crate::transport::log_host(host), args_len = args.len())
     )]
     pub async fn run_command(
         &self,
@@ -385,7 +385,7 @@ impl WinrmClient {
     #[tracing::instrument(
         level = "debug",
         skip(self, host, command, args),
-        fields(host = %crate::transport::redact_userinfo(host), args_len = args.len())
+        fields(host = %crate::transport::log_host(host), args_len = args.len())
     )]
     pub async fn run_command_with_timeout(
         &self,
@@ -589,7 +589,7 @@ impl WinrmClient {
     #[tracing::instrument(
         level = "debug",
         skip(self, script, host),
-        fields(host = %crate::transport::redact_userinfo(host), script_len = script.len())
+        fields(host = %crate::transport::log_host(host), script_len = script.len())
     )]
     pub async fn run_powershell(
         &self,
@@ -626,7 +626,7 @@ impl WinrmClient {
     #[tracing::instrument(
         level = "debug",
         skip(self, script, host),
-        fields(host = %crate::transport::redact_userinfo(host), script_len = script.len())
+        fields(host = %crate::transport::log_host(host), script_len = script.len())
     )]
     pub async fn run_powershell_with_timeout(
         &self,
@@ -722,7 +722,7 @@ impl WinrmClient {
     #[tracing::instrument(
         level = "debug",
         skip(self, host, query),
-        fields(host = %crate::transport::redact_userinfo(host), query_len = query.len())
+        fields(host = %crate::transport::log_host(host), query_len = query.len())
     )]
     pub async fn run_wql(
         &self,
@@ -796,7 +796,7 @@ impl WinrmClient {
     #[tracing::instrument(
         level = "debug",
         skip(self, host),
-        fields(host = %crate::transport::redact_userinfo(host))
+        fields(host = %crate::transport::log_host(host))
     )]
     pub async fn open_shell(&self, host: &str) -> Result<Shell<'_>, WinrmError> {
         let shell_id = self.create_shell(host).await?;
@@ -836,7 +836,7 @@ impl WinrmClient {
     #[tracing::instrument(
         level = "debug",
         skip(self, host),
-        fields(host = %crate::transport::redact_userinfo(host))
+        fields(host = %crate::transport::log_host(host))
     )]
     pub async fn reconnect_shell(
         &self,
@@ -1000,6 +1000,18 @@ mod tests {
 
     fn test_creds() -> WinrmCredentials {
         WinrmCredentials::new("admin", "pass", "")
+    }
+
+    #[tokio::test]
+    async fn client_span_fields_escape_control_characters() {
+        let (logs, _guard) = crate::transport::capture_logs();
+        let client = WinrmClient::new(basic_config(1), test_creds()).unwrap();
+        let _ = client
+            .run_command("x\nFORGED-LINE three", "whoami", &[])
+            .await;
+        let text = logs.text();
+        assert!(text.contains("x FORGED-LINE three"), "{text}");
+        assert!(!text.contains("\nFORGED-LINE"), "{text}");
     }
 
     fn basic_config(port: u16) -> WinrmConfig {

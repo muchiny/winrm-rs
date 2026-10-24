@@ -187,7 +187,7 @@ impl WinrmClient {
     #[tracing::instrument(
         level = "debug",
         skip(self, host),
-        fields(host = %crate::transport::redact_userinfo(host))
+        fields(host = %crate::transport::log_host(host))
     )]
     pub async fn download_file_with_timeout(
         &self,

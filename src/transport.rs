@@ -461,6 +461,13 @@ pub(crate) fn redact_userinfo(host: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// `host` as a log field: [`redact_userinfo`] first (it relies on the raw
+/// `@`), then [`crate::error::quote_server_text`], so a line break or an ANSI
+/// sequence in the string cannot start a new log line or recolour one.
+pub(crate) fn log_host(host: &str) -> String {
+    crate::error::quote_server_text(&redact_userinfo(host), 256)
+}
+
 /// Refuse a host that, once [`sanitize_host`] has stripped the scheme,
 /// userinfo, path and port, is still not a host name or address.
 ///
@@ -730,8 +737,8 @@ impl HttpTransport {
         let sanitized = sanitize_host(host);
         if sanitized != host {
             tracing::warn!(
-                original = %redact_userinfo(host),
-                sanitized = %sanitized,
+                original = %log_host(host),
+                sanitized = %crate::error::quote_server_text(&sanitized, 256),
                 "host string contained scheme/path/userinfo; using sanitized form"
             );
         }
@@ -763,10 +770,12 @@ impl HttpTransport {
     #[tracing::instrument(
         level = "debug",
         skip(self, host, body),
-        fields(host = %redact_userinfo(host))
+        fields(host = %log_host(host))
     )]
     async fn send_soap(&self, host: &str, body: String) -> Result<String, WinrmError> {
-        let url = self.checked_endpoint(host)?;
+        let url = self
+            .checked_endpoint(host)
+            .inspect_err(|e| debug!(error = %e, "request not sent: invalid host"))?;
         debug!(url = %url, "sending WinRM SOAP request");
         trace!(body = %body, "SOAP request body");
 
@@ -1433,6 +1442,59 @@ pub(crate) fn test_http_client() -> reqwest::Client {
     let _ = rustls::crypto::ring::default_provider().install_default();
     // No proxy from the environment: the tests talk to loopback servers.
     reqwest::Client::builder().no_proxy().build().unwrap()
+}
+
+/// Test-only log sink: the formatted output of every event and span of the
+/// thread that holds the guard of [`capture_logs`].
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct LogBuf(Arc<Mutex<Vec<u8>>>);
+
+#[cfg(test)]
+impl LogBuf {
+    /// Everything written so far.
+    pub(crate) fn text(&self) -> String {
+        let bytes = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+#[cfg(test)]
+impl std::io::Write for LogBuf {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+    type Writer = LogBuf;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Route the logs of the current thread into a [`LogBuf`], unfiltered by span
+/// (unlike `tracing_test`, a line outside the test's span is kept). A
+/// `#[tokio::test]` runs on one thread, so the default covers every await.
+#[cfg(test)]
+pub(crate) fn capture_logs() -> (LogBuf, tracing::subscriber::DefaultGuard) {
+    let buf = LogBuf::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(buf.clone())
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .finish();
+    (buf, tracing::subscriber::set_default(subscriber))
 }
 
 #[cfg(test)]
@@ -2711,6 +2773,33 @@ mod tests {
             .expect(times)
             .mount(server)
             .await;
+    }
+
+    #[tokio::test]
+    async fn host_log_fields_escape_control_characters() {
+        let (logs, _guard) = capture_logs();
+        let server = MockServer::start().await;
+        mount_ok_expecting(&server, 0).await;
+        let transport = basic_transport(server.address().port());
+        // The endpoint() WARN logs the original host (1.5.0 removes it).
+        let _ = transport.endpoint("x/\nFORGED-LINE one");
+        // A control character makes validate_host refuse the host; the refusal is logged.
+        let err = transport
+            .send_soap_raw("x\u{1b}[31m\r\nFORGED-LINE two", "<a/>".into())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, WinrmError::AuthFailed(m) if m.contains("invalid host")),
+            "{err:?}"
+        );
+        let text = logs.text();
+        assert!(text.contains("x/ FORGED-LINE one"), "{text}");
+        assert!(text.contains("x\\u{1b}[31m FORGED-LINE two"), "{text}");
+        assert!(
+            !text.contains("\nFORGED-LINE") && !text.contains("\rFORGED-LINE"),
+            "{text}"
+        );
+        assert!(!text.contains('\u{1b}'), "{text}");
     }
 
     #[tokio::test]

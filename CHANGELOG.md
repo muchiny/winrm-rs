@@ -13,8 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   key and the random session key are now wiped from memory after use. The wire
   output is unchanged.
 - CredSSP builds `TSCredentials` in a single buffer that is wiped after sealing
-  and is never reallocated. The cleartext credentials and the exported session
-  key no longer stay in memory across network rounds. The 1.1.1 entry
+  and is never reallocated. The cleartext `TSCredentials` and the exported
+  session key are no longer held across network rounds. The 1.1.1 entry
   overstated what was wiped: the intermediate DER and UTF-16 copies were freed
   without being wiped.
 

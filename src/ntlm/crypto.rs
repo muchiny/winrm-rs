@@ -117,6 +117,22 @@ pub(crate) fn hmac_md5(key: &[u8], data: &[u8]) -> [u8; 16] {
 /// Written over `Md5` directly because `hmac` does not wipe the pad block it
 /// builds from the key.
 pub(crate) fn hmac_md5_secret(key: &[u8], data: &[u8]) -> Zeroizing<[u8; 16]> {
+    hmac_md5_wiping(key, &[data])
+}
+
+/// HMAC-MD5 of the concatenation of `parts`, keyed by key material, without
+/// copying the parts into one buffer.
+///
+/// Same construction as [`hmac_md5_secret`] (the pad blocks and the inner
+/// digest are wiped), so the NTLM sign and seal checksums, which are keyed by
+/// the session sign keys, stay on it. Equal to `hmac_md5(key, &parts.concat())`.
+pub(crate) fn hmac_md5_parts(key: &[u8], parts: &[&[u8]]) -> [u8; 16] {
+    let mac = hmac_md5_wiping(key, parts);
+    *mac
+}
+
+/// The wiping HMAC-MD5 behind [`hmac_md5_secret`] and [`hmac_md5_parts`].
+fn hmac_md5_wiping(key: &[u8], parts: &[&[u8]]) -> Zeroizing<[u8; 16]> {
     const BLOCK: usize = 64;
     let hashed_key: Zeroizing<[u8; 16]>;
     let key = if key.len() > BLOCK {
@@ -139,7 +155,9 @@ pub(crate) fn hmac_md5_secret(key: &[u8], data: &[u8]) -> Zeroizing<[u8; 16]> {
 
     let mut inner = Md5::new();
     inner.update(ipad.as_slice());
-    inner.update(data);
+    for part in parts {
+        inner.update(part);
+    }
     let mut inner_digest = inner.finalize();
 
     let mut outer = Md5::new();
@@ -614,6 +632,28 @@ mod tests {
                 0xb7, 0x38
             ]
         );
+    }
+
+    #[test]
+    fn hmac_md5_parts_matches_hmac_md5_over_the_concatenation() {
+        let key = [0x0b; 16];
+        assert_eq!(
+            hmac_md5_parts(&key, &[&[0, 0, 0, 0], b"hello"]),
+            hmac_md5(&key, b"\0\0\0\0hello")
+        );
+        assert_eq!(hmac_md5_parts(&key, &[]), hmac_md5(&key, b""));
+        assert_eq!(
+            hmac_md5_parts(&key, &[b"", b"ab", b"", b"c"]),
+            hmac_md5(&key, b"abc")
+        );
+        // Keys longer than the block are hashed first, as in `hmac_md5_secret`.
+        for key_len in [0usize, 16, 64, 65, 200] {
+            let key = vec![0xAAu8; key_len];
+            assert_eq!(
+                hmac_md5_parts(&key, &[b"seq".as_slice(), &[0x5C; 50]]),
+                *hmac_md5_secret(&key, &[b"seq".as_slice(), &[0x5C; 50]].concat())
+            );
+        }
     }
 
     #[test]

@@ -24,7 +24,7 @@ pub use messages::{create_authenticate_message_credssp, create_negotiate_message
 
 // NtlmSession uses crypto internals
 use crate::error::NtlmError;
-use crypto::{Rc4State, hmac_md5};
+use crypto::{Rc4State, hmac_md5_parts};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// NTLM session state for message encryption/decryption after authentication.
@@ -175,10 +175,10 @@ impl NtlmSession {
     /// - Sequence number (4 bytes, little-endian)
     pub fn seal(&mut self, plaintext: &[u8]) -> Vec<u8> {
         // 1. Compute signature: HMAC_MD5(sign_key, seq_num + plaintext)[0..8]
-        let mut sig_input = Vec::with_capacity(4 + plaintext.len());
-        sig_input.extend_from_slice(&self.client_seq_num.to_le_bytes());
-        sig_input.extend_from_slice(plaintext);
-        let checksum = hmac_md5(&self.client_sign_key, &sig_input);
+        let checksum = hmac_md5_parts(
+            &self.client_sign_key,
+            &[&self.client_seq_num.to_le_bytes(), plaintext],
+        );
         let mut checksum_8 = [0u8; 8];
         checksum_8.copy_from_slice(&checksum[..8]);
 
@@ -209,10 +209,10 @@ impl NtlmSession {
     /// (with extended session security + key exchange). Consumes 8 bytes of
     /// the client RC4 keystream and increments the client sequence number.
     pub fn sign(&mut self, data: &[u8]) -> [u8; 16] {
-        let mut sig_input = Vec::with_capacity(4 + data.len());
-        sig_input.extend_from_slice(&self.client_seq_num.to_le_bytes());
-        sig_input.extend_from_slice(data);
-        let checksum = hmac_md5(&self.client_sign_key, &sig_input);
+        let checksum = hmac_md5_parts(
+            &self.client_sign_key,
+            &[&self.client_seq_num.to_le_bytes(), data],
+        );
         let mut checksum_8 = [0u8; 8];
         checksum_8.copy_from_slice(&checksum[..8]);
         // KEY_EXCH path: encrypt the checksum with the client RC4 stream.
@@ -287,10 +287,10 @@ impl NtlmSession {
         // seq || data)[0..8]). RC4 is symmetric, so encrypting our expected
         // value and comparing against the received (encrypted) checksum is
         // equivalent to decrypting theirs.
-        let mut sig_input = Vec::with_capacity(4 + mech_type_list.len());
-        sig_input.extend_from_slice(&self.server_seq_num.to_le_bytes());
-        sig_input.extend_from_slice(mech_type_list);
-        let checksum = hmac_md5(&self.server_sign_key, &sig_input);
+        let checksum = hmac_md5_parts(
+            &self.server_sign_key,
+            &[&self.server_seq_num.to_le_bytes(), mech_type_list],
+        );
         let mut expected = [0u8; 8];
         expected.copy_from_slice(&checksum[..8]);
         self.server_seal_handle.process(&mut expected);
@@ -358,10 +358,10 @@ impl NtlmSession {
         // mismatch does not leak how many leading bytes of the checksum
         // are correct. Defence-in-depth against timing oracles.
         use subtle::ConstantTimeEq;
-        let mut expected_sig_input = Vec::with_capacity(4 + plaintext.len());
-        expected_sig_input.extend_from_slice(&self.server_seq_num.to_le_bytes());
-        expected_sig_input.extend_from_slice(&plaintext);
-        let expected_checksum = hmac_md5(&self.server_sign_key, &expected_sig_input);
+        let expected_checksum = hmac_md5_parts(
+            &self.server_sign_key,
+            &[&self.server_seq_num.to_le_bytes(), &plaintext],
+        );
         if sig_checksum.ct_eq(&expected_checksum[..8]).unwrap_u8() == 0 {
             return Err(NtlmError::InvalidMessage("checksum mismatch".into()));
         }

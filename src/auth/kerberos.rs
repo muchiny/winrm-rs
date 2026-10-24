@@ -161,10 +161,86 @@ mod wire {
             |what| sealing_error(format!("sealed answer: {what} ({} bytes)", data.len())),
         )
     }
+
+    /// Check that the connection which carried the AP-REQ presented the
+    /// certificate the channel binding was computed for. Without a bound
+    /// certificate (plain HTTP) there is nothing to check; with one, only the
+    /// very same, certainly known certificate passes.
+    #[cfg(any(feature = "kerberos", test))]
+    pub(crate) fn check_bound_certificate(
+        bound: Option<&[u8]>,
+        peer: &crate::auth::PeerCertificate,
+    ) -> Result<(), WinrmError> {
+        let Some(bound) = bound else {
+            return Ok(());
+        };
+        match peer {
+            crate::auth::PeerCertificate::Known(der) if der.as_slice() == bound => Ok(()),
+            _ => Err(WinrmError::AuthFailed(
+                "Kerberos over TLS: the connection that carried the AP-REQ did not present the \
+                 certificate its channel binding was computed for; refusing the context"
+                    .into(),
+            )),
+        }
+    }
+
+    /// What one step of a pending security context gave.
+    #[cfg(any(feature = "kerberos", test))]
+    pub(crate) enum StepOutcome<C> {
+        /// The context is established; `extra_token` tells whether the library
+        /// also produced a final token to send to the server.
+        Finished { ctx: C, extra_token: bool },
+        /// The context needs another round trip.
+        Continue,
+    }
+
+    /// A security context that is not yet established, behind the library
+    /// that implements it (so the decisions on its outcome can be tested).
+    #[cfg(any(feature = "kerberos", test))]
+    pub(crate) trait PendingStep: Sized {
+        /// The established context.
+        type Ctx;
+
+        /// Feed the server's token to the pending context.
+        fn step(self, token: &[u8]) -> Result<StepOutcome<Self::Ctx>, String>;
+    }
+
+    /// Complete a context with the server's AP-REP (mutual authentication):
+    /// the token must be there, and a single step must finish the context
+    /// with nothing more to send, which is all WinRM supports.
+    #[cfg(any(feature = "kerberos", test))]
+    pub(crate) fn finish_mutual<P: PendingStep>(
+        pending: P,
+        server_token: Option<Vec<u8>>,
+    ) -> Result<P::Ctx, WinrmError> {
+        let server_token = server_token.ok_or_else(|| {
+            WinrmError::AuthFailed(
+                "Kerberos: the server sent no mutual authentication token, so no context \
+                 for message encryption"
+                    .into(),
+            )
+        })?;
+        match pending.step(&server_token) {
+            Ok(StepOutcome::Finished {
+                ctx,
+                extra_token: false,
+            }) => Ok(ctx),
+            Ok(StepOutcome::Finished { .. } | StepOutcome::Continue) => {
+                Err(WinrmError::AuthFailed(
+                    "Kerberos: the context needs another round trip, which WinRM does not \
+                     support"
+                        .into(),
+                ))
+            }
+            Err(e) => Err(WinrmError::AuthFailed(format!(
+                "Kerberos mutual authentication failed: {e}"
+            ))),
+        }
+    }
 }
 
 #[cfg(feature = "kerberos")]
-use wire::{SEALING_PROTOCOL, sealing_error};
+use wire::{SEALING_PROTOCOL, check_bound_certificate, finish_mutual, sealing_error};
 #[cfg(any(feature = "kerberos", feature = "__internal", test))]
 pub(crate) use wire::{check_acceptor_sealed, parse_sealed_answer, windows_layout};
 
@@ -271,6 +347,24 @@ impl KerberosSession {
     }
 }
 
+/// The library's pending client context, seen through the testable seam.
+#[cfg(feature = "kerberos")]
+impl wire::PendingStep for cross_krb5::PendingClientCtx {
+    type Ctx = cross_krb5::ClientCtx;
+
+    fn step(self, token: &[u8]) -> Result<wire::StepOutcome<Self::Ctx>, String> {
+        use cross_krb5::Step;
+        match cross_krb5::PendingClientCtx::step(self, token) {
+            Ok(Step::Finished((ctx, extra))) => Ok(wire::StepOutcome::Finished {
+                ctx,
+                extra_token: extra.is_some(),
+            }),
+            Ok(Step::Continue(_)) => Ok(wire::StepOutcome::Continue),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
+
 #[cfg(feature = "kerberos")]
 impl KerberosAuth {
     /// The first Kerberos token for the service principal, and the pending
@@ -369,7 +463,6 @@ impl KerberosAuth {
         cert: Option<&crate::tls::CertHandle>,
         url: &str,
     ) -> Result<(KerberosSession, bool), WinrmError> {
-        use cross_krb5::Step;
         use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
         let bound = if url.starts_with("https://") {
             let der = self.endpoint_certificate(http, cert, url).await?;
@@ -404,16 +497,10 @@ impl KerberosAuth {
             .send()
             .await
             .map_err(crate::auth::send_error)?;
-        if let Some(bound) = &bound
-            && crate::auth::peer_certificate(&resp, cert)
-                != crate::auth::PeerCertificate::Known(bound.clone())
-        {
-            return Err(WinrmError::AuthFailed(
-                "Kerberos over TLS: the connection that carried the AP-REQ did not present the \
-                 certificate its channel binding was computed for; refusing the context"
-                    .into(),
-            ));
-        }
+        check_bound_certificate(
+            bound.as_deref(),
+            &crate::auth::peer_certificate(&resp, cert),
+        )?;
         let status = resp.status();
         if status.as_u16() == 401 {
             return Err(WinrmError::AuthFailed(
@@ -435,28 +522,7 @@ impl KerberosAuth {
                 },
             ));
         }
-        let server_token = server_token.ok_or_else(|| {
-            WinrmError::AuthFailed(
-                "Kerberos: the server sent no mutual authentication token, so no context \
-                 for message encryption"
-                    .into(),
-            )
-        })?;
-        let ctx = match pending.step(&server_token) {
-            Ok(Step::Finished((ctx, None))) => ctx,
-            Ok(Step::Finished((_, Some(_))) | Step::Continue(_)) => {
-                return Err(WinrmError::AuthFailed(
-                    "Kerberos: the context needs another round trip, which WinRM does not \
-                     support"
-                        .into(),
-                ));
-            }
-            Err(e) => {
-                return Err(WinrmError::AuthFailed(format!(
-                    "Kerberos mutual authentication failed: {e}"
-                )));
-            }
-        };
+        let ctx = finish_mutual(pending, server_token)?;
         Ok((KerberosSession { ctx }, closing))
     }
 }
@@ -704,6 +770,92 @@ mod layout_tests {
             unsealed_error(status, crate::auth::TIMED_OUT_FAULT, true),
             WinrmError::Soap(_)
         ));
+    }
+
+    /// A pending context whose next step is fixed in advance.
+    struct FakePending(Result<wire::StepOutcome<u8>, String>);
+
+    impl wire::PendingStep for FakePending {
+        type Ctx = u8;
+        fn step(self, _token: &[u8]) -> Result<wire::StepOutcome<u8>, String> {
+            self.0
+        }
+    }
+
+    fn auth_failed(result: Result<u8, WinrmError>) -> String {
+        match result {
+            Err(WinrmError::AuthFailed(m)) => m,
+            other => panic!("expected AuthFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn establish_refuses_a_missing_ap_rep() {
+        let pending = FakePending(Ok(wire::StepOutcome::Finished {
+            ctx: 1,
+            extra_token: false,
+        }));
+        let m = auth_failed(wire::finish_mutual(pending, None));
+        assert!(m.contains("no mutual authentication token"), "{m}");
+    }
+
+    #[test]
+    fn establish_refuses_a_failed_ap_rep_step() {
+        let pending = FakePending(Err("boom".into()));
+        let m = auth_failed(wire::finish_mutual(pending, Some(vec![1])));
+        assert!(m.contains("Kerberos mutual authentication failed"), "{m}");
+        assert!(m.contains("boom"), "{m}");
+    }
+
+    #[test]
+    fn establish_refuses_a_continue_needed_context() {
+        let pending = FakePending(Ok(wire::StepOutcome::Continue));
+        let m = auth_failed(wire::finish_mutual(pending, Some(vec![1])));
+        assert!(m.contains("another round trip"), "{m}");
+    }
+
+    #[test]
+    fn establish_refuses_a_finished_context_with_an_extra_token() {
+        let pending = FakePending(Ok(wire::StepOutcome::Finished {
+            ctx: 1,
+            extra_token: true,
+        }));
+        let m = auth_failed(wire::finish_mutual(pending, Some(vec![1])));
+        assert!(m.contains("another round trip"), "{m}");
+    }
+
+    #[test]
+    fn establish_accepts_a_finished_context_without_token() {
+        let pending = FakePending(Ok(wire::StepOutcome::Finished {
+            ctx: 7,
+            extra_token: false,
+        }));
+        assert!(matches!(wire::finish_mutual(pending, Some(vec![1])), Ok(7)));
+    }
+
+    #[test]
+    fn bound_certificate_must_be_the_known_same_certificate() {
+        use crate::auth::PeerCertificate;
+        let der = vec![9u8; 4];
+        assert!(wire::check_bound_certificate(None, &PeerCertificate::Unknown).is_ok());
+        assert!(
+            wire::check_bound_certificate(Some(&der), &PeerCertificate::Known(der.clone())).is_ok()
+        );
+        for peer in [
+            PeerCertificate::Known(vec![8u8; 4]),
+            PeerCertificate::Ambiguous,
+            PeerCertificate::Unknown,
+        ] {
+            match wire::check_bound_certificate(Some(&der), &peer) {
+                Err(WinrmError::AuthFailed(m)) => assert!(
+                    m.contains(
+                        "did not present the certificate its channel binding was computed for"
+                    ),
+                    "{m}"
+                ),
+                other => panic!("expected AuthFailed for {peer:?}, got {other:?}"),
+            }
+        }
     }
 }
 

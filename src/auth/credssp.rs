@@ -10,9 +10,12 @@
 //
 // This implements the CredSSP protocol with TLS-in-TLS architecture:
 //
-// - **Outer channel**: HTTPS via reqwest (regular WinRM connection)
-// - **Inner channel**: rustls ClientConnection in memory-only mode, used to
-//   tunnel TSRequest messages per MS-CSSP. The TLS handshake and all
+// - **Outer channel**: HTTPS on one raw `tokio-rustls` stream (not reqwest:
+//   the server binds the CredSSP context to the TCP connection, and reqwest
+//   cannot pin requests to one), with HTTP/1.1 written and read by hand in
+//   `CredSspConnection`.
+// - **Inner channel**: OpenSSL TLS 1.2 in memory-only mode (`OpenSslMemTls`),
+//   tunnelling the TSRequest messages of MS-CSSP. The TLS handshake and all
 //   subsequent CredSSP messages flow through Authorization: CredSSP headers.
 //
 // Architecture matches pyspnego (which uses `ssl.MemoryBIO`). No socket is
@@ -20,12 +23,12 @@
 //
 // **Working:**
 // - Primer request and CredSSP advertisement detection
-// - Inner TLS handshake (rustls in memory mode) — completes in 2 rounds
+// - Inner TLS handshake (OpenSSL in memory mode) — completes in 2 rounds
 // - NTLM Type 1 → Type 2 exchange wrapped in TLS-encrypted TSRequest
 // - SubjectPublicKey extraction from inner TLS server cert
 //
 // **Working (validated against pywinrm reference capture):**
-// - Inner TLS handshake (rustls in memory) — completes in 2 rounds
+// - Inner TLS handshake (OpenSSL in memory) — completes in 2 rounds
 // - SubjectPublicKey extraction from inner TLS server cert
 // - NTLM Type 1 with CredSSP flags (KEY_EXCH, SEAL, SIGN, 128, 56, VERSION)
 // - NTLM Type 1 → 2 exchange wrapped in TLS-encrypted TSRequest
@@ -233,18 +236,17 @@ fn build_inner_openssl_tls() -> Result<OpenSslMemTls, WinrmError> {
 
     let mut builder = SslConnector::builder(SslMethod::tls_client())
         .map_err(|e| WinrmError::AuthFailed(format!("SslConnector: {e}")))?;
-    // SslVerifyMode::NONE is intentional and protocol-correct here.
+    // SslVerifyMode::NONE is intentional (MS-CSSP 1.3: the server is
+    // anonymous at this point, and Windows presents a self-signed
+    // certificate on this inner channel).
     //
-    // The CredSSP inner channel is authenticated by `pubKeyAuth`
-    // (MS-CSSP §3.1.5.1): the client computes a hash over the server's
-    // SubjectPublicKeyInfo + a nonce, the NTLM session seals it, and
-    // the server is expected to echo the symmetric counter-hash. The
-    // pubKeyAuth check is performed after the NTLM exchange (see the
-    // `expected_server_hash` comparison in `CredSspConnection`'s
-    // handshake); if it fails we abort with
-    // `CredSspError::PublicKeyMismatch`. So an X.509 chain check on this
-    // leg would be redundant — and crucially, the outer/transport leg
-    // already validates the chain (see `CredSspConnection::connect`).
+    // `pubKeyAuth` (MS-CSSP 3.1.5) binds the NTLM session key to this inner
+    // TLS public key and to nothing else. It proves that the peer holds the
+    // NTLM session key. It does not identify the server, and it binds
+    // nothing to the outer HTTPS connection, which carries the SOAP bodies.
+    // Server identity and body integrity come only from the outer TLS
+    // verifier (`CredSspConnection::connect`); under `accept_invalid_certs`
+    // there is none.
     builder.set_verify(SslVerifyMode::NONE);
     // Force TLS 1.2 to match what Microsoft CredSSP server expects.
     builder
@@ -304,9 +306,9 @@ impl CredSspConnection {
     /// Open a TCP+TLS connection to (host:port). The returned object owns
     /// the underlying socket; drop to close.
     ///
-    /// `accept_invalid_certs=true` disables outer TLS verification — TEST USE
-    /// ONLY. The inner CredSSP TLS is authenticated via pubKeyAuth (MS-CSSP
-    /// §3.1.5.1), independent of the outer chain.
+    /// `accept_invalid_certs = true` disables outer TLS verification (test
+    /// use only). Nothing inside CredSSP replaces it: the inner TLS is not
+    /// verified (MS-CSSP 1.3) and `pubKeyAuth` binds only the inner TLS key.
     async fn connect(
         host: &str,
         port: u16,
@@ -482,7 +484,7 @@ impl CredSspConnection {
             }
         }
 
-        // Determine body length: Content-Length only (we send Accept-Encoding: identity).
+        // Body length: Content-Length only; Transfer-Encoding and Content-Encoding are not handled.
         let content_length: usize = headers
             .get("content-length")
             .and_then(|v| v.parse().ok())
@@ -579,8 +581,8 @@ pub(crate) struct CredSspAuth {
     pub(crate) password: Zeroizing<String>,
     pub(crate) domain: String,
     /// Mirrors `WinrmConfig.accept_invalid_certs`. When true, the outer TLS
-    /// channel skips chain validation. Inner TLS authentication relies on
-    /// pubKeyAuth regardless (MS-CSSP §3.1.5.1).
+    /// channel skips chain validation, and nothing in CredSSP authenticates
+    /// the server instead (`pubKeyAuth` binds only the inner TLS key).
     pub(crate) accept_invalid_certs: bool,
     /// Largest response body read (see `transport::max_response_bytes`).
     pub(crate) max_response_bytes: usize,
@@ -1176,5 +1178,23 @@ mod tests {
         assert!(!bytes.is_empty(), "should produce ClientHello bytes");
         // First byte of TLS record is 0x16 (Handshake)
         assert_eq!(bytes[0], 0x16);
+    }
+
+    #[tokio::test]
+    async fn credssp_outer_tls_refuses_an_impostor() {
+        for (label, versions) in [
+            ("TLS 1.3", &[&rustls::version::TLS13][..]),
+            ("TLS 1.2", &[&rustls::version::TLS12][..]),
+        ] {
+            let (port, _read) =
+                crate::test_pki::spawn_tls_sink(crate::test_pki::impostor_server_config(versions));
+            match CredSspConnection::connect("127.0.0.1", port, "/wsman", true, 1 << 20).await {
+                Err(WinrmError::AuthFailed(m)) => {
+                    assert!(m.starts_with("CredSSP outer TLS:"), "{label}: {m}");
+                }
+                Err(e) => panic!("{label}: {e:?}"),
+                Ok(_) => panic!("{label}: impostor accepted on the CredSSP outer TLS"),
+            }
+        }
     }
 }

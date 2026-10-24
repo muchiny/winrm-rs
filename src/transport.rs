@@ -2952,20 +2952,16 @@ mod tests {
         cert_pem: &'static str,
         key_pem: &'static str,
     ) -> (u16, Arc<std::sync::Mutex<Vec<Vec<u8>>>>) {
+        spawn_ntlm_tls_server_with(crate::test_pki::server_config(cert_pem, key_pem))
+    }
+
+    /// Like [`spawn_ntlm_tls_server`], with the server's TLS config given.
+    fn spawn_ntlm_tls_server_with(
+        config: Arc<rustls::ServerConfig>,
+    ) -> (u16, Arc<std::sync::Mutex<Vec<Vec<u8>>>>) {
         use base64::Engine as _;
-        use rustls::pki_types::pem::PemObject;
-        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
         use std::io::{Read, Write};
 
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let chain = vec![CertificateDer::from_pem_slice(cert_pem.as_bytes()).unwrap()];
-        let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).unwrap();
-        let config = Arc::new(
-            rustls::ServerConfig::builder()
-                .with_no_client_auth()
-                .with_single_cert(chain, key)
-                .unwrap(),
-        );
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -3175,6 +3171,112 @@ mod tests {
         let seen = seen.lock().unwrap().clone();
         assert_eq!(seen.len(), 1);
         assert_eq!(type3_channel_bindings(&seen[0]), Some(cbt_of(RSA_CERT_PEM)));
+    }
+
+    /// A server presenting the real server's certificate without its key is a
+    /// party in the middle: the handshake must fail before any NTLM Type 3 (and
+    /// its channel binding) is sent, even with `accept_invalid_certs`.
+    async fn assert_impostor_refused(
+        versions: &[&'static rustls::SupportedProtocolVersion],
+        via_proxy: bool,
+    ) {
+        let (port, seen) =
+            spawn_ntlm_tls_server_with(crate::test_pki::impostor_server_config(versions));
+        let transport = ntlm_tls_transport(port, spawn_connect_proxy());
+        let url = format!("https://127.0.0.1:{port}/wsman");
+        let send = async {
+            if via_proxy {
+                // Dedicated connection: CertCapturingVerifier -> NoVerifier.
+                transport
+                    .send_ntlm_over_tls("127.0.0.1", &url, "<soap/>")
+                    .await
+            } else {
+                // Direct, as in `ntlm_cbt_comes_from_the_response_tls_details`.
+                let tls = rustls::ClientConfig::builder()
+                    .dangerous()
+                    .with_custom_certificate_verifier(Arc::new(crate::tls::NoVerifier))
+                    .with_no_client_auth();
+                let http = reqwest::Client::builder()
+                    .no_proxy()
+                    .tls_info(true)
+                    .tls_backend_preconfigured(tls)
+                    .build()
+                    .unwrap();
+                transport
+                    .ntlm_auth()
+                    .send_with_binding(&http, None, &url, "<soap/>")
+                    .await
+            }
+        };
+        let result = tokio::time::timeout(Duration::from_secs(20), send)
+            .await
+            .expect("did not finish in 20 s");
+        assert!(result.is_err(), "impostor accepted: {result:?}");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "no Type 3 may reach an impostor"
+        );
+    }
+
+    #[tokio::test]
+    async fn impostor_is_refused_tls13_via_proxy() {
+        assert_impostor_refused(&[&rustls::version::TLS13], true).await;
+    }
+
+    #[tokio::test]
+    async fn impostor_is_refused_tls12_via_proxy() {
+        assert_impostor_refused(&[&rustls::version::TLS12], true).await;
+    }
+
+    #[tokio::test]
+    async fn impostor_is_refused_tls13_direct() {
+        assert_impostor_refused(&[&rustls::version::TLS13], false).await;
+    }
+
+    #[tokio::test]
+    async fn impostor_is_refused_tls12_direct() {
+        assert_impostor_refused(&[&rustls::version::TLS12], false).await;
+    }
+
+    /// The production shared client (`HttpTransport::new`: `build_http_client`
+    /// with the preconfigured rustls config, no proxy) refuses the impostor
+    /// before any HTTP byte, so no Basic `Authorization` header leaves.
+    #[tokio::test]
+    async fn impostor_is_refused_basic_shared_client() {
+        for (label, versions) in [
+            ("TLS 1.3", &[&rustls::version::TLS13][..]),
+            ("TLS 1.2", &[&rustls::version::TLS12][..]),
+        ] {
+            let (port, read) =
+                crate::test_pki::spawn_tls_sink(crate::test_pki::impostor_server_config(versions));
+            let config = WinrmConfig {
+                auth_method: AuthMethod::Basic,
+                use_tls: true,
+                accept_invalid_certs: true,
+                port,
+                max_retries: 0,
+                connect_timeout_secs: 5,
+                operation_timeout_secs: 5,
+                ..Default::default()
+            };
+            let transport =
+                HttpTransport::new(config, WinrmCredentials::new(USER, PASS, "")).unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(20),
+                transport.send_soap_with_retry("127.0.0.1", "<soap/>".into()),
+            )
+            .await
+            .expect("did not finish in 20 s");
+            assert!(
+                matches!(result, Err(WinrmError::Http(_))),
+                "{label}: {result:?}"
+            );
+            assert_eq!(
+                read.load(Ordering::SeqCst),
+                0,
+                "{label}: no HTTP byte may reach an impostor"
+            );
+        }
     }
 
     // --- Response cap formula and sealing table ---

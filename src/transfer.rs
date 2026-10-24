@@ -45,14 +45,35 @@ pub(crate) fn validate_remote_path(path: &str) -> Result<(), WinrmError> {
     Ok(())
 }
 
-/// Escape a value for embedding in a PowerShell single-quoted string literal.
+/// The five characters PowerShell accepts as a single quote.
+pub(crate) const PS_SINGLE_QUOTES: [char; 5] =
+    ['\'', '\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}'];
+
+/// Escape a value for embedding in a PowerShell single-quoted (verbatim)
+/// string literal whose delimiters are ASCII `'` (U+0027) written by this
+/// crate.
 ///
-/// Inside `'...'` PowerShell treats `''` as a literal quote and gives no other
-/// character special meaning, so doubling every `'` is sufficient — and leaves
-/// every maximal run of quotes even-length, which is what keeps the literal
-/// from being terminated early.
+/// PowerShell opens and closes a verbatim string on any of the five
+/// [`PS_SINGLE_QUOTES`] (`single-quote-character`, Windows PowerShell
+/// Language Specification 3.0, section 2.3.5.2). Inside one, two adjacent
+/// quote characters read as one literal quote: the second (`verbatim-string-part`).
+/// No other character is special there. Each of the five is therefore
+/// doubled with itself, as `CodeGeneration.EscapeSingleQuotedStringContent`
+/// does. Every run of quotes then comes out as equal adjacent pairs, so
+/// none can end the literal, and keeping one character of each pair gives
+/// the input back. Doubling with a different quote would also close no
+/// literal, but it would change the value.
+///
+/// The output is valid only between the crate's own U+0027 delimiters.
 pub(crate) fn escape_ps_single_quoted(s: &str) -> String {
-    s.replace('\'', "''")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        out.push(c);
+        if PS_SINGLE_QUOTES.contains(&c) {
+            out.push(c);
+        }
+    }
+    out
 }
 
 impl WinrmClient {
@@ -261,15 +282,70 @@ mod tests {
         );
     }
 
-    // Every run of quotes must come out even-length: an odd one would close
-    // the surrounding '...' literal and let the rest parse as PowerShell.
+    #[test]
+    fn escape_ps_single_quoted_doubles_unicode_quotes() {
+        for q in ['\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}'] {
+            assert_eq!(
+                escape_ps_single_quoted(&format!("a{q}b")),
+                format!("a{q}{q}b")
+            );
+        }
+        assert_eq!(
+            escape_ps_single_quoted("x'\u{2019}y"),
+            "x''\u{2019}\u{2019}y"
+        );
+    }
+
+    #[test]
+    fn download_script_keeps_a_unicode_quote_inside_the_literal() {
+        assert_eq!(
+            download_script("C:\\temp\\a\u{2019})); x #"),
+            "[Convert]::ToBase64String([IO.File]::ReadAllBytes('C:\\temp\\a\u{2019}\u{2019})); x #'))"
+        );
+    }
+
+    /// Undo the doubling: each quote character must be followed by the same
+    /// one; the pair is read as one. `None` on an unpaired or mixed pair.
+    fn collapse_quote_pairs(escaped: &str) -> Option<String> {
+        let mut out = String::new();
+        let mut chars = escaped.chars();
+        while let Some(c) = chars.next() {
+            if PS_SINGLE_QUOTES.contains(&c) && chars.next() != Some(c) {
+                return None;
+            }
+            out.push(c);
+        }
+        Some(out)
+    }
+
+    #[test]
+    fn collapse_quote_pairs_rejects_unpaired_and_mixed() {
+        assert_eq!(collapse_quote_pairs("a''b").as_deref(), Some("a'b"));
+        assert_eq!(collapse_quote_pairs("a'b"), None);
+        assert_eq!(collapse_quote_pairs("a'"), None);
+        assert_eq!(collapse_quote_pairs("'\u{2019}"), None);
+        assert_eq!(collapse_quote_pairs("'''"), None);
+    }
+
+    // Every run of quotes must come out even-length: an odd one would end
+    // the surrounding '...' literal early.
     #[test]
     fn escape_ps_single_quoted_leaves_no_odd_quote_run() {
-        for input in ["'", "''", "'''", "a'b''c'''d", "\\'"] {
+        for input in [
+            "'",
+            "''",
+            "'''",
+            "a'b''c'''d",
+            "\\'",
+            "\u{2019}",
+            "a\u{2018}b\u{2019}",
+            "x'\u{2019}\u{2018}\u{201A}\u{201B}'y",
+            "\u{201B}\u{201B}\u{201B}",
+        ] {
             let escaped = escape_ps_single_quoted(input);
             let mut run = 0usize;
             for c in escaped.chars() {
-                if c == '\'' {
+                if PS_SINGLE_QUOTES.contains(&c) {
                     run += 1;
                 } else {
                     assert_eq!(run % 2, 0, "odd quote run in {escaped:?}");
@@ -277,7 +353,7 @@ mod tests {
                 }
             }
             assert_eq!(run % 2, 0, "odd trailing quote run in {escaped:?}");
-            assert_eq!(escaped.replace("''", "'"), input);
+            assert_eq!(collapse_quote_pairs(&escaped).as_deref(), Some(input));
         }
     }
 

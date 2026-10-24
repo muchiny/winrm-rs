@@ -21,8 +21,10 @@ use crate::soap::{self, ReceiveOutput};
 /// multiple command executions, avoiding the overhead of creating and
 /// deleting a shell per command.
 ///
-/// The shell is automatically closed when dropped (best-effort).
-/// For reliable cleanup, call [`close`](Self::close) explicitly.
+/// Dropping a `Shell` without calling [`close`](Self::close) does not
+/// delete it: a warning is logged and the server keeps the shell until its
+/// idle timeout ([`WinrmConfig::idle_timeout_secs`](crate::WinrmConfig::idle_timeout_secs),
+/// or the server's default). Call [`close`](Self::close) when done.
 pub struct Shell<'a> {
     client: &'a WinrmClient,
     host: String,
@@ -253,6 +255,8 @@ impl<'a> Shell<'a> {
     /// `PipelineState` `Stopped`. The plain `cmd` signal used to be sent
     /// there, which the server answers with a fault because no such shell
     /// exists under `cmd`.
+    ///
+    /// Like every request, it goes through the client's [`before_send`](crate::WinrmClientBuilder::before_send) hook: a refusal fails with [`WinrmError::Cancelled`](crate::WinrmError::Cancelled) and the command keeps running.
     pub async fn signal_ctrl_c(&self, command_id: &str) -> Result<(), WinrmError> {
         let endpoint = self.client.endpoint(&self.host);
         let config = self.client.config();

@@ -12,14 +12,14 @@ readme = "README.md"
 documentation = "https://docs.rs/winrm-rs"
 homepage = "https://github.com/muchiny/winrm-rs"
 include = [
-    "src/**/*.rs",
-    "examples/**/*.rs",
-    "tests/**/*.rs",
-    "Cargo.toml",
-    "LICENSE-MIT",
-    "LICENSE-APACHE",
-    "README.md",
-    "CHANGELOG.md",
+    "/src/**/*.rs",
+    "/examples/**/*.rs",
+    "/tests/**/*.rs",
+    "/Cargo.toml",
+    "/LICENSE-MIT",
+    "/LICENSE-APACHE",
+    "/README.md",
+    "/CHANGELOG.md",
 ]
 
 [features]

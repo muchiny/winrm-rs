@@ -3190,7 +3190,16 @@ async fn setup_certificate_auth() {
         .expect("ca.pem body is base64");
     let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
     let pass = std::env::var("WINRM_TEST_PASS").expect("WINRM_TEST_PASS");
-    let ps_quote = |s: &str| s.replace('\'', "''");
+    let ps_quote = |s: &str| {
+        let mut out = String::with_capacity(s.len());
+        for c in s.chars() {
+            out.push(c);
+            if ['\'', '\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}'].contains(&c) {
+                out.push(c);
+            }
+        }
+        out
+    };
 
     // The script travels as -EncodedCommand (UTF-16 + base64), which cmd.exe
     // caps at ~8 KB: one request per step keeps each under the limit.

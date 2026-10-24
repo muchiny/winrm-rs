@@ -280,8 +280,15 @@ impl CertHandle {
     }
 }
 
-/// A no-op verifier that accepts any certificate. Used as inner verifier when
+/// A verifier that accepts any certificate. Used as inner verifier when
 /// `accept_invalid_certs` is enabled.
+///
+/// It still checks the handshake signatures: they prove the server holds the
+/// private key of the certificate it presented. Without that check, a
+/// man-in-the-middle could present the real server's (public) certificate,
+/// so that NTLM / Kerberos channel binding, which is computed from that
+/// certificate, would match the real server and the authentication could be
+/// relayed to it.
 #[derive(Debug)]
 pub(crate) struct NoVerifier;
 
@@ -299,20 +306,30 @@ impl ServerCertVerifier for NoVerifier {
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
@@ -792,21 +809,70 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn no_verifier_accepts_tls12_signature() {
-        let verifier = NoVerifier;
-        let cert = CertificateDer::from(vec![0xCC; 32]);
-        let dss = make_dss();
-        let result = verifier.verify_tls12_signature(b"message", &cert, &dss);
-        assert!(result.is_ok());
+    /// `message` signed with the throwaway EC key of `test_pki`, as the
+    /// handshake would carry it, and that key's certificate.
+    fn ec_signed(message: &[u8]) -> (CertificateDer<'static>, DigitallySignedStruct) {
+        let cert = CertificateDer::from_pem_slice(crate::test_pki::EC_CERT_PEM.as_bytes()).unwrap();
+        let key =
+            PrivateKeyDer::from_pem_slice(crate::test_pki::EC_KEY_PKCS8_PEM.as_bytes()).unwrap();
+        let signer = rustls::crypto::ring::sign::any_ecdsa_type(&key)
+            .unwrap()
+            .choose_scheme(&[SignatureScheme::ECDSA_NISTP256_SHA256])
+            .unwrap();
+        let signature = signer.sign(message).unwrap();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&u16::from(SignatureScheme::ECDSA_NISTP256_SHA256).to_be_bytes());
+        buf.extend_from_slice(&u16::try_from(signature.len()).unwrap().to_be_bytes());
+        buf.extend_from_slice(&signature);
+        let dss = DigitallySignedStruct::read(&mut Reader::init(&buf)).unwrap();
+        (cert, dss)
     }
 
     #[test]
-    fn no_verifier_accepts_tls13_signature() {
-        let verifier = NoVerifier;
-        let cert = CertificateDer::from(vec![0xDD; 32]);
+    fn no_verifier_accepts_a_valid_handshake_signature() {
+        let (cert, dss) = ec_signed(b"handshake transcript");
+        assert!(
+            NoVerifier
+                .verify_tls12_signature(b"handshake transcript", &cert, &dss)
+                .is_ok()
+        );
+        assert!(
+            NoVerifier
+                .verify_tls13_signature(b"handshake transcript", &cert, &dss)
+                .is_ok()
+        );
+    }
+
+    /// The point of the check: a party that only has the server's public
+    /// certificate can't produce a signature the certificate verifies.
+    #[test]
+    fn no_verifier_refuses_a_signature_over_another_message() {
+        let (cert, dss) = ec_signed(b"handshake transcript");
+        assert!(
+            NoVerifier
+                .verify_tls12_signature(b"another transcript", &cert, &dss)
+                .is_err()
+        );
+        assert!(
+            NoVerifier
+                .verify_tls13_signature(b"another transcript", &cert, &dss)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn no_verifier_refuses_a_garbage_signature() {
+        let cert = CertificateDer::from_pem_slice(crate::test_pki::EC_CERT_PEM.as_bytes()).unwrap();
         let dss = make_dss();
-        let result = verifier.verify_tls13_signature(b"message", &cert, &dss);
-        assert!(result.is_ok());
+        assert!(
+            NoVerifier
+                .verify_tls12_signature(b"message", &cert, &dss)
+                .is_err()
+        );
+        assert!(
+            NoVerifier
+                .verify_tls13_signature(b"message", &cert, &dss)
+                .is_err()
+        );
     }
 }

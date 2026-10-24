@@ -313,13 +313,37 @@ fn build_inner_openssl_tls() -> Result<OpenSslMemTls, WinrmError> {
 /// dialect with WSMAN listener is finicky enough that we need to control
 /// every header.
 #[cfg(feature = "credssp")]
-struct CredSspConnection {
-    stream: tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+struct CredSspConnection<S = tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
+    stream: S,
     /// `Host` header value (see [`CredSspEndpoint::host_header`]).
     host_header: String,
     path: String,
+    opts: CredSspConnOptions,
+}
+
+/// What the transport derives from `WinrmConfig` for every CredSSP connection.
+#[derive(Clone, Debug)]
+pub(crate) struct CredSspConnOptions {
     /// Largest response body accepted (see `transport::max_response_bytes`).
-    max_response_bytes: usize,
+    pub(crate) max_response_bytes: usize,
+    /// TCP connect and outer TLS handshake, together.
+    pub(crate) connect_timeout: std::time::Duration,
+    /// Each HTTP exchange (request written, response read).
+    pub(crate) exchange_timeout: std::time::Duration,
+}
+
+impl CredSspConnOptions {
+    /// `connect_timeout_secs`; `operation_timeout_secs.saturating_add(10)`;
+    /// `transport::max_response_bytes(config)`.
+    pub(crate) fn from_config(config: &crate::config::WinrmConfig) -> Self {
+        Self {
+            max_response_bytes: crate::transport::max_response_bytes(config),
+            connect_timeout: std::time::Duration::from_secs(config.connect_timeout_secs),
+            exchange_timeout: std::time::Duration::from_secs(
+                config.operation_timeout_secs.saturating_add(10),
+            ),
+        }
+    }
 }
 
 #[cfg(feature = "credssp")]
@@ -327,13 +351,30 @@ impl CredSspConnection {
     /// Open a TCP+TLS connection to `endpoint`. The returned object owns
     /// the underlying socket; drop to close.
     ///
+    /// The TCP connect and the outer TLS handshake share one deadline,
+    /// `opts.connect_timeout`; its expiry is [`WinrmError::Timeout`].
+    ///
     /// `accept_invalid_certs = true` disables outer TLS verification (test
     /// use only). Nothing inside CredSSP replaces it: the inner TLS is not
     /// verified (MS-CSSP 1.3) and `pubKeyAuth` binds only the inner TLS key.
     async fn connect(
         endpoint: &CredSspEndpoint,
         accept_invalid_certs: bool,
-        max_response_bytes: usize,
+        opts: CredSspConnOptions,
+    ) -> Result<Self, WinrmError> {
+        let connect_timeout = opts.connect_timeout;
+        tokio::time::timeout(
+            connect_timeout,
+            Self::connect_inner(endpoint, accept_invalid_certs, opts),
+        )
+        .await
+        .map_err(|_| WinrmError::Timeout(connect_timeout.as_secs()))?
+    }
+
+    async fn connect_inner(
+        endpoint: &CredSspEndpoint,
+        accept_invalid_certs: bool,
+        opts: CredSspConnOptions,
     ) -> Result<Self, WinrmError> {
         use tokio::net::TcpStream;
         use tokio_rustls::TlsConnector;
@@ -372,17 +413,43 @@ impl CredSspConnection {
             .await
             .map_err(|e| WinrmError::AuthFailed(format!("CredSSP outer TLS: {e}")))?;
 
-        Ok(Self {
+        Ok(Self::from_stream(
             stream,
-            host_header: endpoint.host_header.clone(),
-            path: endpoint.path.clone(),
-            max_response_bytes,
-        })
+            endpoint.host_header.clone(),
+            endpoint.path.clone(),
+            opts,
+        ))
+    }
+}
+
+#[cfg(feature = "credssp")]
+impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> CredSspConnection<S> {
+    fn from_stream(stream: S, host_header: String, path: String, opts: CredSspConnOptions) -> Self {
+        Self {
+            stream,
+            host_header,
+            path,
+            opts,
+        }
     }
 
     /// Send one POST and return (status, headers, body bytes). Writes raw
     /// HTTP/1.1 onto the persistent TLS stream.
+    ///
+    /// The whole exchange (request written, response read) is bounded by
+    /// `opts.exchange_timeout`; its expiry is [`WinrmError::Timeout`].
     async fn post(
+        &mut self,
+        auth_header: Option<&str>,
+        body: &str,
+    ) -> Result<(u16, std::collections::HashMap<String, String>, Vec<u8>), WinrmError> {
+        let exchange_timeout = self.opts.exchange_timeout;
+        tokio::time::timeout(exchange_timeout, self.post_inner(auth_header, body))
+            .await
+            .map_err(|_| WinrmError::Timeout(exchange_timeout.as_secs()))?
+    }
+
+    async fn post_inner(
         &mut self,
         auth_header: Option<&str>,
         body: &str,
@@ -489,8 +556,8 @@ impl CredSspConnection {
             .get("content-length")
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
-        if content_length > self.max_response_bytes {
-            return Err(crate::auth::body_too_large(self.max_response_bytes));
+        if content_length > self.opts.max_response_bytes {
+            return Err(crate::auth::body_too_large(self.opts.max_response_bytes));
         }
         let mut body_bytes: Vec<u8> = buf[head_end..].to_vec();
         while body_bytes.len() < content_length {
@@ -617,8 +684,8 @@ pub(crate) struct CredSspAuth {
     /// channel skips chain validation, and nothing in CredSSP authenticates
     /// the server instead (`pubKeyAuth` binds only the inner TLS key).
     pub(crate) accept_invalid_certs: bool,
-    /// Largest response body read (see `transport::max_response_bytes`).
-    pub(crate) max_response_bytes: usize,
+    /// Response size and timeout limits of the connection.
+    pub(crate) opts: CredSspConnOptions,
 }
 
 #[cfg(feature = "credssp")]
@@ -634,12 +701,9 @@ impl AuthTransport for CredSspAuth {
         // reqwest entirely and drive raw HTTP/1.1 over a single tokio_rustls
         // TlsStream. See CredSspConnection above.
         let endpoint = CredSspEndpoint::parse(url)?;
-        let mut conn = CredSspConnection::connect(
-            &endpoint,
-            self.accept_invalid_certs,
-            self.max_response_bytes,
-        )
-        .await?;
+        let mut conn =
+            CredSspConnection::connect(&endpoint, self.accept_invalid_certs, self.opts.clone())
+                .await?;
 
         // Pywinrm sends the SOAP body in every CredSSP round (which is what
         // Microsoft HTTPAPI on the WSMAN listener expects). The same body is
@@ -1266,7 +1330,7 @@ mod tests {
                 crate::test_pki::spawn_tls_sink(crate::test_pki::impostor_server_config(versions));
             let endpoint =
                 CredSspEndpoint::parse(&format!("https://127.0.0.1:{port}/wsman")).unwrap();
-            match CredSspConnection::connect(&endpoint, true, 1 << 20).await {
+            match CredSspConnection::connect(&endpoint, true, test_opts()).await {
                 Err(WinrmError::AuthFailed(m)) => {
                     assert!(m.starts_with("CredSSP outer TLS:"), "{label}: {m}");
                 }
@@ -1292,8 +1356,127 @@ mod tests {
             password: Zeroizing::new(PASS.into()),
             domain: String::new(),
             accept_invalid_certs,
-            max_response_bytes,
+            opts: CredSspConnOptions {
+                max_response_bytes,
+                connect_timeout: Duration::from_secs(20),
+                exchange_timeout: Duration::from_secs(20),
+            },
         }
+    }
+
+    fn test_opts() -> CredSspConnOptions {
+        CredSspConnOptions {
+            max_response_bytes: 512 * 1024,
+            connect_timeout: Duration::from_secs(30),
+            exchange_timeout: Duration::from_secs(70),
+        }
+    }
+
+    /// A connection over an in-memory pipe, and the server end of the pipe.
+    fn duplex_conn() -> (
+        CredSspConnection<tokio::io::DuplexStream>,
+        tokio::io::DuplexStream,
+    ) {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let conn = CredSspConnection::from_stream(
+            client,
+            "127.0.0.1:5986".into(),
+            "/wsman".into(),
+            test_opts(),
+        );
+        (conn, server)
+    }
+
+    /// Read one request from `peer`: the head up to CRLFCRLF plus its
+    /// Content-Length body.
+    async fn read_request(peer: &mut tokio::io::DuplexStream) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::new();
+        let head_end = loop {
+            let mut chunk = [0u8; 1024];
+            let n = peer.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "client closed before finishing the request");
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(pos) = find_double_crlf(&buf) {
+                break pos + 4;
+            }
+        };
+        let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+        let len: usize = head
+            .lines()
+            .find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                k.eq_ignore_ascii_case("content-length")
+                    .then(|| v.trim().parse().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        while buf.len() < head_end + len {
+            let mut chunk = [0u8; 1024];
+            let n = peer.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "client closed before finishing the body");
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    /// Read one request, write `reply`, then keep the pipe open and silent.
+    async fn answer_then_hang(mut peer: tokio::io::DuplexStream, reply: &'static [u8]) {
+        use tokio::io::AsyncWriteExt;
+        read_request(&mut peer).await;
+        peer.write_all(reply).await.unwrap();
+        std::future::pending::<()>().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn credssp_post_times_out_on_an_unfinished_response_head() {
+        let (mut conn, peer) = duplex_conn();
+        tokio::spawn(answer_then_hang(peer, b"HTTP/1.1 401 Unauthorized\r\n"));
+        let res = tokio::time::timeout(
+            Duration::from_secs(600),
+            conn.post(Some("CredSSP AAAA"), "<a/>"),
+        )
+        .await
+        .expect("post is not bounded");
+        assert!(matches!(res, Err(WinrmError::Timeout(70))), "{res:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn credssp_post_times_out_on_a_trickled_body() {
+        let (mut conn, peer) = duplex_conn();
+        tokio::spawn(answer_then_hang(
+            peer,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nx",
+        ));
+        let res = tokio::time::timeout(Duration::from_secs(600), conn.post(None, "<a/>"))
+            .await
+            .expect("post is not bounded");
+        assert!(matches!(res, Err(WinrmError::Timeout(70))), "{res:?}");
+    }
+
+    #[tokio::test]
+    async fn credssp_connect_times_out_when_the_server_never_sends_server_hello() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        // Never accepted: the kernel completes the TCP handshake and nobody
+        // answers the ClientHello.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let endpoint = CredSspEndpoint::parse(&format!("https://127.0.0.1:{port}/wsman")).unwrap();
+        let opts = CredSspConnOptions {
+            connect_timeout: Duration::from_secs(1),
+            ..test_opts()
+        };
+        let start = std::time::Instant::now();
+        let res = tokio::time::timeout(
+            Duration::from_secs(10),
+            CredSspConnection::connect(&endpoint, true, opts),
+        )
+        .await
+        .expect("connect is not bounded");
+        let err = res.err().expect("connected to a silent listener");
+        assert!(matches!(err, WinrmError::Timeout(1)), "{err:?}");
+        assert!(start.elapsed() < Duration::from_secs(5));
+        drop(listener);
     }
 
     /// One CredSSP exchange posting `body` to the acceptor on `port`.

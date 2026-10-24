@@ -21,7 +21,7 @@ use crate::auth::AuthTransport;
 use crate::auth::basic::BasicAuth;
 use crate::auth::certificate::CertificateAuth;
 #[cfg(feature = "credssp")]
-use crate::auth::credssp::CredSspAuth;
+use crate::auth::credssp::{CredSspAuth, CredSspConnOptions};
 use crate::auth::kerberos::KerberosAuth;
 #[cfg(feature = "kerberos")]
 use crate::auth::kerberos::KerberosSession;
@@ -770,7 +770,7 @@ impl HttpTransport {
                     password: Zeroizing::new(self.credentials.password.expose_secret().to_string()),
                     domain: self.credentials.domain.clone(),
                     accept_invalid_certs: self.config.accept_invalid_certs,
-                    max_response_bytes: self.max_response_bytes(),
+                    opts: CredSspConnOptions::from_config(&self.config),
                 };
                 auth.send_authenticated(&self.http, &url, body).await?
             }
@@ -3211,6 +3211,27 @@ mod tests {
             WinrmCredentials::new(USER, PASS, ""),
         )
         .unwrap()
+    }
+
+    /// A CredSSP request to a host that never answers the TLS handshake ends
+    /// at `connect_timeout_secs`.
+    #[cfg(feature = "credssp")]
+    #[tokio::test]
+    async fn credssp_transport_request_is_bounded_by_connect_timeout() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); // never accepted
+        let port = listener.local_addr().unwrap().port();
+        let transport = credssp_test_transport(port);
+        let start = std::time::Instant::now();
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            transport.send_soap_raw("127.0.0.1", "<a/>".into()),
+        )
+        .await
+        .expect("CredSSP request is not bounded")
+        .unwrap_err();
+        assert!(matches!(err, WinrmError::Timeout(1)), "{err:?}");
+        assert!(start.elapsed() < Duration::from_secs(5));
+        drop(listener);
     }
 
     /// A CredSSP request to a bracketed IPv6 host reaches the TLS handshake.

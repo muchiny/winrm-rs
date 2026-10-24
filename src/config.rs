@@ -69,7 +69,8 @@ pub struct WinrmConfig {
     pub accept_invalid_certs: bool,
     /// TCP connect timeout in seconds (default: 30).
     ///
-    /// Not applied with [`AuthMethod::CredSsp`] in this release (see its doc).
+    /// With [`AuthMethod::CredSsp`] it bounds the TCP connect and the TLS
+    /// handshake together.
     pub connect_timeout_secs: u64,
     /// WS-Management `OperationTimeout` in seconds (default: 60): how long the
     /// server may hold one request. The HTTP client timeout is set to this
@@ -87,7 +88,9 @@ pub struct WinrmConfig {
     /// `Shell::run_command` additionally gives up after
     /// `2 * operation_timeout_secs` in total.
     ///
-    /// Not applied with [`AuthMethod::CredSsp`] in this release (see its doc).
+    /// With [`AuthMethod::CredSsp`] one request takes up to five HTTP
+    /// exchanges on one connection (the CredSSP handshake, then the
+    /// credentials with the body); each gets this budget plus 10 seconds.
     pub operation_timeout_secs: u64,
     /// Authentication method to use for all requests (default: [`AuthMethod::Ntlm`]).
     pub auth_method: AuthMethod,
@@ -103,8 +106,11 @@ pub struct WinrmConfig {
     /// sent, triggers a retry, whatever the auth method: a request that went
     /// out may have run on the server (a command, a stdin write, an upload
     /// chunk), so a timeout, a reset or a dropped connection after sending is
-    /// returned, as are authentication errors and SOAP faults. With
-    /// [`AuthMethod::CredSsp`] nothing is retried: its connection errors are not `WinrmError::Http`.
+    /// returned, as are authentication errors and SOAP faults. A CredSSP
+    /// connection error is
+    /// [`WinrmError::AuthFailed`](crate::WinrmError::AuthFailed) or
+    /// [`WinrmError::Timeout`](crate::WinrmError::Timeout), never
+    /// `WinrmError::Http`, so it is not retried.
     pub max_retries: u32,
     /// Path to the client certificate PEM file (for `AuthMethod::Certificate`).
     ///
@@ -493,20 +499,16 @@ pub enum AuthMethod {
     /// # Limitations in this release
     ///
     /// CredSSP runs on a TLS connection of its own, outside the HTTP client
-    /// of the other methods, and does not apply these [`WinrmConfig`] fields:
-    /// - `connect_timeout_secs` and `operation_timeout_secs`: a host or network
-    ///   path that stops answering blocks the call until it is cancelled.
-    ///   Bound CredSSP calls with the `*_with_timeout` or `*_with_cancel`
-    ///   methods of [`WinrmClient`](crate::WinrmClient), or wrap the call in
-    ///   `tokio::time::timeout`. Dropping the future closes its connection; a
-    ///   shell whose creation was cut short can stay open on the host until
-    ///   its idle timeout.
+    /// of the other methods. It applies `connect_timeout_secs` and
+    /// `operation_timeout_secs`, and does not apply these [`WinrmConfig`]
+    /// fields:
     /// - `proxy`, and the `HTTPS_PROXY` / `ALL_PROXY` environment variables:
     ///   CredSSP connects directly to the endpoint.
     /// - `user_agent`: CredSSP sends `Python WinRM client`.
     /// - `max_retries`: a CredSSP connection error is
-    ///   [`WinrmError::AuthFailed`](crate::WinrmError::AuthFailed), not
-    ///   `WinrmError::Http`, so it is never retried.
+    ///   [`WinrmError::AuthFailed`](crate::WinrmError::AuthFailed) or
+    ///   [`WinrmError::Timeout`](crate::WinrmError::Timeout), never
+    ///   `WinrmError::Http`, so it is not retried.
     CredSsp,
 }
 

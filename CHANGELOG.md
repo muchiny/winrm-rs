@@ -74,6 +74,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - CredSSP works with a host given as a bracketed IPv6 literal or an
   internationalised name: the TLS server name, the TCP connection and the SPN
   now come from the endpoint URL, parsed as for the other methods.
+- CredSSP applies `connect_timeout_secs` (TCP connect and TLS handshake) and
+  `operation_timeout_secs` (+ 10 s per HTTP exchange) like the other methods;
+  a deadline is `WinrmError::Timeout`.
 
 ## [1.4.1] - 2026-10-24
 

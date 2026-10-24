@@ -35,6 +35,12 @@ pub enum WinrmError {
     ///   sealing, NTLM over HTTPS, Kerberos over HTTPS) and waited for one of
     ///   the 32 connection slots of the client longer than one request may
     ///   take reports `operation_timeout_secs + 10`; nothing was sent.
+    /// - with `AuthMethod::CredSsp`, a TCP connect plus TLS handshake longer
+    ///   than `connect_timeout_secs` reports that value, and one HTTP exchange
+    ///   longer than `operation_timeout_secs + 10` reports that value; only a
+    ///   timeout on the last exchange of the handshake, which carries the
+    ///   delegated credentials and the request body, may leave the request run
+    ///   on the server.
     #[error("WinRM operation timed out after {0}s")]
     Timeout(u64),
     /// File transfer error (upload or download failure).

@@ -301,22 +301,11 @@ pub(crate) fn create_authenticate_message_full(
     let domain_for_sb = display_domain.unwrap_or(domain);
     let domain_bytes = to_utf16le(domain_for_sb);
     let user_bytes = to_utf16le(username);
-    // Workstation: client hostname (uppercase). Empty if hostname unavailable.
-    let workstation_bytes: Vec<u8> = if mic_input.is_some() {
-        // Try to get hostname for CredSSP / modern Type 3 messages
-        std::env::var("HOSTNAME")
-            .ok()
-            .or_else(|| {
-                std::process::Command::new("hostname")
-                    .output()
-                    .ok()
-                    .and_then(|o| String::from_utf8(o.stdout).ok())
-                    .map(|s| s.trim().to_string())
-            })
-            .map(|h| to_utf16le(&h.to_uppercase()))
-            .unwrap_or_default()
+    // Workstation: this machine's name; empty when no MIC is required.
+    let workstation_bytes: &[u8] = if mic_input.is_some() {
+        workstation()
     } else {
-        Vec::new()
+        &[]
     };
 
     // Build Type 3 message
@@ -372,7 +361,7 @@ pub(crate) fn create_authenticate_message_full(
     msg.extend_from_slice(&nt_response);
     msg.extend_from_slice(&domain_bytes);
     msg.extend_from_slice(&user_bytes);
-    msg.extend_from_slice(&workstation_bytes);
+    msg.extend_from_slice(workstation_bytes);
     msg.extend_from_slice(&encrypted_random_session_key);
 
     // Compute and patch MIC if requested
@@ -548,6 +537,65 @@ pub(crate) fn decode_challenge_header(header: &str) -> Result<ChallengeMessage, 
         .decode(token.trim_ascii())
         .map_err(|e| NtlmError::InvalidMessage(format!("base64 decode: {e}")))?;
     parse_challenge(&bytes)
+}
+
+/// Longest NetBIOS computer name, in characters.
+const WORKSTATION_MAX_CHARS: usize = 15;
+
+/// Turns a raw host name into the `Workstation` field of an NTLM AUTHENTICATE
+/// message: the first label before `.`, only ASCII alphanumerics, `-` and `_`,
+/// upper-cased, cut to 15 characters (the NetBIOS name length), as UTF-16LE.
+pub(crate) fn sanitize_workstation(raw: &str) -> Vec<u8> {
+    let label = raw.split('.').next().unwrap_or_default();
+    let name: String = label
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .map(|c| c.to_ascii_uppercase())
+        .take(WORKSTATION_MAX_CHARS)
+        .collect();
+    to_utf16le(&name)
+}
+
+/// This machine's name for the `Workstation` field of the NTLM AUTHENTICATE
+/// message, as UTF-16LE, computed once.
+///
+/// Sources, in order, each sanitized as it is read (the first non-empty result
+/// wins): the `HOSTNAME` environment variable; on Linux,
+/// `/proc/sys/kernel/hostname`; on Windows, the `COMPUTERNAME` environment
+/// variable. On other systems the name is empty unless `HOSTNAME` is exported.
+/// No subprocess is started.
+///
+/// The field is informational, except for accounts restricted to named
+/// workstations ("Log On To").
+pub(crate) fn workstation() -> &'static [u8] {
+    static WORKSTATION: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    WORKSTATION.get_or_init(|| {
+        let from_env = std::env::var("HOSTNAME")
+            .map(|h| sanitize_workstation(&h))
+            .unwrap_or_default();
+        if !from_env.is_empty() {
+            return from_env;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let from_kernel = std::fs::read_to_string("/proc/sys/kernel/hostname")
+                .map(|h| sanitize_workstation(&h))
+                .unwrap_or_default();
+            if !from_kernel.is_empty() {
+                return from_kernel;
+            }
+        }
+        #[cfg(windows)]
+        {
+            let from_computer = std::env::var("COMPUTERNAME")
+                .map(|h| sanitize_workstation(&h))
+                .unwrap_or_default();
+            if !from_computer.is_empty() {
+                return from_computer;
+            }
+        }
+        Vec::new()
+    })
 }
 
 #[cfg(test)]
@@ -1188,5 +1236,52 @@ mod tests {
         let flags = u32::from_le_bytes(msg[12..16].try_into().unwrap());
         // Should have NEGOTIATE_OEM which TYPE1_FLAGS doesn't
         assert_ne!(flags & NEGOTIATE_OEM, 0, "CredSSP flags should include OEM");
+    }
+
+    #[test]
+    fn workstation_name_is_sanitized_and_capped() {
+        assert_eq!(
+            sanitize_workstation("web-01.corp.example\r\n"),
+            to_utf16le("WEB-01")
+        );
+        assert_eq!(sanitize_workstation("build_box"), to_utf16le("BUILD_BOX"));
+        assert_eq!(
+            sanitize_workstation("h\u{e9}te\u{1F600}x"),
+            to_utf16le("HTEX")
+        );
+        assert_eq!(sanitize_workstation("a\r\nb c\0d"), to_utf16le("ABCD"));
+        assert_eq!(
+            sanitize_workstation("abcdefghijklmnopqrstuvwxyz"),
+            to_utf16le("ABCDEFGHIJKLMNO")
+        );
+        assert!(sanitize_workstation("").is_empty());
+        assert!(sanitize_workstation(".corp").is_empty());
+    }
+
+    #[test]
+    fn workstation_name_is_computed_once() {
+        assert!(std::ptr::eq(workstation(), workstation()));
+    }
+
+    #[test]
+    fn workstation_never_exceeds_15_utf16_units() {
+        assert!(workstation().len() <= 30);
+        assert_eq!(workstation().len() % 2, 0);
+    }
+
+    /// Pins the source order on Linux (kills a mutant that returns `&[]`).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn workstation_on_linux_is_hostname_env_else_kernel_hostname() {
+        let from_env = std::env::var("HOSTNAME")
+            .map(|h| sanitize_workstation(&h))
+            .unwrap_or_default();
+        let expected = if from_env.is_empty() {
+            sanitize_workstation(&std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap())
+        } else {
+            from_env
+        };
+        assert_eq!(workstation(), expected.as_slice());
+        assert!(!expected.is_empty(), "this Linux box has a kernel hostname");
     }
 }

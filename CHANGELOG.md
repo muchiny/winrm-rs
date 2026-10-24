@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- NTLM: the AUTHENTICATE message's workstation name now comes from
+  `HOSTNAME`, `/proc/sys/kernel/hostname` (Linux) or `COMPUTERNAME` (Windows),
+  cut to its first label and 15 characters. The crate no longer runs the
+  `hostname` program.
+
 ## [1.4.1] - 2026-10-24
 
 Security fixes for `accept_invalid_certs` and for remote file paths; PSRP

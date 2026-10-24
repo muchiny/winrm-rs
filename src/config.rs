@@ -393,6 +393,12 @@ pub enum AuthMethod {
     /// handshake. Where the network path is not trusted, use it only over
     /// HTTPS with certificate validation, where NTLM carries a channel binding
     /// to the server's certificate.
+    ///
+    /// The `Workstation` field of the NTLM AUTHENTICATE message is this
+    /// machine's name: `HOSTNAME` if set, else `/proc/sys/kernel/hostname` on
+    /// Linux or `COMPUTERNAME` on Windows. It is cut to its first label and 15
+    /// characters. On other systems it is empty unless `HOSTNAME` is exported.
+    /// It matters only for accounts restricted to named workstations.
     Ntlm,
     /// Kerberos authentication (requires `kerberos` feature and prior `kinit`).
     ///

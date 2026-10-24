@@ -4321,6 +4321,10 @@ impl TlsRecordingRelay {
         ));
         std::fs::create_dir_all(&dir).expect("relay temp dir");
         let (cert_path, key_path) = (dir.join("cert.pem"), dir.join("key.pem"));
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test-only certificate generation with openssl"
+        )]
         let status = std::process::Command::new("openssl")
             .args([
                 "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",

@@ -3103,6 +3103,351 @@ async fn command_on_deleted_shell_returns_error() {
     );
 }
 
+// === Host command line (command-line probes) ===
+//
+// How Windows runs a WinRS command line is not settled by the spec or by the
+// reference clients. These probes measure it against the bench, with harmless
+// payloads only (`whoami`, `Write-Output` markers). They use the public API
+// alone. Run them with
+// `cargo test --test integration_real -- --ignored --test-threads=1 probe_`.
+// When a probe shows a different behaviour from the one asserted, change its
+// assertion to the observed value and say so in its doc comment.
+
+/// Full path of the 64-bit Windows PowerShell, with the variable left for the
+/// host to expand.
+const FULL_POWERSHELL: &str = r"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe";
+
+/// Scratch directory the probes write to (and remove).
+const PROBE_DIR: &str = r"C:\Users\Public\winrm-rs-probe";
+
+/// Encode a script for `-EncodedCommand`.
+fn ps(script: &str) -> String {
+    winrm_rs::encode_powershell_command(script)
+}
+
+/// Remove the scratch directory; the result is ignored.
+async fn probe_cleanup(client: &WinrmClient, host: &str) {
+    let _ = client
+        .run_powershell(
+            host,
+            "Remove-Item -LiteralPath 'C:\\Users\\Public\\winrm-rs-probe' -Recurse -Force -ErrorAction SilentlyContinue",
+        )
+        .await;
+}
+
+/// Standard output as CRLF-split, trimmed lines.
+fn probe_lines(stdout: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(stdout)
+        .split("\r\n")
+        .map(|l| l.trim().to_string())
+        .collect()
+}
+
+/// Standard output (or error) as lossy text.
+fn probe_text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// The full path with `%SystemRoot%` runs the 64-bit System32 PowerShell.
+#[tokio::test]
+#[ignore]
+async fn probe_full_powershell_path_runs_system32() {
+    let Some((client, host)) = test_client() else {
+        eprintln!(
+            "SKIP probe_full_powershell_path_runs_system32: set WINRM_TEST_HOST and WINRM_TEST_PASS"
+        );
+        return;
+    };
+    let out = client
+        .run_command(
+            &host,
+            FULL_POWERSHELL,
+            &[
+                "-NoProfile",
+                "-NonInteractive",
+                "-EncodedCommand",
+                &ps("[Environment]::Is64BitProcess; $PSHOME"),
+            ],
+        )
+        .await
+        .expect("run the full-path PowerShell");
+    let stdout = probe_text(&out.stdout);
+    let stderr = probe_text(&out.stderr);
+    assert_eq!(out.exit_code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let lines: Vec<String> = probe_lines(&out.stdout)
+        .into_iter()
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(lines.len(), 2, "unexpected stdout: {stdout}");
+    assert_eq!(lines[0], "True", "stdout: {stdout}");
+    assert!(
+        lines[1].eq_ignore_ascii_case(r"C:\Windows\System32\WindowsPowerShell\v1.0"),
+        "unexpected $PSHOME: {}",
+        lines[1]
+    );
+}
+
+/// A bare command name resolves from the shell's working directory before the
+/// search path, whereas the full path runs the real PowerShell.
+#[tokio::test]
+#[ignore]
+async fn probe_bare_name_resolves_from_the_working_directory() {
+    let Some((client, host)) = test_client() else {
+        eprintln!(
+            "SKIP probe_bare_name_resolves_from_the_working_directory: set WINRM_TEST_HOST and WINRM_TEST_PASS"
+        );
+        return;
+    };
+    probe_cleanup(&client, &host).await;
+    let setup = client
+        .run_powershell(
+            &host,
+            "New-Item -ItemType Directory -Force -Path 'C:\\Users\\Public\\winrm-rs-probe' | Out-Null; Copy-Item C:\\Windows\\System32\\whoami.exe 'C:\\Users\\Public\\winrm-rs-probe\\powershell.exe'",
+        )
+        .await;
+
+    let Some((planted, _)) = test_client_with(|c| c.working_directory = Some(PROBE_DIR.into()))
+    else {
+        probe_cleanup(&client, &host).await;
+        eprintln!("SKIP probe_bare_name_resolves_from_the_working_directory: no client");
+        return;
+    };
+    let bare = planted
+        .run_command(
+            &host,
+            "powershell.exe",
+            &["-EncodedCommand", &ps("Write-Output PS-RAN")],
+        )
+        .await;
+    let full = planted
+        .run_command(
+            &host,
+            FULL_POWERSHELL,
+            &[
+                "-NoProfile",
+                "-NonInteractive",
+                "-EncodedCommand",
+                &ps("Write-Output PS-RAN"),
+            ],
+        )
+        .await;
+    probe_cleanup(&client, &host).await;
+
+    let setup = setup.expect("plant the copy");
+    assert_eq!(
+        setup.exit_code,
+        0,
+        "plant failed: {}",
+        probe_text(&setup.stderr)
+    );
+    let bare = bare.expect("run the bare name");
+    let bare_stdout = probe_text(&bare.stdout);
+    eprintln!(
+        "bare name: exit {}, stdout {:?}, stderr {:?}",
+        bare.exit_code,
+        bare_stdout,
+        probe_text(&bare.stderr)
+    );
+    assert!(
+        !bare_stdout.contains("PS-RAN"),
+        "the bare name ran the real PowerShell: {bare_stdout}"
+    );
+    assert!(
+        bare_stdout.contains('\\'),
+        "expected whoami output (domain\\user), got: {bare_stdout}"
+    );
+    let full = full.expect("run the full path");
+    let full_stdout = probe_text(&full.stdout);
+    assert!(
+        full_stdout.contains("PS-RAN"),
+        "the full path did not run PowerShell: {full_stdout}\nstderr: {}",
+        probe_text(&full.stderr)
+    );
+}
+
+/// `-NoProfile` keeps the profile's output out of the command's stdout.
+#[tokio::test]
+#[ignore]
+async fn probe_noprofile_skips_profile_output() {
+    let Some((client, host)) = test_client() else {
+        eprintln!(
+            "SKIP probe_noprofile_skips_profile_output: set WINRM_TEST_HOST and WINRM_TEST_PASS"
+        );
+        return;
+    };
+    // Save the current profile (as base64, so the bytes come back exactly).
+    let saved = client
+        .run_powershell(
+            &host,
+            "if (Test-Path $PROFILE.CurrentUserAllHosts) { [Convert]::ToBase64String([IO.File]::ReadAllBytes($PROFILE.CurrentUserAllHosts)) }",
+        )
+        .await
+        .expect("read the current profile");
+    let saved_b64 = probe_text(&saved.stdout).trim().to_string();
+
+    let write = client
+        .run_powershell(
+            &host,
+            "New-Item -Force -Path $PROFILE.CurrentUserAllHosts -Value 'Write-Output PROFILE-MARKER' | Out-Null",
+        )
+        .await;
+    // Collect both outputs, restore, then assert.
+    let with_profile = client.run_powershell(&host, "Write-Output body").await;
+    let without_profile = client
+        .run_command(
+            &host,
+            FULL_POWERSHELL,
+            &[
+                "-NoProfile",
+                "-NonInteractive",
+                "-EncodedCommand",
+                &ps("Write-Output body"),
+            ],
+        )
+        .await;
+    let restore_script = if saved_b64.is_empty() {
+        "Remove-Item -LiteralPath $PROFILE.CurrentUserAllHosts -Force -ErrorAction SilentlyContinue"
+            .to_string()
+    } else {
+        format!(
+            "[IO.File]::WriteAllBytes($PROFILE.CurrentUserAllHosts, [Convert]::FromBase64String('{saved_b64}'))"
+        )
+    };
+    let restore = client.run_powershell(&host, &restore_script).await;
+
+    let write = write.expect("write the profile");
+    assert_eq!(
+        write.exit_code,
+        0,
+        "write failed: {}",
+        probe_text(&write.stderr)
+    );
+    let with_profile = probe_text(&with_profile.expect("run with the profile").stdout);
+    let without_profile = probe_text(&without_profile.expect("run with -NoProfile").stdout);
+    let restore = restore.expect("restore the profile");
+    assert_eq!(
+        restore.exit_code,
+        0,
+        "restore failed: {}",
+        probe_text(&restore.stderr)
+    );
+    assert!(
+        with_profile.contains("PROFILE-MARKER"),
+        "the profile did not run without -NoProfile: {with_profile}"
+    );
+    assert!(
+        !without_profile.contains("PROFILE-MARKER"),
+        "-NoProfile still ran the profile: {without_profile}"
+    );
+}
+
+/// Measures the longest command line the host accepts. `L` is the largest `n`
+/// of the list whose row has `exit_code == 0` and no "too long" in stderr, that
+/// is, the character count of the longest probe line that ran.
+#[tokio::test]
+#[ignore]
+async fn probe_command_line_limit() {
+    let Some((client, host)) = test_client() else {
+        eprintln!("SKIP probe_command_line_limit: set WINRM_TEST_HOST and WINRM_TEST_PASS");
+        return;
+    };
+    // WinRS joins the command and its arguments with one space each, so the
+    // line is `cmd.exe /c echo ` (16 characters) plus `n - 16` times `x`.
+    let mut rows: Vec<(usize, bool)> = Vec::new();
+    for n in [8000_usize, 8100, 8150, 8191, 8200] {
+        let filler = "x".repeat(n - 16);
+        let result = client
+            .run_command(&host, "cmd.exe", &["/c", "echo", &filler])
+            .await;
+        let ok = match result {
+            Ok(out) => {
+                let too_long = probe_text(&out.stderr).contains("too long");
+                eprintln!("n={n} exit_code={} too_long={too_long}", out.exit_code);
+                out.exit_code == 0 && !too_long
+            }
+            Err(e) => {
+                eprintln!(
+                    "n={n} error={e} too_long={}",
+                    e.to_string().contains("too long")
+                );
+                false
+            }
+        };
+        rows.push((n, ok));
+    }
+    let l = rows.iter().filter(|(_, ok)| *ok).map(|(n, _)| *n).max();
+    eprintln!("L = {l:?}");
+    assert!(
+        rows.iter().any(|&(n, ok)| n == 8000 && ok),
+        "the 8000 row should succeed: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|&(n, ok)| n == 8200 && !ok),
+        "the 8200 row should fail: {rows:?}"
+    );
+}
+
+/// The arguments reach `cmd.exe` as one command line, so an `&` inside one
+/// argument is an operator.
+#[tokio::test]
+#[ignore]
+async fn probe_arguments_are_one_cmd_line() {
+    let Some((client, host)) = test_client() else {
+        eprintln!("SKIP probe_arguments_are_one_cmd_line: set WINRM_TEST_HOST and WINRM_TEST_PASS");
+        return;
+    };
+    let out = client
+        .run_command(&host, "cmd.exe", &["/c", "echo", "a&echo", "PROBE-MARKER"])
+        .await
+        .expect("run cmd.exe");
+    let lines = probe_lines(&out.stdout);
+    assert!(
+        lines.iter().any(|l| l == "a") && lines.iter().any(|l| l == "PROBE-MARKER"),
+        "expected separate lines `a` and `PROBE-MARKER`, got: {lines:?}"
+    );
+}
+
+/// A `PATH` set through `env_vars` steers the bare `powershell.exe`, while the
+/// full path is unaffected.
+#[tokio::test]
+#[ignore]
+async fn probe_path_env_steers_bare_powershell() {
+    let Some((client, host)) = test_client_with(|c| {
+        c.env_vars = vec![(
+            "PATH".into(),
+            r"C:\Windows\SysWOW64\WindowsPowerShell\v1.0;C:\Windows\System32".into(),
+        )];
+    }) else {
+        eprintln!(
+            "SKIP probe_path_env_steers_bare_powershell: set WINRM_TEST_HOST and WINRM_TEST_PASS"
+        );
+        return;
+    };
+    let bare = client
+        .run_command(
+            &host,
+            "powershell.exe",
+            &["-EncodedCommand", &ps("[Environment]::Is64BitProcess")],
+        )
+        .await
+        .expect("run the bare name");
+    let full = client
+        .run_command(
+            &host,
+            FULL_POWERSHELL,
+            &[
+                "-NoProfile",
+                "-NonInteractive",
+                "-EncodedCommand",
+                &ps("[Environment]::Is64BitProcess"),
+            ],
+        )
+        .await
+        .expect("run the full path");
+    assert_eq!(probe_text(&bare.stdout).trim(), "False", "bare name");
+    assert_eq!(probe_text(&full.stdout).trim(), "True", "full path");
+}
+
 // === Certificate authentication (TLS client certificate) ===
 //
 // Prepare the bench with `tests/scripts/make-client-cert.sh` (eval its output),

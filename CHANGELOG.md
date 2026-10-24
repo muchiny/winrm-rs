@@ -41,6 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Parsing a Receive response takes time linear in its size.
 - Decoding PowerShell CLIXML on stderr takes time linear in the record size,
   however the server slices it.
+- An unparseable `ExitCode` is logged as a 32-character excerpt.
 
 ## [1.4.1] - 2026-10-24
 

@@ -100,7 +100,7 @@ pub(crate) fn parse_receive_output_raw(xml: &str) -> Result<ReceiveOutput, SoapE
             Ok(c) => exit_code = Some(c),
             Err(e) => {
                 tracing::warn!(
-                    raw = %code_str.escape_debug(),
+                    raw = %crate::error::quote_server_text(&code_str, 32),
                     error = %e,
                     "WinRM ExitCode element present but unparseable; treating as absent",
                 );
@@ -804,6 +804,23 @@ mod tests {
         let output = parse_receive_output(xml).unwrap();
         assert!(output.done);
         assert!(output.exit_code.is_none());
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn unparseable_exit_code_is_logged_as_a_bounded_excerpt() {
+        let xml = format!(
+            "<rsp:ReceiveResponse><rsp:CommandState State=\"x\"><rsp:ExitCode>{}</rsp:ExitCode>\
+             </rsp:CommandState></rsp:ReceiveResponse>",
+            "9".repeat(1 << 20) // overflows i32, so the warn path runs
+        );
+        let out = parse_receive_output_raw(&xml).unwrap();
+        assert_eq!(out.exit_code, None);
+        assert!(logs_contain("[1048576 bytes in total]"));
+        logs_assert(|lines| match lines.iter().find(|l| l.len() >= 1024) {
+            Some(l) => Err(format!("a {} byte log line", l.len())),
+            None => Ok(()),
+        });
     }
 
     #[test]

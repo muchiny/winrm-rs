@@ -63,6 +63,14 @@ struct Scan {
     pos: usize,
     /// Elements named like the item's root that are open at `pos`.
     depth: usize,
+    /// Offset of the byte that ends the item's element name, once it has
+    /// arrived; the name is then not looked for again.
+    name_end: Option<usize>,
+    /// When `pos` is a `<` whose `>` has not arrived: how far the bytes after
+    /// it are known to hold no `>`. While `name_end` is `None` (then `pos` is
+    /// 0): how far they are known to hold no byte that ends a name (which
+    /// includes `>`). Not above `pos` otherwise.
+    searched: usize,
 }
 
 /// Turns a stderr byte stream into readable text, decoding PowerShell CLIXML
@@ -359,10 +367,19 @@ enum Step {
 /// Raw `<` and `>` only delimit tags in well-formed CLIXML, where text
 /// escapes them; a malformed stream still scans deterministically.
 fn scan_item(item: &[u8], scan: Scan) -> Step {
-    let partial_at_start = Step::Partial(Scan::default());
-    let Some(name) = item.get(1..).and_then(element_name) else {
-        return partial_at_start;
+    let name_end = match scan.name_end {
+        Some(end) => end,
+        None => match name_end_from(item, scan.searched.max(1)) {
+            Some(end) => end,
+            None => {
+                return Step::Partial(Scan {
+                    searched: item.len(),
+                    ..Scan::default()
+                });
+            }
+        },
     };
+    let name = item.get(1..name_end).unwrap_or_default();
     let lone_tag = matches!(item.get(1), Some(b'/' | b'!' | b'?'));
     if lone_tag {
         let from = scan.pos.max(1);
@@ -375,6 +392,8 @@ fn scan_item(item: &[u8], scan: Scan) -> Step {
             None => Step::Partial(Scan {
                 pos: item.len(),
                 depth: 0,
+                name_end: Some(name_end),
+                searched: item.len(),
             }),
         };
     }
@@ -385,10 +404,24 @@ fn scan_item(item: &[u8], scan: Scan) -> Step {
             return Step::Partial(Scan {
                 pos: item.len(),
                 depth,
+                name_end: Some(name_end),
+                searched: item.len(),
             });
         };
-        let Some(gt) = find_byte_from(item, lt, b'>') else {
-            return Step::Partial(Scan { pos: lt, depth });
+        // The bytes of a `<` left open by the previous push were already
+        // searched for its `>`; only the new ones are looked at.
+        let gt_from = if lt == scan.pos {
+            scan.searched.max(lt)
+        } else {
+            lt
+        };
+        let Some(gt) = find_byte_from(item, gt_from, b'>') else {
+            return Step::Partial(Scan {
+                pos: lt,
+                depth,
+                name_end: Some(name_end),
+                searched: item.len(),
+            });
         };
         let tag = item.get(lt..=gt).unwrap_or_default();
         let len = gt.saturating_add(1);
@@ -416,6 +449,16 @@ fn scan_item(item: &[u8], scan: Scan) -> Step {
         }
         pos = len;
     }
+}
+
+/// Offset of the first byte at or after `from` that ends an element name
+/// (ASCII whitespace, `/` or `>`).
+fn name_end_from(item: &[u8], from: usize) -> Option<usize> {
+    let pos = item
+        .get(from..)?
+        .iter()
+        .position(|&b| b.is_ascii_whitespace() || b == b'/' || b == b'>')?;
+    from.checked_add(pos)
 }
 
 /// The element name at the start of `tag` (the bytes after `<` or `</`), or
@@ -1088,6 +1131,151 @@ mod tests {
         ) {
             let s: String = parts.concat();
             proptest::prop_assert_eq!(decode_entities(&s), reference_decode_entities(&s), "{:?}", s);
+        }
+    }
+
+    /// An inner `<` whose `>` comes 8 MiB later, pushed 1 KiB at a time.
+    #[test]
+    fn stderr_decoder_scans_an_unclosed_inner_tag_in_linear_time() {
+        use std::time::{Duration, Instant};
+        let started = Instant::now();
+        let mut decoder = ClixmlDecoder::new();
+        let mut out = decoder.push(b"#< CLIXML\r\n<Objs Version=\"1.1.0.1\"><S S=\"Error\">a<");
+        let slice = vec![b'b'; 1024];
+        for _ in 0..8192 {
+            out.extend(decoder.push(&slice));
+        }
+        out.extend(decoder.push(b">x</S></Objs>"));
+        out.extend(decoder.finish());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // The record's text stops at its first `<`.
+        assert_eq!(out, b"a");
+    }
+
+    /// A record whose element name runs for 8 MiB, pushed 1 KiB at a time.
+    #[test]
+    fn stderr_decoder_scans_a_long_element_name_in_linear_time() {
+        use std::time::{Duration, Instant};
+        let started = Instant::now();
+        let mut decoder = ClixmlDecoder::new();
+        let mut out = decoder.push(b"#< CLIXML\r\n<Objs Version=\"1.1.0.1\"><");
+        let slice = vec![b'a'; 1024];
+        for _ in 0..8192 {
+            out.extend(decoder.push(&slice));
+        }
+        out.extend(decoder.push(b" /></Objs>"));
+        out.extend(decoder.finish());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(out.is_empty(), "{} bytes", out.len());
+    }
+
+    /// `scan_item` as it was before scans resumed inside a tag, for fresh
+    /// scans only (the `Scan` it returns is not compared).
+    fn reference_scan_item(item: &[u8], scan: Scan) -> Step {
+        let partial_at_start = Step::Partial(Scan::default());
+        let Some(name) = item.get(1..).and_then(element_name) else {
+            return partial_at_start;
+        };
+        let lone_tag = matches!(item.get(1), Some(b'/' | b'!' | b'?'));
+        if lone_tag {
+            let from = scan.pos.max(1);
+            return match find_byte_from(item, from, b'>') {
+                Some(end) => Step::Complete {
+                    len: end.saturating_add(1),
+                    end_of_document: item.get(2..).and_then(element_name) == Some(ROOT)
+                        && item.get(1) == Some(&b'/'),
+                },
+                None => Step::Partial(Scan {
+                    pos: item.len(),
+                    depth: 0,
+                    ..Scan::default()
+                }),
+            };
+        }
+        let mut pos = scan.pos;
+        let mut depth = scan.depth;
+        loop {
+            let Some(lt) = find_byte_from(item, pos, b'<') else {
+                return Step::Partial(Scan {
+                    pos: item.len(),
+                    depth,
+                    ..Scan::default()
+                });
+            };
+            let Some(gt) = find_byte_from(item, lt, b'>') else {
+                return Step::Partial(Scan {
+                    pos: lt,
+                    depth,
+                    ..Scan::default()
+                });
+            };
+            let tag = item.get(lt..=gt).unwrap_or_default();
+            let len = gt.saturating_add(1);
+            if let Some(closing) = tag.strip_prefix(b"</") {
+                if element_name(closing) == Some(name) {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Step::Complete {
+                            len,
+                            end_of_document: false,
+                        };
+                    }
+                }
+            } else if tag.get(1..).and_then(element_name) == Some(name) {
+                if tag.ends_with(b"/>") {
+                    if depth == 0 {
+                        return Step::Complete {
+                            len,
+                            end_of_document: false,
+                        };
+                    }
+                } else {
+                    depth = depth.saturating_add(1);
+                }
+            }
+            pos = len;
+        }
+    }
+
+    proptest::proptest! {
+        /// Scanning a growing item and resuming from the returned `Scan` gives
+        /// what a fresh scan of the same prefix gives, and what the scan gave
+        /// before it resumed inside tags.
+        #[test]
+        fn scan_item_resumed_matches_a_fresh_scan(
+            parts in proptest::collection::vec(
+                proptest::sample::select(vec![
+                    "S S=\"Error\">", "<S>", "</S>", "<S/>", "<Obj>", "</Obj>",
+                    "<", ">", "/", " ", "a", "S", "!", "?",
+                ]),
+                1..24,
+            ),
+            cuts in proptest::collection::vec(0usize..256, 0..8),
+        ) {
+            let item = format!("<{}", parts.concat()).into_bytes();
+            let mut ends: Vec<usize> = cuts.iter().map(|c| c % (item.len() + 1)).collect();
+            ends.push(item.len());
+            ends.sort_unstable();
+            ends.dedup();
+            let mut scan = Scan::default();
+            for &end in &ends {
+                let prefix = &item[..end];
+                let resumed = scan_item(prefix, scan);
+                let fresh = scan_item(prefix, Scan::default());
+                let reference = reference_scan_item(prefix, Scan::default());
+                match &resumed {
+                    Step::Complete { .. } => {
+                        proptest::prop_assert_eq!(&resumed, &fresh);
+                        proptest::prop_assert_eq!(&resumed, &reference);
+                        break;
+                    }
+                    Step::Partial(next) => {
+                        proptest::prop_assert!(matches!(fresh, Step::Partial(_)), "{:?} vs {:?}", resumed, fresh);
+                        proptest::prop_assert!(matches!(reference, Step::Partial(_)), "{:?} vs {:?}", resumed, reference);
+                        scan = *next;
+                    }
+                }
+            }
         }
     }
 }

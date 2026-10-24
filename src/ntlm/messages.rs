@@ -690,13 +690,6 @@ mod tests {
         type3[offset + 32..offset + 40].try_into().unwrap()
     }
 
-    // EncryptedRandomSessionKey: security buffer at offset 52.
-    fn encrypted_random_session_key_of(type3: &[u8]) -> [u8; 16] {
-        let offset =
-            usize::try_from(u32::from_le_bytes(type3[56..60].try_into().unwrap())).unwrap();
-        type3[offset..offset + 16].try_into().unwrap()
-    }
-
     #[test]
     #[ignore = "child process of fixed_rng_hooks_need_the_internal_feature"]
     fn fixed_rng_hooks_child() {
@@ -705,10 +698,15 @@ mod tests {
         let a = create_authenticate_message(&challenge, "u", "p", "").unwrap();
         let b = create_authenticate_message(&challenge, "u", "p", "").unwrap();
         assert_ne!(client_challenge_of(&a), client_challenge_of(&b));
-        assert_ne!(
-            encrypted_random_session_key_of(&a),
-            encrypted_random_session_key_of(&b)
-        );
+        // The exported session key is the random session key when key exchange
+        // is on, and does not depend on the challenge or the clock.
+        let (_, key_a) =
+            create_authenticate_message_internal(&challenge, "u", "p", "", None, None, None)
+                .unwrap();
+        let (_, key_b) =
+            create_authenticate_message_internal(&challenge, "u", "p", "", None, None, None)
+                .unwrap();
+        assert_ne!(*key_a, *key_b);
     }
 
     #[cfg(not(feature = "__internal"))]

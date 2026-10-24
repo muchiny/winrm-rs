@@ -2621,7 +2621,8 @@ async fn credssp_run_command_whoami() {
     // this far. Passes against Server 2025 since the SPNEGO mechListMIC RC4
     // reset fix (`NtlmSession::sign_mech_list_mic`); before it the server
     // answered the pubKeyAuth TSRequest with a bare 401. `CREDSSP_DUMP=1`
-    // (debug builds) dumps every intermediate value if it regresses.
+    // dumps every intermediate value if it regresses; it needs a debug build
+    // with `--features credssp,__internal`.
     if is_server_2012_r2().await {
         eprintln!(
             "SKIP credssp_run_command_whoami: Server 2012 R2 SCHANNEL pairs GCM only with static-RSA \

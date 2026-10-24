@@ -101,8 +101,9 @@ silently producing a wrong offset.
 ## Reproducibility
 
 `create_authenticate_message_full` draws its client challenge from the CSPRNG,
-which makes Type 3 output non-deterministic. In debug-assertion builds it
-honours `CREDSSP_FIXED_CC`; `scripts/fuzz.sh` sets it, so `fuzz_ntlm_type3`
+which makes Type 3 output non-deterministic. In debug-assertion builds with the
+`__internal` feature (which the fuzz crate enables) it honours
+`CREDSSP_FIXED_CC`; `scripts/fuzz.sh` sets it, so `fuzz_ntlm_type3`
 replays identically. The challenge timestamp is supplied by the target rather
 than read from the clock for the same reason.
 

@@ -131,21 +131,30 @@ pub(crate) fn parse_enumerate_response(xml: &str) -> Result<(String, Option<Stri
     // Extract items — may be inside <w:Items>, <wsen:Items>, or <n:Items>
     let items = extract_element_text(xml, "Items").unwrap_or_default();
 
-    // Extract EnumerationContext for Pull continuation
-    let context = extract_element_text(xml, "EnumerationContext");
+    // The end marker and the continuation context are elements of the
+    // response itself, outside `Items`: what lies inside the items is data.
+    let span = items_span(xml).unwrap_or(xml.len()..xml.len());
+    let head = xml.get(..span.start).unwrap_or_default();
+    let tail = xml.get(span.end..).unwrap_or_default();
 
-    // Check for EndOfSequence — means no more items
-    let end_of_seq = xml.contains("EndOfSequence");
-
-    let context = if end_of_seq { None } else { context };
+    let end_of_seq = has_element(head, "EndOfSequence") || has_element(tail, "EndOfSequence");
+    let context = if end_of_seq {
+        None
+    } else {
+        extract_element_text(head, "EnumerationContext")
+            .or_else(|| extract_element_text(tail, "EnumerationContext"))
+    };
 
     Ok((items, context))
 }
 
 /// Check a SOAP response for fault elements and return an error if found.
 ///
-/// Scans the XML for `<Fault>` or `<s:Fault>` elements and extracts the
-/// fault code and reason text. Returns `Ok(())` if no fault is present.
+/// A fault is a `Fault` element that is the first child of the SOAP `Body`
+/// (SOAP 1.2 Part 1 §5.4); in a fragment without a `Body`, any tag-shaped
+/// `Fault` element. Text that merely contains `Fault>` is not a fault.
+/// Extracts the fault code and reason text. Returns `Ok(())` if no fault is
+/// present.
 #[allow(unreachable_pub)] // re-exported under the `__internal` feature for fuzz targets
 pub fn check_soap_fault(xml: &str) -> Result<(), SoapError> {
     if let Some(fault) = extract_soap_fault(xml) {
@@ -284,6 +293,138 @@ fn prefixed_tags<'a>(xml: &'a str, suffixed: &'a str) -> impl Iterator<Item = Pr
     })
 }
 
+/// One tag-shaped occurrence of an element's local name.
+struct ElementTag<'a> {
+    /// Offset of the tag's `<`.
+    lt: usize,
+    /// The namespace prefix; `None` for `<local` / `</local`.
+    prefix: Option<&'a str>,
+    closing: bool,
+}
+
+/// Whether `byte` may appear in a namespace prefix as [`element_tags`] reads
+/// one: anything but ASCII whitespace and ``< > / " = :``.
+fn is_prefix_byte(byte: u8) -> bool {
+    !byte.is_ascii_whitespace() && !matches!(byte, b'<' | b'>' | b'/' | b'"' | b'=' | b':')
+}
+
+/// Every tag-shaped occurrence of the element `local` in `xml`, in document
+/// order: `<local`, `</local`, `<prefix:local` or `</prefix:local`, followed
+/// by `>`, `/` (opening tags only) or ASCII whitespace. Nothing after that
+/// byte is read, so a tag may carry attributes.
+///
+/// XML text escapes `<`, so text never yields a tag. Linear in the size of
+/// `xml`: the terminator is checked before the prefix is walked backwards,
+/// and a terminator is never a prefix byte, so the walk stops at the latest
+/// at the terminator of the previous walked occurrence: no byte is walked
+/// twice.
+fn element_tags<'a>(xml: &'a str, local: &'a str) -> impl Iterator<Item = ElementTag<'a>> + 'a {
+    xml.match_indices(local)
+        .filter_map(move |(i, _)| element_tag_at(xml, i, local.len()))
+}
+
+/// The tag whose local name starts at `i` and is `len` bytes long, if the
+/// bytes around it make it one (see [`element_tags`]).
+fn element_tag_at(xml: &str, i: usize, len: usize) -> Option<ElementTag<'_>> {
+    let bytes = xml.as_bytes();
+    let terminator = *bytes.get(i.checked_add(len)?)?;
+    if terminator != b'>' && terminator != b'/' && !terminator.is_ascii_whitespace() {
+        return None;
+    }
+    let before = i.checked_sub(1)?;
+    let (name_start, prefix) = if bytes.get(before) == Some(&b':') {
+        let mut start = before;
+        while let Some(previous) = start.checked_sub(1)
+            && bytes.get(previous).copied().is_some_and(is_prefix_byte)
+        {
+            start = previous;
+        }
+        if start == before {
+            return None;
+        }
+        // `start` follows an ASCII byte (or is 0): a char boundary.
+        (start, Some(xml.get(start..before)?))
+    } else {
+        (i, None)
+    };
+    let mark = name_start.checked_sub(1)?;
+    let (lt, closing) = match bytes.get(mark)? {
+        b'<' => (mark, false),
+        b'/' => {
+            let lt = mark.checked_sub(1)?;
+            if bytes.get(lt)? != &b'<' || terminator == b'/' {
+                return None;
+            }
+            (lt, true)
+        }
+        _ => return None,
+    };
+    Some(ElementTag {
+        lt,
+        prefix,
+        closing,
+    })
+}
+
+/// Whether `part` holds a tag-shaped `local` element (opening or closing).
+fn has_element(part: &str, local: &str) -> bool {
+    element_tags(part, local).next().is_some()
+}
+
+/// The offset just past the `>` that ends the closing tag at `lt` (`</` then
+/// the name, optional ASCII whitespace, `>`), or `None` when no `>` ends it.
+fn closing_tag_end(xml: &str, lt: usize) -> Option<usize> {
+    let tag = xml.get(lt..)?;
+    let name_len = tag.find(|c: char| c == '>' || c.is_ascii_whitespace())?;
+    let after_name = tag.get(name_len..)?;
+    let rest = after_name.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    if !rest.starts_with('>') {
+        return None;
+    }
+    let gt = lt.checked_add(name_len)?.checked_add(after_name.len())?;
+    gt.checked_sub(rest.len())?.checked_add(1)
+}
+
+/// The span of the `Items` element: from the `<` of its first opening tag to
+/// just past the `>` of the last closing tag with the same prefix after it.
+///
+/// Taking the last closing tag keeps a closing tag spelled inside a value
+/// from shortening the span. `None` when either tag is missing: the whole
+/// document then counts as outside the items.
+fn items_span(xml: &str) -> Option<std::ops::Range<usize>> {
+    let open = element_tags(xml, "Items").find(|tag| !tag.closing)?;
+    let end = element_tags(xml, "Items")
+        .filter(|tag| tag.closing && tag.prefix == open.prefix && tag.lt > open.lt)
+        .filter_map(|tag| closing_tag_end(xml, tag.lt))
+        .last()?;
+    Some(open.lt..end)
+}
+
+/// Whether `xml` carries a SOAP fault: a `Fault` element that is the first
+/// child of the first `Body` (SOAP 1.2 Part 1 §5.4). Without a `Body` start
+/// tag (a fragment), any tag-shaped `Fault` element counts.
+fn fault_element_present(xml: &str) -> bool {
+    let Some(body) = element_tags(xml, "Body").find(|tag| !tag.closing) else {
+        return has_element(xml, "Fault");
+    };
+    let Some(start_tag) = xml.get(body.lt..) else {
+        return false;
+    };
+    let Some(gt) = start_tag.find('>') else {
+        return false;
+    };
+    if start_tag.get(..gt).is_some_and(|tag| tag.ends_with('/')) {
+        return false;
+    }
+    let Some(content) = gt.checked_add(1).and_then(|from| start_tag.get(from..)) else {
+        return false;
+    };
+    let first_child = content.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    element_tags(first_child, "Fault")
+        .next()
+        .is_some_and(|tag| tag.lt == 0 && !tag.closing)
+}
+
 /// Extract all Stream elements with their Name attribute and base64 content.
 fn extract_streams(xml: &str) -> Vec<(String, String)> {
     let mut streams = Vec::new();
@@ -367,9 +508,7 @@ const FAULT_REASON_CHARS: usize = 2048;
 
 /// Extract a SOAP fault from the response, if present.
 fn extract_soap_fault(xml: &str) -> Option<SoapError> {
-    // Check for Fault element
-    let has_fault = xml.contains(":Fault>") || xml.contains("<Fault>");
-    if !has_fault {
+    if !fault_element_present(xml) {
         return None;
     }
 
@@ -1081,6 +1220,130 @@ mod tests {
         let (items, context) = parse_enumerate_response(xml).unwrap();
         assert!(items.is_empty(), "no <Items> tag should yield empty");
         assert!(context.is_none());
+    }
+
+    fn enumerate_page(items: &str, trailer: &str) -> String {
+        format!(
+            "<s:Envelope><s:Body><wsen:EnumerateResponse>\
+             <wsen:EnumerationContext>ctx-1</wsen:EnumerationContext>\
+             <w:Items>{items}</w:Items>{trailer}</wsen:EnumerateResponse></s:Body></s:Envelope>"
+        )
+    }
+
+    #[test]
+    fn enumerate_item_text_mentioning_end_of_sequence_keeps_the_context() {
+        let xml = enumerate_page(
+            "<p:Win32_Process><p:CommandLine>rem EndOfSequence</p:CommandLine></p:Win32_Process>",
+            "",
+        );
+        let (items, context) = parse_enumerate_response(&xml).unwrap();
+        assert!(items.contains("rem EndOfSequence"));
+        assert_eq!(context.as_deref(), Some("ctx-1"));
+    }
+
+    #[test]
+    fn enumerate_end_of_sequence_element_forms_end_the_enumeration() {
+        for trailer in [
+            "<wsen:EndOfSequence/>",
+            "<w:EndOfSequence />",
+            "<wsman:EndOfSequence></wsman:EndOfSequence>",
+            "<EndOfSequence/>",
+            "<n:EndOfSequence\n/>",
+        ] {
+            let (_, context) =
+                parse_enumerate_response(&enumerate_page("<p:X/>", trailer)).unwrap();
+            assert_eq!(context, None, "{trailer}");
+        }
+        // Before the items, too.
+        let xml = "<s:Envelope><s:Body><n:PullResponse><n:EnumerationContext>ctx-1</n:EnumerationContext>\
+                   <n:EndOfSequence/><n:Items><p:X/></n:Items></n:PullResponse></s:Body></s:Envelope>";
+        assert_eq!(parse_enumerate_response(xml).unwrap().1, None);
+    }
+
+    #[test]
+    fn enumerate_end_of_sequence_property_inside_items_is_ignored() {
+        let xml = enumerate_page(
+            "<p:Win32_X><p:EndOfSequence>1</p:EndOfSequence>\
+             <p:EnumerationContext>forged</p:EnumerationContext></p:Win32_X>",
+            "",
+        );
+        assert_eq!(
+            parse_enumerate_response(&xml).unwrap().1.as_deref(),
+            Some("ctx-1")
+        );
+    }
+
+    #[test]
+    fn fault_text_inside_items_is_not_a_fault() {
+        let xml = enumerate_page(
+            "<p:Win32_Process><p:CommandLine>x a:Fault> y s:Fault&gt; &lt;s:Fault&gt;\
+             </p:CommandLine><p:Fault>1</p:Fault></p:Win32_Process>",
+            "",
+        );
+        assert!(check_soap_fault(&xml).is_ok());
+        assert_eq!(
+            parse_enumerate_response(&xml).unwrap().1.as_deref(),
+            Some("ctx-1")
+        );
+    }
+
+    #[test]
+    fn fault_as_first_child_of_body_is_detected() {
+        let body =
+            "<s:Code><s:Value>s:Receiver</s:Value></s:Code><s:Reason><s:Text>x</s:Text></s:Reason>";
+        for xml in [
+            format!("<s:Envelope><s:Body><s:Fault>{body}</s:Fault></s:Body></s:Envelope>"),
+            format!("<s:Envelope><s:Body>\n  <s:Fault>{body}</s:Fault></s:Body></s:Envelope>"),
+            format!(
+                "<s:Envelope><s:Body xmlns:s=\"urn:s\"><s:Fault xmlns:f=\"urn:f\">{body}</s:Fault></s:Body></s:Envelope>"
+            ),
+            format!(
+                "<soap:Envelope><soap:Body><soap:Fault>{body}</soap:Fault></soap:Body></soap:Envelope>"
+            ),
+            format!("<Envelope><Body><Fault>{body}</Fault></Body></Envelope>"),
+        ] {
+            assert!(check_soap_fault(&xml).is_err(), "{xml}");
+        }
+        // Not the first child of Body, or an empty Body: not a fault (SOAP 1.2 Part 1 §5.4).
+        assert!(
+            check_soap_fault(&format!(
+                "<s:Envelope><s:Body><x/><s:Fault>{body}</s:Fault></s:Body></s:Envelope>"
+            ))
+            .is_ok()
+        );
+        assert!(check_soap_fault("<s:Envelope><s:Body/><s:Fault/></s:Envelope>").is_ok());
+    }
+
+    #[test]
+    fn items_span_needs_a_closing_tag() {
+        assert_eq!(items_span("a<w:Items>x</w:Items>b"), Some(1..21));
+        assert_eq!(items_span("a<w:Items>x"), None);
+        assert_eq!(items_span("</w:Items><w:Items>x"), None);
+    }
+
+    /// The span ends at the `>` of the closing tag itself, never at a later one.
+    #[test]
+    fn items_span_ends_at_the_closing_tags_own_gt() {
+        assert_eq!(items_span("<w:Items>x</w:Items \n>b"), Some(0..22));
+        assert_eq!(items_span("<w:Items>x</w:Items <w:EndOfSequence/>"), None);
+        let xml = "<s:Body><n:EnumerationContext>c</n:EnumerationContext>\
+                   <n:Items>x</n:Items <n:EndOfSequence/>";
+        assert_eq!(parse_enumerate_response(xml).unwrap().1, None);
+    }
+
+    /// A tag-shaped check that walked back to the nearest `<` would be quadratic here.
+    #[test]
+    fn element_tags_is_linear() {
+        use std::time::{Duration, Instant};
+        for (shape, xml) in [
+            ("after >", format!("<a {}", "x:Fault>".repeat(130_000))),
+            ("after space", format!("<a {}", "x:Fault ".repeat(130_000))),
+        ] {
+            let started = Instant::now();
+            assert!(check_soap_fault(&xml).is_ok(), "{shape}");
+            assert!(!has_element(&xml, "Fault"), "{shape}");
+            assert!(started.elapsed() < Duration::from_secs(5), "{shape}");
+        }
     }
 
     fn fault(code: &str) -> SoapError {

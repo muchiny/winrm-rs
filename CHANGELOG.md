@@ -43,6 +43,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Decoding PowerShell CLIXML on stderr takes time linear in the record size,
   however the server slices it.
 - An unparseable `ExitCode` is logged as a 32-character excerpt.
+- `run_wql` reads the end of the enumeration, and `check_soap_fault` reads a
+  fault, from elements rather than from text: item text that mentions
+  `EndOfSequence` or `Fault>` no longer ends a query early or turns a page
+  into an error.
 
 ## [1.4.1] - 2026-10-24
 

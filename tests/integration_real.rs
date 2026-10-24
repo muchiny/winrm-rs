@@ -377,6 +377,31 @@ async fn wql_query_win32_service() {
     );
 }
 
+/// Many small pages: the enumeration is followed to its end.
+#[tokio::test]
+#[ignore]
+async fn run_wql_pages_to_the_end_with_a_small_envelope() {
+    let (client, host) = test_client_with(|c| c.max_envelope_size = 8192)
+        .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let xml = client
+        .run_wql(&host, "SELECT * FROM Win32_Service", None)
+        .await
+        .unwrap();
+    let count = client
+        .run_powershell(
+            &host,
+            "(Get-CimInstance Win32_Service | Measure-Object).Count",
+        )
+        .await
+        .unwrap();
+    let expected: usize = String::from_utf8_lossy(&count.stdout)
+        .trim()
+        .parse()
+        .unwrap();
+    // One start tag per instance: `<p:Win32_Service xmlns:p=... >`.
+    assert_eq!(xml.matches(":Win32_Service ").count(), expected);
+}
+
 // === NTLM authentication ===
 
 fn test_client_ntlm() -> Option<(WinrmClient, String)> {

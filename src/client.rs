@@ -691,6 +691,10 @@ impl WinrmClient {
     /// WMI object instances matching the query. Use a `namespace` of `None`
     /// for the default `root/cimv2`.
     ///
+    /// Pages are pulled until a response carries an `EndOfSequence` element
+    /// outside its `Items`, or no `EnumerationContext`. Text inside the items,
+    /// or a property element of that name, never ends the enumeration.
+    ///
     /// # Example
     /// ```rust,no_run
     /// # use winrm_rs::{WinrmClient, WinrmConfig, WinrmCredentials};
@@ -3437,6 +3441,40 @@ mod tests {
         assert!(
             result.contains("Windows"),
             "run_wql should return items, got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_wql_keeps_paging_when_item_text_mentions_end_of_sequence() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("enumeration/Enumerate"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<s:Envelope><s:Body><wsen:EnumerateResponse>\
+                 <wsen:EnumerationContext>ctx-1</wsen:EnumerationContext>\
+                 <w:Items><p:Win32_Process><p:CommandLine>rem EndOfSequence</p:CommandLine></p:Win32_Process></w:Items>\
+                 </wsen:EnumerateResponse></s:Body></s:Envelope>",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("enumeration/Pull"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<s:Envelope><s:Body><n:PullResponse><n:Items><p:Win32_Process><p:Name>second</p:Name>\
+                 </p:Win32_Process></n:Items><n:EndOfSequence/></n:PullResponse></s:Body></s:Envelope>",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        let items = client
+            .run_wql("127.0.0.1", "SELECT * FROM Win32_Process", None)
+            .await
+            .unwrap();
+        assert!(
+            items.contains("rem EndOfSequence") && items.contains("second"),
+            "{items}"
         );
     }
 

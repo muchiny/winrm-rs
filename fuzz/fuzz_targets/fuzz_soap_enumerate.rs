@@ -11,6 +11,22 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
 
+    // Item text, escaped as an XML writer escapes it, never ends it.
+    let text = xml.replace('&', "&amp;").replace('<', "&lt;");
+    let page = format!(
+        "<s:Envelope><s:Body><wsen:EnumerateResponse>\
+         <wsen:EnumerationContext>ctx-1</wsen:EnumerationContext><wsen:Items>{text}</wsen:Items>\
+         </wsen:EnumerateResponse></s:Body></s:Envelope>"
+    );
+    assert_eq!(
+        parse_enumerate_response(&page)
+            .ok()
+            .and_then(|(_, c)| c)
+            .as_deref(),
+        Some("ctx-1"),
+        "item text ended the enumeration or read as a fault"
+    );
+
     let Ok((items, context)) = parse_enumerate_response(xml) else {
         return;
     };
@@ -20,13 +36,12 @@ fuzz_target!(|data: &[u8]| {
         "items text longer than the response"
     );
 
-    // `EndOfSequence` must stop the Pull loop.
-    if xml.contains("EndOfSequence") {
-        assert!(
-            context.is_none(),
-            "continuation context survived EndOfSequence"
-        );
-    }
+    // An end marker after the document always ends the enumeration.
+    assert_eq!(
+        parse_enumerate_response(&format!("{xml}<w:EndOfSequence/>")).ok(),
+        Some((items.clone(), None)),
+        "an EndOfSequence element did not end the enumeration"
+    );
 
     if let Some(context) = context {
         // Round-trip the context the server gave us back into a Pull envelope.

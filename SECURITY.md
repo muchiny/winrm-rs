@@ -86,6 +86,9 @@ We will credit reporters in the release notes and CHANGELOG (unless you prefer t
   Protection on other services.
 - What a malicious server runs or returns, except for the client-side issues
   listed above.
+- Security issues in the OpenSSL library that the `credssp` feature links from
+  the host: report them to OpenSSL or to your distribution. A way this crate
+  uses OpenSSL that weakens it is in scope.
 - Command text and arguments recorded in `debug` spans, and SOAP bodies
   logged in plaintext at `trace` level (before sealing, after unsealing).
   Keep the `winrm_rs` target at `info` where commands carry secrets.

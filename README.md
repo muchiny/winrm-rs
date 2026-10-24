@@ -310,7 +310,13 @@ cargo test --test integration_real -- --ignored
 |---|---|---|
 | *(default)* | stable | NTLMv2, Basic, Certificate auth; no optional deps |
 | `kerberos` | stable | Pulls `cross-krb5`; requires a working `kinit` |
-| `credssp` | **experimental** | Double-hop delegation. Validated end-to-end against Windows Server 2025 (live `credssp_run_command_whoami`); not yet exercised on other host generations. Up to 1.4.1 it ignored `proxy`, `max_retries`, `connect_timeout_secs`, `operation_timeout_secs` and `user_agent`; since 1.4.2 it applies both timeouts and `user_agent`, and still ignores `proxy` and `max_retries` (see `AuthMethod::CredSsp`). Pulls `openssl` (C dep: `libssl-dev` on Debian). |
+| `credssp` | **experimental** | Double-hop delegation. Validated end-to-end against Windows Server 2025 (live `credssp_run_command_whoami`); not yet exercised on other host generations. Up to 1.4.1 it ignored `proxy`, `max_retries`, `connect_timeout_secs`, `operation_timeout_secs` and `user_agent`; since 1.4.2 it applies both timeouts and `user_agent`, and still ignores `proxy` and `max_retries` (see `AuthMethod::CredSsp`). Links the host OpenSSL; see below. |
+
+### `credssp` and the host OpenSSL
+
+The `credssp` feature links the host's OpenSSL (libssl) through `openssl-sys`: dynamically by default, statically with `OPENSSL_STATIC=1`, from a chosen install with `OPENSSL_DIR`. Building needs the headers and `pkg-config` (`libssl-dev pkg-config` on Debian and Ubuntu, `openssl-devel` on Fedora and RHEL).
+
+The inner CredSSP TLS client runs on that library. It parses records the server controls, including the server certificate, before any NTLM authentication and with certificate verification off (the inner channel is bound by `pubKeyAuth` instead). Keep that library on a branch that still receives security fixes, from OpenSSL upstream or from your distribution's backports. As of `openssl-sys` 0.9.117 it builds against OpenSSL 1.1.0, 1.1.1, 3.x and 4.x and LibreSSL 3.5 to 4.3. This crate is interop-tested only with OpenSSL 3.5 against Windows Server 2025. LibreSSL builds but has never been tested against SChannel. Each CredSSP handshake logs the OpenSSL version loaded at run time (`debug` level, target `winrm_rs::credssp`).
 
 ## License
 

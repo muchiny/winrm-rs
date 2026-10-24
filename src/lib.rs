@@ -48,9 +48,12 @@
 //!
 //! - **`kerberos`** -- Enables Kerberos authentication via `cross-krb5`.
 //! - **`credssp`** -- *Experimental.* Enables `CredSSP` authentication for
-//!   double-hop delegation. Pulls in `openssl` as a C dependency
+//!   double-hop delegation. Links the host's OpenSSL through `openssl-sys`
 //!   (required because Microsoft's `CredSSP` server has proven incompatible
 //!   with `rustls` in-memory TLS — see `src/auth/credssp.rs`).
+//!   The inner `CredSSP` TLS client parses server-controlled records before
+//!   authentication, so that library must still receive security fixes
+//!   (README, "`credssp` and the host OpenSSL").
 //!   Validated end-to-end against Windows Server 2025; not yet exercised
 //!   on other host generations.
 //!

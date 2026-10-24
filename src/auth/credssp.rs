@@ -319,6 +319,12 @@ fn inner_openssl_connector() -> Result<openssl::ssl::SslConnector, WinrmError> {
 fn build_inner_openssl_tls(
     connector: &openssl::ssl::SslConnector,
 ) -> Result<OpenSslMemTls, WinrmError> {
+    tracing::debug!(
+        target: "winrm_rs::credssp",
+        openssl = openssl::version::version(),
+        openssl_num = %format_args!("{:#x}", openssl::version::number()),
+        "CredSSP inner TLS backend"
+    );
     let mem_bio = MemBio {
         incoming: std::collections::VecDeque::new(),
         outgoing: Vec::new(),
@@ -2183,6 +2189,18 @@ mod tests {
 
     fn test_tls() -> CredSspTls {
         test_tls_with(true)
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn inner_tls_logs_the_runtime_openssl_version() {
+        let _tls = build_inner_openssl_tls(&test_tls().inner).expect("inner TLS builds");
+        assert!(logs_contain("CredSSP inner TLS backend"));
+        assert!(logs_contain(openssl::version::version()));
+        assert!(logs_contain(&format!(
+            "openssl_num={:#x}",
+            openssl::version::number()
+        )));
     }
 
     static TLS13_ONLY: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS13];

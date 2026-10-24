@@ -40,6 +40,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `code` and `reason` fields hold the neutralised text.
 - Debug logs print shell and command ids quoted and escaped (`shell_id="…"`).
 
+### Added
+
+- CredSSP logs the OpenSSL version used for its inner TLS at `debug` level
+  (target `winrm_rs::credssp`); the README documents the host OpenSSL
+  dependency.
+
 ### Fixed
 
 - NTLM: the AUTHENTICATE message now builds its own `TargetInfo` AV list

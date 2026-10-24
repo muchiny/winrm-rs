@@ -375,6 +375,9 @@ pub(crate) struct HttpTransport {
     conn_slots: Mutex<std::collections::HashMap<String, HostSlots>>,
     /// Client-wide slots for data exchanges on dedicated connections.
     all_slots: Arc<tokio::sync::Semaphore>,
+    /// Kerberos ticket requests in flight for this client, each on a thread
+    /// of tokio's blocking pool (see `auth::kerberos::run_blocking_bounded`).
+    kdc_slots: Arc<tokio::sync::Semaphore>,
     /// `wsmv:SessionId` value stamped on every request (`uuid:<UPPERCASE>`),
     /// one per transport. See [`crate::soap::envelope::with_session_id`].
     session_id: String,
@@ -767,6 +770,7 @@ impl HttpTransport {
             conn_pool: Mutex::new(Vec::new()),
             conn_slots: Mutex::new(std::collections::HashMap::new()),
             all_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONNS_IN_FLIGHT_TOTAL)),
+            kdc_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONNS_PER_HOST)),
             session_id: format!("uuid:{}", uuid::Uuid::new_v4().to_string().to_uppercase()),
             before_send: None,
         })
@@ -953,6 +957,8 @@ impl HttpTransport {
         KerberosAuth {
             service_principal: format!("HTTP/{host}"),
             max_response_bytes: self.max_response_bytes(),
+            kdc_timeout: Duration::from_secs(self.config.operation_timeout_secs),
+            kdc_slots: Arc::clone(&self.kdc_slots),
         }
     }
 

@@ -160,6 +160,13 @@ TLS server name once the URL is parsed is refused before the AP-REQ). Accepted b
 server certificate with no binding hash (Ed25519, unknown algorithm) is
 refused. `EncryptionMode::Never` over plain HTTP has none of this.
 
+The KDC exchange runs on a bounded blocking pool (at most 32 concurrent per
+client); a ticket request longer than `operation_timeout_secs` fails with
+`WinrmError::Timeout`. The OS thread inside libkrb5 cannot be cancelled, so
+set `[libdefaults] request_timeout` in `krb5.conf` to cap libkrb5's own
+retries. On a Windows client the KDC call runs on a pool thread, which drops
+any per-thread SSPI impersonation a caller set on the tokio worker.
+
 Limits: WinRM sends its sealed Kerberos answers with sequence number 0, so
 the Kerberos session detects no replay; each sealed answer is bound to its
 request through `RelatesTo`, and a sealed request replayed by an active

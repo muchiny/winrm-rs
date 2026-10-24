@@ -24,6 +24,43 @@ pub(crate) struct KerberosAuth {
     /// Largest response body read (see `transport::max_response_bytes`).
     #[cfg_attr(not(feature = "kerberos"), allow(dead_code))]
     pub(crate) max_response_bytes: usize,
+    /// Budget of one ticket request (`operation_timeout_secs`).
+    #[cfg_attr(not(feature = "kerberos"), allow(dead_code))]
+    pub(crate) kdc_timeout: std::time::Duration,
+    /// Ticket requests in flight for the client (see [`run_blocking_bounded`]).
+    #[cfg_attr(not(feature = "kerberos"), allow(dead_code))]
+    pub(crate) kdc_slots: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+/// Run `f`, a blocking library call (the KDC exchange of libkrb5 or SSPI),
+/// on tokio's blocking pool instead of an async worker, within `budget`.
+///
+/// `f` starts once a slot of `slots` is free, and the wait for it counts in
+/// `budget`. The slot stays held until `f` returns: a call that outlives its
+/// budget cannot be cancelled, so it keeps its slot (and its pool thread) and
+/// the number of such calls stays below the size of `slots`. A call that
+/// exceeds `budget` gives `WinrmError::Timeout` (in whole seconds, at least
+/// 1); one that panics gives `WinrmError::AuthFailed`.
+#[cfg(any(feature = "kerberos", test))]
+async fn run_blocking_bounded<T: Send + 'static>(
+    budget: std::time::Duration,
+    slots: std::sync::Arc<tokio::sync::Semaphore>,
+    f: impl FnOnce() -> Result<T, WinrmError> + Send + 'static,
+) -> Result<T, WinrmError> {
+    let run = async {
+        let permit = slots.acquire_owned().await.map_err(|_| {
+            WinrmError::AuthFailed("Kerberos: internal: KDC slot semaphore closed".into())
+        })?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            f()
+        })
+        .await
+        .map_err(|e| WinrmError::AuthFailed(format!("Kerberos: library call failed: {e}")))?
+    };
+    tokio::time::timeout(budget, run)
+        .await
+        .unwrap_or_else(|_| Err(WinrmError::Timeout(budget.as_secs().max(1))))
 }
 
 /// The pure parts of Kerberos message encryption (no GSS-API call): wrap
@@ -373,23 +410,27 @@ impl KerberosAuth {
     /// `channel_bindings` is the application data of the GSS-API channel
     /// bindings (`tls-server-end-point:` and the certificate hash over
     /// HTTPS), carried in the AP-REQ authenticator.
-    fn initiate(
+    async fn initiate(
         &self,
-        channel_bindings: Option<&[u8]>,
+        channel_bindings: Option<Vec<u8>>,
     ) -> Result<(cross_krb5::PendingClientCtx, String), WinrmError> {
-        use base64::Engine;
-        use base64::engine::general_purpose::STANDARD as B64;
-        use cross_krb5::{ClientCtx, InitiateFlags};
-        // Empty flags: mutual authentication and confidentiality are both
-        // requested and required by cross-krb5.
-        let (ctx, token) = ClientCtx::new(
-            InitiateFlags::empty(),
-            None, // use default credentials (from kinit)
-            &self.service_principal,
-            channel_bindings,
-        )
-        .map_err(|e| WinrmError::AuthFailed(format!("Kerberos init: {e}")))?;
-        Ok((ctx, format!("Negotiate {}", B64.encode(&*token))))
+        let service_principal = self.service_principal.clone();
+        run_blocking_bounded(self.kdc_timeout, self.kdc_slots.clone(), move || {
+            use base64::Engine;
+            use base64::engine::general_purpose::STANDARD as B64;
+            use cross_krb5::{ClientCtx, InitiateFlags};
+            // Empty flags: mutual authentication and confidentiality are both
+            // requested and required by cross-krb5.
+            let (ctx, token) = ClientCtx::new(
+                InitiateFlags::empty(),
+                None, // use default credentials (from kinit)
+                &service_principal,
+                channel_bindings.as_deref(),
+            )
+            .map_err(|e| WinrmError::AuthFailed(format!("Kerberos init: {e}")))?;
+            Ok((ctx, format!("Negotiate {}", B64.encode(&*token))))
+        })
+        .await
     }
 
     /// The server's Kerberos token (`WWW-Authenticate: Negotiate <token>`).
@@ -485,7 +526,7 @@ impl KerberosAuth {
             .map(crate::ntlm::crypto::tls_server_end_point)
             .transpose()
             .map_err(|e| WinrmError::AuthFailed(format!("Kerberos channel binding: {e}")))?;
-        let (pending, auth_header) = self.initiate(bindings.as_deref())?;
+        let (pending, auth_header) = self.initiate(bindings).await?;
         let resp = http
             .post(url)
             .header(CONTENT_TYPE, "application/soap+xml;charset=UTF-8")
@@ -543,7 +584,7 @@ impl AuthTransport for KerberosAuth {
     ) -> Result<String, WinrmError> {
         use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 
-        let (ctx, auth_header) = self.initiate(None)?;
+        let (ctx, auth_header) = self.initiate(None).await?;
         let resp = http
             .post(url)
             .header(CONTENT_TYPE, "application/soap+xml;charset=UTF-8")
@@ -857,6 +898,95 @@ mod layout_tests {
             }
         }
     }
+
+    mod blocking {
+        use super::super::run_blocking_bounded;
+        use crate::error::WinrmError;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::time::{Duration, Instant};
+        use tokio::sync::Semaphore;
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn kerberos_blocking_call_returns_its_result() {
+            let out =
+                run_blocking_bounded(Duration::from_secs(5), Arc::new(Semaphore::new(4)), || {
+                    Ok::<_, WinrmError>(42u32)
+                })
+                .await;
+            assert!(matches!(out, Ok(42)), "{out:?}");
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn kerberos_blocking_call_does_not_stall_a_current_thread_runtime() {
+            let ticks = Arc::new(AtomicU32::new(0));
+            let ticker = {
+                let ticks = Arc::clone(&ticks);
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        ticks.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+            };
+            let start = Instant::now();
+            let out = run_blocking_bounded(
+                Duration::from_millis(100),
+                Arc::new(Semaphore::new(4)),
+                || {
+                    std::thread::sleep(Duration::from_millis(1000));
+                    Ok::<_, WinrmError>(())
+                },
+            )
+            .await;
+            let elapsed = start.elapsed();
+            ticker.abort();
+            assert!(matches!(out, Err(WinrmError::Timeout(1))), "{out:?}");
+            assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+            assert!(
+                ticks.load(Ordering::Relaxed) >= 1,
+                "the executor made no progress during the blocking call"
+            );
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn kerberos_blocking_call_panic_is_auth_failed() {
+            let out = run_blocking_bounded(
+                Duration::from_secs(5),
+                Arc::new(Semaphore::new(4)),
+                || -> Result<(), WinrmError> { panic!("x") },
+            )
+            .await;
+            match out {
+                Err(WinrmError::AuthFailed(m)) => {
+                    assert!(m.contains("library call failed"), "{m}");
+                }
+                other => panic!("expected AuthFailed, got {other:?}"),
+            }
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn kerberos_blocking_slot_is_held_until_the_call_returns() {
+            let slots = Arc::new(Semaphore::new(1));
+            let start = Instant::now();
+            let first = run_blocking_bounded(Duration::from_millis(50), Arc::clone(&slots), || {
+                std::thread::sleep(Duration::from_millis(300));
+                Ok::<_, WinrmError>(0u32)
+            })
+            .await;
+            assert!(matches!(first, Err(WinrmError::Timeout(1))), "{first:?}");
+            let second = run_blocking_bounded(Duration::from_millis(800), slots, || {
+                Ok::<_, WinrmError>(1u32)
+            })
+            .await;
+            assert!(matches!(second, Ok(1)), "{second:?}");
+            assert!(
+                start.elapsed() >= Duration::from_millis(300),
+                "the second call did not wait for the slot: {:?}",
+                start.elapsed()
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -869,6 +999,8 @@ mod tests {
         let auth = KerberosAuth {
             service_principal: "HTTP/test".into(),
             max_response_bytes: 1024,
+            kdc_timeout: std::time::Duration::from_secs(1),
+            kdc_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
         };
         let http = crate::transport::test_http_client();
         let result = auth

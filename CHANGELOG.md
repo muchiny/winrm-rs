@@ -128,6 +128,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Idle authenticated connections are kept per host: up to 8 per host and 32
   per client. Traffic to one host no longer closes another host's connections,
   which would then have to authenticate again.
+- Kerberos: the ticket request to the KDC runs on tokio's blocking pool, at
+  most 32 at a time per client, and fails with `WinrmError::Timeout` after
+  `operation_timeout_secs`. It no longer blocks an async worker thread.
 
 ### Documentation
 

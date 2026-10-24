@@ -299,8 +299,8 @@ mod tests {
     #[test]
     fn download_script_keeps_a_unicode_quote_inside_the_literal() {
         assert_eq!(
-            download_script("C:\\temp\\a\u{2019})); calc #"),
-            "[Convert]::ToBase64String([IO.File]::ReadAllBytes('C:\\temp\\a\u{2019}\u{2019})); calc #'))"
+            download_script("C:\\temp\\a\u{2019})); x #"),
+            "[Convert]::ToBase64String([IO.File]::ReadAllBytes('C:\\temp\\a\u{2019}\u{2019})); x #'))"
         );
     }
 

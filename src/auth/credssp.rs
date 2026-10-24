@@ -23,12 +23,12 @@
 //
 // **Working:**
 // - Primer request and CredSSP advertisement detection
-// - Inner TLS handshake (rustls in memory mode) — completes in 2 rounds
+// - Inner TLS handshake (OpenSSL in memory mode) — completes in 2 rounds
 // - NTLM Type 1 → Type 2 exchange wrapped in TLS-encrypted TSRequest
 // - SubjectPublicKey extraction from inner TLS server cert
 //
 // **Working (validated against pywinrm reference capture):**
-// - Inner TLS handshake (rustls in memory) — completes in 2 rounds
+// - Inner TLS handshake (OpenSSL in memory) — completes in 2 rounds
 // - SubjectPublicKey extraction from inner TLS server cert
 // - NTLM Type 1 with CredSSP flags (KEY_EXCH, SEAL, SIGN, 128, 56, VERSION)
 // - NTLM Type 1 → 2 exchange wrapped in TLS-encrypted TSRequest

@@ -38,6 +38,10 @@ Security Advisories and submitted to the RustSec advisory database, so
 - **7 days** — initial assessment and severity classification
 - **30 days** — target for a fix release (depending on complexity)
 
+### Credit
+
+We will credit reporters in the release notes and CHANGELOG (unless you prefer to remain anonymous).
+
 ## Scope
 
 ### In scope
@@ -94,7 +98,3 @@ Security Advisories and submitted to the RustSec advisory database, so
   `run_command` and `run_powershell` wait as long as the command runs: bound
   them with the `*_with_timeout` or `*_with_cancel` variants.
 - Physical access to the machine, social engineering.
-
-### Credit
-
-We will credit reporters in the release notes and CHANGELOG (unless you prefer to remain anonymous).

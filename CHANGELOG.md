@@ -125,6 +125,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `EncryptionMode` states what sealing does not protect, and why the server
   must keep `AllowUnencrypted = false`. The README gains *Choosing a
   transport*.
+- Proxies: which environment variables and OS settings apply, what a
+  forwarding proxy means for NTLM and Kerberos over plain HTTP, how proxy
+  credentials travel, and that CredSSP uses no proxy. `WinrmClient`: one
+  `wsmv:SessionId` per client, sent to every host.
 
 ## [1.4.1] - 2026-10-24
 

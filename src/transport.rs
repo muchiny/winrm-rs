@@ -375,9 +375,10 @@ pub(crate) fn url_server_name(url: &str) -> Option<rustls::pki_types::ServerName
 /// handshake, since the dedicated client only connects to the endpoint (no
 /// redirects) and to its proxy, so the extra exception is inert. `http://`,
 /// scheme-less (taken as `http://`) and SOCKS proxies only relay bytes and
-/// do no TLS of their own. A proxy from system settings (reqwest's
-/// `system-proxy` feature, off in this crate's build) is not covered: the
-/// pin refuses its handshake.
+/// do no TLS of their own. A proxy from system settings
+/// (`hyper-util/client-proxy-system`, which another crate in the build may
+/// enable through `reqwest`'s default features) is not covered: the pin
+/// refuses its handshake.
 fn proxy_server_names(
     config: &WinrmConfig,
     var: impl Fn(&str) -> Option<String>,
@@ -556,8 +557,9 @@ fn build_http_client(
         builder = builder.proxy(proxy);
     } else if cfg!(test) {
         // Unit tests talk to loopback servers: keep `HTTP(S)_PROXY` from the
-        // environment out of them. Builds outside tests keep reqwest's
-        // system-proxy behaviour.
+        // environment out of them. Builds outside tests keep `reqwest`'s
+        // environment proxies and, when the build enables it, the OS proxy
+        // (see `WinrmConfig::proxy`).
         builder = builder.no_proxy();
     }
     if let Some(tls_config) = tls_config {

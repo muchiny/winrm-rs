@@ -276,6 +276,13 @@ let bytes = client.download_file("win-server", "C:\\remote\\file.bin", Path::new
 | `encryption` | `Auto` | Message sealing for NTLM and Kerberos: `Auto` (over HTTP only), `Always`, `Never`. No effect with Basic, Certificate or CredSSP, `Always` included (Basic over HTTP stays plaintext; a WARN is logged) |
 | `max_output_bytes` | `Some(64 MiB)` | Cap on a command's stdout+stderr; `None` removes it |
 
+### Proxies
+
+- `proxy` takes `http://`, `https://`, `socks4://`, `socks4a://`, `socks5://` or `socks5h://` URLs; one without a scheme is taken as `http://`. CredSSP never uses a proxy: it always connects directly.
+- With `proxy` unset, `reqwest` reads `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` (and their lower-case forms). It also reads the operating system's proxy settings (Windows registry, macOS configuration) whenever a crate in your build enables `hyper-util/client-proxy-system`, as the default features of `reqwest` 0.13 do. Set `proxy`, or `NO_PROXY`, to choose the route yourself.
+- Over plain HTTP, an `http://` or `https://` proxy forwards each request and keeps the server connection that NTLM or Kerberos authenticated; WinRM then sends sealed requests on it without credentials. A proxy that shares those server connections between its clients (RFC 4559 section 6 forbids it) lets its other users send requests that run as you, whenever the server accepts unencrypted messages. Keep `AllowUnencrypted = false` on the server, and prefer HTTPS or a SOCKS proxy. See [Choosing a transport](#choosing-a-transport).
+- Credentials in a proxy URL reach `http://` and `socks5://` proxies in cleartext (`socks4://` ignores them); an `https://` proxy receives them inside TLS.
+
 ## Logging
 
 winrm-rs logs through `tracing`. Below `trace` it logs no command text, arguments, scripts or WQL queries; `debug` adds the host (userinfo redacted), ids and argument counts. `trace` logs every SOAP body in plaintext (before sealing, after unsealing): commands and arguments, `env_vars` values, stdin, uploaded file contents and output. Keep `winrm_rs` below `trace` wherever commands carry secrets. The WARN about NTLM over plain HTTP has its own target, so it can be silenced alone: `RUST_LOG=info,winrm_rs::ntlm_over_http=error`.

@@ -32,6 +32,16 @@ use crate::transport::HttpTransport;
 ///
 /// What the client logs at each level, and what `trace` exposes, is described
 /// in the crate-level *Logging* section.
+///
+/// # Session identifier
+///
+/// Every request this client sends carries the same `wsmv:SessionId`
+/// header (MS-WSMV), to every host it talks to: Windows binds each shell
+/// to the session that created it. Hosts that compare their logs can
+/// therefore tell that requests came from one client instance, as they can
+/// from the source address, the user name, the NTLM workstation name and the
+/// `User-Agent`. To keep hosts from linking requests at this level, use one
+/// client per host.
 pub struct WinrmClient {
     pub(crate) transport: HttpTransport,
 }

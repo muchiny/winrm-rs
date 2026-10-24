@@ -182,6 +182,26 @@ pub struct WinrmConfig {
     /// `ALL_PROXY` environment variables, which `reqwest` uses when this field
     /// is `None`, or from system settings.
     ///
+    /// Credentials in the URL (`http://user:password@proxy:8080`) are the
+    /// proxy account's, never the WinRM credentials. They reach `http://`
+    /// proxies in cleartext (`Proxy-Authorization: Basic` on every forwarded
+    /// plain-HTTP request, or on the `CONNECT`), and `socks5://` /
+    /// `socks5h://` proxies in cleartext too (RFC 1929). `socks4://` and
+    /// `socks4a://` ignore them. An `https://` proxy receives them inside TLS.
+    /// Its certificate is checked against the `webpki-roots` CA set for an
+    /// `https://` WinRM endpoint and against the operating system's store for
+    /// an `http://` endpoint, and not verified with
+    /// [`accept_invalid_certs`](Self::accept_invalid_certs) (see there for
+    /// what is still checked).
+    ///
+    /// With this field `None`, `reqwest` reads `HTTP_PROXY`, `HTTPS_PROXY`,
+    /// `ALL_PROXY` and `NO_PROXY` (and their lower-case forms) from the
+    /// environment. It also reads the operating system's proxy settings
+    /// (Windows registry, macOS configuration) whenever any crate in the build
+    /// enables `hyper-util/client-proxy-system`, as the default features of
+    /// `reqwest` 0.13 do (its `system-proxy` feature). Set this field, or
+    /// `NO_PROXY`, to choose the route.
+    ///
     /// [`accept_invalid_certs`](Self::accept_invalid_certs) also turns off
     /// verification of an `https://` proxy's certificate; see there.
     ///
@@ -395,10 +415,22 @@ impl std::fmt::Debug for EnvVarNames<'_> {
 /// plain HTTP an attacker can also forward the sealed request to the server,
 /// let it run, and answer 401 itself, so a resend could run it twice.)
 ///
-/// NTLM and Kerberos bind their session to one TCP connection: a forwarding
-/// (not tunnelling) HTTP proxy that does not keep one server connection per client
-/// connection breaks that binding, and sealed requests then fail with errors
-/// rather than going out unsealed.
+/// NTLM and Kerberos bind their session to one TCP connection, and a sealed
+/// request carries no `Authorization` header: the server runs it as the user
+/// that connection was authenticated for. A forwarding `http://` or
+/// `https://` proxy does not tunnel an `http://` endpoint: it sends each
+/// request in absolute form and owns the connection to the server. RFC 4559
+/// section 6 makes the proxy responsible for never sharing that connection
+/// with its other clients (a proxy that does this announces
+/// `Proxy-Support: Session-Based-Authentication`). A proxy that pools server
+/// connections anyway breaks the binding. Sealed requests of this client then
+/// fail with errors rather than going out unsealed. And when the server
+/// accepts unencrypted messages (`AllowUnencrypted = true`, which
+/// [`Self::Never`] requires), the proxy's other users can send plaintext
+/// requests that run as this client. A SOCKS proxy (a 1:1 relay) or an
+/// `https://` endpoint (a `CONNECT` tunnel) keeps the connection this
+/// client's own. The client cannot see an intercepting (transparent) proxy.
+/// Keep `AllowUnencrypted = false` on the server, and prefer HTTPS.
 ///
 /// Sealing protects the messages of this client. Server side, integrity on
 /// plain HTTP, against a party that can write on the network path, also

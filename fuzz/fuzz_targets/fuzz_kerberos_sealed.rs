@@ -1,11 +1,13 @@
 //! The pure parts of Kerberos message encryption, which read what the server
 //! controls or reshape what GSS-API returned: the sealed-answer framing
 //! (`auth/sealed.rs::parse` with the Kerberos header rule), the RFC 4121
-//! wrap-token checks of an answer, the conversion of a `gss_wrap_iov` result
-//! to the Windows SSPI layout, and the `RelatesTo` binding of an answer to
-//! its request. None may panic; errors stay short; the layout conversion is
-//! a right rotation by the RRC it writes; a binding is accepted only when the
-//! request's `MessageID` equals the response's first `RelatesTo`.
+//! wrap-token checks of an answer (which take the announced plaintext length
+//! and enforce EC = 0 and a header of 32 + RRC bytes), the conversion of a
+//! `gss_wrap_iov` result to the Windows SSPI layout, and the `RelatesTo`
+//! binding of an answer to its request. None may panic; errors stay short; the
+//! layout conversion is a right rotation by the RRC it writes; a binding is
+//! accepted only when the request's `MessageID` equals the response's first
+//! `RelatesTo`.
 //!
 //! Input layout: one byte choosing the part, then the rest.
 //! - 0: the rest is a sealed answer body: parsed, then its token checked.

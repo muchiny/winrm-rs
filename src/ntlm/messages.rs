@@ -1590,8 +1590,6 @@ mod tests {
         blob_av_pairs(&type3)
     }
 
-    const AV_SINGLE_HOST_ID: u16 = 0x0008;
-
     #[test]
     fn av_list_stops_at_first_server_eol() {
         let ti = concat(&[
@@ -1688,11 +1686,11 @@ mod tests {
     fn av_list_drops_server_single_host() {
         let ti = concat(&[
             av(AV_NB_DOMAIN_NAME, &to_utf16le("CORP")),
-            av(AV_SINGLE_HOST_ID, &[0x5A; 48]),
+            av(AV_SINGLE_HOST, &[0x5A; 48]),
             av(AV_EOL, &[]),
         ]);
         let pairs = av_list_for(ti, None);
-        assert!(!ids(&pairs).contains(&AV_SINGLE_HOST_ID));
+        assert!(!ids(&pairs).contains(&AV_SINGLE_HOST));
         assert_eq!(
             value(&pairs, AV_FLAGS_ID),
             Some(2u32.to_le_bytes().to_vec())
@@ -1713,9 +1711,10 @@ mod tests {
     /// Differential oracle: a verbatim copy of the `TargetInfo` splice that
     /// `create_authenticate_message_full` used before `authenticate_target_info`
     /// replaced it (only the signature differs, `mic_input.is_some()` became
-    /// `mic`, `len16(..)?` became `.unwrap()`, and one comment word changed). For a conformant challenge
-    /// (no server `MsvAvFlags`, `MsvAvSingleHost`, `MsvAvTargetName` or
-    /// `MsvAvChannelBindings`, one EOL, last) both must give the same bytes.
+    /// `mic`, `len16(..)?` became `.unwrap()`, and one comment word changed).
+    /// For a conformant challenge (no server `MsvAvFlags`, `MsvAvSingleHost`,
+    /// `MsvAvTargetName` or `MsvAvChannelBindings`, one EOL, last) both must
+    /// give the same bytes.
     fn reference_splice_target_info(
         server_ti: &[u8],
         channel_bindings: Option<[u8; 16]>,

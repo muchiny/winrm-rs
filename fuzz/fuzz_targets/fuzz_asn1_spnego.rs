@@ -1,6 +1,8 @@
 //! SPNEGO token wrapping/unwrapping. `decode_spnego_token` walks a GSS-API
 //! `APPLICATION[0]` or `NegTokenResp` structure straight off the CredSSP wire
-//! to find the inner NTLM message.
+//! to find the inner NTLM message. The server's final token goes through the
+//! strict decoder `decode_spnego_final`, which reads `negState` and
+//! `mechListMIC` and turns a truncated or malformed field into an error.
 #![no_main]
 
 use arbitrary::Arbitrary;

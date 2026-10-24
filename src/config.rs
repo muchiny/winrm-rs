@@ -118,7 +118,7 @@ pub struct WinrmConfig {
     /// `Shell::run_command` additionally gives up after
     /// `2 * operation_timeout_secs` in total.
     ///
-    /// With [`AuthMethod::CredSsp`] one request takes usually five HTTP
+    /// With [`AuthMethod::CredSsp`] one request usually takes five HTTP
     /// exchanges (at most 13) on one connection (the CredSSP handshake, then
     /// the credentials with the body); each gets this budget plus 10 seconds.
     pub operation_timeout_secs: u64,

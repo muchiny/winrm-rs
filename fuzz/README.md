@@ -34,7 +34,7 @@ drives; "invariant" is what it asserts beyond *must not panic*.
 | `fuzz_ntlm_challenge_header` | same, magic-prefixed inputs | — |
 | `fuzz_ntlm_header_decode` | `decode_challenge_header` | base64 framing does not change message validity |
 | `fuzz_ntlm_av_pairs` | `crypto::parse_av_pairs`, `from_utf16le` | decoded text never exceeds its code-unit count |
-| `fuzz_ntlm_type3` | `create_authenticate_message*` | every Type 3 security buffer stays inside the message, and the declared lengths fill it exactly |
+| `fuzz_ntlm_type3` | `create_authenticate_message*` | every Type 3 security buffer stays inside the message, the declared lengths fill it exactly, and the AV list is the canonical one (`check_av_list`) |
 
 ### NTLM crypto and session state
 
@@ -44,7 +44,7 @@ drives; "invariant" is what it asserts beyond *must not panic*.
 | `fuzz_ntlm_seal` | `NtlmSession::seal`/`unseal` | seal prepends exactly 16 bytes |
 | `fuzz_ntlm_session` | multi-message seal/sign/unseal | signature version and sequence numbering across a conversation |
 | `fuzz_ntlm_unseal_body` | `auth/ntlm.rs::unseal_body` (MS-WSMV multipart/encrypted framing) | never panics; errors do not echo the body; a server-sealed frame round-trips exactly; a flipped bit is rejected or leaves the plaintext unchanged; any truncation is rejected |
-| `fuzz_kerberos_sealed` | `auth/sealed.rs::parse` with the Kerberos header rule, `auth/kerberos.rs` `check_acceptor_sealed` / `windows_layout`, `soap/parser.rs::check_relates_to` (no KDC needed) | never panics; errors stay short; a parsed token is a 16..=1024-byte header plus exactly `Length` bytes; the layout conversion keeps the data, writes RRC = trailer length and is a right rotation by it |
+| `fuzz_kerberos_sealed` | `auth/sealed.rs::parse` with the Kerberos header rule, `auth/kerberos.rs` `check_acceptor_sealed` / `windows_layout`, `soap/parser.rs::check_relates_to` (no KDC needed) | never panics; errors stay short; a parsed token is a 16..=1024-byte header plus exactly `Length` bytes, and `check_acceptor_sealed` (given that length) accepts only EC = 0 and a header of 32 + RRC bytes; the layout conversion keeps the data, writes RRC = trailer length and is a right rotation by it |
 
 ### SOAP
 
@@ -69,7 +69,7 @@ drives; "invariant" is what it asserts beyond *must not panic*.
 | Target | Source | Invariant |
 |---|---|---|
 | `fuzz_asn1_ts_request` | `decode_ts_request`, `encode_ts_request`, `encode_ts_credentials` | encode → decode is the identity for every field |
-| `fuzz_asn1_spnego` | `decode_spnego_token`, `decode_spnego_mech_list_mic`, `encode_spnego_init/response` | both wrappers roundtrip; the `mechListMIC` does not disturb the token and comes back out unchanged; a `NegTokenInit` is refused by the MIC extractor |
+| `fuzz_asn1_spnego` | `decode_spnego_token`, `decode_spnego_mech_list_mic`, `decode_spnego_final` (strict final-token decoder, must not panic), `encode_spnego_init/response` | both wrappers roundtrip; the `mechListMIC` does not disturb the token and comes back out unchanged; a `NegTokenInit` is refused by the MIC extractor |
 | `fuzz_asn1_cert` | `extract_subject_public_key` | extracted key fits inside the certificate |
 | `fuzz_credssp_http` | `ResponseReader`, `extract_credssp_token_str` | never panics; same result for any chunking; a single all-digit `Content-Length` frames the body exactly; an extracted token is non-empty, has no whitespace or comma, and occurs in the header |
 

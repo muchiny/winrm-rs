@@ -66,7 +66,9 @@ async fn run_blocking_bounded<T: Send + 'static>(
 /// The pure parts of Kerberos message encryption (no GSS-API call): wrap
 /// token checks, the Windows layout, the sealed-answer framing. Built with
 /// the `kerberos` feature, and for tests and the fuzz targets (`__internal`)
-/// without it.
+/// without it. `check_bound_certificate`, `StepOutcome`, `PendingStep` and
+/// `finish_mutual` are the exception: they are built with the `kerberos`
+/// feature and for tests, not for the fuzz targets.
 #[cfg(any(feature = "kerberos", feature = "__internal", test))]
 mod wire {
     use crate::auth::sealed;
@@ -196,6 +198,8 @@ mod wire {
                 .and_then(|b| <[u8; 2]>::try_from(b).ok())
                 .map(u16::from_be_bytes)
         };
+        // Cannot fail: `header` is exactly `TOKEN_HEADER_LEN` (16) bytes, so both
+        // ranges exist. Kept so that no index is needed.
         let (Some(ec), Some(rrc)) = (be16(4..6), be16(6..8)) else {
             return Err(sealing_error(
                 "sealed answer shorter than a wrap token header",

@@ -21,7 +21,8 @@ impl<'a> NextMatch<'a> {
 
     /// Absolute offset of the first `needle` at or after `from`: always
     /// equal to `hay.get(from..)?.find(needle).and_then(|i| from.checked_add(i))`,
-    /// whatever the call order.
+    /// whatever the call order. `None` also when `from` is past the end or
+    /// not on a character boundary.
     pub(super) fn at_or_after(&mut self, from: usize) -> Option<usize> {
         // A `from` inside a character (or past the end) has no answer, and
         // says nothing about later offsets: leave the memo alone.

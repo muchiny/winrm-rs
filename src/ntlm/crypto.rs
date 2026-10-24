@@ -101,7 +101,10 @@ pub(crate) fn compute_ntlmv2_hash(
     hmac_md5_secret(nt_hash, &identity_bytes)
 }
 
-/// HMAC-MD5 over public values (MIC, checksums, NTProofStr).
+/// HMAC-MD5 for callers whose key is not secret: the tests, the fuzz
+/// facade and the test NTLM server. Anything keyed by key material (NTLMv2
+/// hash, session keys, the MIC) goes through [`hmac_md5_secret`] or
+/// [`hmac_md5_parts`], which wipe the pad blocks they build.
 pub(crate) fn hmac_md5(key: &[u8], data: &[u8]) -> [u8; 16] {
     let mut mac = HmacMd5::new_from_slice(key).expect("HMAC accepts any key size");
     mac.update(data);

@@ -163,7 +163,8 @@ pub enum SoapError {
 pub enum NtlmError {
     /// An NTLM exchange failed. The message says which case:
     /// - an NTLM message is structurally invalid: too short, bad signature,
-    ///   wrong message type, corrupt base64, a MIC of the wrong size;
+    ///   wrong message type, corrupt base64, a MIC of the wrong size, or a field
+    ///   of an outgoing message too large for its 16-bit length or 32-bit offset;
     /// - a sealed answer does not unseal: bad framing, signature, sequence
     ///   number or checksum;
     /// - the server answered a sealed request without sealing (any error

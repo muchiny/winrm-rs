@@ -1,6 +1,7 @@
-//! `AV_PAIR` list parsing. The `TargetInfo` blob is copied verbatim out of the
-//! server's Type 2 message and walked with raw `u16` length arithmetic, so it is
-//! the densest offset-handling code in the NTLM path.
+//! `AV_PAIR` list parsing. The `TargetInfo` blob comes verbatim out of the
+//! server's Type 2 message and is walked pair by pair with checked splits (a
+//! pair whose length runs past the buffer ends the walk), so it is one of the
+//! densest offset-handling spots in the NTLM path.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;

@@ -35,7 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   to keep `winrm_rs` at `info`: `debug` no longer carries command content,
   but `trace` still logs SOAP bodies. The crate docs gain a *Logging*
   section.
-- Kerberos: a sealed answer must have a zero extra count (EC) and a security header whose length matches its rotation count (RRC), as Windows always sends. An unrotated token (RRC 0) in a 60-byte header, which older versions accepted, is now refused.
+- Kerberos: a sealed answer must have a zero extra count (EC) and a security
+  header whose length matches its rotation count (RRC), as Windows always
+  sends. An unrotated token (RRC 0) in a 60-byte header, which older versions
+  accepted, is now refused.
 
 ### Changed
 
@@ -86,15 +89,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Decoding PowerShell CLIXML on stderr takes time linear in the record size,
   however the server slices it.
 - An unparseable `ExitCode` is logged as a 32-character excerpt.
-- `run_wql` reads the end of the enumeration, and `check_soap_fault` reads a
-  fault, from elements rather than from text: item text that mentions
-  `EndOfSequence` or `Fault>` no longer ends a query early or turns a page
-  into an error.
+- `run_wql` reads the end of the enumeration, and every response is checked
+  for a SOAP fault, from elements rather than from text: item text that
+  mentions `EndOfSequence` or `Fault>` no longer ends a query early or turns
+  a page into an error.
 - A very large `operation_timeout_secs` no longer panics, or wraps to a short
   timeout, when the client is built or in `Shell::run_command`.
-- `run_command`, `run_powershell`, `Shell::run_command` and `run_wql` wait
-  before polling again when the server answers three or more times in a row,
-  at once, with nothing (50 ms doubling to 1 s).
+- `run_command`, `run_powershell`, `run_command_with_cancel`,
+  `run_powershell_with_cancel`, `Shell::run_command` and `run_wql` wait before
+  polling again when the server answers three or more times in a row, at
+  once, with nothing (50 ms doubling to 1 s).
 - CredSSP now requires the server's final SPNEGO token to carry
   `accept-completed` and a `mechListMIC`, as RFC 4178 §5 requires once the
   client has sent one. Windows sends both on every version after Server 2003.
@@ -144,7 +148,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   unchanged.
 - `upload_file` to a long remote path no longer fails with a command line over
   the Windows limit: the chunk size now shrinks to fit the path.
-- **`upload_file` of an empty local file** now creates or truncates the remote file. It used to send nothing and return `Ok(0)`, leaving any previous remote content in place.
+- `upload_file` of an empty local file now creates or truncates the remote
+  file. It used to send nothing and return `Ok(0)`, leaving any previous
+  remote content in place.
 - `upload_file` deletes its shell when a chunk fails or times out. It used to
   return without deleting it, so failed uploads used up `MaxShellsPerUser`
   until the server's idle timeout. The Delete is bounded by
@@ -161,6 +167,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `/powershell` path segment case-insensitively.
 - Kerberos: a zero `operation_timeout_secs` no longer makes every ticket
   request time out; the KDC timeout is at least one second.
+- `NtlmError::InvalidMessage` is also returned for NTLM messages with
+  oversized or out-of-range fields: a Type 3 field longer than a 16-bit
+  length can hold is refused instead of being truncated.
 
 ### Documentation
 

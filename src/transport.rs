@@ -197,9 +197,11 @@ const MAX_IDLE_TOTAL: usize = 32;
 const CONN_MAX_IDLE: Duration = Duration::from_secs(60);
 
 /// Dedicated-connection exchanges (sealed, NTLM over TLS, Kerberos over TLS)
-/// in flight: 32 per host and 128 per client. Signal and Delete use 2 more
-/// per host, outside both limits, so clean-up never queues behind data
-/// requests. At most 128 + 2 × hosts sockets in total. Hosts are keyed by
+/// in flight: 32 per host and 128 per client. Signal and Delete use their own
+/// lane of 2 slots per host, outside both limits, so clean-up never queues
+/// behind data requests. At most 128 + 2 × hosts sockets are in use at once;
+/// the idle pooled connections ([`MAX_IDLE_PER_HOST`]: 8 per host,
+/// [`MAX_IDLE_TOTAL`]: 32 in total) come on top. Hosts are keyed by
 /// their string, ASCII case aside: `win01` and its address get separate
 /// budgets. Further requests wait for a slot, within the request timeout.
 const MAX_CONNS_PER_HOST: usize = 32;
@@ -631,7 +633,11 @@ impl HttpTransport {
     ///
     /// Builds the underlying HTTP client with the configured timeouts and TLS
     /// settings. Returns [`WinrmError::Http`] if the HTTP client cannot be
-    /// constructed (e.g. invalid TLS configuration).
+    /// constructed, and [`WinrmError::AuthFailed`] if the authentication
+    /// method cannot be set up: Certificate or CredSSP without HTTPS,
+    /// Certificate auth without a usable certificate and key, a TLS verifier
+    /// or client certificate that rustls rejects, or, with the `credssp`
+    /// feature, the CredSSP TLS contexts.
     #[tracing::instrument(level = "debug", skip(config, credentials))]
     pub(crate) fn new(
         config: WinrmConfig,
@@ -682,10 +688,10 @@ impl HttpTransport {
             tracing::warn!(
                 target: "winrm_rs::ntlm_over_http",
                 sealed = config.encryption != EncryptionMode::Never,
-                "NTLM over plain HTTP: the handshake does not authenticate the server and is not bound to the \
-                 connection, so a party on the network path can relay it, or record it to \
-                 guess the password offline; sealing protects only the SOAP bodies. Use HTTPS \
-                 (use_tls = true, port = 5986) or Kerberos"
+                "NTLM over plain HTTP: the handshake does not authenticate the server and is \
+                 not bound to the connection, so a party on the network path can relay it, \
+                 or record it to guess the password offline; sealing protects only the SOAP \
+                 bodies. Use HTTPS (use_tls = true, port = 5986) or Kerberos"
             );
         }
 

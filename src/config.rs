@@ -23,13 +23,49 @@ pub struct WinrmConfig {
     ///
     /// # Security
     ///
-    /// Setting this to `true` disables chain verification on **both** the
-    /// regular HTTPS transport and the CredSSP outer TLS leg, leaving the
-    /// connection vulnerable to MITM. Credentials transmitted over Basic,
-    /// NTLM, or CredSSP can then be intercepted.
-    ///
-    /// Use **only** in test environments. The constructor logs a
+    /// Setting this to `true` stops checking the server certificate's chain,
+    /// validity dates and host name: on the HTTPS transport, on the CredSSP
+    /// outer TLS leg, and on the leg to an `https://` proxy (see below). Use
+    /// it **only** in test environments. The constructor logs a
     /// `tracing::warn` when this flag is enabled.
+    ///
+    /// Since 1.4.1 the WinRM server must still prove, in the TLS handshake,
+    /// that it holds the private key of the certificate it presents. NTLM and
+    /// Kerberos channel binding are computed from that certificate, and
+    /// Kerberos pins it, so a party in the middle cannot relay the
+    /// authentication to the real server by showing it the real server's
+    /// certificate. That is all this mode keeps. Someone in the middle who
+    /// presents a certificate of its own is accepted. It receives, and can
+    /// change, what TLS was meant to protect: Basic credentials, SOAP bodies
+    /// and their output (over HTTPS, [`EncryptionMode::Auto`] does not seal
+    /// them), and the NTLMv2 response, which it can relay to a service that
+    /// ignores channel binding or use to guess the password offline.
+    ///
+    /// Certificates the verifier cannot use are refused even in this mode:
+    /// X.509 v1 and v2, a certificate with an unknown critical extension, RSA
+    /// keys under 2048 or over 8192 bits, a certificate whose inner and outer
+    /// signature algorithms differ, and P-521 keys. Re-issue such a listener
+    /// certificate.
+    ///
+    /// This flag also turns off verification of an `https://` proxy's
+    /// certificate: [`proxy`](Self::proxy), one named in `HTTPS_PROXY`,
+    /// `https_proxy`, `HTTP_PROXY`, `http_proxy`, `ALL_PROXY` or `all_proxy`,
+    /// or one `reqwest` takes from system settings. With `use_tls = true`
+    /// that proxy must still prove it holds its key; with `use_tls = false`
+    /// not even that is checked. Whoever answers on that leg receives the
+    /// proxy credentials of the proxy URL (`Proxy-Authorization`). With
+    /// `use_tls = false` it also receives every request: Basic credentials,
+    /// the NTLM handshake, and the SOAP bodies that are not sealed (Basic,
+    /// [`EncryptionMode::Never`]). NTLM and Kerberos bodies sealed under
+    /// [`EncryptionMode::Auto`] stay sealed.
+    ///
+    /// **CredSSP is the exception.** Its HTTPS connection carries no channel
+    /// binding, and nothing inside CredSSP identifies the server. With this
+    /// flag, a party on the network path who presents a certificate of its
+    /// own can relay the CredSSP exchange, read and rewrite every SOAP body
+    /// and its output, and so run commands in a session that holds your
+    /// delegated credentials. Do not combine CredSSP with this flag outside
+    /// an isolated test network.
     pub accept_invalid_certs: bool,
     /// TCP connect timeout in seconds (default: 30).
     ///
@@ -87,12 +123,22 @@ pub struct WinrmConfig {
     /// uses no proxy at all, neither this one nor one from the environment.
     ///
     /// Limitation with [`AuthMethod::Certificate`]: with an `https://` proxy,
-    /// `reqwest` uses the same TLS client configuration for the connection
-    /// to the proxy, so the client certificate may be presented to the proxy
-    /// if it requests one. `http://` (CONNECT) and SOCKS5 proxies only relay
-    /// bytes: TLS, and the certificate, stay end-to-end with the WinRM host.
-    /// The same applies to a proxy taken from the `HTTPS_PROXY` / `ALL_PROXY`
-    /// environment variables, which `reqwest` uses when this field is `None`.
+    /// `reqwest` uses a copy of the same TLS client configuration for the
+    /// connection to the proxy, so a proxy that requests a client certificate
+    /// receives the client's certificate chain. Only that public chain is
+    /// disclosed. The private key never leaves the client, and the handshake
+    /// signature made with it covers only that proxy handshake, so it cannot
+    /// be replayed to the WinRM host. With
+    /// [`accept_invalid_certs`](Self::accept_invalid_certs) the proxy's own
+    /// certificate is not verified, so any party in the middle of the proxy
+    /// leg can request the chain. `http://` (CONNECT) and SOCKS5 proxies only
+    /// relay bytes: TLS, and the certificate, stay end-to-end with the WinRM
+    /// host. The same applies to a proxy taken from the `HTTPS_PROXY` /
+    /// `ALL_PROXY` environment variables, which `reqwest` uses when this field
+    /// is `None`, or from system settings.
+    ///
+    /// [`accept_invalid_certs`](Self::accept_invalid_certs) also turns off
+    /// verification of an `https://` proxy's certificate; see there.
     ///
     /// Kerberos over HTTPS pins the server certificate in the connection's
     /// verifier and refuses a TLS handshake for any other server name than
@@ -365,13 +411,16 @@ pub enum AuthMethod {
     /// of the parsed endpoint URL; once pinned, a handshake for another name
     /// is refused (the `https://` proxy's own leg aside), and a host that is
     /// no valid TLS server name is refused before the AP-REQ. With
-    /// `accept_invalid_certs`, binding and pin are what keep an attacker in
-    /// the middle from using the authentication on the real server; a
-    /// certificate whose signature algorithm defines no binding
-    /// hash (Ed25519, unknown) is refused. With [`EncryptionMode::Never`] over
-    /// HTTP, each request authenticates with a fresh context, the AP-REP is
-    /// checked only when the answer carries one, and body and answer cross the
-    /// network in plaintext, unprotected. See [`EncryptionMode`] for the
+    /// `accept_invalid_certs`, binding and pin are what keep a party in the
+    /// middle from using the authentication on the real server's HTTPS
+    /// listener (since 1.4.1 the server must prove it holds the pinned
+    /// certificate's key); they do not stop a party with a certificate of its
+    /// own from reading the traffic or relaying the token to a service that
+    /// ignores channel binding. A certificate whose signature algorithm
+    /// defines no binding hash (Ed25519, unknown) is refused. With
+    /// [`EncryptionMode::Never`] over HTTP, each request authenticates with a
+    /// fresh context, the AP-REP is checked only when the answer carries one,
+    /// and body and answer cross the network in plaintext, unprotected. See [`EncryptionMode`] for the
     /// replay limit of Kerberos sealing and the Windows-client caveat.
     Kerberos,
     /// TLS client certificate authentication. Requires HTTPS (`use_tls = true`).
@@ -400,6 +449,22 @@ pub enum AuthMethod {
     /// client with `use_tls = false`, or sending a request without the
     /// feature, fails with
     /// [`WinrmError::AuthFailed`](crate::WinrmError::AuthFailed).
+    ///
+    /// # Security
+    ///
+    /// CredSSP sends your cleartext password to the server. Only the HTTPS
+    /// certificate identifies that server: for a domain account, any
+    /// domain-joined computer can complete the NTLM exchange inside CredSSP
+    /// through a domain controller. With
+    /// [`WinrmConfig::accept_invalid_certs`] nothing identifies the server
+    /// (see that field). Until a listener certificate can be pinned, keep
+    /// `accept_invalid_certs = false` with a certificate the default roots
+    /// trust, or use [`AuthMethod::Ntlm`] or [`AuthMethod::Kerberos`], whose
+    /// channel binding still protects them in that mode.
+    ///
+    /// Anyone who controls the target, now or while your logon session lives
+    /// there, can read the delegated password. Use CredSSP only toward hosts
+    /// you trust as much as the account.
     ///
     /// Validated live against Windows Server 2025 (`credssp_run_command_whoami`
     /// in `tests/integration_real.rs`). Not validated on Windows Server 2012 R2:

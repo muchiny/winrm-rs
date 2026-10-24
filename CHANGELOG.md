@@ -9,7 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [1.4.1] - 2026-10-24
 
-PSRP callers can now stop a running pipeline.
+Security fixes for `accept_invalid_certs` and for remote file paths; PSRP
+callers can now stop a running pipeline.
+
+### Security
+
+- **`accept_invalid_certs` still requires the server to hold its
+  certificate's key.** `NoVerifier`, the verifier used with
+  `accept_invalid_certs = true`, accepted the TLS 1.2 / 1.3 handshake
+  signature without checking it. A party in the middle could therefore
+  present the real server's (public) certificate without its private key.
+  NTLM and Kerberos channel binding, computed from that certificate, then
+  matched the real server, and the authentication could be relayed to it.
+  The signatures are now verified on the HTTPS transport, on the Kerberos
+  pinned connections and on the CredSSP outer TLS. NTLM and Kerberos channel
+  binding therefore hold under `accept_invalid_certs`. CredSSP has no channel
+  binding (see the `AuthMethod::CredSsp` documentation). Reported and fixed by
+  Etienne Saimond (@ol-etienne-saimond).
+- **Remote file paths are quoted with every PowerShell single quote.**
+  `upload_file`, `download_file` and `download_file_with_timeout` now also
+  double U+2018, U+2019, U+201A and U+201B, which PowerShell treats as single
+  quotes too. Before this, a remote path containing one could end the quoted
+  literal early.
+
+### Changed
+
+- **With `accept_invalid_certs`, listener certificates the verifier cannot
+  use are refused.** Checking the handshake signature parses the
+  certificate, which refuses X.509 v1 and v2, an unknown critical extension,
+  RSA keys under 2048 or over 8192 bits, and differing inner and outer
+  signature algorithms. These were accepted before. Re-issue such a
+  certificate (`New-SelfSignedCertificate` creates X.509 v3 RSA-2048 by
+  default).
+- The crate tarball no longer includes `tests/vagrant/`.
 
 ### Fixed
 

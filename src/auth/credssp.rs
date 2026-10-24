@@ -236,18 +236,17 @@ fn build_inner_openssl_tls() -> Result<OpenSslMemTls, WinrmError> {
 
     let mut builder = SslConnector::builder(SslMethod::tls_client())
         .map_err(|e| WinrmError::AuthFailed(format!("SslConnector: {e}")))?;
-    // SslVerifyMode::NONE is intentional and protocol-correct here.
+    // SslVerifyMode::NONE is intentional (MS-CSSP 1.3: the server is
+    // anonymous at this point, and Windows presents a self-signed
+    // certificate on this inner channel).
     //
-    // The CredSSP inner channel is authenticated by `pubKeyAuth`
-    // (MS-CSSP §3.1.5.1): the client computes a hash over the server's
-    // SubjectPublicKeyInfo + a nonce, the NTLM session seals it, and
-    // the server is expected to echo the symmetric counter-hash. The
-    // pubKeyAuth check is performed after the NTLM exchange (see the
-    // `expected_server_hash` comparison in `CredSspConnection`'s
-    // handshake); if it fails we abort with
-    // `CredSspError::PublicKeyMismatch`. So an X.509 chain check on this
-    // leg would be redundant — and crucially, the outer/transport leg
-    // already validates the chain (see `CredSspConnection::connect`).
+    // `pubKeyAuth` (MS-CSSP 3.1.5) binds the NTLM session key to this inner
+    // TLS public key and to nothing else. It proves that the peer holds the
+    // NTLM session key. It does not identify the server, and it binds
+    // nothing to the outer HTTPS connection, which carries the SOAP bodies.
+    // Server identity and body integrity come only from the outer TLS
+    // verifier (`CredSspConnection::connect`); under `accept_invalid_certs`
+    // there is none.
     builder.set_verify(SslVerifyMode::NONE);
     // Force TLS 1.2 to match what Microsoft CredSSP server expects.
     builder
@@ -307,9 +306,9 @@ impl CredSspConnection {
     /// Open a TCP+TLS connection to (host:port). The returned object owns
     /// the underlying socket; drop to close.
     ///
-    /// `accept_invalid_certs=true` disables outer TLS verification — TEST USE
-    /// ONLY. The inner CredSSP TLS is authenticated via pubKeyAuth (MS-CSSP
-    /// §3.1.5.1), independent of the outer chain.
+    /// `accept_invalid_certs = true` disables outer TLS verification (test
+    /// use only). Nothing inside CredSSP replaces it: the inner TLS is not
+    /// verified (MS-CSSP 1.3) and `pubKeyAuth` binds only the inner TLS key.
     async fn connect(
         host: &str,
         port: u16,
@@ -582,8 +581,8 @@ pub(crate) struct CredSspAuth {
     pub(crate) password: Zeroizing<String>,
     pub(crate) domain: String,
     /// Mirrors `WinrmConfig.accept_invalid_certs`. When true, the outer TLS
-    /// channel skips chain validation. Inner TLS authentication relies on
-    /// pubKeyAuth regardless (MS-CSSP §3.1.5.1).
+    /// channel skips chain validation, and nothing in CredSSP authenticates
+    /// the server instead (`pubKeyAuth` binds only the inner TLS key).
     pub(crate) accept_invalid_certs: bool,
     /// Largest response body read (see `transport::max_response_bytes`).
     pub(crate) max_response_bytes: usize,

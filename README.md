@@ -214,7 +214,7 @@ let bytes = client.download_file("win-server", "C:\\remote\\file.bin", Path::new
 |---|---|---|
 | `port` | `5985` | WinRM HTTP(S) port |
 | `use_tls` | `false` | Use HTTPS instead of HTTP |
-| `accept_invalid_certs` | `false` | Skip TLS certificate validation |
+| `accept_invalid_certs` | `false` | Skip certificate chain and host-name checks (test only; see its rustdoc) |
 | `connect_timeout_secs` | `30` | TCP connection timeout |
 | `operation_timeout_secs` | `60` | WinRM operation timeout (SOAP-level) |
 | `auth_method` | `Ntlm` | `Basic`, `Ntlm`, `Kerberos`, or `Certificate` |

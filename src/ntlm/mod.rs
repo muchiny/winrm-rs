@@ -77,33 +77,62 @@ impl NtlmSession {
     /// Computes the four session keys (client/server seal/sign) per
     /// MS-NLMP section 3.4.4 and initializes the RC4 cipher handles.
     pub fn from_auth(exported_session_key: &[u8; 16]) -> Self {
-        let client_seal_key = Self::derive_key(
+        let mut session = Self::INERT;
+        session.rekey_in_place(exported_session_key);
+        session
+    }
+
+    /// The same session as [`Self::from_auth`], built in its box.
+    ///
+    /// The keys and RC4 S-boxes are written straight into the heap
+    /// allocation, so no stack copy of them is made on the way to the box.
+    pub(crate) fn boxed_from_auth(exported_session_key: &[u8; 16]) -> Box<Self> {
+        let mut session = Box::new(Self::INERT);
+        session.rekey_in_place(exported_session_key);
+        session
+    }
+
+    /// An all-zero session holding no key material. It is only ever a
+    /// placeholder for [`Self::rekey_in_place`] to fill, never sealed with.
+    const INERT: Self = Self {
+        client_sign_key: [0; 16],
+        server_sign_key: [0; 16],
+        client_seal_key: [0; 16],
+        server_seal_key: [0; 16],
+        client_seq_num: 0,
+        server_seq_num: 0,
+        client_seal_handle: Rc4State::INERT,
+        server_seal_handle: Rc4State::INERT,
+    };
+
+    /// Derive the four session keys (client/server seal/sign) from the
+    /// exported session key per MS-NLMP section 3.4.4, reset the sequence
+    /// numbers, and initialise the RC4 handles, all in place.
+    fn rekey_in_place(&mut self, exported_session_key: &[u8; 16]) {
+        Self::derive_key_into(
+            &mut self.client_seal_key,
             exported_session_key,
             b"session key to client-to-server sealing key magic constant\0",
         );
-        let client_sign_key = Self::derive_key(
+        Self::derive_key_into(
+            &mut self.client_sign_key,
             exported_session_key,
             b"session key to client-to-server signing key magic constant\0",
         );
-        let server_seal_key = Self::derive_key(
+        Self::derive_key_into(
+            &mut self.server_seal_key,
             exported_session_key,
             b"session key to server-to-client sealing key magic constant\0",
         );
-        let server_sign_key = Self::derive_key(
+        Self::derive_key_into(
+            &mut self.server_sign_key,
             exported_session_key,
             b"session key to server-to-client signing key magic constant\0",
         );
-
-        Self {
-            client_sign_key,
-            server_sign_key,
-            client_seal_key,
-            server_seal_key,
-            client_seq_num: 0,
-            server_seq_num: 0,
-            client_seal_handle: Rc4State::new(&client_seal_key),
-            server_seal_handle: Rc4State::new(&server_seal_key),
-        }
+        self.client_seq_num = 0;
+        self.server_seq_num = 0;
+        self.client_seal_handle.reinit(&self.client_seal_key);
+        self.server_seal_handle.reinit(&self.server_seal_key);
     }
 
     /// The server's view of the session derived from the same key: what it
@@ -116,21 +145,20 @@ impl NtlmSession {
         let mut session = Self::from_auth(exported_session_key);
         std::mem::swap(&mut session.client_sign_key, &mut session.server_sign_key);
         std::mem::swap(&mut session.client_seal_key, &mut session.server_seal_key);
-        session.client_seal_handle = Rc4State::new(&session.client_seal_key);
-        session.server_seal_handle = Rc4State::new(&session.server_seal_key);
+        session.client_seal_handle.reinit(&session.client_seal_key);
+        session.server_seal_handle.reinit(&session.server_seal_key);
         session
     }
 
-    fn derive_key(session_key: &[u8; 16], magic: &[u8]) -> [u8; 16] {
+    /// `out = MD5(session_key || magic)`, with the digest output wiped.
+    fn derive_key_into(out: &mut [u8; 16], session_key: &[u8; 16], magic: &[u8]) {
         use md5::Digest;
         let mut hasher = md5::Md5::new();
         hasher.update(session_key);
         hasher.update(magic);
         let mut result = hasher.finalize();
-        let mut key = [0u8; 16];
-        key.copy_from_slice(&result);
+        out.copy_from_slice(&result);
         result.as_mut_slice().zeroize();
-        key
     }
 
     /// Seal (encrypt + sign) a message for sending to the server.
@@ -206,7 +234,7 @@ impl NtlmSession {
     /// answers a bare 401 without any TSRequest.
     pub fn sign_mech_list_mic(&mut self, mech_type_list: &[u8]) -> [u8; 16] {
         let sig = self.sign(mech_type_list);
-        self.client_seal_handle = Rc4State::new(&self.client_seal_key);
+        self.client_seal_handle.reinit(&self.client_seal_key);
         sig
     }
 
@@ -265,7 +293,7 @@ impl NtlmSession {
         }
 
         self.server_seq_num += 1;
-        self.server_seal_handle = Rc4State::new(&self.server_seal_key);
+        self.server_seal_handle.reinit(&self.server_seal_key);
         Ok(())
     }
 
@@ -336,6 +364,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn boxed_session_matches_by_value_session() {
+        let key = [0x42; 16];
+        let mut boxed = NtlmSession::boxed_from_auth(&key);
+        let mut by_val = NtlmSession::from_auth(&key);
+        assert_eq!(boxed.seal(b"ping"), by_val.seal(b"ping"));
+    }
+
+    #[test]
     fn server_side_session_mirrors_the_client_session() {
         let key = [0x42; 16];
         let mut client = NtlmSession::from_auth(&key);
@@ -385,19 +421,24 @@ mod tests {
             0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
             0x1e, 0x1f,
         ];
-        let cli_seal = NtlmSession::derive_key(
+        let derive = |key: &[u8; 16], magic: &[u8]| {
+            let mut out = [0u8; 16];
+            NtlmSession::derive_key_into(&mut out, key, magic);
+            out
+        };
+        let cli_seal = derive(
             &key,
             b"session key to client-to-server sealing key magic constant\0",
         );
-        let srv_seal = NtlmSession::derive_key(
+        let srv_seal = derive(
             &key,
             b"session key to server-to-client sealing key magic constant\0",
         );
-        let cli_sign = NtlmSession::derive_key(
+        let cli_sign = derive(
             &key,
             b"session key to client-to-server signing key magic constant\0",
         );
-        let srv_sign = NtlmSession::derive_key(
+        let srv_sign = derive(
             &key,
             b"session key to server-to-client signing key magic constant\0",
         );

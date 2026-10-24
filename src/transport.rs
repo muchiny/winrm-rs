@@ -85,15 +85,8 @@ const MAX_CONNS_IN_FLIGHT: usize = 32;
 const POOL_RETURN_YIELDS: usize = 4;
 
 /// The security context that seals a connection's messages.
-#[cfg_attr(
-    feature = "kerberos",
-    expect(
-        clippy::large_enum_variant,
-        reason = "held in a boxed AuthConn; another box would add a heap copy of NTLM keys"
-    )
-)]
 enum Sealer {
-    Ntlm(NtlmSession),
+    Ntlm(Box<NtlmSession>),
     #[cfg(feature = "kerberos")]
     Kerberos(KerberosSession),
 }
@@ -899,10 +892,10 @@ impl HttpTransport {
         match self.config.auth_method {
             AuthMethod::Ntlm => {
                 let (session_key, closing) = self.ntlm_auth().authenticate(http, cert, url).await?;
-                // The session (keys, RC4 S-boxes) is built on the stack and
-                // then moved into the boxed connection: that stack copy is not
-                // wiped.
-                Ok((Sealer::Ntlm(NtlmSession::from_auth(&session_key)), closing))
+                Ok((
+                    Sealer::Ntlm(NtlmSession::boxed_from_auth(&session_key)),
+                    closing,
+                ))
             }
             #[cfg(feature = "kerberos")]
             AuthMethod::Kerberos => {

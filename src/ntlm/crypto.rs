@@ -495,17 +495,33 @@ pub(crate) struct Rc4State {
 }
 
 impl Rc4State {
+    /// An all-zero state holding no key material: a placeholder for
+    /// [`Self::reinit`] to fill, never used to process data.
+    pub(crate) const INERT: Self = Rc4State {
+        s: [0; 256],
+        i: 0,
+        j: 0,
+    };
+
     pub(crate) fn new(key: &[u8]) -> Self {
-        let mut s = [0u8; 256];
-        for (i, v) in s.iter_mut().enumerate() {
+        let mut state = Self::INERT;
+        state.reinit(key);
+        state
+    }
+
+    /// Re-key the state in place: the S-box is rewritten where it lies, so no
+    /// new copy of it is made, and the keystream restarts at offset 0.
+    pub(crate) fn reinit(&mut self, key: &[u8]) {
+        for (i, v) in self.s.iter_mut().enumerate() {
             *v = i as u8;
         }
+        self.i = 0;
+        self.j = 0;
         let mut j: u8 = 0;
         for i in 0..256 {
-            j = j.wrapping_add(s[i]).wrapping_add(key[i % key.len()]);
-            s.swap(i, j as usize);
+            j = j.wrapping_add(self.s[i]).wrapping_add(key[i % key.len()]);
+            self.s.swap(i, j as usize);
         }
-        Rc4State { s, i: 0, j: 0 }
     }
 
     pub(crate) fn process(&mut self, data: &mut [u8]) {
@@ -523,6 +539,30 @@ impl Rc4State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rc4_reinit_equals_new() {
+        let mut a = Rc4State::new(&[0x11; 16]);
+        let mut b = Rc4State::new(&[0x22; 16]);
+        b.reinit(&[0x11; 16]);
+        let (mut x, mut y) = ([0xABu8; 32], [0xABu8; 32]);
+        a.process(&mut x);
+        b.process(&mut y);
+        assert_eq!(x, y);
+    }
+
+    #[test]
+    fn rc4_reinit_resets_the_keystream_position() {
+        let mut a = Rc4State::new(&[0x11; 16]);
+        let mut used = [0u8; 40];
+        a.process(&mut used);
+        a.reinit(&[0x11; 16]);
+        let mut fresh = Rc4State::new(&[0x11; 16]);
+        let (mut x, mut y) = ([0u8; 24], [0u8; 24]);
+        a.process(&mut x);
+        fresh.process(&mut y);
+        assert_eq!(x, y);
+    }
 
     // Kills | → ^ and | → & mutants on TYPE1_FLAGS and TYPE1_FLAGS_CREDSSP.
     // Assert against hardcoded hex values so the constant itself is tested.

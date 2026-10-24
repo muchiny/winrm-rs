@@ -242,8 +242,8 @@ impl NtlmAuth {
         // and wipe this copy in place, so no unboxed copy of it lives in this
         // future while it waits on the network, and returning it moves a
         // pointer. Not wiped: the stack copies the message builder made
-        // (`ntlm::messages`), and later the `NtlmSession` built from it on
-        // the stack (keys and RC4 S-boxes) before it moves into its box.
+        // (`ntlm::messages`). The `NtlmSession` built from it is constructed
+        // in its box, so its keys and RC4 S-boxes have no stack copy.
         let mut session_key = session_key;
         let mut boxed_key = Box::new(Zeroizing::new([0u8; 16]));
         boxed_key.copy_from_slice(&*session_key);

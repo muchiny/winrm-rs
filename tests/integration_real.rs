@@ -3898,6 +3898,39 @@ async fn kerberos_two_commands_on_one_client() {
     }
 }
 
+/// Sealed answers of several sizes over Kerberos, to read the framing the
+/// server really sends. The client ties each answer's security header length
+/// to the token's rotation count (RRC) and requires a zero extra count (EC):
+/// `header_len = 32 + RRC`, so a genuine answer shows `ec=0 rrc=28
+/// header_len=60` whatever its size. Run it alone to read the trace events:
+///
+/// ```text
+/// cargo test --test integration_real --features kerberos kerberos_sealed_answer_sizes \
+///     -- --ignored --nocapture 2>&1 | grep 'sealed answer framing'
+/// ```
+///
+/// If a genuine answer shows `rrc != header_len - 32`, the RRC check in
+/// `check_acceptor_sealed` has to go (the EC check stays).
+#[cfg(feature = "kerberos")]
+#[tokio::test]
+#[ignore]
+async fn kerberos_sealed_answer_sizes() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("winrm_rs::kerberos::sealed=trace")
+        .with_test_writer()
+        .try_init();
+    let (client, host) = kerberos_client_from_env(|c| c.encryption = EncryptionMode::Auto);
+    for n in [0usize, 1, 15, 16, 17, 4096, 204_800] {
+        let output = client
+            .run_powershell(&host, &format!("Write-Output ('x' * {n})"))
+            .await
+            .unwrap_or_else(|e| panic!("sealed answer of {n} characters: {e}"));
+        assert_eq!(output.exit_code, 0, "n = {n}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(stdout.trim(), "x".repeat(n), "n = {n}");
+    }
+}
+
 // === Kerberos over HTTPS (DC bench) ===
 //
 // Needs the DC's HTTPS listener (`setup_dc_https_listener`, once) and the

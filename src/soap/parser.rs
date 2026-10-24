@@ -2,6 +2,7 @@
 
 use super::clixml::ClixmlDecoder;
 use super::namespaces::COMMAND_STATE_DONE;
+use super::scan::NextMatch;
 use crate::error::SoapError;
 
 /// Parsed output from a single WinRM Receive response.
@@ -286,53 +287,66 @@ fn prefixed_tags<'a>(xml: &'a str, suffixed: &'a str) -> impl Iterator<Item = Pr
 /// Extract all Stream elements with their Name attribute and base64 content.
 fn extract_streams(xml: &str) -> Vec<(String, String)> {
     let mut streams = Vec::new();
-    let mut search_from = 0;
+    let mut search_from: usize = 0;
 
-    let stream_tags = ["<rsp:Stream ", "<Stream "];
+    // One forward-only search per spelling: every offset below only moves
+    // forward, so each spelling is looked for once over the whole body.
+    let mut open_prefixed = NextMatch::new(xml, "<rsp:Stream ");
+    let mut open_bare = NextMatch::new(xml, "<Stream ");
+    let mut close_prefixed = NextMatch::new(xml, "</rsp:Stream>");
+    let mut close_bare = NextMatch::new(xml, "</Stream>");
 
     while search_from < xml.len() {
-        let found = stream_tags
-            .iter()
-            .filter_map(|tag| {
-                xml[search_from..]
-                    .find(tag)
-                    .map(|pos| (search_from + pos, *tag))
-            })
-            .min_by_key(|(pos, _)| *pos);
-
-        let Some((tag_start, _)) = found else {
+        // Two spellings never match at the same offset, so `min` has no ties.
+        let Some(tag_start) = [
+            open_prefixed.at_or_after(search_from),
+            open_bare.at_or_after(search_from),
+        ]
+        .into_iter()
+        .flatten()
+        .min() else {
             break;
         };
 
-        let tag_region = &xml[tag_start..];
+        let Some(tag_region) = xml.get(tag_start..) else {
+            break;
+        };
 
         // Find the end of the opening tag
         let Some(tag_end) = tag_region.find('>') else {
             break;
         };
-        let opening_tag = &tag_region[..tag_end];
+        let opening_tag = tag_region.get(..tag_end).unwrap_or_default();
 
         // Extract Name attribute
         let name = extract_attribute(opening_tag, "Name").unwrap_or_default();
 
         // Find content between > and closing tag
-        let content_start = tag_start + tag_end + 1;
-
-        let close_tags = ["</rsp:Stream>", "</Stream>"];
-        let close_pos = close_tags
-            .iter()
-            .filter_map(|close| xml[content_start..].find(close))
-            .min();
-
-        if let Some(end_offset) = close_pos {
-            let content = &xml[content_start..content_start + end_offset];
-            if !content.trim_ascii().is_empty() {
-                streams.push((name, content.to_string()));
-            }
-            search_from = content_start + end_offset + 1;
-        } else {
+        let Some(content_start) = tag_start
+            .checked_add(tag_end)
+            .and_then(|i| i.checked_add(1))
+        else {
             break;
+        };
+
+        let Some(close) = [
+            close_prefixed.at_or_after(content_start),
+            close_bare.at_or_after(content_start),
+        ]
+        .into_iter()
+        .flatten()
+        .min() else {
+            break;
+        };
+
+        let content = xml.get(content_start..close).unwrap_or_default();
+        if !content.trim_ascii().is_empty() {
+            streams.push((name, content.to_string()));
         }
+        let Some(next) = close.checked_add(1) else {
+            break;
+        };
+        search_from = next;
     }
 
     streams
@@ -1245,6 +1259,107 @@ mod tests {
             proptest::prop_assert_eq!(
                 linear,
                 reference_extract_element_text(&xml, "X"),
+                "{:?}", xml
+            );
+        }
+    }
+
+    /// Each element used to rescan the rest of the body for the spelling
+    /// (`<rsp:Stream ` / `<Stream `, `</rsp:Stream>` / `</Stream>`) it does not
+    /// use. About 2 MiB, the default `max_response_bytes`.
+    #[test]
+    fn extract_streams_is_linear_when_one_spelling_is_absent() {
+        use std::time::{Duration, Instant};
+        let shapes: [(&str, String, usize); 3] = [
+            ("prefixed", "<rsp:Stream ></rsp:Stream>".repeat(80_660), 0),
+            ("bare", "<Stream ></Stream>".repeat(116_500), 0),
+            (
+                "prefixed open, bare close",
+                "<rsp:Stream >x</Stream>".repeat(80_000),
+                80_000,
+            ),
+        ];
+        for (shape, xml, expected) in &shapes {
+            let started = Instant::now();
+            assert_eq!(extract_streams(xml).len(), *expected, "{shape}");
+            let took = started.elapsed();
+            assert!(took < Duration::from_secs(5), "{shape}: {took:?}");
+        }
+        // The whole Receive path, on the first shape (empty streams decode to nothing).
+        let started = Instant::now();
+        let out = parse_receive_output_raw(&shapes[0].1).unwrap();
+        assert!(out.stdout.is_empty() && out.stderr.is_empty() && !out.done);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// The implementation this module used before, kept verbatim as the
+    /// reference for the differential test below.
+    fn reference_extract_streams(xml: &str) -> Vec<(String, String)> {
+        let mut streams = Vec::new();
+        let mut search_from = 0;
+
+        let stream_tags = ["<rsp:Stream ", "<Stream "];
+
+        while search_from < xml.len() {
+            let found = stream_tags
+                .iter()
+                .filter_map(|tag| {
+                    xml[search_from..]
+                        .find(tag)
+                        .map(|pos| (search_from + pos, *tag))
+                })
+                .min_by_key(|(pos, _)| *pos);
+
+            let Some((tag_start, _)) = found else {
+                break;
+            };
+
+            let tag_region = &xml[tag_start..];
+
+            let Some(tag_end) = tag_region.find('>') else {
+                break;
+            };
+            let opening_tag = &tag_region[..tag_end];
+
+            let name = extract_attribute(opening_tag, "Name").unwrap_or_default();
+
+            let content_start = tag_start + tag_end + 1;
+
+            let close_tags = ["</rsp:Stream>", "</Stream>"];
+            let close_pos = close_tags
+                .iter()
+                .filter_map(|close| xml[content_start..].find(close))
+                .min();
+
+            if let Some(end_offset) = close_pos {
+                let content = &xml[content_start..content_start + end_offset];
+                if !content.trim_ascii().is_empty() {
+                    streams.push((name, content.to_string()));
+                }
+                search_from = content_start + end_offset + 1;
+            } else {
+                break;
+            }
+        }
+
+        streams
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn extract_streams_matches_the_reference(
+            parts in proptest::collection::vec(
+                proptest::sample::select(vec![
+                    "<rsp:Stream ", "<Stream ", "</rsp:Stream>", "</Stream>",
+                    "Name=\"stdout\"", "Name=\"stderr\"", ">", "QQ==", " ", "<", "é",
+                ]),
+                0..24,
+            )
+        ) {
+            let xml: String = parts.concat();
+            proptest::prop_assert_eq!(
+                extract_streams(&xml),
+                reference_extract_streams(&xml),
                 "{:?}", xml
             );
         }

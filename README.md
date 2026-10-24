@@ -37,7 +37,7 @@ async fn main() -> Result<(), winrm_rs::WinrmError> {
 - **Full shell lifecycle** -- create, execute, receive, signal, delete
 - **Streaming output** -- `start_command` + `receive_next` for incremental polling
 - **File transfer** -- upload/download files via PowerShell base64 chunking
-- **Proxy support** -- HTTP proxy for all WinRM requests
+- **Proxy support** -- HTTP(S) and SOCKS proxies (`WinrmConfig::proxy` or the environment) for every authentication method except CredSSP, which connects directly
 - **Async/await** -- built on `tokio` and `reqwest`
 - **TLS support** -- `rustls` backend, optional invalid cert acceptance
 - **Cross-platform** -- runs from Linux, macOS, or Windows
@@ -222,7 +222,7 @@ let bytes = client.download_file("win-server", "C:\\remote\\file.bin", Path::new
 | `max_retries` | `0` | Retries for transient HTTP errors (exponential backoff) |
 | `client_cert_pem` | `None` | Path to client cert PEM (Certificate auth) |
 | `client_key_pem` | `None` | Path to client key PEM (Certificate auth) |
-| `proxy` | `None` | HTTP proxy URL (e.g. `http://proxy:8080`) |
+| `proxy` | `None` | Proxy URL (e.g. `http://proxy:8080`); not used by CredSSP |
 | `encryption` | `Auto` | Message sealing for NTLM and Kerberos: `Auto` (over HTTP only), `Always`, `Never`. No effect with Basic, Certificate or CredSSP, `Always` included (Basic over HTTP stays plaintext; a WARN is logged) |
 
 ## Roadmap
@@ -310,7 +310,7 @@ cargo test --test integration_real -- --ignored
 |---|---|---|
 | *(default)* | stable | NTLMv2, Basic, Certificate auth; no optional deps |
 | `kerberos` | stable | Pulls `cross-krb5`; requires a working `kinit` |
-| `credssp` | **experimental** | Double-hop delegation. Validated end-to-end against Windows Server 2025 (live `credssp_run_command_whoami`); not yet exercised on other host generations. Pulls `openssl` (C dep: `libssl-dev` on Debian). |
+| `credssp` | **experimental** | Double-hop delegation. Validated end-to-end against Windows Server 2025 (live `credssp_run_command_whoami`); not yet exercised on other host generations. In 1.4.1 it ignores `proxy`, `connect_timeout_secs`, `operation_timeout_secs` and `user_agent` (see `AuthMethod::CredSsp`). Pulls `openssl` (C dep: `libssl-dev` on Debian). |
 
 ## License
 

@@ -10,9 +10,12 @@
 //
 // This implements the CredSSP protocol with TLS-in-TLS architecture:
 //
-// - **Outer channel**: HTTPS via reqwest (regular WinRM connection)
-// - **Inner channel**: rustls ClientConnection in memory-only mode, used to
-//   tunnel TSRequest messages per MS-CSSP. The TLS handshake and all
+// - **Outer channel**: HTTPS on one raw `tokio-rustls` stream (not reqwest:
+//   the server binds the CredSSP context to the TCP connection, and reqwest
+//   cannot pin requests to one), with HTTP/1.1 written and read by hand in
+//   `CredSspConnection`.
+// - **Inner channel**: OpenSSL TLS 1.2 in memory-only mode (`OpenSslMemTls`),
+//   tunnelling the TSRequest messages of MS-CSSP. The TLS handshake and all
 //   subsequent CredSSP messages flow through Authorization: CredSSP headers.
 //
 // Architecture matches pyspnego (which uses `ssl.MemoryBIO`). No socket is
@@ -482,7 +485,7 @@ impl CredSspConnection {
             }
         }
 
-        // Determine body length: Content-Length only (we send Accept-Encoding: identity).
+        // Body length: Content-Length only; Transfer-Encoding and Content-Encoding are not handled.
         let content_length: usize = headers
             .get("content-length")
             .and_then(|v| v.parse().ok())

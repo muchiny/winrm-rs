@@ -32,6 +32,8 @@ pub struct WinrmConfig {
     /// `tracing::warn` when this flag is enabled.
     pub accept_invalid_certs: bool,
     /// TCP connect timeout in seconds (default: 30).
+    ///
+    /// Not applied with [`AuthMethod::CredSsp`] in this release (see its doc).
     pub connect_timeout_secs: u64,
     /// WS-Management `OperationTimeout` in seconds (default: 60): how long the
     /// server may hold one request. The HTTP client timeout is set to this
@@ -47,6 +49,8 @@ pub struct WinrmConfig {
     /// stop them from elsewhere).
     /// `Shell::run_command` additionally gives up after
     /// `2 * operation_timeout_secs` in total.
+    ///
+    /// Not applied with [`AuthMethod::CredSsp`] in this release (see its doc).
     pub operation_timeout_secs: u64,
     /// Authentication method to use for all requests (default: [`AuthMethod::Ntlm`]).
     pub auth_method: AuthMethod,
@@ -62,7 +66,8 @@ pub struct WinrmConfig {
     /// sent, triggers a retry, whatever the auth method: a request that went
     /// out may have run on the server (a command, a stdin write, an upload
     /// chunk), so a timeout, a reset or a dropped connection after sending is
-    /// returned, as are authentication errors and SOAP faults.
+    /// returned, as are authentication errors and SOAP faults. With
+    /// [`AuthMethod::CredSsp`] nothing is retried: its connection errors are not `WinrmError::Http`.
     pub max_retries: u32,
     /// Path to the client certificate PEM file (for `AuthMethod::Certificate`).
     ///
@@ -75,9 +80,11 @@ pub struct WinrmConfig {
     /// and `EC PRIVATE KEY` (SEC1), unencrypted. It must match the end-entity
     /// certificate of [`client_cert_pem`](Self::client_cert_pem).
     pub client_key_pem: Option<String>,
-    /// HTTP proxy URL (e.g. `"http://proxy:8080"`).
+    /// Proxy URL (e.g. `"http://proxy:8080"`).
     ///
-    /// When set, all WinRM HTTP(S) requests are routed through this proxy.
+    /// When set, WinRM requests go through this proxy, with one exception:
+    /// [`AuthMethod::CredSsp`] opens its own TCP connection to the host and
+    /// uses no proxy at all, neither this one nor one from the environment.
     ///
     /// Limitation with [`AuthMethod::Certificate`]: with an `https://` proxy,
     /// `reqwest` uses the same TLS client configuration for the connection
@@ -122,6 +129,7 @@ pub struct WinrmConfig {
     /// with the NTLM session or the Kerberos context.
     pub encryption: EncryptionMode,
     /// Custom HTTP `User-Agent` header (default: `None` = `winrm-rs/<version>`).
+    /// Not sent by [`AuthMethod::CredSsp`] in this release.
     pub user_agent: Option<String>,
     /// Shell idle timeout in seconds (default: `None` = server default).
     ///
@@ -399,6 +407,24 @@ pub enum AuthMethod {
     /// `rustls` does not support, so the HTTPS leg shares no cipher suite with
     /// a default 2012 R2 listener and the live test skips there (it was not
     /// measured on 2012 R2 in the latest validation round either).
+    ///
+    /// # Limitations in this release
+    ///
+    /// CredSSP runs on a TLS connection of its own, outside the HTTP client
+    /// of the other methods, and does not apply these [`WinrmConfig`] fields:
+    /// - `connect_timeout_secs` and `operation_timeout_secs`: a host or network
+    ///   path that stops answering blocks the call until it is cancelled.
+    ///   Bound CredSSP calls with the `*_with_timeout` or `*_with_cancel`
+    ///   methods of [`WinrmClient`](crate::WinrmClient), or wrap the call in
+    ///   `tokio::time::timeout`. Dropping the future closes its connection; a
+    ///   shell whose creation was cut short can stay open on the host until
+    ///   its idle timeout.
+    /// - `proxy`, and the `HTTPS_PROXY` / `ALL_PROXY` environment variables:
+    ///   CredSSP connects directly to the endpoint.
+    /// - `user_agent`: CredSSP sends `Python WinRM client`.
+    /// - `max_retries`: a CredSSP connection error is
+    ///   [`WinrmError::AuthFailed`](crate::WinrmError::AuthFailed), not
+    ///   `WinrmError::Http`, so it is never retried.
     CredSsp,
 }
 

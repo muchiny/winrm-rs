@@ -38,6 +38,9 @@ PSRP callers can now stop a running pipeline.
 - `WinrmConfig::max_output_bytes` says what each API does when the cap is
   reached: `Shell::run_command` returns the error and leaves the command
   running.
+- `AuthMethod::CredSsp` lists the `WinrmConfig` settings CredSSP does not apply
+  yet (timeouts, proxy, user agent, retries); the docs of those fields, and the
+  README proxy lines, say so too.
 
 ## [1.4.0] - 2026-10-22
 

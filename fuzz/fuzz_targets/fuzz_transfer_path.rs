@@ -1,18 +1,23 @@
 //! Remote-path handling for `upload_file` / `download_file`. The path is
 //! validated, then embedded in a PowerShell single-quoted literal that is sent
 //! to the remote host. Both halves have to hold: the validator must not let
-//! control characters through, and the quoting must not be escapable.
+//! control characters through, and the quoting must keep every quote inside
+//! the literal.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
 use winrm_rs::__fuzz::{escape_ps_single_quoted, validate_remote_path};
 
-/// Longest run of consecutive `'` characters.
+/// The five characters PowerShell accepts as a single quote, stated here
+/// independently of the implementation.
+const QUOTES: [char; 5] = ['\'', '\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}'];
+
+/// Longest run of consecutive single-quote characters.
 fn longest_quote_run(s: &str) -> usize {
     let mut best = 0;
     let mut run = 0;
     for c in s.chars() {
-        if c == '\'' {
+        if QUOTES.contains(&c) {
             run += 1;
             best = best.max(run);
         } else {
@@ -20,6 +25,20 @@ fn longest_quote_run(s: &str) -> usize {
         }
     }
     best
+}
+
+/// Undo the doubling: each quote character must be followed by the same one,
+/// and the pair reads as one. `None` on an unpaired or mixed pair.
+fn collapse_pairs(escaped: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = escaped.chars();
+    while let Some(c) = chars.next() {
+        if QUOTES.contains(&c) && chars.next() != Some(c) {
+            return None;
+        }
+        out.push(c);
+    }
+    Some(out)
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -37,30 +56,17 @@ fuzz_target!(|data: &[u8]| {
         );
     }
 
-    // Quoting: every run of quotes must come out even-length, otherwise one of
-    // them terminates the `'...'` literal and the rest of the path is parsed as
-    // PowerShell code.
+    // Quoting: every quote character is doubled with itself, so no run can end
+    // the `'...'` literal early, and collapsing the pairs gives the path back.
     let escaped = escape_ps_single_quoted(path);
-    let mut run = 0usize;
-    for c in escaped.chars() {
-        if c == '\'' {
-            run += 1;
-        } else {
-            assert_eq!(run % 2, 0, "odd run of quotes in {escaped:?}");
-            run = 0;
-        }
-    }
-    assert_eq!(run % 2, 0, "odd trailing run of quotes in {escaped:?}");
     assert_eq!(
         longest_quote_run(&escaped),
-        longest_quote_run(path) * 2,
+        2 * longest_quote_run(path),
         "quote doubling is not exact"
     );
-
-    // And the escaping is reversible, so the remote host sees the path we meant.
     assert_eq!(
-        escaped.replace("''", "'"),
-        path,
+        collapse_pairs(&escaped).as_deref(),
+        Some(path),
         "PowerShell quote escaping is not reversible"
     );
 });

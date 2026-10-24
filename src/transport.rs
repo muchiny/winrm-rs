@@ -47,6 +47,7 @@ use rustls::client::danger::ServerCertVerifier;
 /// The pool holds boxes, so checking a connection in and out moves a pointer,
 /// not the session's key material.
 struct AuthConn {
+    /// [`host_key`] of the host this connection was opened for.
     host: String,
     http: reqwest::Client,
     /// Certificates this client's verifier accepted (HTTPS). TLS session
@@ -174,13 +175,21 @@ where
     }
 }
 
-/// Idle dedicated connections a transport keeps for reuse. Each holds one
-/// TCP connection (and, sealed, one NTLM or Kerberos session on the server):
-/// eight covers a client running several shells in parallel (each concurrent
-/// request needs its own connection) without holding many idle sockets on the
-/// host. Extra
-/// connections are opened as needed and the oldest idle ones closed.
-const MAX_IDLE_CONNS: usize = 8;
+/// Idle dedicated connections a transport keeps for reuse, per host. Each
+/// holds one TCP connection (and, sealed, one NTLM or Kerberos session on the
+/// server): eight covers a client running several shells in parallel (each
+/// concurrent request needs its own connection) without holding many idle
+/// sockets on the host. Extra connections are opened as needed and the
+/// oldest idle ones closed. Hosts are keyed by [`host_key`]. With
+/// [`MAX_IDLE_TOTAL`]: 8 per host, as a single-host client had before, and 32
+/// per client, each closed after 60 s idle ([`CONN_MAX_IDLE`], below
+/// HTTP.sys's 120 s).
+const MAX_IDLE_PER_HOST: usize = 8;
+
+/// Idle dedicated connections a transport keeps for reuse, all hosts
+/// together (see [`MAX_IDLE_PER_HOST`]). Past this, the oldest idle ones are
+/// closed.
+const MAX_IDLE_TOTAL: usize = 32;
 
 /// A dedicated connection idle longer than this is not reused but closed: it
 /// stays below the 90 s idle timeout of the `reqwest` pool and the 120 s of
@@ -969,28 +978,45 @@ impl HttpTransport {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Number of idle connections the pool holds for `host`.
+    #[cfg(test)]
+    fn idle_count(&self, host: &str) -> usize {
+        let key = host_key(host);
+        self.conn_pool().iter().filter(|c| c.host == key).count()
+    }
+
     /// Check out the most recently used idle dedicated connection to `host`
     /// (sealed or not), closing those idle for longer than
     /// [`CONN_MAX_IDLE`].
     fn take_conn(&self, host: &str, sealed: bool) -> Option<Box<AuthConn>> {
+        let key = host_key(host);
         let mut pool = self.conn_pool();
         pool.retain(|c| c.idle_since.elapsed() < CONN_MAX_IDLE);
         let at = pool
             .iter()
-            .rposition(|c| c.host == host && c.session.is_some() == sealed)?;
+            .rposition(|c| c.host == key && c.session.is_some() == sealed)?;
         Some(pool.remove(at))
     }
 
-    /// Return a dedicated connection after a clean exchange, closing the oldest
-    /// idle ones beyond [`MAX_IDLE_CONNS`].
+    /// Return a dedicated connection after a clean exchange. The pool is kept
+    /// in age order, oldest first. The oldest idle connection of this host
+    /// beyond [`MAX_IDLE_PER_HOST`] is closed, then the oldest ones beyond
+    /// [`MAX_IDLE_TOTAL`]. A closed connection drops its sealing session
+    /// with it.
     fn return_conn(&self, mut conn: Box<AuthConn>) {
         if conn.closing {
             return;
         }
         conn.idle_since = Instant::now();
+        let key = conn.host.clone();
         let mut pool = self.conn_pool();
         pool.push(conn);
-        let excess = pool.len().saturating_sub(MAX_IDLE_CONNS);
+        if pool.iter().filter(|c| c.host == key).count() > MAX_IDLE_PER_HOST
+            && let Some(at) = pool.iter().position(|c| c.host == key)
+        {
+            pool.remove(at);
+        }
+        let excess = pool.len().saturating_sub(MAX_IDLE_TOTAL);
         pool.drain(..excess);
     }
 
@@ -1100,7 +1126,7 @@ impl HttpTransport {
         };
         let gate = Arc::new(ConnGate::new(&self.config));
         Ok(Box::new(AuthConn {
-            host: host.to_string(),
+            host: host_key(host),
             http: build_http_client(&self.config, tls, 1, Some(Arc::clone(&gate)))?,
             cert,
             gate: Some(gate),
@@ -4277,6 +4303,61 @@ mod tests {
             transport.host_slots("c").0.available_permits(),
             32,
             "the host permit is released"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_pool_keeps_each_hosts_connections() {
+        let (_server, _fake, transport, _host) = sealed_setup().await;
+        transport.return_conn(transport.new_conn("b").unwrap());
+        for _ in 0..9 {
+            transport.return_conn(transport.new_conn("a").unwrap());
+        }
+        assert_eq!(transport.idle_count("a"), 8);
+        assert!(
+            transport.take_conn("b", false).is_some(),
+            "host a's traffic evicted host b"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_pool_drops_the_oldest_beyond_32_in_total() {
+        let (_server, _fake, transport, _host) = sealed_setup().await;
+        for h in ["h0", "h1", "h2", "h3", "h4"] {
+            for _ in 0..8 {
+                transport.return_conn(transport.new_conn(h).unwrap());
+            }
+        }
+        assert_eq!(transport.conn_pool().len(), 32);
+        assert_eq!(
+            (transport.idle_count("h0"), transport.idle_count("h4")),
+            (0, 8)
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_pool_matches_hosts_ignoring_ascii_case() {
+        let (_server, _fake, transport, _host) = sealed_setup().await;
+        transport.return_conn(transport.new_conn("WIN01").unwrap());
+        assert_eq!(transport.idle_count("win01"), 1);
+        assert!(transport.take_conn("win01", false).is_some());
+        transport.return_conn(transport.new_conn("win02").unwrap());
+        assert!(transport.take_conn("WIN02", false).is_some());
+    }
+
+    #[tokio::test]
+    async fn idle_pool_still_expires_connections_idle_too_long() {
+        let (_server, _fake, transport, _host) = sealed_setup().await;
+        let mut old = transport.new_conn("a").unwrap();
+        old.idle_since = Instant::now()
+            .checked_sub(CONN_MAX_IDLE + Duration::from_secs(1))
+            .expect("monotonic clock far enough from its origin");
+        transport.conn_pool().push(old);
+        transport.return_conn(transport.new_conn("a").unwrap());
+        assert!(transport.take_conn("a", false).is_some());
+        assert!(
+            transport.take_conn("a", false).is_none(),
+            "the old one expired"
         );
     }
 

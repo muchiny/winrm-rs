@@ -125,6 +125,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `operation_timeout_secs + 10` seconds, not per round trip. A slower
   handshake fails with `WinrmError::Timeout`, and nothing has been sent at
   that point.
+- Idle authenticated connections are kept per host: up to 8 per host and 32
+  per client. Traffic to one host no longer closes another host's connections,
+  which would then have to authenticate again.
 
 ### Documentation
 

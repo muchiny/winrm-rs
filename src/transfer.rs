@@ -113,6 +113,13 @@ impl WinrmClient {
     /// [`WinrmConfig::idle_timeout_secs`](crate::WinrmConfig::idle_timeout_secs)
     /// can shorten.
     ///
+    /// The whole local file is read into memory before the transfer starts.
+    /// `local_path` should be a regular file: a FIFO, a device or a hung
+    /// network mount blocks the read. The read runs on tokio's blocking pool,
+    /// so other tasks keep running and a deadline around the call fires, but
+    /// the blocked read holds a blocking-pool thread (and delays runtime
+    /// shutdown) until it returns.
+    ///
     /// Returns the number of bytes uploaded.
     pub async fn upload_file(
         &self,
@@ -122,12 +129,7 @@ impl WinrmClient {
     ) -> Result<u64, WinrmError> {
         validate_remote_path(remote_path)?;
 
-        let data = std::fs::read(local_path).map_err(|e| {
-            WinrmError::Transfer(format!(
-                "failed to read local file {}: {e}",
-                local_path.display()
-            ))
-        })?;
+        let data = read_local(local_path).await?;
 
         let escaped_path = escape_ps_single_quoted(remote_path);
         // Checked before the shell is opened: a path too long for any chunk
@@ -189,6 +191,13 @@ impl WinrmClient {
     /// `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -NonInteractive`:
     /// profile scripts do not run, and a prompt fails instead of waiting.
     ///
+    /// `local_path` is created, or overwritten in place, once the whole remote
+    /// file has arrived: a local write error (disk full, quota) can leave it
+    /// truncated. Nothing local is created or modified when the remote read
+    /// fails or times out. The write runs on tokio's blocking pool: dropping
+    /// the future while it runs does not stop it, so the file may still be
+    /// written after the caller gave up.
+    ///
     /// Returns the number of bytes downloaded.
     pub async fn download_file(
         &self,
@@ -201,7 +210,10 @@ impl WinrmClient {
         let output = self
             .run_command(host, POWERSHELL_EXE, &transfer_args(&encoded))
             .await?;
-        write_download(&output, local_path)
+        let data = decode_download(&output)?;
+        let total = data.len() as u64;
+        write_local(local_path, data).await?;
+        Ok(total)
     }
 
     /// Download a file from a remote Windows host, giving up after `timeout`.
@@ -213,6 +225,13 @@ impl WinrmClient {
     /// with `timeout` rounded up to whole seconds. The limit covers the
     /// transfer from the host, not the local write that follows it. No local
     /// file is created or modified on timeout.
+    ///
+    /// `local_path` is created, or overwritten in place, once the whole remote
+    /// file has arrived: a local write error (disk full, quota) can leave it
+    /// truncated. Nothing local is created or modified when the remote read
+    /// fails or times out. The write runs on tokio's blocking pool: dropping
+    /// the future while it runs does not stop it, so the file may still be
+    /// written after the caller gave up.
     ///
     /// Returns the number of bytes downloaded.
     ///
@@ -250,7 +269,10 @@ impl WinrmClient {
         let output = self
             .run_command_with_timeout(host, POWERSHELL_EXE, &transfer_args(&encoded), timeout)
             .await?;
-        write_download(&output, local_path)
+        let data = decode_download(&output)?;
+        let total = data.len() as u64;
+        write_local(local_path, data).await?;
+        Ok(total)
     }
 }
 
@@ -338,8 +360,8 @@ fn download_script(remote_path: &str) -> String {
     format!("[Convert]::ToBase64String([IO.File]::ReadAllBytes('{escaped}'))")
 }
 
-/// Decode the base64 a download script printed and write it to `local_path`.
-fn write_download(output: &CommandOutput, local_path: &Path) -> Result<u64, WinrmError> {
+/// Check a download's exit code and decode the base64 its script printed.
+fn decode_download(output: &CommandOutput) -> Result<Vec<u8>, WinrmError> {
     if output.exit_code != 0 {
         return Err(WinrmError::Transfer(format!(
             "download failed: {}",
@@ -348,19 +370,35 @@ fn write_download(output: &CommandOutput, local_path: &Path) -> Result<u64, Winr
     }
 
     let b64 = String::from_utf8_lossy(&output.stdout);
-    let data = B64
-        .decode(b64.trim_ascii())
-        .map_err(|e| WinrmError::Transfer(format!("base64 decode of downloaded file: {e}")))?;
+    B64.decode(b64.trim_ascii())
+        .map_err(|e| WinrmError::Transfer(format!("base64 decode of downloaded file: {e}")))
+}
 
-    let total = data.len() as u64;
-    std::fs::write(local_path, &data).map_err(|e| {
-        WinrmError::Transfer(format!(
-            "failed to write local file {}: {e}",
-            local_path.display()
-        ))
-    })?;
+/// Read a whole local file on tokio's blocking pool.
+async fn read_local(path: &Path) -> Result<Vec<u8>, WinrmError> {
+    let owned = path.to_path_buf();
+    tokio::task::spawn_blocking(move || std::fs::read(&owned))
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|read| read.map_err(|e| e.to_string()))
+        .map_err(|e| {
+            WinrmError::Transfer(format!("failed to read local file {}: {e}", path.display()))
+        })
+}
 
-    Ok(total)
+/// Write `data` to a local file on tokio's blocking pool.
+async fn write_local(path: &Path, data: Vec<u8>) -> Result<(), WinrmError> {
+    let owned = path.to_path_buf();
+    tokio::task::spawn_blocking(move || std::fs::write(&owned, &data))
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|written| written.map_err(|e| e.to_string()))
+        .map_err(|e| {
+            WinrmError::Transfer(format!(
+                "failed to write local file {}: {e}",
+                path.display()
+            ))
+        })
 }
 
 #[cfg(test)]
@@ -572,8 +610,7 @@ mod tests {
             stderr: b"Cannot find path\r\n\x1b[31mC:\\x\x1b[0m\r\n".to_vec(),
             exit_code: 1,
         };
-        let path = std::env::temp_dir().join(format!("winrm-rs-quote-{}", uuid::Uuid::new_v4()));
-        match write_download(&output, &path) {
+        match decode_download(&output) {
             Err(WinrmError::Transfer(msg)) => {
                 assert_eq!(
                     msg,
@@ -592,11 +629,7 @@ mod tests {
             stderr: "E".repeat(100_000).into_bytes(),
             exit_code: 1,
         };
-        let path = std::env::temp_dir().join(format!(
-            "winrm-rs-download-failure-{}",
-            uuid::Uuid::new_v4()
-        ));
-        match write_download(&output, &path) {
+        match decode_download(&output) {
             Err(WinrmError::Transfer(msg)) => {
                 assert!(msg.len() < 1_000, "{} bytes", msg.len());
                 assert!(msg.starts_with("download failed: EEE"), "{msg}");
@@ -604,6 +637,89 @@ mod tests {
             }
             other => panic!("expected a transfer error, got {other:?}"),
         }
-        assert!(!path.exists());
+    }
+
+    /// Run `body` with the path of a fresh FIFO, on its own thread, and wait
+    /// at most 10 s for its result. `None` when `mkfifo` is not available.
+    ///
+    /// Whatever happens, a reader still blocked in `open(2)` is released by
+    /// opening the write end, and the FIFO is removed. Panics when `body` did
+    /// not return in time.
+    #[cfg(unix)]
+    fn with_fifo_guard<R: Send + 'static>(
+        body: impl FnOnce(std::path::PathBuf) -> R + Send + 'static,
+    ) -> Option<R> {
+        use std::time::Duration;
+
+        let fifo = std::env::temp_dir().join(format!("winrm-rs-fifo-{}", uuid::Uuid::new_v4()));
+        #[expect(clippy::disallowed_methods, reason = "test-only subprocess")]
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        if !made.is_ok_and(|status| status.success()) {
+            return None;
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let for_body = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(body(for_body));
+        });
+        let received = rx.recv_timeout(Duration::from_secs(10));
+
+        // Open the write end from a detached thread: it lets a reader stuck in
+        // open(2) go, and only ever blocks itself.
+        let for_writer = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = std::fs::OpenOptions::new().write(true).open(for_writer);
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        let _ = std::fs::remove_file(&fifo);
+
+        match received {
+            Ok(result) => Some(result),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("blocked for 10 s on a FIFO")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("the FIFO test body panicked")
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn upload_file_local_read_does_not_block_the_runtime() {
+        let outcome = with_fifo_guard(|fifo| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let config = crate::config::WinrmConfig {
+                port: 9,
+                connect_timeout_secs: 1,
+                ..Default::default()
+            };
+            let client =
+                WinrmClient::new(config, crate::config::WinrmCredentials::new("u", "p", ""))
+                    .unwrap();
+            // The timer is created inside the runtime, not before block_on.
+            let result = rt.block_on(async {
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(300),
+                    client.upload_file("127.0.0.1", &fifo, "C:\\x"),
+                )
+                .await
+            });
+            // A blocking-pool thread is still stuck in open(2): dropping the
+            // runtime normally would wait for it forever.
+            rt.shutdown_background();
+            result.is_err()
+        });
+        match outcome {
+            None => eprintln!("mkfifo not available: test skipped"),
+            Some(elapsed) => assert!(
+                elapsed,
+                "upload_file returned instead of waiting on the FIFO"
+            ),
+        }
     }
 }

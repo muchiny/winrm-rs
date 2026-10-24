@@ -149,6 +149,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   return without deleting it, so failed uploads used up `MaxShellsPerUser`
   until the server's idle timeout. The Delete is bounded by
   `operation_timeout_secs` (at most 10 s).
+- File transfers no longer block the async runtime on local file I/O. The read
+  of `upload_file`'s local file and the downloads' local write ran on the
+  async worker thread; they now run on tokio's blocking pool, so a slow disk
+  or a FIFO no longer stalls other tasks and a deadline around `upload_file`
+  fires.
 
 ### Documentation
 

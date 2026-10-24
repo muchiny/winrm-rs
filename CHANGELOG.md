@@ -27,6 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   server's bytes. For a conformant Windows challenge the bytes are unchanged.
 - NTLM over HTTPS now sends a MIC, `MsvAvFlags`, the target name and a zero LM
   response, as NTLM over HTTP already did.
+- A sealed or Kerberos-over-TLS request now stays on its authenticated
+  connection instead of occasionally racing onto a fresh one and failing with
+  401.
 
 ## [1.4.1] - 2026-10-24
 

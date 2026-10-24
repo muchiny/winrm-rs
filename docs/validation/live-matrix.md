@@ -259,7 +259,7 @@ Tests de `tests/integration_real.rs` sauf mention contraire.
 | Binding de canal Kerberos sur HTTPS (RFC 5929 `tls-server-end-point`) | `kerberos_channel_binding_through_a_tls_relay_is_refused` (relais TLS présentant son propre certificat : refusé sous `Relaxed`, `Auto` et `Always`, aucun corps SOAP n'atteint le relais) ; `kerberos_over_https_with_dc_cbt_strict` (`Strict` : `Auto` et `Always` en direct passent, le relais est refusé) | — non applicable (banc hors domaine) | n/a : pas de KDC sur cette VM | ✅ 2026-10-22 |
 | Binding de canal Kerberos : cas scindé (la sonde passe intacte jusqu'au contrôleur, la connexion suivante est terminée par un relais avec un autre certificat) | `kerberos_channel_binding_split_relay_fails_at_the_handshake` (`Auto` et `Always` : la poignée de main TLS de la connexion de l'AP-REQ est refusée par le vérificateur épinglé, le relais ne reçoit aucune requête ; avant `b1f5d7f` l'AP-REQ atteignait le relais) ; rejoué sous `Strict` dans `kerberos_over_https_with_dc_cbt_strict` | — non applicable (banc hors domaine) | n/a : pas de KDC sur cette VM | ✅ 2026-10-22 |
 | Kerberos sur HTTPS (`Auto`, connexion authentifiée une fois) : requêtes suivantes restées sur la connexion authentifiée | aucun test nommé ; mesure ad hoc du 2026-10-22 : envoi de 20 Ko puis téléchargement de 200 Ko sur HTTPS, 10 essais par case, runtime current-thread et multi-thread, 0 et 4 cessions de main : 10/10 partout, exactement 2 connexions TCP par essai (la sonde, puis la connexion authentifiée) | — non applicable (banc hors domaine) | n/a : pas de KDC sur cette VM | ⏭ pas de test nommé (mesure ad hoc concluante, voir « Tests ») |
-| Course du pool des connexions dédiées (requête scellée partie sur une connexion TCP neuve non authentifiée) | `sealed_download_after_upload_stays_on_its_connection_allow_unencrypted_false` (3 tours Kerberos + 3 tours NTLM, chacun sur une seule connexion) ; mesure ad hoc, `AllowUnencrypted = false`, envoi de 20 Ko puis téléchargement de 200 Ko, 10 essais par case : runtime current-thread 0/10 réussis sans céder la main, 10/10 en cédant 4 fois, Kerberos comme NTLM ; runtime multi-thread 10/10 avec 0 ou 4 ; avec `AllowUnencrypted = true` aucun échec (7 téléchargements, 80 sorties de 1,5 Mo) | — non applicable (banc hors domaine) | n/a : pas de KDC sur cette VM | ✅ 2026-10-22 (atténué, pas fermé) |
+| Course du pool des connexions dédiées (requête scellée partie sur une connexion TCP neuve non authentifiée) | `sealed_download_after_upload_stays_on_its_connection_allow_unencrypted_false` (3 tours Kerberos + 3 tours NTLM, chacun sur une seule connexion) ; mesure ad hoc, `AllowUnencrypted = false`, envoi de 20 Ko puis téléchargement de 200 Ko, 10 essais par case : runtime current-thread 0/10 réussis sans céder la main, 10/10 en cédant 4 fois, Kerberos comme NTLM ; runtime multi-thread 10/10 avec 0 ou 4 ; avec `AllowUnencrypted = true` aucun échec (7 téléchargements, 80 sorties de 1,5 Mo). Ces mesures précèdent le portail de connexion (`ConnGate`, voir « Tests ») qui supprime les cessions de main : à remesurer en session B, attendu 10/10 sans céder la main avec exactement 1 connexion par client | — non applicable (banc hors domaine) | n/a : pas de KDC sur cette VM | ✅ 2026-10-22 (atténué, avant le portail) ; ⏳ portail à mesurer en session B |
 | Doc de `AuthMethod::CredSsp` (disait « Not yet implemented ») | relue contre `credssp_run_command_whoami` | doc corrigée le 2026-10-21 (relecture ; le passage live est la ligne CredSSP plus bas) | — non applicable (relecture de documentation) | — non applicable |
 
 Couverture des API réservées aux crates aval : `open_psrp_shell` et
@@ -347,17 +347,27 @@ ne figurent pas dans la matrice.
   du banc a été relayé le 2026-10-22 par un relais PowerShell non élevé sur
   la boucle locale (gsudo bloqué sur l'invite UAC), pas par le `netsh
   portproxy` décrit dans le README du banc.
-- **Course du pool des connexions dédiées : atténuée, pas fermée.** `hyper`
-  rend la connexion au pool du client depuis une tâche à lui ; une requête
-  envoyée avant que cette tâche tourne part sur une connexion TCP neuve, non
-  authentifiée, et échoue en HTTP 401 (fermé : erreur, pas de renvoi).
-  L'échange cède la main 4 fois au runtime avant d'envoyer (nombre
-  empirique, voir la ligne de la matrice). Le correctif déterministe,
-  épingler une connexion `hyper` par connexion dédiée (`AuthConn`), demande
-  un changement de `Cargo.toml` (hyper-util en dépendance directe) et n'est
-  pas fait. Sur HTTPS (Kerberos `Auto`, connexion authentifiée une fois),
-  la même mesure n'a montré aucun échec (40/40) ; une connexion perdue y
-  ferait échouer la requête de la même façon (401, pas de renvoi).
+- **Course du pool des connexions dédiées : fermée pour les connexions
+  authentifiées.** `hyper` rend la connexion au pool du client depuis une
+  tâche à lui ; une requête envoyée avant que cette tâche tourne fait courir
+  la sortie du pool contre une connexion TCP neuve, et si la connexion neuve
+  gagne, la requête part sans session et échoue en HTTP 401 (erreur, pas de
+  renvoi) ; une connexion neuve perdante, terminée en arrière-plan, prenait
+  en plus l'unique place libre du pool à la connexion authentifiée. Chaque
+  client dédié (`AuthConn`) a désormais un portail (`ConnGate`) devant son
+  connecteur : ouvert pendant la poignée de main (la sonde puis l'AP-REQ de
+  Kerberos sur HTTPS ouvrent légitimement deux connexions), il est verrouillé
+  dès que la connexion est authentifiée ; verrouillé, il refuse toute
+  nouvelle connexion sans lancer le connecteur (ni TCP, ni proxy, ni TLS),
+  après une attente de `min(1 s, connect_timeout_secs)` qui laisse la sortie
+  du pool gagner. Les 4 cessions de main empiriques sont supprimées. Le
+  correctif passe par `tower-layer` et `tower-service` (déjà dans
+  `Cargo.lock` et exemptés dans `supply-chain/config.toml`), pas par
+  hyper-util en dépendance directe. NTLM sur HTTPS (une poignée de main par
+  requête) ne verrouille pas son portail. À remesurer en session B (ligne de
+  la matrice) ; sur HTTPS (Kerberos `Auto`, connexion authentifiée une fois),
+  la mesure d'avant le portail n'avait montré aucun échec (40/40), attendu
+  depuis : exactement 2 connexions par essai.
 - **Server 2012 R2 : suite complète mesurée, 12 tests sautés.** Run complet à
   `64c4a0b` (VM reconstruite, `vm-connect-2012r2.sh`, ports `56985`/`56986`) :
   81 passés dont 12 sautés, 0 échoué, en série comme en parallèle. Le format de
@@ -460,11 +470,15 @@ ne figurent pas dans la matrice.
   lieu, et `fuzz/Cargo.lock` a été rafraîchi (`cargo audit` propre) ; un proxy HTTP qui transfère les requêtes (sans tunnel) sans
   garder une connexion serveur par connexion cliente casse la liaison NTLM à
   la connexion : les requêtes scellées échouent alors, sans partir en clair ;
-  un 401 sur une connexion inactive que le serveur a fermée sans l'annoncer
-  fait échouer la requête (`WinrmError::Ntlm`, « NOT resent ») au lieu de la
-  renvoyer : `reqwest` n'expose pas l'adresse locale de la connexion qui a
-  porté une réponse, donc un changement de socket ne se détecte pas avant ce
-  401 (une réponse `Connection: close` fait déjà abandonner la connexion, et
+  une connexion inactive que le serveur a fermée sans l'annoncer est
+  réauthentifiée une fois au lieu de donner un 401 : le portail verrouillé
+  refuse la connexion neuve, la requête n'est donc pas partie, et elle est
+  scellée avec la nouvelle session puis envoyée une seule fois ; un 401
+  reçu après envoi fait toujours échouer la requête (`WinrmError::Ntlm`,
+  « NOT resent ») au lieu de la renvoyer : `reqwest` n'expose pas l'adresse
+  locale de la connexion qui a porté une réponse, donc une connexion perdue
+  après l'envoi ne se détecte qu'à ce 401 (une réponse
+  `Connection: close` fait déjà abandonner la connexion, et
   les connexions inactives depuis plus de 60 s ne sont pas réutilisées, sous
   le délai de 120 s de HTTP.sys) ; à travers un proxy, si le client d'une
   connexion NTLM a vu deux certificats différents, la poignée de main

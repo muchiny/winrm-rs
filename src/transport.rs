@@ -3,7 +3,11 @@
 // Manages the reqwest HTTP client, authentication dispatch, and retry logic.
 // Extracted from client.rs.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use reqwest::header::CONTENT_TYPE;
@@ -47,18 +51,125 @@ struct AuthConn {
     http: reqwest::Client,
     /// Certificates this client's verifier accepted (HTTPS). TLS session
     /// resumption is off, so every new connection of this client is
-    /// verified; the client normally has one connection, but hyper may open
-    /// another while an idle one is checked out, so the record is trusted
-    /// only while it holds a single certificate. Used for channel binding
-    /// when the response does not report its TLS details (connections
-    /// through a proxy).
+    /// verified. Once [`Self::gate`] is locked the client never opens a
+    /// second connection; before that (the Kerberos-over-HTTPS probe and
+    /// AP-REQ, or NTLM over TLS, which never locks it) it may open several,
+    /// so the record is trusted only while it holds a single certificate.
+    /// Used for channel binding when the response does not report its TLS
+    /// details (connections through a proxy).
     cert: Option<CertHandle>,
+    /// Gate on the client's connector: locked once the connection is
+    /// authenticated, so the client cannot open another (see [`ConnGate`]).
+    gate: Option<Arc<ConnGate>>,
     /// Sealing session (sealed connections only).
     session: Option<Sealer>,
     idle_since: Instant,
     /// The server announced it closes the connection (`Connection: close`):
     /// its session ends with it, so it is not reused.
     closing: bool,
+}
+
+/// Error type of the boxed connector services `reqwest` layers.
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Gate on a dedicated client's connector. Open, it lets every connect
+/// through; locked ([`Self::lock`]), it refuses every connect without
+/// running the inner connector (no TCP, proxy or TLS handshake).
+///
+/// `hyper` races a pool checkout against a new connect when a request finds
+/// no idle connection, which happens when the previous answer has been read
+/// but the connection is not back in the pool yet. A new connection carries
+/// no session, and a successful background connect would also take the
+/// single idle slot from the authenticated one. Once the dedicated
+/// connection is authenticated, the gate is locked, so the request waits for
+/// the authenticated connection instead.
+struct ConnGate {
+    locked: AtomicBool,
+    /// How long a refused connect waits before failing, so that the pool
+    /// checkout wins when the authenticated connection comes back.
+    wait: Duration,
+}
+
+impl ConnGate {
+    /// An open gate whose refusals wait `min(1 s, connect_timeout_secs)`.
+    fn new(config: &WinrmConfig) -> Self {
+        Self {
+            locked: AtomicBool::new(false),
+            wait: Duration::from_secs(config.connect_timeout_secs.min(1)),
+        }
+    }
+
+    /// Refuse every later connect of this client.
+    fn lock(&self) {
+        self.locked.store(true, Ordering::SeqCst);
+    }
+
+    fn is_locked(&self) -> bool {
+        self.locked.load(Ordering::SeqCst)
+    }
+}
+
+/// Error of a connect refused by a locked [`ConnGate`].
+#[derive(Debug)]
+struct ConnGateRefused;
+
+impl std::fmt::Display for ConnGateRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "the dedicated connection is already authenticated; not opening another connection",
+        )
+    }
+}
+
+impl std::error::Error for ConnGateRefused {}
+
+/// `tower` layer putting a [`ConnGate`] in front of a client's connector.
+#[derive(Clone)]
+struct ConnGateLayer(Arc<ConnGate>);
+
+impl<S> tower_layer::Layer<S> for ConnGateLayer {
+    type Service = GatedConnector<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        GatedConnector {
+            inner,
+            gate: Arc::clone(&self.0),
+        }
+    }
+}
+
+/// A connector behind a [`ConnGate`]. Generic over the request type:
+/// `reqwest`'s connector request and connection types cannot be named.
+#[derive(Clone)]
+struct GatedConnector<S> {
+    inner: S,
+    gate: Arc<ConnGate>,
+}
+
+impl<S, R> tower_service::Service<R> for GatedConnector<S>
+where
+    S: tower_service::Service<R, Error = BoxError> + Clone + Send + Sync + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = BoxError;
+    type Future = Pin<Box<dyn Future<Output = Result<S::Response, BoxError>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: R) -> Self::Future {
+        if self.gate.is_locked() {
+            let wait = self.gate.wait;
+            return Box::pin(async move {
+                tokio::time::sleep(wait).await;
+                let refused: BoxError = Box::new(ConnGateRefused);
+                Err(refused)
+            });
+        }
+        Box::pin(self.inner.call(req))
+    }
 }
 
 /// Idle dedicated connections a transport keeps for reuse. Each holds one
@@ -78,11 +189,6 @@ const CONN_MAX_IDLE: Duration = Duration::from_secs(60);
 /// NTLM over TLS): a bound on the sockets and server sessions one client can
 /// open. Further requests wait for a slot, within the request timeout.
 const MAX_CONNS_IN_FLIGHT: usize = 32;
-
-/// Times a sealed exchange yields to the runtime before sending, so the
-/// dedicated client's connection is back in its pool (see
-/// [`HttpTransport::send_sealed_body`]).
-const POOL_RETURN_YIELDS: usize = 4;
 
 /// The security context that seals a connection's messages.
 enum Sealer {
@@ -176,23 +282,6 @@ fn check_pinned_certificate(
              certificate the authentication was bound to; refusing it"
                 .into(),
         ))
-    }
-}
-
-/// Give `hyper` the chance to hand a dedicated client's connection back to
-/// that client's pool before the next request on it.
-///
-/// `hyper` returns a connection to the pool from a task of its own once the
-/// previous answer is fully read; a request sent before that task runs opens
-/// a new TCP connection, which carries no session and gets a 401 (see the
-/// measurements in `docs/validation/live-matrix.md`). Yielding first lets
-/// that task run; [`POOL_RETURN_YIELDS`] is empirical. This narrows the
-/// window, it does not close it: the request then still fails closed (401
-/// error, not resent). Pinning one `hyper` connection per [`AuthConn`]
-/// would close it.
-async fn let_pool_take_back_connection() {
-    for _ in 0..POOL_RETURN_YIELDS {
-        tokio::task::yield_now().await;
     }
 }
 
@@ -409,12 +498,17 @@ pub(crate) fn validate_host(host: &str) -> Result<(), WinrmError> {
 /// agent, proxy, TLS details on responses and, over HTTPS, the prepared
 /// rustls configuration. At most `max_idle_per_host` idle connections are
 /// kept per host: 10 for the transport's shared client, 1 for the client of
-/// a dedicated NTLM connection (sealed, or NTLM over TLS), so its requests
-/// stay on the authenticated connection.
+/// a dedicated connection (sealed, Kerberos over TLS, or NTLM over TLS).
+///
+/// `gate` is `None` for the shared client and set for a dedicated one: its
+/// connector then sits behind the [`ConnGate`], and once the gate is locked
+/// the client never opens a second connection, so its requests stay on the
+/// authenticated connection.
 fn build_http_client(
     config: &WinrmConfig,
     tls_config: Option<rustls::ClientConfig>,
     max_idle_per_host: usize,
+    gate: Option<Arc<ConnGate>>,
 ) -> Result<reqwest::Client, WinrmError> {
     // The WinRM endpoint is fixed by the caller (host:port/wsman); a
     // server returning a 30x is unexpected and any cross-origin redirect
@@ -449,6 +543,9 @@ fn build_http_client(
     }
     if let Some(tls_config) = tls_config {
         builder = builder.tls_backend_preconfigured(tls_config);
+    }
+    if let Some(gate) = gate {
+        builder = builder.connector_layer(ConnGateLayer(gate));
     }
     builder.build().map_err(WinrmError::Http)
 }
@@ -552,7 +649,12 @@ impl HttpTransport {
             None
         };
 
-        let http = build_http_client(&config, tls_config.as_ref().map(|(c, _)| c.clone()), 10)?;
+        let http = build_http_client(
+            &config,
+            tls_config.as_ref().map(|(c, _)| c.clone()),
+            10,
+            None,
+        )?;
 
         Ok(Self {
             http,
@@ -803,8 +905,8 @@ impl HttpTransport {
     }
 
     /// A dedicated connection to `host`, not yet used: a client keeping
-    /// one connection, and over HTTPS its own capturing verifier with TLS
-    /// session resumption off.
+    /// one connection behind an open [`ConnGate`], and over HTTPS its own
+    /// capturing verifier with TLS session resumption off.
     fn new_conn(&self, host: &str) -> Result<Box<AuthConn>, WinrmError> {
         let (tls, cert) = match &self.tls_config {
             Some((base, verifier)) => {
@@ -830,10 +932,12 @@ impl HttpTransport {
             }
             None => (None, None),
         };
+        let gate = Arc::new(ConnGate::new(&self.config));
         Ok(Box::new(AuthConn {
             host: host.to_string(),
-            http: build_http_client(&self.config, tls, 1)?,
+            http: build_http_client(&self.config, tls, 1, Some(Arc::clone(&gate)))?,
             cert,
+            gate: Some(gate),
             session: None,
             idle_since: Instant::now(),
             closing: false,
@@ -848,6 +952,11 @@ impl HttpTransport {
     /// session is bound to before any sealed request: that connection is
     /// dropped and a new one authenticated, once; a server that closes again
     /// cannot carry sealed messages and gets an error.
+    ///
+    /// The connection's [`ConnGate`] stays open through the handshake (the
+    /// Kerberos-over-HTTPS probe and AP-REQ legitimately use two
+    /// connections) and is locked once it has succeeded: the client then
+    /// never opens another connection.
     async fn open_authenticated_conn(
         &self,
         host: &str,
@@ -865,6 +974,9 @@ impl HttpTransport {
                     "server closed the connection after authentication; authenticating a new one"
                 );
                 continue;
+            }
+            if let Some(gate) = &conn.gate {
+                gate.lock();
             }
             conn.session = Some(session);
             return Ok(conn);
@@ -937,10 +1049,17 @@ impl HttpTransport {
     /// A SOAP fault (sealed by the server when sealing) is returned as
     /// [`WinrmError::Soap`] and the connection kept. Any other failure
     /// discards the connection and is returned, a 401 included: the
-    /// connection no longer carries its session, which a connection the
-    /// server closed or a fresh one opened by the client's pool explains, but
+    /// connection no longer carries its session (typically the server closed
+    /// it; a locked [`ConnGate`] keeps the client off new connections), but
     /// an active attacker can also forward the request to the server and
     /// answer 401 itself, so the request may have run and is not resent.
+    ///
+    /// One failure is retried, because nothing was sent: a reused
+    /// connection that can no longer be used and a client that cannot
+    /// connect (its locked gate refuses), as when the server closed the idle
+    /// connection. That connection is dropped, a new one authenticated, and
+    /// the request sealed with the new session and sent on it, once, under
+    /// the same slot.
     async fn send_on_dedicated(
         &self,
         host: &str,
@@ -949,22 +1068,21 @@ impl HttpTransport {
         sealed: bool,
     ) -> Result<String, WinrmError> {
         let _slot = self.conn_slot().await?;
-        let mut conn = match self.take_conn(host, sealed) {
-            Some(conn) => conn,
-            None => {
-                let mut conn = self.open_authenticated_conn(host, url).await?;
-                if !sealed {
-                    conn.session = None;
-                }
-                conn
-            }
+        let (mut conn, reused) = match self.take_conn(host, sealed) {
+            Some(conn) => (conn, true),
+            None => (self.open_dedicated_conn(host, url, sealed).await?, false),
         };
         let cap = self.max_response_bytes();
-        let outcome = if sealed {
-            Self::send_sealed_body(&mut conn, url, body, cap).await
-        } else {
-            Self::send_plain_body(&mut conn, url, body, cap).await
-        };
+        let mut outcome = Self::exchange_on(&mut conn, url, body, sealed, cap).await;
+        if reused && matches!(&outcome, Err(SealedFailure::Error(e)) if Self::is_retryable(e)) {
+            debug!(
+                method = method_name(&self.config.auth_method),
+                "reused dedicated connection is gone and nothing was sent; authenticating a new one"
+            );
+            drop(conn);
+            conn = self.open_dedicated_conn(host, url, sealed).await?;
+            outcome = Self::exchange_on(&mut conn, url, body, sealed, cap).await;
+        }
         match outcome {
             Ok(text) => {
                 self.return_conn(conn);
@@ -983,14 +1101,42 @@ impl HttpTransport {
                     format!(
                         "HTTP 401 to a {kind}{name} request on an authenticated connection: the \
                          connection no longer carries the {name} session (usually the server \
-                         closed an idle connection, or the client's pool sent the request on a \
-                         fresh, unauthenticated connection right after a large answer), but a \
-                         401 does not prove the request did not run; it was NOT resent: retry \
-                         the call if it is safe to run again"
+                         closed an idle connection), but a 401 does not prove the request did \
+                         not run; it was NOT resent: retry the call if it is safe to run again"
                     ),
                 ))
             }
             Err(SealedFailure::Error(e)) => Err(e),
+        }
+    }
+
+    /// A new authenticated dedicated connection for [`Self::send_on_dedicated`]:
+    /// its sealing session is kept only when `sealed`.
+    async fn open_dedicated_conn(
+        &self,
+        host: &str,
+        url: &str,
+        sealed: bool,
+    ) -> Result<Box<AuthConn>, WinrmError> {
+        let mut conn = self.open_authenticated_conn(host, url).await?;
+        if !sealed {
+            conn.session = None;
+        }
+        Ok(conn)
+    }
+
+    /// One exchange on `conn`: sealed when `sealed`, else plain inside TLS.
+    async fn exchange_on(
+        conn: &mut AuthConn,
+        url: &str,
+        body: &str,
+        sealed: bool,
+        max_response_bytes: usize,
+    ) -> Result<String, SealedFailure> {
+        if sealed {
+            Self::send_sealed_body(conn, url, body, max_response_bytes).await
+        } else {
+            Self::send_plain_body(conn, url, body, max_response_bytes).await
         }
     }
 
@@ -1020,7 +1166,6 @@ impl HttpTransport {
             )));
         }
         let (content_type, sealed) = session.seal(body).map_err(SealedFailure::Error)?;
-        let_pool_take_back_connection().await;
         let resp = conn
             .http
             .post(url)
@@ -1097,7 +1242,6 @@ impl HttpTransport {
         body: &str,
         max_response_bytes: usize,
     ) -> Result<String, SealedFailure> {
-        let_pool_take_back_connection().await;
         let resp = conn
             .http
             .post(url)
@@ -3878,5 +4022,214 @@ mod tests {
             url_server_name("https://proxy.corp:3128"),
             name("proxy.corp")
         );
+    }
+
+    // --- One connection per authenticated client ---
+
+    /// A loopback listener that accepts connections until none arrives for
+    /// [`MTLS_SERVER_DEADLINE`], counts them, and runs `serve` on each, on a
+    /// thread of its own.
+    fn spawn_counting_listener(
+        serve: impl Fn(std::net::TcpStream) + Clone + Send + 'static,
+    ) -> (u16, Arc<AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepts);
+        std::thread::spawn(move || {
+            while let Ok(tcp) = accept_with_deadline(&listener) {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let serve = serve.clone();
+                std::thread::spawn(move || serve(tcp));
+            }
+        });
+        (port, accepts)
+    }
+
+    /// A TCP relay to `127.0.0.1:upstream` that counts the connections it
+    /// accepts. With `idle`, it closes a connection once the upstream has
+    /// been silent for `idle` after sending at least one byte to the client.
+    fn spawn_relay(upstream: u16, idle: Option<Duration>) -> (u16, Arc<AtomicUsize>) {
+        use std::io::{ErrorKind, Read, Write};
+        use std::net::Shutdown;
+        spawn_counting_listener(move |client| {
+            client.set_read_timeout(None).unwrap();
+            let server = std::net::TcpStream::connect(("127.0.0.1", upstream)).unwrap();
+            let mut client_rd = client.try_clone().unwrap();
+            let mut server_wr = server.try_clone().unwrap();
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut client_rd, &mut server_wr);
+                let _ = server_wr.shutdown(Shutdown::Write);
+            });
+            let (mut server_rd, mut client_wr) = (server, client);
+            let Some(idle) = idle else {
+                let _ = std::io::copy(&mut server_rd, &mut client_wr);
+                let _ = client_wr.shutdown(Shutdown::Write);
+                return;
+            };
+            server_rd.set_read_timeout(Some(idle)).unwrap();
+            let mut buf = [0u8; 16 * 1024];
+            let mut sent = false;
+            loop {
+                match server_rd.read(&mut buf) {
+                    Ok(0) => {
+                        let _ = client_wr.shutdown(Shutdown::Write);
+                        return;
+                    }
+                    Ok(n) => {
+                        if client_wr.write_all(&buf[..n]).is_err() {
+                            return;
+                        }
+                        sent = true;
+                    }
+                    Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                        if sent {
+                            let _ = client_wr.shutdown(Shutdown::Both);
+                            let _ = server_rd.shutdown(Shutdown::Both);
+                            return;
+                        }
+                    }
+                    Err(_) => return,
+                }
+            }
+        })
+    }
+
+    /// A TCP relay to `127.0.0.1:upstream` counting the connections it
+    /// accepts.
+    fn spawn_counting_relay(upstream: u16) -> (u16, Arc<AtomicUsize>) {
+        spawn_relay(upstream, None)
+    }
+
+    /// [`spawn_counting_relay`] for a server that silently closes a
+    /// connection idle for `idle`.
+    fn spawn_closing_relay(upstream: u16, idle: Duration) -> (u16, Arc<AtomicUsize>) {
+        spawn_relay(upstream, Some(idle))
+    }
+
+    /// An HTTP server that counts the connections it accepts and answers
+    /// each request head with an empty 200 and `Connection: close`.
+    fn spawn_closing_http_server() -> (u16, Arc<AtomicUsize>) {
+        use std::io::Write;
+        spawn_counting_listener(|mut tcp| {
+            if read_http_head(&mut tcp).is_ok() {
+                let _ = tcp.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+            let _ = tcp.shutdown(std::net::Shutdown::Both);
+        })
+    }
+
+    /// Sealed NTLM transport on plain HTTP, reaching the fake through `relay`.
+    fn relayed_transport(relay: u16) -> HttpTransport {
+        let config = WinrmConfig {
+            auth_method: AuthMethod::Ntlm,
+            port: relay,
+            use_tls: false,
+            max_retries: 0,
+            operation_timeout_secs: 10,
+            ..Default::default()
+        };
+        HttpTransport::new(config, WinrmCredentials::new(USER, PASS, "")).unwrap()
+    }
+
+    /// On a current-thread runtime with no yields, a locked dedicated client
+    /// keeps every sealed exchange on its one authenticated connection.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dedicated_client_never_opens_a_second_connection() {
+        let server = MockServer::start().await;
+        let fake = FakeNtlmServer::mount(&server).await;
+        let (relay, accepts) = spawn_counting_relay(server.address().port());
+        let transport = relayed_transport(relay);
+        let big = "x".repeat(200_000);
+        for _ in 0..20 {
+            fake.push(Reply::ok(&big));
+        }
+        for i in 0..20 {
+            let reply = transport
+                .send_soap_with_retry("127.0.0.1", format!("<r{i}/>"))
+                .await
+                .unwrap();
+            assert_eq!(reply.len(), 200_000, "exchange {i}");
+        }
+        assert_eq!(accepts.load(Ordering::SeqCst), 1, "log: {:?}", fake.log());
+        assert_eq!(fake.handshakes(), 1);
+        assert_eq!(fake.sealed().len(), 20);
+    }
+
+    /// The gate refuses a connect only once locked, and never runs the inner
+    /// connector then.
+    #[tokio::test]
+    async fn locked_gate_refuses_after_handshake_but_not_before() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (port, accepts) = spawn_closing_http_server();
+        let config = WinrmConfig {
+            connect_timeout_secs: 5,
+            ..Default::default()
+        };
+        let gate = Arc::new(ConnGate {
+            locked: AtomicBool::new(false),
+            wait: Duration::from_millis(50),
+        });
+        let client = build_http_client(&config, None, 1, Some(Arc::clone(&gate))).unwrap();
+        let url = format!("http://127.0.0.1:{port}/wsman");
+        for _ in 0..2 {
+            assert_eq!(client.get(&url).send().await.unwrap().status(), 200);
+        }
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            2,
+            "an open gate allows the probe and the AP-REQ connections"
+        );
+        gate.lock();
+        let err = client.get(&url).send().await.unwrap_err();
+        assert!(err.is_connect(), "{err:?}");
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            2,
+            "a locked gate opened a connection"
+        );
+    }
+
+    /// A reused connection the server silently closed is re-authenticated once.
+    #[tokio::test]
+    async fn reused_connection_closed_by_the_server_reauthenticates_once() {
+        let server = MockServer::start().await;
+        let fake = FakeNtlmServer::mount(&server).await;
+        let (relay, accepts) =
+            spawn_closing_relay(server.address().port(), Duration::from_millis(200));
+        let transport = relayed_transport(relay);
+        assert_eq!(
+            transport
+                .send_soap_with_retry("127.0.0.1", "<one/>".into())
+                .await
+                .unwrap(),
+            "<ok/>"
+        );
+        // The relay closes the idle connection.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            transport
+                .send_soap_with_retry("127.0.0.1", "<two/>".into())
+                .await
+                .unwrap(),
+            "<ok/>"
+        );
+        assert_eq!(fake.handshakes(), 2, "exactly one new handshake");
+        assert_eq!(
+            fake.sealed(),
+            vec!["<one/>".to_string(), "<two/>".to_string()],
+            "each body seen once"
+        );
+        assert!(
+            !fake
+                .log()
+                .iter()
+                .any(|e| matches!(e, Event::UnknownSession)),
+            "{:?}",
+            fake.log()
+        );
+        assert_eq!(accepts.load(Ordering::SeqCst), 2);
     }
 }

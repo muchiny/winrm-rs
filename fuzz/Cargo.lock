@@ -1618,6 +1618,8 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-util",
+ "tower-layer",
+ "tower-service",
  "tracing",
  "uuid",
  "webpki-roots",

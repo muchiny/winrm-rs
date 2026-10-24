@@ -178,7 +178,9 @@ protects this client's messages, not its authentication; see
 relies on (`AllowUnencrypted = false`). On a Windows client the SSPI path of `cross-krb5` is built and
 linted by the `kerberos-windows` CI job and not tested live: with
 `--features kerberos`, `Auto` now seals over HTTP, and
-`EncryptionMode::Never` is the way back if that fails.
+`EncryptionMode::Never` is the way back if that fails. Over plain HTTP neither
+NTLM nor Kerberos binds the authentication to the connection, so it can be
+relayed onto another one: see [Choosing a transport](#choosing-a-transport).
 
 ### Certificate authentication
 

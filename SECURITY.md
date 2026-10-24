@@ -78,6 +78,12 @@ We will credit reporters in the release notes and CHANGELOG (unless you prefer t
   - Kerberos over plain HTTP carries no channel binding;
   - Basic over plain HTTP, and `EncryptionMode::Never` over plain HTTP, send
     everything in plaintext.
+- Relay of NTLM or Kerberos authentication over plain HTTP by a party on the
+  network path or controlling DNS. It is inherent to Windows authentication
+  without a TLS channel. Client-side remedy: HTTPS. Server side:
+  `AllowUnencrypted = false` (the default), an HTTPS listener with
+  `CbtHardeningLevel = Strict`, and SMB and LDAP signing plus Extended
+  Protection on the account's other services.
 - What `accept_invalid_certs = true` gives up, as its documentation states:
   the server is not authenticated, CredSSP's outer TLS is not bound to the
   authentication, and the certificate of an `https://` proxy is not verified.

@@ -513,41 +513,46 @@ pub enum AuthMethod {
     ///
     /// Sends raw Kerberos GSS-API tokens (mechanism krb5, RFC 4121; not
     /// SPNEGO-wrapped) under the `Negotiate` HTTP scheme, via the system
-    /// Kerberos library (`cross-krb5`). The service principal is
-    /// `HTTP/<host>`, where host is the endpoint URL's host as parsed
-    /// (IDN in punycode, short/octal IPv4 in dotted-quad form, IPv6 without
-    /// brackets); when the configured host already equals that parsed host up
-    /// to ASCII case, its original spelling is kept. This is the same host the
-    /// connection, the TLS server name and the pin use. Credentials come from the ticket cache (`kinit`), not from
-    /// [`WinrmCredentials`].
+    /// Kerberos library (`cross-krb5`). The service principal is `HTTP/<host>`,
+    /// where host is the endpoint URL's host as parsed (IDN in punycode,
+    /// short/octal IPv4 in dotted-quad form, IPv6 without brackets); when the
+    /// configured host already equals that parsed host up to ASCII case, its
+    /// original spelling is kept. This is the same host the connection, the TLS
+    /// server name and the pin use. Credentials come from the ticket cache
+    /// (`kinit`), not from [`WinrmCredentials`].
     ///
     /// What it guarantees: authentication of the client and, through the
-    /// server's AP-REP, of the server (mutual authentication). Message
-    /// confidentiality and integrity come from HTTPS, or from Kerberos
-    /// sealing ([`EncryptionMode::Auto`] over HTTP, or
+    /// server's AP-REP, of the server (mutual authentication). Over plain HTTP
+    /// the AP-REP proves that the real server took part in the exchange, not
+    /// that this client's connection reaches it: a relay passes the AP-REP
+    /// through. Message confidentiality and integrity come from HTTPS, or from
+    /// Kerberos sealing ([`EncryptionMode::Auto`] over HTTP, or
     /// [`EncryptionMode::Always`]). Both run on dedicated connections
     /// authenticated once, and require the AP-REP. Over HTTPS the AP-REQ
-    /// carries a channel binding (RFC 5929 `tls-server-end-point`) computed
-    /// for the certificate learnt on an unauthenticated probe request; that
+    /// carries a channel binding (RFC 5929 `tls-server-end-point`) computed for
+    /// the certificate learnt on an unauthenticated probe request; that
     /// certificate is then pinned in the connection's own verifier, so the
     /// connection that carries the AP-REQ, and every later one, presents that
     /// same certificate or fails at its TLS handshake before any HTTP byte is
-    /// written (validated against `CbtHardeningLevel = Relaxed` and
-    /// `Strict`). The pin applies to the server name `reqwest` uses, the host
-    /// of the parsed endpoint URL; once pinned, a handshake for another name
-    /// is refused (the `https://` proxy's own leg aside), and a host that is
-    /// no valid TLS server name is refused before the AP-REQ. With
+    /// written (validated against `CbtHardeningLevel = Relaxed` and `Strict`).
+    /// The pin applies to the server name `reqwest` uses, the host of the
+    /// parsed endpoint URL; once pinned, a handshake for another name is
+    /// refused (the `https://` proxy's own leg aside), and a host that is no
+    /// valid TLS server name is refused before the AP-REQ. With
     /// `accept_invalid_certs`, binding and pin are what keep a party in the
-    /// middle from using the authentication on the real server's HTTPS
-    /// listener (since 1.4.1 the server must prove it holds the pinned
-    /// certificate's key); they do not stop a party with a certificate of its
-    /// own from reading the traffic or relaying the token to a service that
-    /// ignores channel binding. A certificate whose signature algorithm
-    /// defines no binding hash (Ed25519, unknown) is refused. With
+    /// middle from using the authentication on the real server's HTTPS listener
+    /// (since 1.4.1 the server must prove it holds the pinned certificate's
+    /// key); they do not stop a party with a certificate of its own from
+    /// reading the traffic or relaying the token to a service that ignores
+    /// channel binding. A certificate whose signature algorithm defines no
+    /// binding hash (Ed25519, unknown) is refused. With
     /// [`EncryptionMode::Never`] over HTTP, each request authenticates with a
     /// fresh context, the AP-REP is checked only when the answer carries one,
-    /// and body and answer cross the network in plaintext, unprotected. See [`EncryptionMode`] for the
-    /// replay limit of Kerberos sealing and the Windows-client caveat.
+    /// and body and answer cross the network in plaintext, unprotected. See
+    /// [`EncryptionMode`] for the replay limit of Kerberos sealing and the
+    /// Windows-client caveat. Over plain HTTP the authentication is not bound
+    /// to the connection: see the Security section of [`WinrmConfig`] and
+    /// [`EncryptionMode`].
     Kerberos,
     /// TLS client certificate authentication. Requires HTTPS (`use_tls = true`).
     ///

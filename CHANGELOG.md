@@ -150,6 +150,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   forwarding proxy means for NTLM and Kerberos over plain HTTP, how proxy
   credentials travel, and that CredSSP uses no proxy. `WinrmClient`: one
   `wsmv:SessionId` per client, sent to every host.
+- `AuthMethod::Kerberos`, the README and SECURITY.md say that over plain HTTP
+  the authentication is not bound to the connection and can be relayed, and
+  what prevents it (HTTPS, `AllowUnencrypted = false`).
 
 ## [1.4.1] - 2026-10-24
 

@@ -167,6 +167,8 @@ set `[libdefaults] request_timeout` in `krb5.conf` to cap libkrb5's own
 retries. On a Windows client the KDC call runs on a pool thread, which drops
 any per-thread SSPI impersonation a caller set on the tokio worker.
 
+Requirements: use a system MIT krb5 1.21.3 or later, or a vendor build with the CVE-2024-37370 and CVE-2024-37371 fixes. `cargo audit` cannot see the system library. The crate refuses a sealed answer with a non-zero extra count (EC) whatever the library version.
+
 Limits: WinRM sends its sealed Kerberos answers with sequence number 0, so
 the Kerberos session detects no replay; each sealed answer is bound to its
 request through `RelatesTo`, and a sealed request replayed by an active

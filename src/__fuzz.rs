@@ -203,10 +203,15 @@ pub fn kerberos_parse_sealed(data: &[u8]) -> Result<(Vec<u8>, usize), WinrmError
     crate::auth::kerberos::parse_sealed_answer(data).map(|f| (f.sealed.to_vec(), f.length))
 }
 
-/// RFC 4121 checks of a sealed answer's token
-/// (`kerberos::check_acceptor_sealed`).
-pub fn kerberos_check_acceptor_sealed(token: &[u8]) -> Result<(), WinrmError> {
-    crate::auth::kerberos::check_acceptor_sealed(token)
+/// RFC 4121 checks of a sealed answer's token and of its framing
+/// (`kerberos::check_acceptor_sealed`): `token` is the security header then
+/// the data, `length` the announced plaintext length, so any header/data
+/// split can be tried.
+pub fn kerberos_check_acceptor_sealed(token: &[u8], length: usize) -> Result<(), WinrmError> {
+    crate::auth::kerberos::check_acceptor_sealed(&crate::auth::sealed::Frame {
+        sealed: token,
+        length,
+    })
 }
 
 /// `gss_wrap_iov` buffers to the Windows SSPI layout

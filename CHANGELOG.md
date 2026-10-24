@@ -35,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   to keep `winrm_rs` at `info`: `debug` no longer carries command content,
   but `trace` still logs SOAP bodies. The crate docs gain a *Logging*
   section.
+- Kerberos: a sealed answer must have a zero extra count (EC) and a security header whose length matches its rotation count (RRC), as Windows always sends. An unrotated token (RRC 0) in a 60-byte header, which older versions accepted, is now refused.
 
 ### Changed
 

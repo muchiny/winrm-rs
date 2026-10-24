@@ -89,6 +89,9 @@ mod wire {
     pub(super) const FLAG_SEALED: u8 = 0x02;
     /// Length of the wrap token header (`TOK_ID` .. `SND_SEQ`).
     pub(super) const TOKEN_HEADER_LEN: usize = 16;
+    /// Length of the confounder that follows the token header in the
+    /// security header of an AES wrap token.
+    pub(super) const CONFOUNDER_LEN: usize = 16;
     /// Largest security header accepted in a sealed answer: an AES wrap token
     /// header is 60 bytes (16-byte token header, 16-byte confounder, 16-byte
     /// encrypted header copy, 12-byte checksum).
@@ -156,15 +159,20 @@ mod wire {
         Ok((out_header, out_data))
     }
 
-    /// Check that `token` (security header then data of a sealed answer) is an
-    /// RFC 4121 wrap token sent by the acceptor with its data encrypted. The
-    /// token's integrity is checked by unwrap.
+    /// Check that `frame.sealed` (security header then data of a sealed
+    /// answer) is an RFC 4121 wrap token sent by the acceptor with its data
+    /// encrypted, framed the way Windows frames it: a zero extra count (EC),
+    /// and a security header of `TOKEN_HEADER_LEN + RRC + CONFOUNDER_LEN`
+    /// bytes (60 for the rotation count of 28 that Windows sends), where the
+    /// header length is what the framing leaves besides `frame.length` bytes
+    /// of data. The token's integrity is checked by unwrap.
     ///
     /// Its sequence number is not checked: WinRM sends `SND_SEQ` 0 in every
     /// answer (measured on Server 2025), so it cannot detect a replay. The
     /// transport binds each sealed answer to its request through `RelatesTo`
     /// instead (see `soap::parser::check_relates_to`).
-    pub(crate) fn check_acceptor_sealed(token: &[u8]) -> Result<(), WinrmError> {
+    pub(crate) fn check_acceptor_sealed(frame: &sealed::Frame<'_>) -> Result<(), WinrmError> {
+        let token = frame.sealed;
         let header = token
             .get(..TOKEN_HEADER_LEN)
             .ok_or_else(|| sealing_error("sealed answer shorter than a wrap token header"))?;
@@ -177,6 +185,42 @@ mod wire {
         }
         if flags & FLAG_SEALED == 0 {
             return Err(sealing_error("answer is signed but not encrypted"));
+        }
+        let header_len = token
+            .len()
+            .checked_sub(frame.length)
+            .ok_or_else(|| sealing_error("sealed answer shorter than its plaintext length"))?;
+        let be16 = |range: std::ops::Range<usize>| {
+            header
+                .get(range)
+                .and_then(|b| <[u8; 2]>::try_from(b).ok())
+                .map(u16::from_be_bytes)
+        };
+        let (Some(ec), Some(rrc)) = (be16(4..6), be16(6..8)) else {
+            return Err(sealing_error(
+                "sealed answer shorter than a wrap token header",
+            ));
+        };
+        tracing::trace!(
+            target: "winrm_rs::kerberos::sealed",
+            ec,
+            rrc,
+            header_len,
+            "sealed answer framing"
+        );
+        if ec != 0 {
+            return Err(sealing_error(
+                "sealed answer has a non-zero extra count (EC): a DCE-style or EC != 0 server, \
+                 which this client does not accept",
+            ));
+        }
+        let expected = TOKEN_HEADER_LEN
+            .checked_add(usize::from(rrc))
+            .and_then(|n| n.checked_add(CONFOUNDER_LEN));
+        if expected != Some(header_len) {
+            return Err(sealing_error(
+                "security header length does not match the token's rotation count (RRC)",
+            ));
         }
         Ok(())
     }
@@ -372,7 +416,7 @@ impl KerberosSession {
         let frame = parse_sealed_answer(data)?;
         // The rotated header followed by the data is a complete RFC 4121
         // token; the library undoes the rotation (RRC).
-        check_acceptor_sealed(frame.sealed)?;
+        check_acceptor_sealed(&frame)?;
         let plaintext = self
             .ctx
             .unwrap(frame.sealed)
@@ -745,11 +789,68 @@ mod layout_tests {
         t
     }
 
+    /// `header` (a token header, possibly longer) followed by `data_len` data
+    /// bytes, as the contiguous bytes of a parsed sealed answer.
+    fn sealed_bytes(header: &[u8], data_len: usize) -> Vec<u8> {
+        let mut bytes = header.to_vec();
+        bytes.extend(std::iter::repeat_n(0xAB, data_len));
+        bytes
+    }
+
+    fn check(bytes: &[u8], length: usize) -> Result<(), WinrmError> {
+        check_acceptor_sealed(&crate::auth::sealed::Frame {
+            sealed: bytes,
+            length,
+        })
+    }
+
     #[test]
     fn acceptor_sealed_token_is_accepted() {
         // Windows sets SentByAcceptor | Sealed | AcceptorSubkey, SND_SEQ 0.
-        assert!(check_acceptor_sealed(&acceptor_token(0x07, 0)).is_ok());
-        assert!(check_acceptor_sealed(&acceptor_token(0x03, 42)).is_ok());
+        let bytes = sealed_bytes(&acceptor_token(0x07, 0), 5);
+        assert!(check(&bytes, 5).is_ok());
+        let bytes = sealed_bytes(&acceptor_token(0x03, 42), 5);
+        assert!(check(&bytes, 5).is_ok());
+    }
+
+    #[test]
+    fn acceptor_sealed_windows_layout_is_accepted() {
+        let bytes = sealed_bytes(&acceptor_token(0x07, 0), 10);
+        assert_eq!(bytes.len(), 70);
+        assert!(check(&bytes, 10).is_ok());
+    }
+
+    #[test]
+    fn acceptor_sealed_nonzero_ec_is_refused() {
+        // A genuine 92-byte frame (60-byte header, 32 data bytes); the
+        // forgery sets EC to 16 and announces 16 bytes of plaintext, so the
+        // header is read as 76 bytes (CVE-2024-37370 shape).
+        let mut bytes = sealed_bytes(&acceptor_token(0x07, 0), 32);
+        assert_eq!(bytes.len(), 92);
+        assert!(check(&bytes, 32).is_ok());
+        bytes[4..6].copy_from_slice(&16u16.to_be_bytes());
+        match check(&bytes, 16) {
+            Err(WinrmError::AuthFailed(m)) => {
+                assert!(m.contains("extra count (EC)"), "{m}");
+            }
+            other => panic!("expected AuthFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn acceptor_sealed_header_len_must_match_rrc() {
+        // RRC 28 needs a 60-byte header; 61 is refused.
+        let bytes = sealed_bytes(&acceptor_token(0x07, 0), 11);
+        match check(&bytes, 10) {
+            Err(WinrmError::AuthFailed(m)) => assert!(m.contains("rotation count"), "{m}"),
+            other => panic!("expected AuthFailed, got {other:?}"),
+        }
+        // RRC 40 (an AES-SHA2-shaped token) goes with a 72-byte header.
+        let mut token = acceptor_token(0x07, 0);
+        token[6..8].copy_from_slice(&40u16.to_be_bytes());
+        token.resize(72, 0);
+        let bytes = sealed_bytes(&token, 10);
+        assert!(check(&bytes, 10).is_ok());
     }
 
     #[test]
@@ -764,7 +865,8 @@ mod layout_tests {
                 t
             }),
         ] {
-            assert!(check_acceptor_sealed(&token).is_err(), "{name}");
+            // No data bytes, so the 15-byte token is the whole input.
+            assert!(check(&token, 0).is_err(), "{name}");
         }
     }
 

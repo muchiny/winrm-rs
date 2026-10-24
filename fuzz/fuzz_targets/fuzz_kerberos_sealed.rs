@@ -34,7 +34,7 @@ fuzz_target!(|data: &[u8]| {
             Ok((token, length)) => {
                 // The token is the header then exactly `length` bytes.
                 assert!(token.len() >= 16 + length && token.len() <= 1024 + length);
-                let _ = kerberos_check_acceptor_sealed(&token);
+                let _ = kerberos_check_acceptor_sealed(&token, length);
             }
             Err(e) => assert!(e.to_string().len() < 256, "error grows with input"),
         },

@@ -502,6 +502,67 @@ async fn upload_and_download_file() {
     let _ = std::fs::remove_file(&local_download);
 }
 
+/// An empty local file truncates an existing remote file, and creates the
+/// remote file when it is missing.
+#[tokio::test]
+#[ignore]
+async fn upload_empty_file_truncates_the_remote_file() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+
+    let remote_path = "C:\\Users\\Public\\winrm-rs-empty.txt";
+    let length_query = format!("(Get-Item -LiteralPath '{remote_path}').Length");
+    let local_full = std::env::temp_dir().join("winrm_rs_test_full.txt");
+    let local_empty = std::env::temp_dir().join("winrm_rs_test_empty.txt");
+    std::fs::write(&local_full, b"abc").expect("write local file");
+    std::fs::write(&local_empty, b"").expect("write empty local file");
+
+    // A remote file with content, then truncated by the empty upload.
+    let bytes_up = client
+        .upload_file(&host, &local_full, remote_path)
+        .await
+        .expect("upload file");
+    assert_eq!(bytes_up, 3);
+    let bytes_up = client
+        .upload_file(&host, &local_empty, remote_path)
+        .await
+        .expect("upload empty file");
+    assert_eq!(bytes_up, 0);
+    let output = client
+        .run_powershell(&host, &length_query)
+        .await
+        .expect("query length");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "0");
+
+    // A missing remote file, created by the empty upload.
+    client
+        .run_powershell(
+            &host,
+            &format!("Remove-Item -LiteralPath '{remote_path}' -Force"),
+        )
+        .await
+        .expect("remove remote file");
+    let bytes_up = client
+        .upload_file(&host, &local_empty, remote_path)
+        .await
+        .expect("upload empty file");
+    assert_eq!(bytes_up, 0);
+    let output = client
+        .run_powershell(&host, &length_query)
+        .await
+        .expect("query length");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "0");
+
+    // Cleanup
+    let _ = client
+        .run_powershell(
+            &host,
+            &format!("Remove-Item -LiteralPath '{remote_path}' -Force"),
+        )
+        .await;
+    let _ = std::fs::remove_file(&local_full);
+    let _ = std::fs::remove_file(&local_empty);
+}
+
 /// One-off check that the chunk size shrinks with a long, quote-heavy path:
 /// a 10 000-byte file goes to a 200-character path holding four U+2019 and
 /// comes back identical.

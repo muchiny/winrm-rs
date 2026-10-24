@@ -100,6 +100,8 @@ impl WinrmClient {
     /// `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -NonInteractive`:
     /// profile scripts do not run, and a prompt fails instead of waiting.
     ///
+    /// An empty local file creates or truncates the remote file.
+    ///
     /// Returns the number of bytes uploaded.
     pub async fn upload_file(
         &self,
@@ -122,7 +124,7 @@ impl WinrmClient {
         let shell = self.open_shell(host).await?;
         let total = data.len() as u64;
 
-        for (i, chunk) in data.chunks(chunk_len).enumerate() {
+        for (i, chunk) in chunks_to_send(&data, chunk_len).into_iter().enumerate() {
             let b64 = B64.encode(chunk);
 
             let script = upload_script(&escaped_path, &b64, i == 0);
@@ -270,6 +272,17 @@ fn upload_chunk_len(escaped_path: &str) -> Result<usize, WinrmError> {
     Ok(lo)
 }
 
+/// The chunks `upload_file` sends: `data` in pieces of `chunk_len` bytes, or
+/// one empty chunk when `data` is empty, so that the remote file is still
+/// created or truncated.
+fn chunks_to_send(data: &[u8], chunk_len: usize) -> Vec<&[u8]> {
+    if data.is_empty() {
+        vec![data]
+    } else {
+        data.chunks(chunk_len).collect()
+    }
+}
+
 /// The remote script for one upload chunk: the first chunk creates the file,
 /// later chunks append to it.
 fn upload_script(escaped_path: &str, b64: &str, first: bool) -> String {
@@ -382,6 +395,13 @@ mod tests {
             matches!(&err, WinrmError::Transfer(m) if m == "remote path too long for a transfer command line"),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn chunks_to_send_of_an_empty_file_is_one_empty_chunk() {
+        assert_eq!(chunks_to_send(b"", 2000), vec![&b""[..]]);
+        assert_eq!(chunks_to_send(&[7u8; 4001], 2000).len(), 3);
+        assert_eq!(chunks_to_send(&[7u8; 4000], 2000).len(), 2);
     }
 
     #[test]

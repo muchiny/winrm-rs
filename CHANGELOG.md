@@ -144,6 +144,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   unchanged.
 - `upload_file` to a long remote path no longer fails with a command line over
   the Windows limit: the chunk size now shrinks to fit the path.
+- **`upload_file` of an empty local file** now creates or truncates the remote file. It used to send nothing and return `Ok(0)`, leaving any previous remote content in place.
 
 ### Documentation
 

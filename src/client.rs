@@ -3523,43 +3523,10 @@ mod tests {
             .await;
         assert!(result.is_ok(), "upload failed: {result:?}");
 
-        let requests = server.received_requests().await.unwrap();
-        let mut found_write_all_bytes = false;
-        let mut found_append = false;
-        for req in &requests {
-            let body = String::from_utf8_lossy(&req.body);
-            if !body.contains("-EncodedCommand") {
-                continue;
-            }
-            let tag_open = "<rsp:Arguments>";
-            let tag_close = "</rsp:Arguments>";
-            let mut pos = 0;
-            while let Some(start) = body[pos..].find(tag_open) {
-                let content_start = pos + start + tag_open.len();
-                if let Some(end) = body[content_start..].find(tag_close) {
-                    let arg_val = &body[content_start..content_start + end];
-                    if let Ok(bytes) = B64.decode(arg_val.trim()) {
-                        let u16s: Vec<u16> = bytes
-                            .as_chunks::<2>()
-                            .0
-                            .iter()
-                            .map(|c| u16::from_le_bytes(*c))
-                            .collect();
-                        if let Ok(script) = String::from_utf16(&u16s) {
-                            if script.contains("WriteAllBytes") {
-                                found_write_all_bytes = true;
-                            }
-                            if script.contains("Append") {
-                                found_append = true;
-                            }
-                        }
-                    }
-                    pos = content_start + end + tag_close.len();
-                } else {
-                    break;
-                }
-            }
-        }
+        let bodies = received_bodies(&server).await;
+        let scripts = powershell_scripts(&bodies);
+        let found_write_all_bytes = scripts.iter().any(|s| s.contains("WriteAllBytes"));
+        let found_append = scripts.iter().any(|s| s.contains("Append"));
 
         assert!(
             found_write_all_bytes,
@@ -4084,6 +4051,106 @@ mod tests {
 
     fn count_containing(bodies: &[String], needle: &str) -> usize {
         bodies.iter().filter(|b| b.contains(needle)).count()
+    }
+
+    /// For every body in order, the UTF-16LE-decoded script of each
+    /// `<rsp:Arguments>` value that follows an `-EncodedCommand` argument.
+    fn powershell_scripts(bodies: &[String]) -> Vec<String> {
+        let (tag_open, tag_close) = ("<rsp:Arguments>", "</rsp:Arguments>");
+        let mut scripts = Vec::new();
+        for body in bodies {
+            let mut after_flag = false;
+            let mut rest = body.as_str();
+            while let Some(start) = rest.find(tag_open) {
+                let value_and_rest = &rest[start + tag_open.len()..];
+                let Some(end) = value_and_rest.find(tag_close) else {
+                    break;
+                };
+                let value = value_and_rest[..end].trim();
+                rest = &value_and_rest[end + tag_close.len()..];
+                if after_flag && let Ok(bytes) = B64.decode(value) {
+                    let u16s: Vec<u16> = bytes
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|c| u16::from_le_bytes(*c))
+                        .collect();
+                    if let Ok(script) = String::from_utf16(&u16s) {
+                        scripts.push(script);
+                    }
+                }
+                after_flag = value == "-EncodedCommand";
+            }
+        }
+        scripts
+    }
+
+    /// A `ReceiveResponse` for `CommandId="C1"`: a base64 `stdout` and
+    /// `stderr` stream each (omitted when empty), then the `Done` state with
+    /// `exit_code`.
+    fn receive_done(stdout: &[u8], stderr: &[u8], exit_code: i32) -> String {
+        let stream = |name: &str, data: &[u8]| {
+            if data.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    r#"<rsp:Stream Name="{name}" CommandId="C1">{}</rsp:Stream>"#,
+                    B64.encode(data)
+                )
+            }
+        };
+        format!(
+            r#"<s:Envelope><s:Body><rsp:ReceiveResponse>{}{}<rsp:CommandState CommandId="C1" State="http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Done"><rsp:ExitCode>{exit_code}</rsp:ExitCode></rsp:CommandState></rsp:ReceiveResponse></s:Body></s:Envelope>"#,
+            stream("stdout", stdout),
+            stream("stderr", stderr)
+        )
+    }
+
+    #[tokio::test]
+    async fn upload_file_of_an_empty_file_truncates_the_remote_file() {
+        let server = MockServer::start().await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        mount_ok(&server, SHELL_S1, 1).await;
+        mount_ok(&server, COMMAND_C1, 1).await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("windows/shell/Receive"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(receive_done(b"", b"", 0)))
+            .mount(&server)
+            .await;
+        mount_ok(&server, EMPTY_BODY, u64::MAX).await;
+        let local = unique_temp_path("winrm-rs-test-upload-empty");
+        std::fs::write(&local, b"").unwrap();
+
+        let sent = client
+            .upload_file("127.0.0.1", &local, "C:\\dest.txt")
+            .await
+            .unwrap();
+
+        assert_eq!(sent, 0);
+        let bodies = received_bodies(&server).await;
+        let scripts = powershell_scripts(&bodies);
+        assert_eq!(scripts.len(), 1, "{scripts:?}");
+        assert!(
+            scripts[0].contains("FromBase64String('')"),
+            "{}",
+            scripts[0]
+        );
+        assert!(
+            scripts[0].contains("WriteAllBytes('C:\\dest.txt'"),
+            "{}",
+            scripts[0]
+        );
+        assert!(!scripts[0].contains("Append"), "{}", scripts[0]);
+        assert_eq!(
+            count_containing(&bodies, "transfer/Delete"),
+            1,
+            "{bodies:?}"
+        );
+        assert!(
+            bodies.last().is_some_and(|b| b.contains("transfer/Delete")),
+            "{bodies:?}"
+        );
+        std::fs::remove_file(&local).ok();
     }
 
     #[tracing_test::traced_test]

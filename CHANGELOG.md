@@ -47,6 +47,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   fault, from elements rather than from text: item text that mentions
   `EndOfSequence` or `Fault>` no longer ends a query early or turns a page
   into an error.
+- A very large `operation_timeout_secs` no longer panics, or wraps to a short
+  timeout, when the client is built or in `Shell::run_command`.
 
 ## [1.4.1] - 2026-10-24
 

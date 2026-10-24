@@ -73,8 +73,9 @@ pub struct WinrmConfig {
     pub connect_timeout_secs: u64,
     /// WS-Management `OperationTimeout` in seconds (default: 60): how long the
     /// server may hold one request. The HTTP client timeout is set to this
-    /// value plus 10 seconds to allow the server to respond before the
-    /// transport gives up.
+    /// value plus 10 seconds (saturating) to allow the server to respond
+    /// before the transport gives up. Every duration derived from it
+    /// saturates: no derived timeout panics or wraps.
     ///
     /// It bounds each Receive poll, not the command. A Receive that finds no
     /// output within it comes back as an empty poll and polling goes on, so

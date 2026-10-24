@@ -950,6 +950,15 @@ mod tests {
         }
     }
 
+    #[test]
+    fn client_builds_with_operation_timeout_at_u64_max() {
+        let config = WinrmConfig {
+            operation_timeout_secs: u64::MAX,
+            ..Default::default()
+        };
+        assert!(WinrmClient::new(config, test_creds()).is_ok());
+    }
+
     fn ntlm_config(port: u16) -> WinrmConfig {
         WinrmConfig {
             port,

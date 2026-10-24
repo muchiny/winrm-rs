@@ -15,6 +15,12 @@ use crate::error::WinrmError;
 use crate::soap::clixml::ClixmlDecoder;
 use crate::soap::{self, ReceiveOutput};
 
+/// Total deadline of `Shell::run_command`: twice `operation_timeout_secs`,
+/// saturating at `u64::MAX` so that no value of the setting can overflow.
+pub(crate) fn run_command_deadline_secs(operation_timeout_secs: u64) -> u64 {
+    operation_timeout_secs.saturating_mul(2)
+}
+
 /// A reusable WinRM shell session.
 ///
 /// Created via [`WinrmClient::open_shell`]. The shell persists across
@@ -90,7 +96,9 @@ impl<'a> Shell<'a> {
             .await?;
         debug!(command_id = ?command_id, "shell command started");
 
-        let timeout_duration = Duration::from_secs(self.client.config().operation_timeout_secs * 2);
+        let timeout_duration = Duration::from_secs(run_command_deadline_secs(
+            self.client.config().operation_timeout_secs,
+        ));
         let max_output = self.client.config().max_output_bytes;
 
         let result = tokio::time::timeout(timeout_duration, async {
@@ -145,9 +153,9 @@ impl<'a> Shell<'a> {
 
         match result {
             Ok(inner) => inner,
-            Err(_) => Err(WinrmError::Timeout(
-                self.client.config().operation_timeout_secs * 2,
-            )),
+            Err(_) => Err(WinrmError::Timeout(run_command_deadline_secs(
+                self.client.config().operation_timeout_secs,
+            ))),
         }
     }
 
@@ -1464,6 +1472,28 @@ mod tests {
             1,
         )
         .await;
+    }
+
+    #[test]
+    fn run_command_deadline_secs_saturates() {
+        assert_eq!(super::run_command_deadline_secs(60), 120);
+        assert_eq!(super::run_command_deadline_secs(0), 0);
+        assert_eq!(super::run_command_deadline_secs(u64::MAX / 2 + 1), u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn shell_run_command_deadline_saturates_for_huge_operation_timeout() {
+        let server = MockServer::start().await;
+        mount_open_shell_and_command(&server).await;
+        mount_ok(&server, DONE_OK, 1).await;
+        mount_ok(&server, "<s:Envelope><s:Body/></s:Envelope>", u64::MAX).await;
+        let config = WinrmConfig {
+            operation_timeout_secs: u64::MAX / 2 + 1,
+            ..basic_config(server.address().port())
+        };
+        let client = WinrmClient::new(config, test_creds()).unwrap();
+        let shell = client.open_shell("127.0.0.1").await.unwrap();
+        assert_eq!(shell.run_command("x", &[]).await.unwrap().exit_code, 3);
     }
 
     #[tokio::test]

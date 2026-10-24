@@ -28,7 +28,7 @@ pub enum WinrmError {
     /// The operation exceeded a deadline, which the payload gives in
     /// seconds. The value depends on where it was raised:
     /// - `Shell::run_command` reports `2 * operation_timeout_secs` (its
-    ///   total deadline);
+    ///   total deadline; the product saturates at `u64::MAX`);
     /// - the `WinrmClient::*_with_timeout` methods report the caller's
     ///   `timeout` rounded up to whole seconds (at least 1);
     /// - a request that needs a dedicated connection (NTLM or Kerberos

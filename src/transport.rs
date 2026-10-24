@@ -614,6 +614,17 @@ impl HttpTransport {
             );
         }
 
+        if matches!(config.auth_method, AuthMethod::Ntlm) && !config.use_tls {
+            tracing::warn!(
+                target: "winrm_rs::ntlm_over_http",
+                sealed = config.encryption != EncryptionMode::Never,
+                "NTLM over plain HTTP: the handshake is bound neither to the server nor to the \
+                 connection, so a party on the network path can relay it, or record it to \
+                 guess the password offline; sealing protects only the SOAP bodies. Use HTTPS \
+                 (use_tls = true, port = 5986) or Kerberos"
+            );
+        }
+
         if config.encryption == EncryptionMode::Always
             && !matches!(config.auth_method, AuthMethod::Ntlm | AuthMethod::Kerberos)
         {
@@ -2462,6 +2473,43 @@ mod tests {
         assert!(!transport.unwrap().seals());
         assert!(logs_contain("EncryptionMode::Always has no effect"));
         assert!(logs_contain("auth_method=\"Basic\""));
+    }
+
+    /// NTLM over plain HTTP is accepted (it is the default) but says at
+    /// construction what it leaves unprotected, under its own target.
+    #[tracing_test::traced_test]
+    #[test]
+    fn ntlm_over_plain_http_is_accepted_with_a_warning() {
+        let creds = || WinrmCredentials::new("admin", "pass", "");
+        assert!(HttpTransport::new(WinrmConfig::default(), creds()).is_ok());
+        assert!(logs_contain("NTLM over plain HTTP"));
+        assert!(logs_contain("winrm_rs::ntlm_over_http"));
+        assert!(logs_contain("sealed=true"));
+        let never = WinrmConfig {
+            encryption: EncryptionMode::Never,
+            ..Default::default()
+        };
+        assert!(HttpTransport::new(never, creds()).is_ok());
+        assert!(logs_contain("sealed=false"));
+    }
+
+    /// Guard: neither NTLM over HTTPS nor Basic over HTTP logs it.
+    #[tracing_test::traced_test]
+    #[test]
+    fn plain_http_warning_is_for_ntlm_over_http_only() {
+        let creds = || WinrmCredentials::new("admin", "pass", "");
+        let https = WinrmConfig {
+            use_tls: true,
+            port: 5986,
+            ..Default::default()
+        };
+        assert!(HttpTransport::new(https, creds()).is_ok());
+        let basic = WinrmConfig {
+            auth_method: AuthMethod::Basic,
+            ..Default::default()
+        };
+        assert!(HttpTransport::new(basic, creds()).is_ok());
+        assert!(!logs_contain("NTLM over plain HTTP"));
     }
 
     #[test]

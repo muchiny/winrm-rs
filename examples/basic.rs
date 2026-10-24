@@ -1,6 +1,6 @@
 //! Basic WinRM command execution example.
 //!
-//! Usage: WINRM_HOST=win-server WINRM_USER=admin WINRM_PASS=password cargo run --example basic
+//! Usage: WINRM_HOST=win-server WINRM_USER=admin WINRM_PASS=password [WINRM_TLS=1] cargo run --example basic
 
 use winrm_rs::{WinrmClient, WinrmConfig, WinrmCredentials};
 
@@ -10,10 +10,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let user = std::env::var("WINRM_USER").unwrap_or_else(|_| "administrator".into());
     let pass = std::env::var("WINRM_PASS").expect("set WINRM_PASS");
 
-    let client = WinrmClient::new(
-        WinrmConfig::default(),
-        WinrmCredentials::new(user, pass, ""),
-    )?;
+    // WINRM_TLS=1: HTTPS on 5986. Otherwise plain HTTP on 5985, where NTLM does
+    // not authenticate the server (README, "Choosing a transport").
+    let config = if std::env::var_os("WINRM_TLS").is_some() {
+        WinrmConfig {
+            use_tls: true,
+            port: 5986,
+            ..WinrmConfig::default()
+        }
+    } else {
+        WinrmConfig::default()
+    };
+
+    let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, ""))?;
 
     let output = client
         .run_powershell(&host, "$PSVersionTable | ConvertTo-Json")

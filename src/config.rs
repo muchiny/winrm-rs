@@ -7,8 +7,35 @@ use secrecy::SecretString;
 /// Configuration for a [`WinrmClient`](crate::WinrmClient) connection.
 ///
 /// Controls the transport (HTTP vs HTTPS), timeouts, and authentication
-/// method. Use [`Default::default()`] for sensible defaults (HTTP on port
-/// 5985, NTLM auth, 30 s connect / 60 s operation timeouts).
+/// method. [`Default::default()`] gives the settings of a Windows host's stock
+/// listener (`Enable-PSRemoting`, `winrm quickconfig`): HTTP on port 5985,
+/// NTLM, sealed SOAP bodies, 30 s connect / 60 s operation timeouts.
+///
+/// # Security
+///
+/// The default, NTLM over plain HTTP, protects the SOAP bodies (sealing, see
+/// [`EncryptionMode`]) but not the authentication. NTLM authenticates the
+/// client only, and over plain HTTP its handshake is bound neither to the
+/// server nor to the TCP connection. A party on the network path can
+/// relay it, before this client notices, to a service that accepts NTLM
+/// without signing or channel binding (an SMB server without signing, LDAP
+/// without channel binding, AD CS web enrollment without Extended
+/// Protection, a WinRM listener that allows unencrypted messages, this one
+/// included). A passive observer who records the challenge and the response
+/// can guess the password offline. On a network you do not trust:
+///
+/// - use HTTPS with certificate validation (`use_tls = true`, `port = 5986`,
+///   `accept_invalid_certs = false`): TLS authenticates the server, and NTLM
+///   carries a channel binding to its certificate (MS-NLMP 2.2.2.1, RFC 5929
+///   `tls-server-end-point`), which a server with `CbtHardeningLevel`
+///   `Relaxed` or `Strict` checks;
+/// - or use [`AuthMethod::Kerberos`], which also authenticates the server
+///   (AP-REP) but carries no channel binding over plain HTTP either.
+///
+/// With `accept_invalid_certs`, HTTPS does not authenticate the server: an
+/// impostor presenting its own certificate receives the NTLM authentication
+/// and can use it as over plain HTTP, except against a WinRM server that
+/// checks channel binding.
 ///
 /// Its `Debug` output lists every field but redacts the userinfo of
 /// [`proxy`](Self::proxy) (`http://<redacted>@proxy:8080`), shows only the
@@ -347,6 +374,9 @@ impl std::fmt::Debug for EnvVarNames<'_> {
 /// with confidentiality; only RFC 4121 "CFX" wrap tokens are accepted, so AES
 /// session keys: an RC4-only realm cannot seal and needs [`Self::Never`]).
 /// When using HTTPS, the TLS layer provides that, making sealing redundant.
+/// Sealing starts once the authentication is done: it protects the SOAP
+/// bodies, not the authentication itself (see the Security section of
+/// [`WinrmConfig`]).
 ///
 /// When sealing applies, it applies to every SOAP body, failing closed: the
 /// authentication runs with empty request bodies (NTLM handshake; Kerberos
@@ -371,10 +401,22 @@ impl std::fmt::Debug for EnvVarNames<'_> {
 /// rather than going out unsealed.
 ///
 /// Sealing protects the messages of this client. Server side, integrity on
-/// plain HTTP against an active network attacker also needs the server to
-/// refuse unencrypted messages (`AllowUnencrypted = false`), for NTLM as for
-/// Kerberos: a server that allows them runs unprotected requests (from a
-/// client with [`Self::Never`], or Basic).
+/// plain HTTP, against a party that can write on the network path, also
+/// needs the server to refuse unencrypted messages (`AllowUnencrypted =
+/// false`, the Windows default), for NTLM as for Kerberos. NTLM and Kerberos
+/// authenticate the TCP connection, not each request, so a server that allows
+/// unencrypted messages runs any unencrypted request on an authenticated
+/// connection: from a client with [`Self::Never`] or Basic, and also requests
+/// that a party on the network path writes on this client's own sealed
+/// connection, which then run as this client's user. Over plain HTTP that
+/// party does not even need this connection: it can relay this client's NTLM
+/// handshake or Kerberos AP-REQ onto a connection of its own. Nothing the
+/// client does on plain HTTP prevents this; only HTTPS or
+/// `AllowUnencrypted = false` does. Over HTTPS with certificate validation no
+/// other party can write on the connection. With `accept_invalid_certs` it
+/// can: with NTLM and Kerberos unless the server checks channel binding
+/// (`CbtHardeningLevel` `Relaxed` or `Strict`; `None` ignores it), and with
+/// CredSSP always, since its outer TLS carries no channel binding.
 ///
 /// On a Windows client, Kerberos sealing goes through the SSPI branch of
 /// `cross-krb5`, which the `kerberos-windows` CI job builds and lints and
@@ -427,7 +469,7 @@ pub enum AuthMethod {
     /// password offline from it; sealing protects the SOAP bodies, not the
     /// handshake. Where the network path is not trusted, use it only over
     /// HTTPS with certificate validation, where NTLM carries a channel binding
-    /// to the server's certificate.
+    /// to the server's certificate. See the Security section of [`WinrmConfig`].
     ///
     /// The `Workstation` field of the NTLM AUTHENTICATE message is this
     /// machine's name: `HOSTNAME` if set, else `/proc/sys/kernel/hostname` on

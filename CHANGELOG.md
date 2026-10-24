@@ -39,6 +39,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   bidirectional formatting characters are written as `\u{..}` escapes. The
   `code` and `reason` fields hold the neutralised text.
 - Debug logs print shell and command ids quoted and escaped (`shell_id="…"`).
+- **A WARN for NTLM over plain HTTP.** Building a client with
+  `AuthMethod::Ntlm` and `use_tls = false` (the default configuration) logs
+  one WARN, target `winrm_rs::ntlm_over_http`: over plain HTTP, NTLM does
+  not authenticate the server and its handshake can be relayed or guessed
+  offline; sealing protects only the SOAP bodies. Nothing is refused. To
+  silence it alone, add `winrm_rs::ntlm_over_http=error` to the filter.
 
 ### Added
 
@@ -103,6 +109,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `idle_timeout_secs`, the `credssp` feature description and the README now
   say that the target receives the delegated password, and what to do to
   limit how long it keeps it.
+- `WinrmConfig` gains a Security section on the default transport.
+  `EncryptionMode` states what sealing does not protect, and why the server
+  must keep `AllowUnencrypted = false`. The README gains *Choosing a
+  transport*.
 
 ## [1.4.1] - 2026-10-24
 

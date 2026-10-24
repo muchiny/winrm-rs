@@ -14,7 +14,7 @@ use winrm_rs::{WinrmClient, WinrmConfig, WinrmCredentials};
 #[tokio::main]
 async fn main() -> Result<(), winrm_rs::WinrmError> {
     let client = WinrmClient::new(
-        WinrmConfig::default(),
+        WinrmConfig::default(), // NTLM over plain HTTP: read "Choosing a transport"
         WinrmCredentials::new("administrator", "secret", ""),
     )?;
 
@@ -50,6 +50,41 @@ cargo add winrm-rs
 cargo add winrm-rs --features kerberos
 ```
 
+## Choosing a transport
+
+| Setting | Server authenticated | Authentication bound to the connection | SOAP bodies | Use |
+|---|---|---|---|---|
+| HTTPS + NTLM, certificate validated | yes (certificate) | yes (channel binding) | TLS | untrusted networks, hosts outside a domain |
+| HTTPS + Kerberos, certificate validated | yes (certificate, AP-REP) | yes (channel binding, certificate pin) | TLS | domain members, connected to by name |
+| HTTPS + Certificate | yes (certificate) | yes (client certificate in the TLS handshake) | TLS | certificate-mapped accounts |
+| HTTPS + CredSSP, certificate validated | yes (certificate) | inner TLS only | TLS | when the host must reach other machines with your credentials |
+| HTTP + Kerberos | yes (AP-REP) | no: a party on the path, or one controlling DNS, can relay the AP-REQ | sealed (`EncryptionMode::Auto`) | trusted networks |
+| HTTP + NTLM (the default) | no | no: the handshake can be relayed, or recorded to guess the password offline | sealed (`EncryptionMode::Auto`) | trusted networks only |
+| Basic | over HTTPS only | n/a | TLS; plaintext over HTTP (a WARN is logged) | HTTPS only |
+| any method with `accept_invalid_certs` | no | channel binding stops a relay to the real WinRM server only; CredSSP not at all | TLS to whoever answers | test environments |
+
+Sealing starts once the authentication is done: it protects this client's
+SOAP bodies, not the authentication. Two server-side settings matter as
+much as the client's:
+
+- `AllowUnencrypted = false`, the Windows default. NTLM and Kerberos
+  authenticate the TCP connection, not each request, so a server with
+  `AllowUnencrypted = true` runs any unencrypted request on an
+  authenticated connection. That includes requests a party on the
+  network path writes on this client's own sealed connection, which then
+  run as this client's user. Over plain HTTP that party does not even
+  need that connection: it can relay this client's NTLM handshake or
+  Kerberos AP-REQ onto a connection of its own. Only HTTPS or
+  `AllowUnencrypted = false` prevents this. Over HTTPS with certificate
+  validation no other party can write on the connection. With
+  `accept_invalid_certs` it can: with NTLM and Kerberos unless the
+  server checks channel binding (`CbtHardeningLevel = Relaxed` or
+  `Strict`), and with CredSSP always.
+- Signing and channel-binding enforcement on the network's other
+  services (SMB signing, LDAP channel binding, Extended Protection on
+  AD CS web enrollment) decide where a relayed NTLM handshake is
+  accepted.
+
 ## Usage
 
 ### Basic authentication
@@ -71,11 +106,21 @@ let client = WinrmClient::new(
 ### NTLM authentication (default)
 
 ```rust
+// Plain HTTP on 5985 (the default): see "Choosing a transport".
 let client = WinrmClient::new(
-    WinrmConfig::default(), // port 5985, NTLM, no TLS
+    WinrmConfig::default(),
+    WinrmCredentials::new("admin", "password", "MYDOMAIN"),
+)?;
+
+// HTTPS on 5986: the certificate authenticates the server, and NTLM
+// carries a channel binding to it.
+let client = WinrmClient::new(
+    WinrmConfig { use_tls: true, port: 5986, ..WinrmConfig::default() },
     WinrmCredentials::new("admin", "password", "MYDOMAIN"),
 )?;
 ```
+
+Over plain HTTP the client logs a WARN with target `winrm_rs::ntlm_over_http` at construction; see [Choosing a transport](#choosing-a-transport).
 
 ### Kerberos authentication
 
@@ -119,10 +164,9 @@ Limits: WinRM sends its sealed Kerberos answers with sequence number 0, so
 the Kerberos session detects no replay; each sealed answer is bound to its
 request through `RelatesTo`, and a sealed request replayed by an active
 attacker on the same authenticated connection is not detected. Sealing
-protects this client's messages; server side, integrity on plain HTTP also
-needs `AllowUnencrypted = false` (for NTLM as for Kerberos), since a server
-that allows unencrypted traffic runs unprotected requests from other
-clients. On a Windows client the SSPI path of `cross-krb5` is built and
+protects this client's messages, not its authentication; see
+[Choosing a transport](#choosing-a-transport) for the server settings it
+relies on (`AllowUnencrypted = false`). On a Windows client the SSPI path of `cross-krb5` is built and
 linted by the `kerberos-windows` CI job and not tested live: with
 `--features kerberos`, `Auto` now seals over HTTP, and
 `EncryptionMode::Never` is the way back if that fails.
@@ -218,18 +262,19 @@ let bytes = client.download_file("win-server", "C:\\remote\\file.bin", Path::new
 
 | Field | Default | Description |
 |---|---|---|
-| `port` | `5985` | WinRM HTTP(S) port |
+| `port` | `5985` | Listener port; does not follow `use_tls` (set 5986 for HTTPS) |
 | `use_tls` | `false` | Use HTTPS instead of HTTP |
 | `accept_invalid_certs` | `false` | Skip certificate chain and host-name checks (test only; see its rustdoc) |
 | `connect_timeout_secs` | `30` | TCP connection timeout |
 | `operation_timeout_secs` | `60` | WinRM operation timeout (SOAP-level) |
-| `auth_method` | `Ntlm` | `Basic`, `Ntlm`, `Kerberos`, or `Certificate` |
+| `auth_method` | `Ntlm` | `Basic`, `Ntlm`, `Kerberos`, `Certificate`, or `CredSsp` |
 | `max_envelope_size` | `153600` | Maximum SOAP envelope size in bytes |
 | `max_retries` | `0` | Retries for transient HTTP errors (exponential backoff) |
 | `client_cert_pem` | `None` | Path to client cert PEM (Certificate auth) |
 | `client_key_pem` | `None` | Path to client key PEM (Certificate auth) |
 | `proxy` | `None` | Proxy URL (e.g. `http://proxy:8080`); not used by CredSSP |
 | `encryption` | `Auto` | Message sealing for NTLM and Kerberos: `Auto` (over HTTP only), `Always`, `Never`. No effect with Basic, Certificate or CredSSP, `Always` included (Basic over HTTP stays plaintext; a WARN is logged) |
+| `max_output_bytes` | `Some(64 MiB)` | Cap on a command's stdout+stderr; `None` removes it |
 
 ## Roadmap
 
@@ -240,7 +285,8 @@ let bytes = client.download_file("win-server", "C:\\remote\\file.bin", Path::new
 | **v0.3** | NTLM sealing, credentials security, retry | Done |
 | **v0.4** | Kerberos + Certificate auth | Done |
 | **v0.5** | File transfer, streaming output, proxy | Done |
-| **v1.0** | Stable public API, TLS channel binding, CI/CD | **Current** |
+| **v1.0** | Stable public API, TLS channel binding, CI/CD | Done |
+| **v1.4** | `before_send` request hook | **Current** |
 | **v1.x** | CredSSP stabilization (`--features credssp`) | Planned |
 
 ## Comparison

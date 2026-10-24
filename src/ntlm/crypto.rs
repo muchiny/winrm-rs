@@ -554,9 +554,43 @@ impl Rc4State {
     }
 }
 
+/// Parse exactly `N` bytes from `2 * N` hex digits.
+///
+/// Used by the debug-only environment hooks that pin a random value. Returns
+/// `None` for any other length, for a non-hex byte (including a leading `+`,
+/// which `u8::from_str_radix` would accept) and for non-ASCII text. It never
+/// panics.
+#[cfg(any(test, all(debug_assertions, feature = "__internal")))]
+pub(crate) fn parse_fixed_hex<const N: usize>(s: &str) -> Option<[u8; N]> {
+    if s.len() != N.checked_mul(2)? {
+        return None;
+    }
+    let mut out = [0u8; N];
+    // The length check above leaves no remainder.
+    let (pairs, _) = s.as_bytes().as_chunks::<2>();
+    for (slot, pair) in out.iter_mut().zip(pairs) {
+        if !pair.iter().all(u8::is_ascii_hexdigit) {
+            return None;
+        }
+        let text = std::str::from_utf8(pair).ok()?;
+        *slot = u8::from_str_radix(text, 16).ok()?;
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_fixed_hex_rejects_odd_length_and_non_ascii() {
+        assert_eq!(parse_fixed_hex::<1>("0f"), Some([0x0f]));
+        assert_eq!(parse_fixed_hex::<2>("00fF"), Some([0x00, 0xff]));
+        for bad in ["0", "\u{250}", "\u{250}0", "+f", "zz", "0f0f", ""] {
+            assert_eq!(parse_fixed_hex::<1>(bad), None, "{bad:?}");
+        }
+        assert_eq!(parse_fixed_hex::<2>("0f"), None);
+    }
 
     #[test]
     fn rc4_reinit_equals_new() {

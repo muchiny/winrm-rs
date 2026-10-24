@@ -17,6 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   session key are no longer held across network rounds. The 1.1.1 entry
   overstated what was wiped: the intermediate DER and UTF-16 copies were freed
   without being wiped.
+- The `SSLKEYLOGFILE`, `CREDSSP_DUMP`, `CREDSSP_DEBUG`, `CREDSSP_FIXED_CC`,
+  `CREDSSP_FIXED_RSK` and `CREDSSP_FIXED_NONCE` environment variables are
+  honoured only by debug builds that enable the internal `__internal` feature.
+  Since 1.1.1 they depended on debug assertions alone, which follow the build
+  profile of the application using winrm-rs, so its debug and test builds
+  honoured them. `SSLKEYLOGFILE`, `CREDSSP_DUMP` and `CREDSSP_FIXED_NONCE`
+  exist only with the `credssp` feature. The other three are on the default
+  NTLM path. The fixed-value parsers no longer panic on odd-length or
+  non-ASCII values.
 
 ### Changed
 

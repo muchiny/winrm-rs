@@ -298,21 +298,16 @@ pub(crate) fn create_authenticate_message_full(
     let nt_hash = compute_nt_hash(password);
     let ntlmv2_hash = compute_ntlmv2_hash(&nt_hash, username, domain);
 
-    // CREDSSP_FIXED_CC is a deterministic-test backdoor — only honoured in
-    // debug builds. Production binaries always use the CSPRNG.
-    let client_challenge: [u8; 8] = {
-        #[cfg(debug_assertions)]
-        let from_env = std::env::var("CREDSSP_FIXED_CC").ok().and_then(|s| {
-            let bytes = (0..s.len())
-                .step_by(2)
-                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
-                .collect::<Option<Vec<_>>>()?;
-            bytes.try_into().ok()
-        });
-        #[cfg(not(debug_assertions))]
-        let from_env: Option<[u8; 8]> = None;
-        from_env.unwrap_or_else(rand::random)
-    };
+    // CREDSSP_FIXED_CC pins the client challenge for deterministic tests. It is
+    // honoured only in debug builds with the internal `__internal` feature;
+    // every other build draws from the CSPRNG.
+    #[cfg(all(debug_assertions, feature = "__internal"))]
+    let client_challenge: [u8; 8] = std::env::var("CREDSSP_FIXED_CC")
+        .ok()
+        .and_then(|s| super::crypto::parse_fixed_hex::<8>(&s))
+        .unwrap_or_else(rand::random);
+    #[cfg(not(all(debug_assertions, feature = "__internal")))]
+    let client_challenge: [u8; 8] = rand::random();
     let timestamp = challenge.timestamp.unwrap_or_else(current_windows_filetime);
 
     let target_info = authenticate_target_info(
@@ -338,18 +333,15 @@ pub(crate) fn create_authenticate_message_full(
     // If NEGOTIATE_KEY_EXCH: generate random ExportedSessionKey, encrypt with RC4
     // Otherwise: ExportedSessionKey = KeyExchangeKey
     let (exported_session_key, encrypted_random_session_key) = if with_key_exch {
-        // CREDSSP_FIXED_RSK is a deterministic-test backdoor — only honoured
-        // in debug builds. Production binaries always use the CSPRNG.
+        // CREDSSP_FIXED_RSK pins the session key for deterministic tests. It is
+        // honoured only in debug builds with the internal `__internal` feature;
+        // every other build draws from the CSPRNG.
         let random_key: Zeroizing<[u8; 16]> = {
-            #[cfg(debug_assertions)]
-            let from_env = std::env::var("CREDSSP_FIXED_RSK").ok().and_then(|s| {
-                let bytes = (0..s.len())
-                    .step_by(2)
-                    .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
-                    .collect::<Option<Vec<_>>>()?;
-                bytes.try_into().ok()
-            });
-            #[cfg(not(debug_assertions))]
+            #[cfg(all(debug_assertions, feature = "__internal"))]
+            let from_env = std::env::var("CREDSSP_FIXED_RSK")
+                .ok()
+                .and_then(|s| super::crypto::parse_fixed_hex::<16>(&s));
+            #[cfg(not(all(debug_assertions, feature = "__internal")))]
             let from_env: Option<[u8; 16]> = None;
             match from_env {
                 Some(key) => Zeroizing::new(key),
@@ -470,10 +462,10 @@ pub(crate) fn create_authenticate_message_full(
         let mic = *hmac_md5_secret(exported_session_key.as_slice(), &input);
         msg[mic_pos..mic_pos + 16].copy_from_slice(&mic);
 
-        // CREDSSP_DEBUG dumps every secret in the handshake to stderr —
-        // strictly a debug-build aid. Compiled out of release binaries
-        // entirely so a hostile env var cannot enable it in production.
-        #[cfg(debug_assertions)]
+        // CREDSSP_DEBUG dumps every secret in the handshake to stderr. It is
+        // compiled in only for debug builds with the internal `__internal`
+        // feature.
+        #[cfg(all(debug_assertions, feature = "__internal"))]
         if std::env::var("CREDSSP_DEBUG").is_ok() {
             eprintln!("[CREDSSP_DEBUG] type1 ({}B): {}", type1.len(), hex(type1));
             eprintln!("[CREDSSP_DEBUG] type2 ({}B): {}", type2.len(), hex(type2));
@@ -503,8 +495,9 @@ pub(crate) fn create_authenticate_message_full(
     Ok((msg, exported_session_key))
 }
 
-// Only used inside the CREDSSP_DEBUG block, which is debug-only.
-#[cfg(debug_assertions)]
+// Only used inside the CREDSSP_DEBUG block, which exists only in debug builds
+// with the internal `__internal` feature (and by the unit tests).
+#[cfg(any(test, all(debug_assertions, feature = "__internal")))]
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{:02x}", x)).collect()
 }
@@ -689,6 +682,57 @@ pub(crate) fn workstation() -> &'static [u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Client challenge: NT response + 32 (NTProofStr 16, blob header 16).
+    fn client_challenge_of(type3: &[u8]) -> [u8; 8] {
+        let offset =
+            usize::try_from(u32::from_le_bytes(type3[24..28].try_into().unwrap())).unwrap();
+        type3[offset + 32..offset + 40].try_into().unwrap()
+    }
+
+    // EncryptedRandomSessionKey: security buffer at offset 52.
+    fn encrypted_random_session_key_of(type3: &[u8]) -> [u8; 16] {
+        let offset =
+            usize::try_from(u32::from_le_bytes(type3[56..60].try_into().unwrap())).unwrap();
+        type3[offset..offset + 16].try_into().unwrap()
+    }
+
+    #[test]
+    #[ignore = "child process of fixed_rng_hooks_need_the_internal_feature"]
+    fn fixed_rng_hooks_child() {
+        let challenge =
+            decode_challenge_header(&crate::test_ntlm_server::challenge_header()).unwrap();
+        let a = create_authenticate_message(&challenge, "u", "p", "").unwrap();
+        let b = create_authenticate_message(&challenge, "u", "p", "").unwrap();
+        assert_ne!(client_challenge_of(&a), client_challenge_of(&b));
+        assert_ne!(
+            encrypted_random_session_key_of(&a),
+            encrypted_random_session_key_of(&b)
+        );
+    }
+
+    #[cfg(not(feature = "__internal"))]
+    #[test]
+    fn fixed_rng_hooks_need_the_internal_feature() {
+        #[expect(clippy::disallowed_methods, reason = "test-only subprocess")]
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ntlm::messages::tests::fixed_rng_hooks_child",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env("CREDSSP_FIXED_CC", "0011223344556677")
+            .env("CREDSSP_FIXED_RSK", "00112233445566778899aabbccddeeff")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{stdout}");
+        assert!(
+            stdout.contains("1 passed"),
+            "child test did not run: {stdout}"
+        );
+    }
 
     #[test]
     fn negotiate_message_has_correct_signature() {

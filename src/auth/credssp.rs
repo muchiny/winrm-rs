@@ -43,7 +43,8 @@
 // mechListMIC, v6 pubKeyAuth with client nonce, server pubKeyAuth
 // verification, TSCredentials delegation. A byte-for-byte differential
 // against pyspnego 0.12.1 on identical inputs (fixed client challenge,
-// session key and nonce — see the `CREDSSP_FIXED_*` debug hooks) matches at
+// session key and nonce — see the `CREDSSP_FIXED_*` debug hooks, available in
+// debug builds with the internal `__internal` feature) matches at
 // every step.
 //
 // The last blocker was the SPNEGO mechListMIC RC4 reset: Windows re-keys the
@@ -87,6 +88,23 @@ pub(crate) mod test_server;
 /// CredSSP protocol version (v6 = modern Windows 10+).
 #[cfg(feature = "credssp")]
 const CREDSSP_VERSION: u32 = 6;
+
+/// Export the outer TLS session keys to the file named by `SSLKEYLOGFILE`.
+///
+/// This exists only in debug builds that enable the internal `__internal`
+/// feature, for packet-capture work on the lab. Every other build leaves the
+/// configuration untouched and ignores the variable.
+#[cfg(all(debug_assertions, feature = "__internal"))]
+pub(crate) fn apply_debug_key_log(cfg: &mut rustls::ClientConfig) {
+    if std::env::var_os("SSLKEYLOGFILE").is_some() {
+        cfg.key_log = Arc::new(rustls::KeyLogFile::new());
+    }
+}
+
+/// Leaves the configuration untouched: the `SSLKEYLOGFILE` hook exists only in
+/// debug builds that enable the internal `__internal` feature.
+#[cfg(not(all(debug_assertions, feature = "__internal")))]
+pub(crate) fn apply_debug_key_log(_cfg: &mut rustls::ClientConfig) {}
 
 /// Extract a CredSSP token from a response's WWW-Authenticate headers.
 #[cfg(feature = "credssp")]
@@ -339,26 +357,11 @@ impl CredSspConnection {
                 .map_err(|e| WinrmError::AuthFailed(format!("CredSSP TLS verifier build: {e}")))?
         };
 
-        // The `mut` is only needed when we honour SSLKEYLOGFILE — that is in
-        // debug builds. In release the binding is immutable so rustc doesn't
-        // emit an "unused mut" warning.
-        #[cfg(debug_assertions)]
         let mut outer_config = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(verifier)
             .with_no_client_auth();
-        #[cfg(not(debug_assertions))]
-        let outer_config = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(verifier)
-            .with_no_client_auth();
-        // Honour SSLKEYLOGFILE only in debug builds. In release this env var
-        // is ignored so a hostile environment cannot enable wireshark-style
-        // session-key export of the outer CredSSP TLS leg.
-        #[cfg(debug_assertions)]
-        if std::env::var("SSLKEYLOGFILE").is_ok() {
-            outer_config.key_log = Arc::new(rustls::KeyLogFile::new());
-        }
+        apply_debug_key_log(&mut outer_config);
         let connector = TlsConnector::from(Arc::new(outer_config));
 
         let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
@@ -781,23 +784,16 @@ impl AuthTransport for CredSspAuth {
 
         // Compute pubKeyAuth (v6): SHA256(magic + nonce + SubjectPublicKey).
         //
-        // CREDSSP_FIXED_NONCE is a deterministic-test backdoor — only honoured
-        // in debug builds. Production binaries always use the CSPRNG so a
-        // hostile environment cannot collapse the v6 nonce defence against
-        // cross-protocol relay.
-        let nonce: [u8; 32] = {
-            #[cfg(debug_assertions)]
-            let from_env = std::env::var("CREDSSP_FIXED_NONCE").ok().and_then(|s| {
-                let bytes = (0..s.len())
-                    .step_by(2)
-                    .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
-                    .collect::<Option<Vec<_>>>()?;
-                bytes.try_into().ok()
-            });
-            #[cfg(not(debug_assertions))]
-            let from_env: Option<[u8; 32]> = None;
-            from_env.unwrap_or_else(rand::random)
-        };
+        // CREDSSP_FIXED_NONCE pins the v6 nonce for deterministic tests. It is
+        // honoured only in debug builds with the internal `__internal` feature;
+        // every other build draws from the CSPRNG.
+        #[cfg(all(debug_assertions, feature = "__internal"))]
+        let nonce: [u8; 32] = std::env::var("CREDSSP_FIXED_NONCE")
+            .ok()
+            .and_then(|s| crate::ntlm::crypto::parse_fixed_hex::<32>(&s))
+            .unwrap_or_else(rand::random);
+        #[cfg(not(all(debug_assertions, feature = "__internal")))]
+        let nonce: [u8; 32] = rand::random();
         let client_hash = {
             let mut hasher = Sha256::new();
             hasher.update(b"CredSSP Client-To-Server Binding Hash\0");
@@ -816,9 +812,9 @@ impl AuthTransport for CredSspAuth {
             Some(&nonce),
         );
         // CREDSSP_DUMP dumps every secret (nonce, public key bind, sealed
-        // pubKeyAuth) to stderr — strictly a debug-build aid. Compiled out
-        // of release binaries entirely.
-        #[cfg(debug_assertions)]
+        // pubKeyAuth) to stderr. It is compiled in only for debug builds with
+        // the internal `__internal` feature.
+        #[cfg(all(debug_assertions, feature = "__internal"))]
         if std::env::var("CREDSSP_DUMP").is_ok() {
             let h = |b: &[u8]| b.iter().map(|x| format!("{:02x}", x)).collect::<String>();
             eprintln!(
@@ -855,7 +851,7 @@ impl AuthTransport for CredSspAuth {
                 "CredSSP: NTLM authenticate: expected 401, got {status}"
             )));
         }
-        #[cfg(debug_assertions)]
+        #[cfg(all(debug_assertions, feature = "__internal"))]
         if std::env::var("CREDSSP_DUMP").is_ok() {
             eprintln!("[CREDSSP_DUMP] step6 response status={status} headers={headers:?}");
         }

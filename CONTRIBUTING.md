@@ -72,6 +72,23 @@ We follow [Conventional Commits](https://www.conventionalcommits.org/):
 - Use `tracing` for logging, not `println!`
 - Wrap secrets with `secrecy::SecretString` and zeroize sensitive data
 
+## CredSSP differential against pyspnego
+
+The CredSSP handshake can be compared byte for byte with pyspnego. The debug
+environment hooks it needs (`SSLKEYLOGFILE`, `CREDSSP_DUMP`, `CREDSSP_DEBUG`,
+`CREDSSP_FIXED_CC`, `CREDSSP_FIXED_RSK` and `CREDSSP_FIXED_NONCE`) exist only
+in debug builds that enable the internal `__internal` feature. Pin the random
+values on both sides and dump the messages:
+
+```bash
+CREDSSP_FIXED_CC=… CREDSSP_FIXED_RSK=… CREDSSP_FIXED_NONCE=… CREDSSP_DUMP=1 \
+  cargo test --features credssp,__internal --test integration_real \
+  credssp_run_command_whoami -- --ignored --nocapture
+```
+
+This runs against a lab host. The hooks print secrets: never use them against
+a production host.
+
 ## Reporting bugs
 
 When reporting bugs, please include:

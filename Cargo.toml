@@ -38,7 +38,11 @@ credssp = ["dep:hyper", "dep:hyper-util", "dep:tokio-rustls", "dep:http-body-uti
 # Internal-only. Re-exports crate internals needed by `fuzz/` targets.
 # NOT part of the public API. Do not enable from downstream code — any
 # item gated by this feature may change or disappear without a SemVer
-# bump.
+# bump. With debug assertions it also enables the environment debug hooks
+# `SSLKEYLOGFILE` (CredSSP outer TLS), `CREDSSP_DUMP`, `CREDSSP_DEBUG`,
+# `CREDSSP_FIXED_CC`, `CREDSSP_FIXED_RSK` and `CREDSSP_FIXED_NONCE`, used by
+# `fuzz/` and the pyspnego differential. Cargo features unify: a crate in your
+# build that enables this feature turns those hooks on in your debug builds.
 __internal = []
 
 [dependencies]

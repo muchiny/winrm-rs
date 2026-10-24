@@ -132,6 +132,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Kerberos: the ticket request to the KDC runs on tokio's blocking pool, at
   most 32 at a time per client, and fails with `WinrmError::Timeout` after
   `operation_timeout_secs`. It no longer blocks an async worker thread.
+- Kerberos: the service principal now names the host the connection goes to
+  (IDN, short or octal IPv4 and IPv6-literal endpoints). ASCII host names are
+  unchanged.
 
 ### Documentation
 

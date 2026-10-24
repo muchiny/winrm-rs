@@ -907,7 +907,7 @@ impl HttpTransport {
         } else if self.config.use_tls {
             self.send_kerberos_over_tls(host, url, &body, lane).await
         } else {
-            self.kerberos_auth(url)
+            self.kerberos_auth(url)?
                 .send_authenticated(&self.http, url, body)
                 .await
         }
@@ -923,7 +923,7 @@ impl HttpTransport {
         body: String,
         _lane: Lane,
     ) -> Result<String, WinrmError> {
-        self.kerberos_auth(url)
+        self.kerberos_auth(url)?
             .send_authenticated(&self.http, url, body)
             .await
     }
@@ -943,23 +943,36 @@ impl HttpTransport {
     }
 
     /// Kerberos authenticator for the endpoint `url` (service principal
-    /// `HTTP/<host>`, the host of the URL without its port).
-    fn kerberos_auth(&self, url: &str) -> KerberosAuth {
+    /// `HTTP/<host>`, the host of the URL without its port). The host is the
+    /// one the connection goes to ([`url_host`]); when the host as written in
+    /// `url` is that host up to ASCII case, its spelling is kept, so a
+    /// principal registered in a particular case is still named.
+    fn kerberos_auth(&self, url: &str) -> Result<KerberosAuth, WinrmError> {
         let authority = url
             .split_once("://")
             .map_or(url, |(_, rest)| rest)
             .split('/')
             .next()
             .unwrap_or_default();
-        let host = authority
+        let written = authority
             .rsplit_once(':')
             .map_or(authority, |(host, _)| host);
-        KerberosAuth {
+        let parsed = url_host(url).ok_or_else(|| {
+            WinrmError::AuthFailed(
+                "Kerberos: the endpoint URL has no host to name the service principal".into(),
+            )
+        })?;
+        let host = if written.eq_ignore_ascii_case(&parsed) {
+            written
+        } else {
+            parsed.as_str()
+        };
+        Ok(KerberosAuth {
             service_principal: format!("HTTP/{host}"),
             max_response_bytes: self.max_response_bytes(),
             kdc_timeout: Duration::from_secs(self.config.operation_timeout_secs),
             kdc_slots: Arc::clone(&self.kdc_slots),
-        }
+        })
     }
 
     /// NTLM authenticator for this transport's credentials.
@@ -1220,7 +1233,8 @@ impl HttpTransport {
             }
             #[cfg(feature = "kerberos")]
             AuthMethod::Kerberos => {
-                let (session, closing) = self.kerberos_auth(url).establish(http, cert, url).await?;
+                let (session, closing) =
+                    self.kerberos_auth(url)?.establish(http, cert, url).await?;
                 Ok((Sealer::Kerberos(session), closing))
             }
             _ => Err(WinrmError::AuthFailed(
@@ -1736,24 +1750,27 @@ mod tests {
         assert_eq!(sanitize_host("win01:5985"), "win01");
     }
 
+    /// Hosts `validate_host` accepts.
+    const VALID_HOSTS: &[&str] = &[
+        "win01",
+        "win-01.corp.local",
+        "WIN_01",
+        "10.0.0.5",
+        "10.1",
+        "[::1]",
+        "[fe80::1]",
+        "[::ffff:10.0.0.1]",
+        "bücher.example",
+        // Stripped by sanitize_host, so what is left is a valid name.
+        "win01:5985",
+        "http://win01/wsman",
+        "https://user:pw@win01:5986/wsman",
+        "[fe80::1]:5985",
+    ];
+
     #[test]
     fn validate_host_accepts_names_addresses_and_the_forms_sanitize_strips() {
-        for host in [
-            "win01",
-            "win-01.corp.local",
-            "WIN_01",
-            "10.0.0.5",
-            "10.1",
-            "[::1]",
-            "[fe80::1]",
-            "[::ffff:10.0.0.1]",
-            "bücher.example",
-            // Stripped by sanitize_host, so what is left is a valid name.
-            "win01:5985",
-            "http://win01/wsman",
-            "https://user:pw@win01:5986/wsman",
-            "[fe80::1]:5985",
-        ] {
+        for host in VALID_HOSTS {
             assert!(validate_host(host).is_ok(), "{host:?} should be accepted");
         }
     }
@@ -4120,7 +4137,56 @@ mod tests {
                 "HTTP/srv.corp.example",
             ),
         ] {
-            assert_eq!(transport.kerberos_auth(url).service_principal, spn);
+            assert_eq!(transport.kerberos_auth(url).unwrap().service_principal, spn);
+        }
+    }
+
+    #[test]
+    fn kerberos_spn_uses_the_parsed_endpoint_host() {
+        let transport = basic_transport(5985);
+        for (url, spn) in [
+            (
+                "http://bücher.example:5985/wsman",
+                "HTTP/xn--bcher-kva.example",
+            ),
+            ("http://10.1:5985/wsman", "HTTP/10.0.0.1"),
+            ("http://0x7f.1:5985/wsman", "HTTP/127.0.0.1"),
+            // The configured spelling is kept: it is the parsed host up to
+            // ASCII case.
+            (
+                "http://WIN01.Corp.Local:5985/wsman",
+                "HTTP/WIN01.Corp.Local",
+            ),
+            ("http://[::1]:5985/wsman", "HTTP/::1"),
+            (
+                "https://srv.corp.example:5986/wsman",
+                "HTTP/srv.corp.example",
+            ),
+        ] {
+            assert_eq!(
+                transport.kerberos_auth(url).unwrap().service_principal,
+                spn,
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn kerberos_spn_host_is_the_tls_server_name_host() {
+        let transport = basic_transport(5986);
+        for host in VALID_HOSTS {
+            let url = endpoint_url(true, &sanitize_host(host), 5986);
+            let parsed = url_host(&url).unwrap();
+            let spn = transport.kerberos_auth(&url).unwrap().service_principal;
+            let spn_host = spn.strip_prefix("HTTP/").unwrap();
+            assert!(spn_host.eq_ignore_ascii_case(&parsed), "{url}: {spn}");
+            if let Some(name) = url_server_name(&url) {
+                assert_eq!(
+                    name,
+                    rustls::pki_types::ServerName::try_from(parsed).unwrap(),
+                    "{url}"
+                );
+            }
         }
     }
 

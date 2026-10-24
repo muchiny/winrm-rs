@@ -513,9 +513,12 @@ pub enum AuthMethod {
     ///
     /// Sends raw Kerberos GSS-API tokens (mechanism krb5, RFC 4121; not
     /// SPNEGO-wrapped) under the `Negotiate` HTTP scheme, via the system
-    /// Kerberos library (`cross-krb5`). The service principal is derived as
-    /// `HTTP/<hostname>` from the host string, so connect by name, not by
-    /// address. Credentials come from the ticket cache (`kinit`), not from
+    /// Kerberos library (`cross-krb5`). The service principal is
+    /// `HTTP/<host>`, where host is the endpoint URL's host as parsed
+    /// (IDN in punycode, short/octal IPv4 in dotted-quad form, IPv6 without
+    /// brackets); when the configured host already equals that parsed host up
+    /// to ASCII case, its original spelling is kept. This is the same host the
+    /// connection, the TLS server name and the pin use. Credentials come from the ticket cache (`kinit`), not from
     /// [`WinrmCredentials`].
     ///
     /// What it guarantees: authentication of the client and, through the

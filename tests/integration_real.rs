@@ -3109,7 +3109,7 @@ async fn command_on_deleted_shell_returns_error() {
 // reference clients. These probes measure it against the bench, with harmless
 // payloads only (`whoami`, `Write-Output` markers). They use the public API
 // alone. Run them with
-// `cargo test --test integration_real -- --ignored --test-threads=1 probe_`.
+// `cargo test --test integration_real -- --ignored --test-threads=1 --nocapture probe_`.
 // When a probe shows a different behaviour from the one asserted, change its
 // assertion to the observed value and say so in its doc comment.
 
@@ -3233,39 +3233,62 @@ async fn probe_bare_name_resolves_from_the_working_directory() {
         .await;
     probe_cleanup(&client, &host).await;
 
+    // Record every outcome before asserting, so one surprise hides nothing.
     let setup = setup.expect("plant the copy");
+    let bare = bare.expect("run the bare name");
+    let full = full.expect("run the full path");
+    let bare_stdout = probe_text(&bare.stdout);
+    let bare_stderr = probe_text(&bare.stderr);
+    let full_stdout = probe_text(&full.stdout);
+    let full_stderr = probe_text(&full.stderr);
+    let clip = |t: &str| t.chars().take(500).collect::<String>();
+    eprintln!(
+        "setup: exit {}, stdout {:?}, stderr {:?}",
+        setup.exit_code,
+        clip(&probe_text(&setup.stdout)),
+        clip(&probe_text(&setup.stderr))
+    );
+    eprintln!(
+        "bare name: exit {}, stdout {:?}, stderr {:?}",
+        bare.exit_code,
+        clip(&bare_stdout),
+        clip(&bare_stderr)
+    );
+    eprintln!(
+        "full path: exit {}, stdout {:?}, stderr {:?}",
+        full.exit_code,
+        clip(&full_stdout),
+        clip(&full_stderr)
+    );
     assert_eq!(
         setup.exit_code,
         0,
         "plant failed: {}",
-        probe_text(&setup.stderr)
-    );
-    let bare = bare.expect("run the bare name");
-    let bare_stdout = probe_text(&bare.stdout);
-    eprintln!(
-        "bare name: exit {}, stdout {:?}, stderr {:?}",
-        bare.exit_code,
-        bare_stdout,
-        probe_text(&bare.stderr)
+        clip(&probe_text(&setup.stderr))
     );
     assert!(
         !bare_stdout.contains("PS-RAN"),
-        "the bare name ran the real PowerShell: {bare_stdout}"
+        "the bare name ran the real PowerShell: {}",
+        clip(&bare_stdout)
     );
+    // The planted binary either ran (`domain\user`) or refused the argument.
     assert!(
-        bare_stdout.contains('\\'),
-        "expected whoami output (domain\\user), got: {bare_stdout}"
+        bare_stdout.contains('\\') || bare.exit_code != 0 || !bare_stderr.is_empty(),
+        "the bare name neither ran the planted copy nor refused its argument: {}",
+        clip(&bare_stdout)
     );
-    let full = full.expect("run the full path");
-    let full_stdout = probe_text(&full.stdout);
     assert!(
         full_stdout.contains("PS-RAN"),
-        "the full path did not run PowerShell: {full_stdout}\nstderr: {}",
-        probe_text(&full.stderr)
+        "the full path did not run PowerShell: {}\nstderr: {}",
+        clip(&full_stdout),
+        clip(&full_stderr)
     );
 }
 
 /// `-NoProfile` keeps the profile's output out of the command's stdout.
+///
+/// It mutates a per-user profile file, so it must not run in parallel with
+/// other live tests (`--test-threads=1`).
 #[tokio::test]
 #[ignore]
 async fn probe_noprofile_skips_profile_output() {

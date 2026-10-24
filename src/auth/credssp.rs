@@ -1428,6 +1428,25 @@ mod tests {
         std::future::pending::<()>().await;
     }
 
+    #[test]
+    fn conn_options_derive_from_the_config() {
+        let config = |connect: u64, operation: u64| crate::config::WinrmConfig {
+            connect_timeout_secs: connect,
+            operation_timeout_secs: operation,
+            ..Default::default()
+        };
+        let opts = CredSspConnOptions::from_config(&config(7, 60));
+        assert_eq!(opts.connect_timeout, Duration::from_secs(7));
+        assert_eq!(opts.exchange_timeout, Duration::from_secs(70));
+        assert_eq!(
+            opts.max_response_bytes,
+            crate::transport::max_response_bytes(&config(7, 60))
+        );
+        let opts = CredSspConnOptions::from_config(&config(u64::MAX, u64::MAX));
+        assert_eq!(opts.connect_timeout, Duration::from_secs(u64::MAX));
+        assert_eq!(opts.exchange_timeout, Duration::from_secs(u64::MAX));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn credssp_post_times_out_on_an_unfinished_response_head() {
         let (mut conn, peer) = duplex_conn();

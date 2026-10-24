@@ -21,6 +21,32 @@ pub(crate) fn run_command_deadline_secs(operation_timeout_secs: u64) -> u64 {
     operation_timeout_secs.saturating_mul(2)
 }
 
+/// What a shell runs, fixed when the shell is opened: it picks the SOAP
+/// requests that differ between a `cmd` shell and a PowerShell (PSRP) shell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ShellKind {
+    /// A `cmd` shell (also any shell that is not under the PowerShell
+    /// `ResourceURI`).
+    Cmd,
+    /// A shell under the PowerShell `ResourceURI` (PSRP).
+    Psrp,
+}
+
+impl ShellKind {
+    /// `Psrp` when `uri`, compared in ASCII lowercase, has the path segment
+    /// `/powershell` followed by `/` or by the end of the string; `Cmd`
+    /// otherwise (so `.../powershellish/x` is `Cmd`).
+    pub(crate) fn from_resource_uri(uri: &str) -> Self {
+        const SEGMENT: &str = "/powershell";
+        let lower = uri.to_ascii_lowercase();
+        let is_psrp = lower.match_indices(SEGMENT).any(|(start, matched)| {
+            let after = lower.as_bytes().get(start.saturating_add(matched.len()));
+            matches!(after, None | Some(b'/'))
+        });
+        if is_psrp { Self::Psrp } else { Self::Cmd }
+    }
+}
+
 /// A reusable WinRM shell session.
 ///
 /// Created via [`WinrmClient::open_shell`]. The shell persists across
@@ -40,6 +66,8 @@ pub struct Shell<'a> {
     /// Defaults to `RESOURCE_URI_CMD` for standard command shells;
     /// PSRP shells use `RESOURCE_URI_PSRP`.
     resource_uri: String,
+    /// Whether this is a `cmd` or a PSRP shell, recorded when it was opened.
+    kind: ShellKind,
     stderr_decoders: Mutex<StderrDecoders>,
 }
 
@@ -51,6 +79,7 @@ impl<'a> Shell<'a> {
             shell_id,
             closed: false,
             resource_uri: crate::soap::namespaces::RESOURCE_URI_CMD.to_string(),
+            kind: ShellKind::Cmd,
             stderr_decoders: Mutex::default(),
         }
     }
@@ -60,6 +89,7 @@ impl<'a> Shell<'a> {
         host: String,
         shell_id: String,
         resource_uri: String,
+        kind: ShellKind,
     ) -> Self {
         Self {
             client,
@@ -67,6 +97,7 @@ impl<'a> Shell<'a> {
             shell_id,
             closed: false,
             resource_uri,
+            kind,
             stderr_decoders: Mutex::default(),
         }
     }
@@ -78,7 +109,7 @@ impl<'a> Shell<'a> {
 
     /// Whether this shell lives under the PowerShell `ResourceURI` (PSRP).
     fn is_psrp(&self) -> bool {
-        self.resource_uri.contains("powershell")
+        self.kind == ShellKind::Psrp
     }
 
     /// Execute a command in this shell.
@@ -671,6 +702,7 @@ mod tests {
     use crate::client::WinrmClient;
     use crate::config::{AuthMethod, WinrmConfig, WinrmCredentials};
     use crate::error::WinrmError;
+    use crate::shell::ShellKind;
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -876,6 +908,31 @@ mod tests {
             .await
             .unwrap();
         shell.signal_ctrl_c("CMD-Z").await.unwrap();
+    }
+
+    #[test]
+    fn shell_kind_reads_the_powershell_path_segment() {
+        use ShellKind::{Cmd, Psrp};
+        for (uri, kind) in [
+            (
+                "http://schemas.microsoft.com/powershell/Microsoft.PowerShell",
+                Psrp,
+            ),
+            (
+                "http://schemas.microsoft.com/PowerShell/Microsoft.PowerShell",
+                Psrp,
+            ),
+            ("http://schemas.microsoft.com/powershell/JEA.Endpoint", Psrp),
+            ("http://schemas.microsoft.com/powershell", Psrp),
+            ("http://schemas.microsoft.com/powershell/", Psrp),
+            (
+                "http://schemas.microsoft.com/wbem/wsman/1/windows/shell/cmd",
+                Cmd,
+            ),
+            ("http://example.com/powershellish/x", Cmd),
+        ] {
+            assert_eq!(ShellKind::from_resource_uri(uri), kind, "{uri}");
+        }
     }
 
     #[tokio::test]

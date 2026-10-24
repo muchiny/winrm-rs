@@ -15,7 +15,7 @@ use crate::builder::WinrmClientBuilder;
 use crate::command::{CommandOutput, encode_powershell_command};
 use crate::config::{WinrmConfig, WinrmCredentials};
 use crate::error::WinrmError;
-use crate::shell::Shell;
+use crate::shell::{Shell, ShellKind};
 use crate::soap;
 use crate::transport::HttpTransport;
 
@@ -151,6 +151,7 @@ impl WinrmClient {
             host.to_string(),
             shell_id,
             resource_uri.to_string(),
+            ShellKind::Psrp,
         ))
     }
 
@@ -883,6 +884,7 @@ impl WinrmClient {
             host.to_string(),
             shell_id.to_string(),
             resource_uri.to_string(),
+            ShellKind::from_resource_uri(resource_uri),
         ))
     }
 }
@@ -3721,6 +3723,51 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(shell.shell_id(), "PSRP-SH");
+    }
+
+    /// A shell opened with `open_psrp_shell` is a PSRP shell whatever the case
+    /// of its resource URI: its stop signal is the PSRP one, addressed to that
+    /// URI, never the `cmd` one.
+    #[tokio::test]
+    async fn psrp_shell_with_a_mixed_case_uri_signals_as_psrp() {
+        use wiremock::matchers::body_string_contains;
+
+        let server = MockServer::start().await;
+        let port = server.address().port();
+        let uri = "http://schemas.microsoft.com/PowerShell/Microsoft.PowerShell";
+
+        Mock::given(method("POST"))
+            .and(body_string_contains("<rsp:Signal"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("<s:Envelope><s:Body/></s:Envelope>"),
+            )
+            .expect(1)
+            .named("signal")
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>PSRP-SH</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
+            ))
+            .mount(&server)
+            .await;
+
+        let client = WinrmClient::new(basic_config(port), test_creds()).unwrap();
+        let shell = client
+            .open_psrp_shell("127.0.0.1", "AAAA", uri)
+            .await
+            .unwrap();
+        shell.signal_ctrl_c("SIG-CMD").await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let signal = requests
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .find(|b| b.contains("<rsp:Signal"))
+            .expect("a Signal request was sent");
+        assert!(signal.contains("powershell/signal/crtl_c"), "{signal}");
+        assert!(signal.contains(uri), "{signal}");
+        assert!(!signal.contains("windows/shell/signal/ctrl_c"), "{signal}");
     }
 
     #[tokio::test]

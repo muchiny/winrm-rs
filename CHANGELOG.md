@@ -156,6 +156,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   fires.
 - `open_psrp_shell` XML-escapes `creation_xml_b64` like every other value it
   puts in the envelope (valid base64 is unchanged).
+- A shell opened with `open_psrp_shell` is handled as a PowerShell shell
+  whatever the case of its resource URI; `reconnect_shell` recognises the
+  `/powershell` path segment case-insensitively.
 
 ### Documentation
 

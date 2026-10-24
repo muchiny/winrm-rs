@@ -519,7 +519,7 @@ impl WinrmClient {
 
     /// Longest an expiry clean-up request may take: `operation_timeout_secs`,
     /// at most 10 s, at least 1 s.
-    fn cleanup_budget(&self) -> Duration {
+    pub(crate) fn cleanup_budget(&self) -> Duration {
         Duration::from_secs(self.transport.config().operation_timeout_secs.clamp(1, 10))
     }
 
@@ -921,7 +921,7 @@ async fn best_effort<T>(
 
 /// Await a best-effort `fut` for at most `budget`; a request that outlives it
 /// is an error like any other failed one.
-async fn bounded<T>(
+pub(crate) async fn bounded<T>(
     budget: Duration,
     fut: impl std::future::Future<Output = Result<T, WinrmError>>,
 ) -> Result<T, WinrmError> {
@@ -3949,6 +3949,14 @@ mod tests {
         }
     }
 
+    /// A SOAP fault body with `code` as its Subcode and `reason` as its text.
+    fn soap_fault(code: &str, reason: &str) -> String {
+        format!(
+            r"<s:Envelope><s:Body><s:Fault><s:Code><s:Value>s:Receiver</s:Value><s:Subcode><s:Value>{code}</s:Value></s:Subcode></s:Code>
+                <s:Reason><s:Text>{reason}</s:Text></s:Reason></s:Fault></s:Body></s:Envelope>"
+        )
+    }
+
     #[tokio::test]
     async fn receive_output_other_faults_are_still_errors() {
         for (code, reason) in [
@@ -3959,12 +3967,8 @@ mod tests {
             let server = MockServer::start().await;
             let client =
                 WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
-            let fault = format!(
-                r"<s:Envelope><s:Body><s:Fault><s:Code><s:Value>s:Receiver</s:Value><s:Subcode><s:Value>{code}</s:Value></s:Subcode></s:Code>
-                <s:Reason><s:Text>{reason}</s:Text></s:Reason></s:Fault></s:Body></s:Envelope>"
-            );
             Mock::given(method("POST"))
-                .respond_with(ResponseTemplate::new(500).set_body_string(fault))
+                .respond_with(ResponseTemplate::new(500).set_body_string(soap_fault(code, reason)))
                 .mount(&server)
                 .await;
 
@@ -4149,6 +4153,127 @@ mod tests {
         assert!(
             bodies.last().is_some_and(|b| b.contains("transfer/Delete")),
             "{bodies:?}"
+        );
+        std::fs::remove_file(&local).ok();
+    }
+
+    #[tokio::test]
+    async fn upload_file_deletes_the_shell_when_a_chunk_request_fails() {
+        let server = MockServer::start().await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        mount_ok(&server, SHELL_S1, 1).await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("windows/shell/Command"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_string(soap_fault("w:AccessDenied", "Access is denied.")),
+            )
+            .mount(&server)
+            .await;
+        mount_ok(&server, EMPTY_BODY, u64::MAX).await;
+        let local = unique_temp_path("winrm-rs-test-upload-cmd-fault");
+        std::fs::write(&local, b"data").unwrap();
+
+        let err = client
+            .upload_file("127.0.0.1", &local, "C:\\dest.txt")
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, WinrmError::Soap(crate::error::SoapError::Fault { code, .. }) if code == "w:AccessDenied"),
+            "{err:?}"
+        );
+        let bodies = received_bodies(&server).await;
+        let deletes: Vec<&String> = bodies
+            .iter()
+            .filter(|b| b.contains("transfer/Delete"))
+            .collect();
+        assert_eq!(deletes.len(), 1, "{bodies:?}");
+        assert!(deletes[0].contains(">S1<"), "{}", deletes[0]);
+        std::fs::remove_file(&local).ok();
+    }
+
+    #[tokio::test]
+    async fn upload_file_deletes_the_shell_when_a_chunk_times_out() {
+        let server = MockServer::start().await;
+        let config = WinrmConfig {
+            operation_timeout_secs: 1,
+            ..basic_config(server.address().port())
+        };
+        let client = WinrmClient::new(config, test_creds()).unwrap();
+        mount_ok(&server, SHELL_S1, 1).await;
+        mount_ok(&server, COMMAND_C1, 1).await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("windows/shell/Receive"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(receive_done(b"", b"", 0))
+                    .set_delay(std::time::Duration::from_secs(3)),
+            )
+            .mount(&server)
+            .await;
+        mount_ok(&server, EMPTY_BODY, u64::MAX).await;
+        let local = unique_temp_path("winrm-rs-test-upload-timeout");
+        std::fs::write(&local, b"data").unwrap();
+
+        let err = client
+            .upload_file("127.0.0.1", &local, "C:\\dest.txt")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, WinrmError::Timeout(2)), "{err:?}");
+        let bodies = received_bodies(&server).await;
+        assert_eq!(
+            count_containing(&bodies, "transfer/Delete"),
+            1,
+            "{bodies:?}"
+        );
+        std::fs::remove_file(&local).ok();
+    }
+
+    #[tokio::test]
+    async fn upload_file_cleanup_after_failure_is_bounded() {
+        let server = MockServer::start().await;
+        let config = WinrmConfig {
+            operation_timeout_secs: 1,
+            ..basic_config(server.address().port())
+        };
+        let client = WinrmClient::new(config, test_creds()).unwrap();
+        mount_ok(&server, SHELL_S1, 1).await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("windows/shell/Command"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_string(soap_fault("w:AccessDenied", "Access is denied.")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("transfer/Delete"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(EMPTY_BODY)
+                    .set_delay(std::time::Duration::from_secs(30)),
+            )
+            .mount(&server)
+            .await;
+        let local = unique_temp_path("winrm-rs-test-upload-bounded");
+        std::fs::write(&local, b"data").unwrap();
+
+        let started = std::time::Instant::now();
+        let err = client
+            .upload_file("127.0.0.1", &local, "C:\\dest.txt")
+            .await
+            .unwrap_err();
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            matches!(&err, WinrmError::Soap(_)),
+            "the Command fault is reported, got {err:?}"
         );
         std::fs::remove_file(&local).ok();
     }

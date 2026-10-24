@@ -618,6 +618,102 @@ async fn upload_to_a_long_quoted_path() {
     let _ = std::fs::remove_file(&local_download);
 }
 
+/// A failed upload leaves no shell and no `powershell.exe` behind.
+///
+/// A 4001-byte upload sends three chunks. A `before_send` hook refuses
+/// request number 6, the Receive of chunk 2 (1 Create; chunk 1: 2 Command,
+/// 3 Receive, 4 Signal; chunk 2: 5 Command, 6 Receive); the clean-up Delete
+/// (number 7) is allowed. The open shells and the `powershell.exe` processes,
+/// counted by a separate client, must be back to their earlier values.
+///
+/// Run it alone (`-- --ignored --test-threads=1`): other tests open shells and
+/// start `powershell.exe` on the same host. If an orphaned `powershell.exe`
+/// remains while the shell count is back, the shell Delete does not end the
+/// running command on this host; that is a known limit of this fix, not a
+/// failure of the shell count.
+#[tokio::test]
+#[ignore]
+async fn upload_failure_leaves_no_shell_behind() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let (counter, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    let pass = std::env::var("WINRM_TEST_PASS").expect("set WINRM_TEST_PASS");
+    let port: u16 = std::env::var("WINRM_TEST_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(5985);
+    let sent = Arc::new(AtomicU32::new(0));
+    let hook_sent = Arc::clone(&sent);
+    let client = WinrmClient::builder(WinrmConfig {
+        auth_method: AuthMethod::Basic,
+        port,
+        ..Default::default()
+    })
+    .credentials(WinrmCredentials::new(user, pass, ""))
+    .before_send(move || hook_sent.fetch_add(1, Ordering::SeqCst) + 1 != 6)
+    .build()
+    .expect("build client");
+
+    let count = |script: &'static str| {
+        let counter = &counter;
+        let host = &host;
+        async move {
+            let out = counter
+                .run_powershell(host, script)
+                .await
+                .expect("count query");
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            stdout
+                .trim()
+                .parse::<usize>()
+                .unwrap_or_else(|_| panic!("cannot parse count from {stdout:?}"))
+        }
+    };
+    let shells_script = "@(Get-WSManInstance -ResourceURI shell -Enumerate).Count";
+    let processes_script =
+        "@(Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\").Count";
+    let shells_before = count(shells_script).await;
+    let processes_before = count(processes_script).await;
+
+    let local = std::env::temp_dir().join("winrm_rs_test_leak.bin");
+    std::fs::write(&local, vec![0x5a_u8; 4001]).expect("write local file");
+    let remote_path = "C:\\Users\\Public\\winrm-rs-leak.bin";
+
+    let err = client
+        .upload_file(&host, &local, remote_path)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, WinrmError::Cancelled), "{err:?}");
+
+    let shells_after = count(shells_script).await;
+    let processes_after = count(processes_script).await;
+    eprintln!(
+        "open shells: before={shells_before} after={shells_after}; \
+         powershell.exe: before={processes_before} after={processes_after}"
+    );
+
+    let _ = counter
+        .run_powershell(
+            &host,
+            &format!(
+                "Remove-Item -LiteralPath '{remote_path}' -Force -ErrorAction SilentlyContinue"
+            ),
+        )
+        .await;
+    let _ = std::fs::remove_file(&local);
+
+    assert_eq!(
+        shells_after, shells_before,
+        "shell leaked after failed upload"
+    );
+    assert_eq!(
+        processes_after, processes_before,
+        "powershell.exe left running after failed upload"
+    );
+}
+
 // === CLIXML stderr parsing ===
 
 #[tokio::test]

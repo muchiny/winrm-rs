@@ -145,6 +145,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `upload_file` to a long remote path no longer fails with a command line over
   the Windows limit: the chunk size now shrinks to fit the path.
 - **`upload_file` of an empty local file** now creates or truncates the remote file. It used to send nothing and return `Ok(0)`, leaving any previous remote content in place.
+- `upload_file` deletes its shell when a chunk fails or times out. It used to
+  return without deleting it, so failed uploads used up `MaxShellsPerUser`
+  until the server's idle timeout. The Delete is bounded by
+  `operation_timeout_secs` (at most 10 s).
 
 ### Documentation
 

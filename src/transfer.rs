@@ -12,6 +12,7 @@ use crate::command::{
     CommandOutput, NON_INTERACTIVE_FLAGS, POWERSHELL_EXE, encode_powershell_command,
 };
 use crate::error::WinrmError;
+use crate::shell::Shell;
 
 /// File transfer chunk size (raw bytes before encoding).
 ///
@@ -102,6 +103,16 @@ impl WinrmClient {
     ///
     /// An empty local file creates or truncates the remote file.
     ///
+    /// On error the shell is deleted before the call returns (best effort,
+    /// bounded by `operation_timeout_secs`, at most 10 s), and the remote file
+    /// may be left partly written. A [`before_send`](crate::WinrmClientBuilder::before_send)
+    /// refusal also blocks that Delete, and so can a broken NTLM or Kerberos
+    /// sealed session. Dropping the future (an outer `tokio::time::timeout`, a
+    /// losing `select!` branch) cannot delete the shell: the server keeps it
+    /// until its idle timeout, which
+    /// [`WinrmConfig::idle_timeout_secs`](crate::WinrmConfig::idle_timeout_secs)
+    /// can shorten.
+    ///
     /// Returns the number of bytes uploaded.
     pub async fn upload_file(
         &self,
@@ -119,30 +130,51 @@ impl WinrmClient {
         })?;
 
         let escaped_path = escape_ps_single_quoted(remote_path);
-        let chunk_len = upload_chunk_len(&escaped_path)?;
+        // Checked before the shell is opened: a path too long for any chunk
+        // fails without a round trip.
+        upload_chunk_len(&escaped_path)?;
 
         let shell = self.open_shell(host).await?;
         let total = data.len() as u64;
 
-        for (i, chunk) in chunks_to_send(&data, chunk_len).into_iter().enumerate() {
+        let uploaded = self.upload_chunks(&shell, &data, &escaped_path).await;
+        let closed = match &uploaded {
+            Ok(()) => shell.close().await,
+            Err(_) => crate::client::bounded(self.cleanup_budget(), shell.close()).await,
+        };
+        if let Err(e) = closed {
+            tracing::debug!(error = %e, "failed to delete upload shell (best-effort)");
+        }
+        uploaded.map(|()| total)
+    }
+
+    /// Send `data` to `escaped_path` in `shell`, one command per chunk.
+    ///
+    /// Does not close the shell: [`upload_file`](Self::upload_file) deletes it
+    /// whatever the outcome.
+    async fn upload_chunks(
+        &self,
+        shell: &Shell<'_>,
+        data: &[u8],
+        escaped_path: &str,
+    ) -> Result<(), WinrmError> {
+        let chunk_len = upload_chunk_len(escaped_path)?;
+        for (i, chunk) in chunks_to_send(data, chunk_len).into_iter().enumerate() {
             let b64 = B64.encode(chunk);
 
-            let script = upload_script(&escaped_path, &b64, i == 0);
+            let script = upload_script(escaped_path, &b64, i == 0);
             let encoded = encode_powershell_command(&script);
             let output = shell
                 .run_command(POWERSHELL_EXE, &transfer_args(&encoded))
                 .await?;
             if output.exit_code != 0 {
-                shell.close().await.ok();
                 return Err(WinrmError::Transfer(format!(
                     "upload chunk {i} failed: {}",
                     crate::auth::excerpt(&String::from_utf8_lossy(&output.stderr))
                 )));
             }
         }
-
-        shell.close().await.ok();
-        Ok(total)
+        Ok(())
     }
 
     /// Download a file from a remote Windows host.

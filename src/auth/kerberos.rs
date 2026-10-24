@@ -38,7 +38,7 @@ pub(crate) struct KerberosAuth {
 /// `f` starts once a slot of `slots` is free, and the wait for it counts in
 /// `budget`. The slot stays held until `f` returns: a call that outlives its
 /// budget cannot be cancelled, so it keeps its slot (and its pool thread) and
-/// the number of such calls stays below the size of `slots`. A call that
+/// the number of such calls is at most the size of `slots`. A call that
 /// exceeds `budget` gives `WinrmError::Timeout` (in whole seconds, at least
 /// 1); one that panics gives `WinrmError::AuthFailed`.
 #[cfg(any(feature = "kerberos", test))]

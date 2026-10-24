@@ -970,7 +970,7 @@ impl HttpTransport {
         Ok(KerberosAuth {
             service_principal: format!("HTTP/{host}"),
             max_response_bytes: self.max_response_bytes(),
-            kdc_timeout: Duration::from_secs(self.config.operation_timeout_secs),
+            kdc_timeout: Duration::from_secs(self.config.operation_timeout_secs.max(1)),
             kdc_slots: Arc::clone(&self.kdc_slots),
         })
     }
@@ -4138,6 +4138,24 @@ mod tests {
             ),
         ] {
             assert_eq!(transport.kerberos_auth(url).unwrap().service_principal, spn);
+        }
+    }
+
+    #[test]
+    fn kerberos_kdc_timeout_is_at_least_one_second() {
+        for (secs, expected) in [(0, 1), (1, 1), (5, 5)] {
+            let config = WinrmConfig {
+                auth_method: AuthMethod::Basic,
+                use_tls: false,
+                operation_timeout_secs: secs,
+                ..Default::default()
+            };
+            let transport =
+                HttpTransport::new(config, WinrmCredentials::new("admin", "pass", "")).unwrap();
+            let auth = transport
+                .kerberos_auth("http://dc.winrm.test:5985/wsman")
+                .unwrap();
+            assert_eq!(auth.kdc_timeout, Duration::from_secs(expected), "{secs}");
         }
     }
 

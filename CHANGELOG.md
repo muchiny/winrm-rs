@@ -159,6 +159,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - A shell opened with `open_psrp_shell` is handled as a PowerShell shell
   whatever the case of its resource URI; `reconnect_shell` recognises the
   `/powershell` path segment case-insensitively.
+- Kerberos: a zero `operation_timeout_secs` no longer makes every ticket
+  request time out; the KDC timeout is at least one second.
 
 ### Documentation
 

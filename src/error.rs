@@ -35,7 +35,7 @@ pub enum WinrmError {
     ///   sealing, NTLM over HTTPS, Kerberos over HTTPS) and waited for one of
     ///   the 32 connection slots of the client longer than one request may
     ///   take reports `operation_timeout_secs + 10`; nothing was sent.
-    /// - a Kerberos ticket request (the KDC exchange inside `initiate`) that
+    /// - a Kerberos ticket request (the KDC exchange) that
     ///   runs longer than `operation_timeout_secs` reports
     ///   `operation_timeout_secs` (at least 1).
     /// - with `AuthMethod::CredSsp`, a TCP connect plus TLS handshake longer

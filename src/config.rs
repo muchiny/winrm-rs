@@ -133,9 +133,27 @@ pub struct WinrmConfig {
     ///
     /// Prevents a malicious or runaway server from exhausting client memory
     /// by streaming an unbounded base64 chunk sequence. When the cap is
-    /// reached, the operation returns [`crate::error::WinrmError::Transfer`]
-    /// and the shell is best-effort closed. Set to `None` to disable the
-    /// cap (pre-1.1 behaviour).
+    /// reached the call returns [`crate::error::WinrmError::Transfer`]:
+    /// - [`WinrmClient::run_command`](crate::WinrmClient::run_command),
+    ///   [`run_powershell`](crate::WinrmClient::run_powershell) and their
+    ///   `_with_timeout` / `_with_cancel` variants (so `download_file` too)
+    ///   send the command a terminate signal and delete their shell, both
+    ///   best effort;
+    /// - [`Shell::run_command`](crate::Shell::run_command) and
+    ///   [`Shell::run_powershell`](crate::Shell::run_powershell) (so
+    ///   `upload_file` too) only return the error: the command keeps running
+    ///   in the shell until [`Shell::close`](crate::Shell::close). To be able
+    ///   to stop it, start it with
+    ///   [`Shell::start_command`](crate::Shell::start_command), which returns
+    ///   its id for [`Shell::signal_ctrl_c`](crate::Shell::signal_ctrl_c) or
+    ///   [`WinrmClient::signal_terminate`](crate::WinrmClient::signal_terminate);
+    /// - [`WinrmClient::run_wql`](crate::WinrmClient::run_wql) stops pulling
+    ///   pages (the server keeps the enumeration until it expires).
+    ///
+    /// Loops over [`Shell::receive_next`](crate::Shell::receive_next) are
+    /// driven by the caller and are not capped: count the bytes yourself.
+    ///
+    /// Set to `None` to disable the cap (pre-1.1 behaviour).
     ///
     /// The cap counts bytes as received, before PowerShell CLIXML on stderr
     /// is decoded, so it also bounds stderr still buffered by the decoder.

@@ -35,6 +35,9 @@ PSRP callers can now stop a running pipeline.
   after 2^32 refused calls, and is now a tested doctest.
 - `Shell` rustdoc says that dropping a shell does not delete it on the server;
   call `Shell::close`.
+- `WinrmConfig::max_output_bytes` says what each API does when the cap is
+  reached: `Shell::run_command` returns the error and leaves the command
+  running.
 
 ## [1.4.0] - 2026-10-22
 

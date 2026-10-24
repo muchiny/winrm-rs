@@ -120,6 +120,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   client, instead of 32 per client. Signal and Delete requests get 2 more per
   host of their own, so clean-up never waits behind data requests. For fleets,
   one client per host is still the recommendation.
+- Opening an authenticated connection (the NTLM or Kerberos handshake before a
+  sealed request, or before Kerberos over HTTPS) is bounded as a whole by
+  `operation_timeout_secs + 10` seconds, not per round trip. A slower
+  handshake fails with `WinrmError::Timeout`, and nothing has been sent at
+  that point.
 
 ### Documentation
 

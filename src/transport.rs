@@ -1123,38 +1123,49 @@ impl HttpTransport {
     /// Kerberos-over-HTTPS probe and AP-REQ legitimately use two
     /// connections) and is locked once it has completed: from then on the
     /// client opens no new connection.
+    ///
+    /// The whole handshake, retry included, is bounded by `budget`: a slower
+    /// one fails with [`WinrmError::Timeout`], and nothing has been sent at
+    /// that point. A Kerberos context creation already in progress is not
+    /// interrupted: it is a synchronous library call.
     async fn open_authenticated_conn(
         &self,
         host: &str,
         url: &str,
+        budget: Duration,
     ) -> Result<Box<AuthConn>, WinrmError> {
         let method = &self.config.auth_method;
-        for _ in 0..2 {
-            let mut conn = self.new_conn(host)?;
-            let (session, closing) = self
-                .sealing_handshake(&conn.http, conn.cert.as_ref(), url)
-                .await?;
-            if closing {
-                debug!(
-                    method = method_name(method),
-                    "server closed the connection after authentication; authenticating a new one"
-                );
-                continue;
+        let handshake = async {
+            for _ in 0..2 {
+                let mut conn = self.new_conn(host)?;
+                let (session, closing) = self
+                    .sealing_handshake(&conn.http, conn.cert.as_ref(), url)
+                    .await?;
+                if closing {
+                    debug!(
+                        method = method_name(method),
+                        "server closed the connection after authentication; authenticating a new one"
+                    );
+                    continue;
+                }
+                if let Some(gate) = &conn.gate {
+                    gate.lock();
+                }
+                conn.session = Some(session);
+                return Ok(conn);
             }
-            if let Some(gate) = &conn.gate {
-                gate.lock();
-            }
-            conn.session = Some(session);
-            return Ok(conn);
-        }
-        Err(method_error(
-            method,
-            format!(
-                "the server closes the connection right after {} authentication, so no \
-                 message can use the session bound to it",
-                method_name(method)
-            ),
-        ))
+            Err(method_error(
+                method,
+                format!(
+                    "the server closes the connection right after {} authentication, so no \
+                     message can use the session bound to it",
+                    method_name(method)
+                ),
+            ))
+        };
+        tokio::time::timeout(budget, handshake)
+            .await
+            .unwrap_or_else(|_| Err(WinrmError::Timeout(budget.as_secs())))
     }
 
     /// The handshake of [`Self::open_authenticated_conn`] on the dedicated client
@@ -1292,7 +1303,9 @@ impl HttpTransport {
         url: &str,
         sealed: bool,
     ) -> Result<Box<AuthConn>, WinrmError> {
-        let mut conn = self.open_authenticated_conn(host, url).await?;
+        let mut conn = self
+            .open_authenticated_conn(host, url, self.request_budget())
+            .await?;
         if !sealed {
             conn.session = None;
         }
@@ -4610,6 +4623,46 @@ mod tests {
         assert_eq!(reply, "<ok/>");
         let seen = seen.lock().unwrap().clone();
         assert_eq!(type3_channel_bindings(&seen[0]), Some(cbt_of(EC_CERT_PEM)));
+    }
+
+    /// A server that accepts the connection and never answers leaves the
+    /// handshake, retry included, to the budget it was given.
+    #[tokio::test]
+    async fn sealing_handshake_is_bounded_as_a_whole() {
+        // Accepted by the kernel backlog, never answered.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = WinrmConfig {
+            auth_method: AuthMethod::Ntlm,
+            port,
+            operation_timeout_secs: 5,
+            ..Default::default()
+        };
+        let transport = HttpTransport::new(config, WinrmCredentials::new(USER, PASS, "")).unwrap();
+        let url = transport.endpoint("127.0.0.1");
+        let start = std::time::Instant::now();
+        let err = transport
+            .open_authenticated_conn("127.0.0.1", &url, Duration::from_secs(1))
+            .await
+            .err()
+            .expect("stalled handshake");
+        assert!(matches!(err, WinrmError::Timeout(1)), "{err:?}");
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            start.elapsed()
+        );
+        drop(listener);
+    }
+
+    #[test]
+    fn request_budget_is_the_operation_timeout_plus_10_seconds() {
+        let config = WinrmConfig {
+            operation_timeout_secs: 5,
+            ..Default::default()
+        };
+        let transport = HttpTransport::new(config, WinrmCredentials::new("u", "p", "")).unwrap();
+        assert_eq!(transport.request_budget(), Duration::from_secs(15));
     }
 
     /// A Type 3 answered with `Connection: close` ends the connection the

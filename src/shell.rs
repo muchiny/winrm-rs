@@ -68,6 +68,11 @@ impl<'a> Shell<'a> {
         &self.resource_uri
     }
 
+    /// Whether this shell lives under the PowerShell `ResourceURI` (PSRP).
+    fn is_psrp(&self) -> bool {
+        self.resource_uri.contains("powershell")
+    }
+
     /// Execute a command in this shell.
     ///
     /// Runs the command, polls for output until completion or timeout, and
@@ -241,16 +246,34 @@ impl<'a> Shell<'a> {
     /// Send Ctrl+C signal to a running command.
     ///
     /// Requests graceful interruption of the command identified by `command_id`.
+    ///
+    /// On a PSRP shell (one opened under the PowerShell `ResourceURI`) this is
+    /// the PSRP stop signal of MS-PSRP 3.1.5.3.9, addressed to that
+    /// `ResourceURI`: the server then stops the pipeline and reports
+    /// `PipelineState` `Stopped`. The plain `cmd` signal used to be sent
+    /// there, which the server answers with a fault because no such shell
+    /// exists under `cmd`.
     pub async fn signal_ctrl_c(&self, command_id: &str) -> Result<(), WinrmError> {
         let endpoint = self.client.endpoint(&self.host);
         let config = self.client.config();
-        let envelope = soap::signal_ctrl_c_request(
-            &endpoint,
-            &self.shell_id,
-            command_id,
-            config.operation_timeout_secs,
-            config.max_envelope_size,
-        );
+        let envelope = if self.is_psrp() {
+            soap::signal_psrp_ctrl_c_request(
+                &endpoint,
+                &self.shell_id,
+                command_id,
+                &self.resource_uri,
+                config.operation_timeout_secs,
+                config.max_envelope_size,
+            )
+        } else {
+            soap::signal_ctrl_c_request(
+                &endpoint,
+                &self.shell_id,
+                command_id,
+                config.operation_timeout_secs,
+                config.max_envelope_size,
+            )
+        };
         self.client.send_soap_raw(&self.host, envelope).await?;
         Ok(())
     }
@@ -347,8 +370,7 @@ impl<'a> Shell<'a> {
     pub async fn receive_next(&self, command_id: &str) -> Result<ReceiveOutput, WinrmError> {
         let endpoint = self.client.endpoint(&self.host);
         let config = self.client.config();
-        let is_psrp = self.resource_uri.contains("powershell");
-        let envelope = if is_psrp {
+        let envelope = if self.is_psrp() {
             // PSRP: stdout only, optional CommandId.
             let cid = if command_id.is_empty() || command_id == self.shell_id {
                 None
@@ -773,6 +795,49 @@ mod tests {
         assert_eq!(shell.shell_id(), "SH-EXISTING");
         // Close cleanly so the drop warning doesn't fire.
         shell.close().await.unwrap();
+    }
+
+    /// A PSRP shell's stop signal is addressed to the PowerShell
+    /// `ResourceURI` with the PSRP code (it used to carry the `cmd` ones, which
+    /// the server answers with "shell not found"); a `cmd` shell keeps its own.
+    #[tokio::test]
+    async fn signal_ctrl_c_on_a_psrp_shell_uses_the_psrp_uri_and_code() {
+        use wiremock::matchers::body_string_contains;
+
+        let server = MockServer::start().await;
+        let port = server.address().port();
+        Mock::given(method("POST"))
+            .and(body_string_contains("<rsp:Signal"))
+            .and(body_string_contains(
+                "<rsp:Code>http://schemas.microsoft.com/powershell/signal/crtl_c</rsp:Code>",
+            ))
+            .and(body_string_contains(
+                crate::soap::namespaces::RESOURCE_URI_PSRP,
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("<s:Envelope><s:Body/></s:Envelope>"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Anything else (the reconnect) is accepted.
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("<s:Envelope><s:Body/></s:Envelope>"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = WinrmClient::new(basic_config(port), test_creds()).unwrap();
+        let shell = client
+            .reconnect_shell(
+                "127.0.0.1",
+                "PSRP-SHELL",
+                crate::soap::namespaces::RESOURCE_URI_PSRP,
+            )
+            .await
+            .unwrap();
+        shell.signal_ctrl_c("CMD-Z").await.unwrap();
     }
 
     #[tokio::test]

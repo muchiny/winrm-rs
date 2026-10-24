@@ -44,6 +44,12 @@ pub(crate) const SIGNAL_TERMINATE: &str =
 pub(crate) const SIGNAL_CTRL_C: &str =
     "http://schemas.microsoft.com/wbem/wsman/1/windows/shell/signal/ctrl_c";
 
+/// Signal code: stop a PSRP pipeline (MS-PSRP 3.1.5.3.9). The protocol spells
+/// it `crtl_c`; PowerShell's WSMan plugin runs `StopCommand` for this code and
+/// merely closes the command for any other (`WSManPlugin.cs`,
+/// `PerformWSManPluginSignal`).
+pub(crate) const SIGNAL_PSRP_CTRL_C: &str = "http://schemas.microsoft.com/powershell/signal/crtl_c";
+
 /// Command state indicating completion.
 pub(crate) const COMMAND_STATE_DONE: &str =
     "http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Done";

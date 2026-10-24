@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`Shell::signal_ctrl_c` stops a PSRP pipeline.** On a PSRP shell the Signal
+  carried the `cmd` `ResourceURI` and the `cmd` Ctrl+C code, so the server
+  answered `InvalidSelectors` ("the shell was not found") and the pipeline
+  went on running. It now goes to the shell's PowerShell `ResourceURI` with
+  the PSRP code of MS-PSRP 3.1.5.3.9 (`.../powershell/signal/crtl_c`, spelled
+  that way by the protocol), the only one for which PowerShell's WSMan plugin
+  stops a command instead of closing it. A `cmd` shell is unchanged. Checked
+  live against Windows Server 2025: the signal is accepted and the pipeline
+  stops. Found from psrp-rs (muchiny/psrp-rs#35).
+
 ## [1.4.0] - 2026-10-22
 
 Adds a hook to meter or refuse each request before it is sent.

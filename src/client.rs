@@ -2435,7 +2435,11 @@ mod tests {
         let encoded = body
             .find("<rsp:Arguments>-EncodedCommand</rsp:Arguments>")
             .expect("-EncodedCommand");
-        assert!(exe < profile && profile < interactive && interactive < encoded);
+        assert!(
+            exe < profile && profile < interactive && interactive < encoded,
+            "offsets of the command, -NoProfile, -NonInteractive and -EncodedCommand must \
+             increase: {exe} {profile} {interactive} {encoded}"
+        );
     }
 
     #[tokio::test]
@@ -4430,7 +4434,12 @@ mod tests {
         // Called directly: run_command fails in create_shell and never gets here.
         assert!(
             client
-                .execute_command(h, "SHELL-1", "cmd-SECRET-G", &["arg-SECRET-H"])
+                .execute_command(
+                    h,
+                    "SHELL-1",
+                    "cmd-SECRET-G",
+                    &["arg-SECRET-H", "arg-SECRET-H2", "arg-SECRET-H3"],
+                )
                 .await
                 .is_err()
         );
@@ -4455,6 +4464,8 @@ mod tests {
         assert!(logs_contain("sending WinRM SOAP request"));
         assert!(logs_contain("args_len=1"));
         assert!(logs_contain("args_len=2"));
+        // Only `execute_command` above has three arguments.
+        assert!(logs_contain("args_len=3"));
         assert!(logs_contain("script_len=23"));
         assert!(logs_contain("query_len=29"));
     }

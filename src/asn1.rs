@@ -973,6 +973,28 @@ mod tests {
         );
     }
 
+    /// The decoder reports the state it reads; the caller refuses anything but
+    /// accept-completed and accepts an absent state (RFC 4178 §4.2.2).
+    #[test]
+    fn decode_spnego_final_reports_other_states_and_an_absent_state() {
+        let mic = [0x5a_u8; 16];
+        for state in [1_u8, 3] {
+            let mut tok = vec![0xa1, 0x1b, 0x30, 0x19, 0xa0, 0x03, 0x0a, 0x01, state];
+            tok.extend_from_slice(&[0xa3, 0x12, 0x04, 0x10]);
+            tok.extend_from_slice(&mic);
+            let (got, got_mic) = decode_spnego_final(&tok).unwrap();
+            assert_eq!(got, Some(state));
+            assert_ne!(got, Some(NEG_STATE_ACCEPT_COMPLETED));
+            assert_eq!(got_mic.as_deref(), Some(&mic[..]));
+        }
+        let mut absent = vec![0xa1, 0x16, 0x30, 0x14, 0xa3, 0x12, 0x04, 0x10];
+        absent.extend_from_slice(&mic);
+        assert_eq!(
+            decode_spnego_final(&absent).unwrap(),
+            (None, Some(mic.to_vec()))
+        );
+    }
+
     #[test]
     fn decode_spnego_final_rejects_malformed_neg_state() {
         // negState as INTEGER, then as a two-byte ENUMERATED.

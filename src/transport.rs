@@ -3884,6 +3884,8 @@ mod tests {
         let lm_len = u16::from_le_bytes([type3[12], type3[13]]) as usize;
         let lm_off = u32::from_le_bytes(type3[16..20].try_into().unwrap()) as usize;
         assert_eq!(lm_len, 24);
+        // 64-byte header, 8-byte version, 16-byte MIC.
+        assert_eq!(lm_off, 88);
         assert!(type3[lm_off..lm_off + 24].iter().all(|&b| b == 0));
         // MIC (bytes 72..88 after the version field) is non-zero.
         assert!(type3[72..88].iter().any(|&b| b != 0));
@@ -4569,6 +4571,20 @@ mod tests {
         .await;
         assert!(waited.is_err(), "the wait should still be pending");
         drop(held);
+        assert_eq!(transport.host_slots(&host).0.available_permits(), 32);
+        assert_eq!(transport.all_slots.available_permits(), 128);
+        // A slot can still be taken, and taking one costs exactly one permit
+        // of each kind.
+        let slot = tokio::time::timeout(
+            Duration::from_millis(100),
+            transport.conn_slot(&host, Lane::Data),
+        )
+        .await
+        .expect("a slot is available after the cancelled wait")
+        .unwrap();
+        assert_eq!(transport.host_slots(&host).0.available_permits(), 31);
+        assert_eq!(transport.all_slots.available_permits(), 127);
+        drop(slot);
         assert_eq!(transport.host_slots(&host).0.available_permits(), 32);
         assert_eq!(transport.all_slots.available_permits(), 128);
     }

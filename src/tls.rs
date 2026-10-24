@@ -978,6 +978,14 @@ mod tests {
         assert!(!looks_like_key_material(&"A".repeat(64)));
         // 0x30 0x82 0x01 0x00: a DER SEQUENCE.
         assert!(looks_like_key_material(&format!("MIIB{}", "A".repeat(60))));
+        // One character short of the 64-byte minimum: not looked at.
+        assert!(!looks_like_key_material(&format!("MIIB{}", "A".repeat(59))));
+        // The first 16 characters decode to `-----BEGIN P`: a PEM armor line
+        // encoded once more.
+        assert!(looks_like_key_material(&format!(
+            "LS0tLS1CRUdJTiBQ{}",
+            "AB/".repeat(20)
+        )));
         // Long dotless paths made only of base64-alphabet characters stay paths.
         assert!(!looks_like_key_material(
             "/opt/winrm/keys/abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -997,12 +1005,15 @@ mod tests {
         assert!(!looks_like_key_material(""));
         assert!(!looks_like_key_material("/etc/winrm/clé-client.pem"));
         assert!(!looks_like_key_material(&"é".repeat(40)));
-        // Multi-byte characters straddling the 16-byte mark of a long value.
+        // A multi-byte character is outside the base64 alphabet, so the value
+        // is refused before the 16-character cut is taken; no component is
+        // over 255 bytes either.
         assert!(!looks_like_key_material(&format!(
             "{}é{}",
             "A".repeat(15),
             "A".repeat(60)
         )));
+        // 400 bytes in one component: key material by the length rule.
         assert!(looks_like_key_material(&"é".repeat(200)));
         // A very long value is a component over 255 bytes: key material.
         assert!(looks_like_key_material(&"A".repeat(1_000_000)));

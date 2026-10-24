@@ -1557,6 +1557,13 @@ mod tests {
                 .port,
             443
         );
+        // Without a port the scheme's default is used.
+        let https = CredSspEndpoint::parse("https://host.example/wsman").unwrap();
+        assert_eq!(https.port, 443);
+        assert_eq!(https.host_header, "host.example:443");
+        let http = CredSspEndpoint::parse("http://host.example/wsman").unwrap();
+        assert_eq!(http.port, 80);
+        assert_eq!(http.host_header, "host.example:80");
     }
 
     #[test]

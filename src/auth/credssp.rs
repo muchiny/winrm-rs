@@ -251,8 +251,43 @@ impl OpenSslMemTls {
     }
 }
 
+/// The TLS contexts every CredSSP connection of a client uses.
+///
+/// Built once when the client is built, so the system CA bundle is read once
+/// and not for every request.
 #[cfg(feature = "credssp")]
-fn build_inner_openssl_tls() -> Result<OpenSslMemTls, WinrmError> {
+pub(crate) struct CredSspTls {
+    /// Outer HTTPS leg (rustls).
+    pub(crate) outer: Arc<rustls::ClientConfig>,
+    /// Inner TLS leg that carries the `TSRequest` messages (OpenSSL).
+    pub(crate) inner: openssl::ssl::SslConnector,
+}
+
+#[cfg(feature = "credssp")]
+impl CredSspTls {
+    /// `outer` is a copy of `base` with no ALPN protocols and with session
+    /// resumption off, plus the debug-build `SSLKEYLOGFILE` key log. The
+    /// resumption store of `base` is shared with the HTTP client, so keeping
+    /// it would let sessions resume and change the key share of the next
+    /// hello; every connection is fully verified instead. TLS 1.2 still
+    /// offers session ids and tickets, so the extension set of the hello is
+    /// unchanged. `inner` is [`inner_openssl_connector`].
+    pub(crate) fn new(base: &rustls::ClientConfig) -> Result<Self, WinrmError> {
+        let mut outer = base.clone();
+        outer.alpn_protocols.clear();
+        outer.resumption = rustls::client::Resumption::disabled()
+            .tls12_resumption(rustls::client::Tls12Resumption::SessionIdOrTickets);
+        apply_debug_key_log(&mut outer);
+        Ok(Self {
+            outer: Arc::new(outer),
+            inner: inner_openssl_connector()?,
+        })
+    }
+}
+
+/// The OpenSSL context of the inner TLS leg: no verification, TLS 1.2 only.
+#[cfg(feature = "credssp")]
+fn inner_openssl_connector() -> Result<openssl::ssl::SslConnector, WinrmError> {
     use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
 
     let mut builder = SslConnector::builder(SslMethod::tls_client())
@@ -266,8 +301,8 @@ fn build_inner_openssl_tls() -> Result<OpenSslMemTls, WinrmError> {
     // NTLM session key. It does not identify the server, and it binds
     // nothing to the outer HTTPS connection, which carries the SOAP bodies.
     // Server identity and body integrity come only from the outer TLS
-    // verifier (`CredSspConnection::connect`); under `accept_invalid_certs`
-    // there is none.
+    // verifier (`CredSspTls::outer`); under `accept_invalid_certs` there is
+    // none.
     builder.set_verify(SslVerifyMode::NONE);
     // Force TLS 1.2 to match what Microsoft CredSSP server expects.
     builder
@@ -276,8 +311,14 @@ fn build_inner_openssl_tls() -> Result<OpenSslMemTls, WinrmError> {
     builder
         .set_max_proto_version(Some(openssl::ssl::SslVersion::TLS1_2))
         .map_err(|e| WinrmError::AuthFailed(format!("max ver: {e}")))?;
-    let connector = builder.build();
+    Ok(builder.build())
+}
 
+/// One inner TLS session over a fresh in-memory BIO, from the cached context.
+#[cfg(feature = "credssp")]
+fn build_inner_openssl_tls(
+    connector: &openssl::ssl::SslConnector,
+) -> Result<OpenSslMemTls, WinrmError> {
     let mem_bio = MemBio {
         incoming: std::collections::VecDeque::new(),
         outgoing: Vec::new(),
@@ -354,54 +395,29 @@ impl CredSspConnection {
     /// The TCP connect and the outer TLS handshake share one deadline,
     /// `opts.connect_timeout`; its expiry is [`WinrmError::Timeout`].
     ///
-    /// `accept_invalid_certs = true` disables outer TLS verification (test
-    /// use only). Nothing inside CredSSP replaces it: the inner TLS is not
+    /// The outer TLS leg uses `tls.outer`, which carries the verifier of the
+    /// client. Nothing inside CredSSP replaces it: the inner TLS is not
     /// verified (MS-CSSP 1.3) and `pubKeyAuth` binds only the inner TLS key.
     async fn connect(
         endpoint: &CredSspEndpoint,
-        accept_invalid_certs: bool,
+        tls: &CredSspTls,
         opts: CredSspConnOptions,
     ) -> Result<Self, WinrmError> {
         let connect_timeout = opts.connect_timeout;
-        tokio::time::timeout(
-            connect_timeout,
-            Self::connect_inner(endpoint, accept_invalid_certs, opts),
-        )
-        .await
-        .map_err(|_| WinrmError::Timeout(connect_timeout.as_secs()))?
+        tokio::time::timeout(connect_timeout, Self::connect_inner(endpoint, tls, opts))
+            .await
+            .map_err(|_| WinrmError::Timeout(connect_timeout.as_secs()))?
     }
 
     async fn connect_inner(
         endpoint: &CredSspEndpoint,
-        accept_invalid_certs: bool,
+        tls: &CredSspTls,
         opts: CredSspConnOptions,
     ) -> Result<Self, WinrmError> {
         use tokio::net::TcpStream;
         use tokio_rustls::TlsConnector;
 
-        let _ = rustls::crypto::ring::default_provider().install_default();
-
-        let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> = if accept_invalid_certs
-        {
-            tracing::warn!(
-                "CredSSP outer TLS verification disabled (accept_invalid_certs=true) \
-                     — credentials transit a MITM-vulnerable channel; do not use in production"
-            );
-            Arc::new(crate::tls::NoVerifier)
-        } else {
-            let root_store =
-                rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            rustls::client::WebPkiServerVerifier::builder(Arc::new(root_store))
-                .build()
-                .map_err(|e| WinrmError::AuthFailed(format!("CredSSP TLS verifier build: {e}")))?
-        };
-
-        let mut outer_config = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(verifier)
-            .with_no_client_auth();
-        apply_debug_key_log(&mut outer_config);
-        let connector = TlsConnector::from(Arc::new(outer_config));
+        let connector = TlsConnector::from(Arc::clone(&tls.outer));
 
         let tcp = TcpStream::connect((endpoint.host.as_str(), endpoint.port))
             .await
@@ -680,10 +696,10 @@ pub(crate) struct CredSspAuth {
     pub(crate) username: String,
     pub(crate) password: Zeroizing<String>,
     pub(crate) domain: String,
-    /// Mirrors `WinrmConfig.accept_invalid_certs`. When true, the outer TLS
+    /// The TLS contexts of the client. With `accept_invalid_certs` the outer
     /// channel skips chain validation, and nothing in CredSSP authenticates
     /// the server instead (`pubKeyAuth` binds only the inner TLS key).
-    pub(crate) accept_invalid_certs: bool,
+    pub(crate) tls: Arc<CredSspTls>,
     /// Response size and timeout limits of the connection.
     pub(crate) opts: CredSspConnOptions,
 }
@@ -701,9 +717,7 @@ impl AuthTransport for CredSspAuth {
         // reqwest entirely and drive raw HTTP/1.1 over a single tokio_rustls
         // TlsStream. See CredSspConnection above.
         let endpoint = CredSspEndpoint::parse(url)?;
-        let mut conn =
-            CredSspConnection::connect(&endpoint, self.accept_invalid_certs, self.opts.clone())
-                .await?;
+        let mut conn = CredSspConnection::connect(&endpoint, &self.tls, self.opts.clone()).await?;
 
         // Pywinrm sends the SOAP body in every CredSSP round (which is what
         // Microsoft HTTPAPI on the WSMAN listener expects). The same body is
@@ -718,7 +732,7 @@ impl AuthTransport for CredSspAuth {
         // === Step 1: Initialize the INNER TLS connection (memory-only) ===
         // Use OpenSSL via in-memory BIO — pyspnego does the same and rustls
         // produces a TLS state Microsoft's CredSSP server silently rejects.
-        let mut inner_tls = build_inner_openssl_tls()?;
+        let mut inner_tls = build_inner_openssl_tls(&self.tls.inner)?;
         // Drive the TLS handshake one step to produce ClientHello.
         inner_tls.handshake_step()?;
 
@@ -1293,14 +1307,14 @@ mod tests {
 
     #[test]
     fn openssl_inner_tls_peer_cert_before_handshake_errors() {
-        let tls = build_inner_openssl_tls().expect("build inner tls");
+        let tls = build_inner_openssl_tls(&test_tls().inner).expect("build inner tls");
         // No handshake completed → no peer cert available
         assert!(tls.peer_cert_der().is_err());
     }
 
     #[test]
     fn openssl_inner_tls_feed_incoming_then_drain_clears_outgoing() {
-        let mut tls = build_inner_openssl_tls().expect("build inner tls");
+        let mut tls = build_inner_openssl_tls(&test_tls().inner).expect("build inner tls");
         let _ = tls.handshake_step();
         let first = tls.drain_outgoing();
         assert!(!first.is_empty());
@@ -1312,7 +1326,7 @@ mod tests {
 
     #[test]
     fn openssl_inner_tls_handshake_starts() {
-        let mut tls = build_inner_openssl_tls().expect("build inner tls");
+        let mut tls = build_inner_openssl_tls(&test_tls().inner).expect("build inner tls");
         let _ = tls.handshake_step();
         let bytes = tls.drain_outgoing();
         assert!(!bytes.is_empty(), "should produce ClientHello bytes");
@@ -1330,7 +1344,7 @@ mod tests {
                 crate::test_pki::spawn_tls_sink(crate::test_pki::impostor_server_config(versions));
             let endpoint =
                 CredSspEndpoint::parse(&format!("https://127.0.0.1:{port}/wsman")).unwrap();
-            match CredSspConnection::connect(&endpoint, true, test_opts()).await {
+            match CredSspConnection::connect(&endpoint, &test_tls(), test_opts()).await {
                 Err(WinrmError::AuthFailed(m)) => {
                     assert!(m.starts_with("CredSSP outer TLS:"), "{label}: {m}");
                 }
@@ -1349,13 +1363,214 @@ mod tests {
 
     const BODY: &str = "<s:Envelope>mock request</s:Envelope>";
 
+    /// The TLS contexts of a client: no outer verification when
+    /// `accept_invalid_certs`, the `webpki_roots` verifier otherwise.
+    fn test_tls_with(accept_invalid_certs: bool) -> CredSspTls {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> = if accept_invalid_certs
+        {
+            Arc::new(crate::tls::NoVerifier)
+        } else {
+            let roots =
+                rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
+                .build()
+                .unwrap()
+        };
+        let base = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth();
+        CredSspTls::new(&base).unwrap()
+    }
+
+    fn test_tls() -> CredSspTls {
+        test_tls_with(true)
+    }
+
+    static TLS13_ONLY: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS13];
+    static TLS12_ONLY: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS12];
+
+    /// A std-thread TLS server (EC test certificate, tickets on) that answers
+    /// every request with an empty `401` and keeps connections alive.
+    fn spawn_tls_401_server(versions: &'static [&'static rustls::SupportedProtocolVersion]) -> u16 {
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        use std::io::{Read, Write};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let chain = vec![CertificateDer::from_pem_slice(EC_CERT_PEM.as_bytes()).unwrap()];
+        let key = PrivateKeyDer::from_pem_slice(EC_KEY_PKCS8_PEM.as_bytes()).unwrap();
+        let mut config = rustls::ServerConfig::builder_with_protocol_versions(versions)
+            .with_no_client_auth()
+            .with_single_cert(chain, key)
+            .unwrap();
+        config.ticketer = rustls::crypto::ring::Ticketer::new().unwrap();
+        let config = Arc::new(config);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for tcp in listener.incoming().flatten() {
+                let config = Arc::clone(&config);
+                std::thread::spawn(move || {
+                    let _ = tcp.set_read_timeout(Some(Duration::from_secs(10)));
+                    let Ok(conn) = rustls::ServerConnection::new(config) else {
+                        return;
+                    };
+                    let mut tls = rustls::StreamOwned::new(conn, tcp);
+                    let mut pending: Vec<u8> = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        // One request: the head up to CRLFCRLF, then its body.
+                        let head_end = loop {
+                            if let Some(pos) = find_double_crlf(&pending) {
+                                break pos;
+                            }
+                            match tls.read(&mut buf) {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => pending.extend_from_slice(&buf[..n]),
+                            }
+                        };
+                        let head =
+                            String::from_utf8_lossy(&pending[..head_end]).to_ascii_lowercase();
+                        let len = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        while pending.len() < head_end + 4 + len {
+                            match tls.read(&mut buf) {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => pending.extend_from_slice(&buf[..n]),
+                            }
+                        }
+                        pending.drain(..head_end + 4 + len);
+                        let reply = b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n";
+                        if tls.write_all(reply).and_then(|()| tls.flush()).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    /// The first TLS record a client with `config` sends to a listener that
+    /// never answers: its ClientHello.
+    async fn captured_client_hello(config: Arc<rustls::ClientConfig>) -> Vec<u8> {
+        use std::io::Read;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let reader = std::thread::spawn(move || {
+            let (mut tcp, _) = listener.accept().unwrap();
+            tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut record = vec![0u8; 5];
+            tcp.read_exact(&mut record).unwrap();
+            let len = usize::from(u16::from_be_bytes([record[3], record[4]]));
+            record.resize(5 + len, 0);
+            tcp.read_exact(&mut record[5..]).unwrap();
+            record
+        });
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio_rustls::TlsConnector::from(config).connect(name, tcp),
+        )
+        .await;
+        reader.join().unwrap()
+    }
+
+    /// Every extension type of a ClientHello record, sorted: rustls shuffles
+    /// the extension order on every hello.
+    fn client_hello_extension_types(record: &[u8]) -> Vec<u16> {
+        // Record header 5, handshake header 4, version 2, random 32.
+        let mut at = 5 + 4 + 2 + 32;
+        let session_id = usize::from(record[at]);
+        at += 1 + session_id;
+        let suites = usize::from(u16::from_be_bytes([record[at], record[at + 1]]));
+        at += 2 + suites;
+        let compression = usize::from(record[at]);
+        at += 1 + compression;
+        let total = usize::from(u16::from_be_bytes([record[at], record[at + 1]]));
+        at += 2;
+        let end = at + total;
+        let mut types = Vec::new();
+        while at < end {
+            types.push(u16::from_be_bytes([record[at], record[at + 1]]));
+            let len = usize::from(u16::from_be_bytes([record[at + 2], record[at + 3]]));
+            at += 4 + len;
+        }
+        types.sort_unstable();
+        types
+    }
+
+    #[test]
+    fn inner_ssl_comes_from_the_cached_context() {
+        let tls = test_tls();
+        let a = build_inner_openssl_tls(&tls.inner).unwrap();
+        let b = build_inner_openssl_tls(&tls.inner).unwrap();
+        assert!(std::ptr::eq(a.ssl.ssl().ssl_context(), tls.inner.context()));
+        assert!(std::ptr::eq(b.ssl.ssl().ssl_context(), tls.inner.context()));
+    }
+
+    #[tokio::test]
+    async fn credssp_outer_tls_never_resumes() {
+        for (label, versions) in [("TLS 1.3", TLS13_ONLY), ("TLS 1.2", TLS12_ONLY)] {
+            let port = spawn_tls_401_server(versions);
+            let tls = test_tls();
+            let endpoint =
+                CredSspEndpoint::parse(&format!("https://127.0.0.1:{port}/wsman")).unwrap();
+            let mut first = CredSspConnection::connect(&endpoint, &tls, test_opts())
+                .await
+                .unwrap();
+            // Reading a response makes the client process any NewSessionTicket.
+            assert_eq!(first.post(None, "<a/>").await.unwrap().0, 401);
+            drop(first);
+            let second = CredSspConnection::connect(&endpoint, &tls, test_opts())
+                .await
+                .unwrap();
+            assert_eq!(
+                second.stream.get_ref().1.handshake_kind(),
+                Some(rustls::HandshakeKind::Full),
+                "{label}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn credssp_outer_client_hello_extensions_unchanged() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        // What `connect` built for every request before the contexts were cached.
+        let today = Arc::new(
+            rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(crate::tls::NoVerifier))
+                .with_no_client_auth(),
+        );
+        let want = client_hello_extension_types(&captured_client_hello(today).await);
+        let got = client_hello_extension_types(
+            &captured_client_hello(Arc::clone(&test_tls().outer)).await,
+        );
+        assert_eq!(got, want);
+        assert!(
+            got.contains(&35),
+            "the empty SessionTicket extension is still sent"
+        );
+    }
+
     /// The client the acceptor knows: `USER` / `PASS`, empty domain.
     fn mock_auth(accept_invalid_certs: bool, max_response_bytes: usize) -> CredSspAuth {
         CredSspAuth {
             username: USER.into(),
             password: Zeroizing::new(PASS.into()),
             domain: String::new(),
-            accept_invalid_certs,
+            tls: Arc::new(test_tls_with(accept_invalid_certs)),
             opts: CredSspConnOptions {
                 max_response_bytes,
                 connect_timeout: Duration::from_secs(20),
@@ -1488,7 +1703,7 @@ mod tests {
         let start = std::time::Instant::now();
         let res = tokio::time::timeout(
             Duration::from_secs(10),
-            CredSspConnection::connect(&endpoint, true, opts),
+            CredSspConnection::connect(&endpoint, &test_tls(), opts),
         )
         .await
         .expect("connect is not bounded");

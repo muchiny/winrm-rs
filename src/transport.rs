@@ -21,7 +21,7 @@ use crate::auth::AuthTransport;
 use crate::auth::basic::BasicAuth;
 use crate::auth::certificate::CertificateAuth;
 #[cfg(feature = "credssp")]
-use crate::auth::credssp::{CredSspAuth, CredSspConnOptions};
+use crate::auth::credssp::{CredSspAuth, CredSspConnOptions, CredSspTls};
 use crate::auth::kerberos::KerberosAuth;
 #[cfg(feature = "kerberos")]
 use crate::auth::kerberos::KerberosSession;
@@ -310,6 +310,10 @@ pub(crate) struct HttpTransport {
     /// rustls configuration of [`Self::http`] and its server certificate
     /// verifier (HTTPS only), the base of the dedicated clients.
     tls_config: Option<(rustls::ClientConfig, Arc<dyn ServerCertVerifier>)>,
+    /// CredSSP TLS contexts, built once from [`Self::tls_config`]. `Some` only
+    /// for [`AuthMethod::CredSsp`].
+    #[cfg(feature = "credssp")]
+    credssp_tls: Option<Arc<CredSspTls>>,
     /// Idle dedicated connections. The lock is only held to check one
     /// out or back in, never across an HTTP exchange.
     #[expect(
@@ -657,6 +661,23 @@ impl HttpTransport {
             None
         };
 
+        #[cfg(feature = "credssp")]
+        let credssp_tls = if matches!(config.auth_method, AuthMethod::CredSsp) {
+            if config.accept_invalid_certs {
+                tracing::warn!(
+                    "CredSSP outer TLS verification disabled (accept_invalid_certs=true): the \
+                     server is not authenticated and the delegated credentials are not \
+                     protected; do not use in production"
+                );
+            }
+            tls_config
+                .as_ref()
+                .map(|(base, _)| CredSspTls::new(base).map(Arc::new))
+                .transpose()?
+        } else {
+            None
+        };
+
         let http = build_http_client(
             &config,
             tls_config.as_ref().map(|(c, _)| c.clone()),
@@ -669,6 +690,8 @@ impl HttpTransport {
             config,
             credentials,
             tls_config,
+            #[cfg(feature = "credssp")]
+            credssp_tls,
             conn_pool: Mutex::new(Vec::new()),
             conn_slots: tokio::sync::Semaphore::new(MAX_CONNS_IN_FLIGHT),
             session_id: format!("uuid:{}", uuid::Uuid::new_v4().to_string().to_uppercase()),
@@ -769,7 +792,9 @@ impl HttpTransport {
                     username: self.credentials.username.clone(),
                     password: Zeroizing::new(self.credentials.password.expose_secret().to_string()),
                     domain: self.credentials.domain.clone(),
-                    accept_invalid_certs: self.config.accept_invalid_certs,
+                    tls: Arc::clone(self.credssp_tls.as_ref().ok_or_else(|| {
+                        WinrmError::AuthFailed("CredSSP requires HTTPS (set use_tls = true)".into())
+                    })?),
                     opts: CredSspConnOptions::from_config(&self.config),
                 };
                 auth.send_authenticated(&self.http, &url, body).await?
@@ -3211,6 +3236,24 @@ mod tests {
             WinrmCredentials::new(USER, PASS, ""),
         )
         .unwrap()
+    }
+
+    /// The CredSSP TLS contexts exist for CredSSP clients only.
+    #[cfg(feature = "credssp")]
+    #[test]
+    fn credssp_tls_is_built_for_credssp_only() {
+        assert!(credssp_test_transport(5986).credssp_tls.is_some());
+        let ntlm = HttpTransport::new(
+            WinrmConfig {
+                auth_method: AuthMethod::Ntlm,
+                use_tls: true,
+                accept_invalid_certs: true,
+                ..Default::default()
+            },
+            WinrmCredentials::new(USER, PASS, ""),
+        )
+        .unwrap();
+        assert!(ntlm.credssp_tls.is_none());
     }
 
     /// A CredSSP request to a host that never answers the TLS handshake ends

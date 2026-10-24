@@ -77,6 +77,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - CredSSP applies `connect_timeout_secs` (TCP connect and TLS handshake) and
   `operation_timeout_secs` (+ 10 s per HTTP exchange) like the other methods;
   a deadline is `WinrmError::Timeout`.
+- CredSSP builds its TLS configuration and its OpenSSL context once per client
+  instead of once per request, so the system CA bundle is no longer read for
+  every request.
 
 ## [1.4.1] - 2026-10-24
 

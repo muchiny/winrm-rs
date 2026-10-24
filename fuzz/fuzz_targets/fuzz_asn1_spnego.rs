@@ -6,7 +6,8 @@
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use winrm_rs::__fuzz::{
-    decode_spnego_mech_list_mic, decode_spnego_token, encode_spnego_init, encode_spnego_response,
+    decode_spnego_final, decode_spnego_mech_list_mic, decode_spnego_token, encode_spnego_init,
+    encode_spnego_response,
 };
 
 #[derive(Arbitrary, Debug)]
@@ -27,6 +28,14 @@ fuzz_target!(|input: Input<'_>| {
 
     // Same for the mechListMIC extractor, and whatever it finds must fit.
     if let Ok(Some(mic)) = decode_spnego_mech_list_mic(input.wire) {
+        assert!(
+            mic.len() <= input.wire.len(),
+            "extracted mechListMIC larger than the SPNEGO message"
+        );
+    }
+
+    // The strict final-token decoder never panics, and a MIC it finds fits too.
+    if let Ok((_, Some(mic))) = decode_spnego_final(input.wire) {
         assert!(
             mic.len() <= input.wire.len(),
             "extracted mechListMIC larger than the SPNEGO message"
@@ -59,6 +68,15 @@ fuzz_target!(|input: Input<'_>| {
         "mechListMIC roundtrip"
     );
     assert!(decode_spnego_mech_list_mic(&init).is_err());
+
+    // The client's NegTokenResp carries negState accept-incomplete (1) and the
+    // same MIC; a NegTokenInit is not a final token.
+    assert_eq!(
+        decode_spnego_final(&resp).expect("our own NegTokenResp must decode"),
+        (Some(1), input.mech_list_mic.map(<[u8]>::to_vec)),
+        "final-token roundtrip"
+    );
+    assert!(decode_spnego_final(&init).is_err());
 
     // Adding the MIC must not disturb the responseToken.
     let without = encode_spnego_response(input.ntlm_token, None);

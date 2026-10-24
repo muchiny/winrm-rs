@@ -511,6 +511,15 @@ pub fn decode_spnego_mech_list_mic(
     crate::asn1::decode_spnego_mech_list_mic(data)
 }
 
+/// Decode the `negState` and `mechListMIC` of a server's final SPNEGO
+/// `NegTokenResp`, rejecting any malformed field.
+#[cfg(feature = "credssp")]
+pub fn decode_spnego_final(
+    data: &[u8],
+) -> Result<(Option<u8>, Option<Vec<u8>>), crate::error::CredSspError> {
+    crate::asn1::decode_spnego_final(data)
+}
+
 /// Wrap an NTLM Type 1 in a SPNEGO `NegTokenInit`.
 #[cfg(feature = "credssp")]
 pub fn encode_spnego_init(ntlm_token: &[u8]) -> Vec<u8> {

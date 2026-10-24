@@ -877,18 +877,32 @@ impl AuthTransport for CredSspAuth {
         if let Some(code) = ts_resp.error_code {
             return Err(WinrmError::CredSsp(CredSspError::ServerError(code)));
         }
-        // The server's final SPNEGO token carries its mechListMIC. Verify it
-        // (GSS_VerifyMIC at server seq 0); this also re-initialises the server
-        // RC4 handle, so the pubKeyAuth below unseals at seq 1, keystream
-        // offset 0 — the same reset Windows applies on its side.
-        if let Some(nego) = &ts_resp.nego_token
-            && let Some(mic) =
-                asn1::decode_spnego_mech_list_mic(nego).map_err(WinrmError::CredSsp)?
+        // The client sent a mechListMIC with its last SPNEGO token, so RFC 4178
+        // §5 c) case I requires the server's final token to answer with its own
+        // and with accept-completed. MS-SPNG <8> makes the mechListMIC
+        // mandatory on every Windows version after Server 2003 / XP. A token
+        // that cannot be parsed surfaces as `Asn1Decode`, not as "omitted".
+        // An absent negState stays allowed (RFC 4178 §4.2.2).
+        // Verifying the MIC (GSS_VerifyMIC at server seq 0) also re-initialises
+        // the server RC4 handle, so the pubKeyAuth below unseals at seq 1,
+        // keystream offset 0 — the same reset Windows applies on its side.
+        let nego = ts_resp.nego_token.as_deref().ok_or_else(|| {
+            WinrmError::AuthFailed("CredSSP: server sent no final SPNEGO token".into())
+        })?;
+        let (state, mic) = asn1::decode_spnego_final(nego).map_err(WinrmError::CredSsp)?;
+        if let Some(s) = state
+            && s != asn1::NEG_STATE_ACCEPT_COMPLETED
         {
-            ntlm_session
-                .verify_mech_list_mic(asn1::MECH_TYPE_LIST_NTLM, &mic)
-                .map_err(WinrmError::Ntlm)?;
+            return Err(WinrmError::AuthFailed(format!(
+                "CredSSP: server final SPNEGO state {s} is not accept-completed"
+            )));
         }
+        let mic = mic.ok_or_else(|| {
+            WinrmError::AuthFailed("CredSSP: server omitted mechListMIC (RFC 4178 §5)".into())
+        })?;
+        ntlm_session
+            .verify_mech_list_mic(asn1::MECH_TYPE_LIST_NTLM, &mic)
+            .map_err(WinrmError::Ntlm)?;
         let server_pub_key_auth = ts_resp
             .pub_key_auth
             .ok_or_else(|| WinrmError::AuthFailed("CredSSP: no pubKeyAuth from server".into()))?;
@@ -1298,6 +1312,36 @@ mod tests {
                 err,
                 WinrmError::CredSsp(CredSspError::ServerError(0x8009_030C))
             ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn final_token_without_mech_list_mic_is_refused_before_delegation() {
+        let (err, _) = refused(Fault::NoMechListMic, 1 << 20).await;
+        assert!(
+            matches!(&err, WinrmError::AuthFailed(m)
+                if m == "CredSSP: server omitted mechListMIC (RFC 4178 §5)"),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reject_neg_state_is_refused_before_delegation() {
+        let (err, _) = refused(Fault::NegStateReject, 1 << 20).await;
+        assert!(
+            matches!(&err, WinrmError::AuthFailed(m)
+                if m == "CredSSP: server final SPNEGO state 2 is not accept-completed"),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn final_ts_request_without_nego_token_is_refused_before_delegation() {
+        let (err, _) = refused(Fault::NoFinalNegoToken, 1 << 20).await;
+        assert!(
+            matches!(&err, WinrmError::AuthFailed(m)
+                if m == "CredSSP: server sent no final SPNEGO token"),
             "{err:?}"
         );
     }

@@ -52,6 +52,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `run_command`, `run_powershell`, `Shell::run_command` and `run_wql` wait
   before polling again when the server answers three or more times in a row,
   at once, with nothing (50 ms doubling to 1 s).
+- CredSSP now requires the server's final SPNEGO token to carry
+  `accept-completed` and a `mechListMIC`, as RFC 4178 §5 requires once the
+  client has sent one. Windows sends both on every version after Server 2003.
+  A malformed `negoTokens` field is now an error instead of being read as
+  absent.
 
 ## [1.4.1] - 2026-10-24
 

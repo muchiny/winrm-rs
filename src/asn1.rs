@@ -342,13 +342,9 @@ pub(crate) fn decode_ts_request(data: &[u8]) -> Result<TsRequest, CredSspError> 
         .transpose()?
         .unwrap_or(2);
 
-    let nego_token = find_context_tag(seq_data, 1).and_then(|nego_data| {
-        // NegoData → SEQUENCE OF SEQUENCE { [0] OCTET STRING }
-        let (_, seq_of, _) = read_tlv(nego_data).ok()?;
-        let (_, inner_seq, _) = read_tlv(seq_of).ok()?;
-        let token_data = find_context_tag(inner_seq, 0)?;
-        Some(decode_octet_string(token_data).ok()?.to_vec())
-    });
+    let nego_token = find_context_tag(seq_data, 1)
+        .map(decode_nego_data)
+        .transpose()?;
 
     let auth_info = find_context_tag(seq_data, 2)
         .map(|d| decode_octet_string(d).map(|v| v.to_vec()))
@@ -374,6 +370,29 @@ pub(crate) fn decode_ts_request(data: &[u8]) -> Result<TsRequest, CredSspError> 
         error_code,
         client_nonce,
     })
+}
+
+/// Decode `NegoData ::= SEQUENCE OF SEQUENCE { [0] OCTET STRING }`, checking
+/// every tag. Any deviation is an error, not an absent token.
+fn decode_nego_data(d: &[u8]) -> Result<Vec<u8>, CredSspError> {
+    let malformed = || CredSspError::Asn1Decode("TSRequest: malformed negoTokens".into());
+    let (seq_of_tag, seq_of, _) = read_tlv(d)?;
+    if seq_of_tag != TAG_SEQUENCE {
+        return Err(malformed());
+    }
+    let (inner_tag, inner, _) = read_tlv(seq_of)?;
+    if inner_tag != TAG_SEQUENCE {
+        return Err(malformed());
+    }
+    let (ctx_tag, token, _) = read_tlv(inner)?;
+    if ctx_tag != 0xA0 {
+        return Err(malformed());
+    }
+    let (octet_tag, value, _) = read_tlv(token)?;
+    if octet_tag != TAG_OCTET_STRING {
+        return Err(malformed());
+    }
+    Ok(value.to_vec())
 }
 
 /// Extract the inner NTLM token from a SPNEGO message (NegTokenInit or NegTokenResp).
@@ -420,17 +439,59 @@ pub(crate) fn decode_spnego_token(data: &[u8]) -> Result<Vec<u8>, CredSspError> 
 /// NegTokenResp with negState accept-completed and a mechListMIC but no
 /// responseToken, so [`decode_spnego_token`] cannot be used for it.
 pub(crate) fn decode_spnego_mech_list_mic(data: &[u8]) -> Result<Option<Vec<u8>>, CredSspError> {
+    decode_spnego_final(data).map(|(_, mic)| mic)
+}
+
+/// negState `accept-completed` (RFC 4178 §4.2.2).
+pub(crate) const NEG_STATE_ACCEPT_COMPLETED: u8 = 0;
+
+/// Decode the server's final SPNEGO `NegTokenResp` into its `negState` and
+/// `mechListMIC` (`[0] ENUMERATED`, `[3] OCTET STRING`).
+///
+/// The SEQUENCE is walked strictly: every field goes through [`read_tlv`], so
+/// a truncated or malformed field is an error, never "absent". `[0]` must hold
+/// an ENUMERATED with exactly one content byte and `[3]` an OCTET STRING; other
+/// fields are skipped.
+pub(crate) fn decode_spnego_final(
+    data: &[u8],
+) -> Result<(Option<u8>, Option<Vec<u8>>), CredSspError> {
     let (tag, contents, _) = read_tlv(data)?;
     if tag != 0xA1 {
         return Err(CredSspError::Asn1Decode(format!(
             "expected NegTokenResp (0xa1), got tag 0x{tag:02x}"
         )));
     }
-    let (_, seq_data, _) = read_tlv(contents)?;
-    match find_context_tag(seq_data, 3) {
-        Some(mic) => Ok(Some(decode_octet_string(mic)?.to_vec())),
-        None => Ok(None),
+    let (seq_tag, mut rest, _) = read_tlv(contents)?;
+    if seq_tag != TAG_SEQUENCE {
+        return Err(CredSspError::Asn1Decode(format!(
+            "expected NegTokenResp SEQUENCE (0x30), got tag 0x{seq_tag:02x}"
+        )));
     }
+    let mut state = None;
+    let mut mic = None;
+    while !rest.is_empty() {
+        let (field_tag, value, consumed) = read_tlv(rest)?;
+        match field_tag {
+            0xA0 => {
+                let (enum_tag, enum_value, _) = read_tlv(value)?;
+                let [byte] = *enum_value else {
+                    return Err(CredSspError::Asn1Decode(
+                        "NegTokenResp: negState must be one byte".into(),
+                    ));
+                };
+                if enum_tag != TAG_ENUM {
+                    return Err(CredSspError::Asn1Decode(format!(
+                        "NegTokenResp: negState must be ENUMERATED (0x0a), got 0x{enum_tag:02x}"
+                    )));
+                }
+                state = Some(byte);
+            }
+            0xA3 => mic = Some(decode_octet_string(value)?.to_vec()),
+            _ => {}
+        }
+        rest = rest.get(consumed..).unwrap_or_default();
+    }
+    Ok((state, mic))
 }
 
 /// Extract SubjectPublicKey from a DER-encoded X.509 certificate.
@@ -770,15 +831,64 @@ mod tests {
         assert!(matches!(err, CredSspError::Asn1Decode(_)));
     }
 
+    /// Server 2025's final NegTokenResp (pubKeyAuth TSRequest): accept-completed + mechListMIC.
+    const SERVER_2025_FINAL_TOKEN: [u8; 29] = [
+        0xa1, 0x1b, 0x30, 0x19, 0xa0, 0x03, 0x0a, 0x01, 0x00, 0xa3, 0x12, 0x04, 0x10, 0x01, 0x00,
+        0x00, 0x00, 0x7c, 0x04, 0x2c, 0xe7, 0x3e, 0x8f, 0x62, 0x15, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    #[test]
+    fn decode_spnego_final_reads_state_and_mic_from_server_2025_token() {
+        let tok: &[u8] = &SERVER_2025_FINAL_TOKEN;
+        let (state, mic) = decode_spnego_final(tok).unwrap();
+        assert_eq!(state, Some(NEG_STATE_ACCEPT_COMPLETED));
+        assert_eq!(mic.as_deref(), Some(&tok[13..]));
+    }
+
+    #[test]
+    fn decode_spnego_final_reads_the_client_shape() {
+        let tok = encode_spnego_response(b"NTLMSSP\0", Some(&[0xAB; 16]));
+        assert_eq!(
+            decode_spnego_final(&tok).unwrap(),
+            (Some(1), Some(vec![0xAB; 16]))
+        );
+    }
+
+    #[test]
+    fn decode_spnego_final_rejects_malformed_neg_state() {
+        // negState as INTEGER, then as a two-byte ENUMERATED.
+        assert!(
+            decode_spnego_final(&[0xa1, 0x07, 0x30, 0x05, 0xa0, 0x03, 0x02, 0x01, 0x00]).is_err()
+        );
+        assert!(
+            decode_spnego_final(&[0xa1, 0x08, 0x30, 0x06, 0xa0, 0x04, 0x0a, 0x02, 0x00, 0x00])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn decode_spnego_final_rejects_truncated_field() {
+        // [3] announces 16 bytes, 2 follow. The lenient walk read this as "no MIC".
+        let tok = [0xa1, 0x06, 0x30, 0x04, 0xa3, 0x10, 0x04, 0x0e];
+        assert!(decode_spnego_final(&tok).is_err());
+        assert!(decode_spnego_mech_list_mic(&tok).is_err());
+    }
+
+    #[test]
+    fn decode_ts_request_rejects_malformed_nego_data() {
+        let mut contents = encode_context_tag(0, &encode_integer_value(6));
+        contents.extend_from_slice(&encode_context_tag(
+            1,
+            &encode_octet_string(b"not NegoData"),
+        ));
+        assert!(decode_ts_request(&encode_sequence(&contents)).is_err());
+    }
+
     #[test]
     fn decode_spnego_mech_list_mic_from_server_final_token() {
         // Captured from Server 2025 in the pubKeyAuth TSRequest: NegTokenResp
         // { negState accept-completed, mechListMIC } — no responseToken.
-        let tok: &[u8] = &[
-            0xa1, 0x1b, 0x30, 0x19, 0xa0, 0x03, 0x0a, 0x01, 0x00, 0xa3, 0x12, 0x04, 0x10, 0x01,
-            0x00, 0x00, 0x00, 0x7c, 0x04, 0x2c, 0xe7, 0x3e, 0x8f, 0x62, 0x15, 0x00, 0x00, 0x00,
-            0x00,
-        ];
+        let tok: &[u8] = &SERVER_2025_FINAL_TOKEN;
         let mic = decode_spnego_mech_list_mic(tok).unwrap();
         assert_eq!(
             mic,

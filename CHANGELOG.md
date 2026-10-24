@@ -92,6 +92,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   send `WinrmConfig::user_agent` (default `winrm-rs/<version>`) like the
   other methods.
 
+### Documentation
+
+- The `AuthMethod::CredSsp` documentation, `Shell::disconnect`,
+  `idle_timeout_secs`, the `credssp` feature description and the README now
+  say that the target receives the delegated password, and what to do to
+  limit how long it keeps it.
+
 ## [1.4.1] - 2026-10-24
 
 Security fixes for `accept_invalid_certs` and for remote file paths; PSRP

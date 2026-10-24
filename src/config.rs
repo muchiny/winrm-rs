@@ -188,6 +188,9 @@ pub struct WinrmConfig {
     ///
     /// When set, the shell will be automatically closed by the server
     /// after this many seconds of inactivity.
+    ///
+    /// With CredSSP, a short value limits how long a shell this client failed
+    /// to close keeps running with your delegated credentials.
     pub idle_timeout_secs: Option<u64>,
     /// Maximum cumulative bytes accepted from the server for a single command's
     /// stdout+stderr (default: `Some(64 * 1024 * 1024)` = 64 MiB).
@@ -488,6 +491,16 @@ pub enum AuthMethod {
     /// Anyone who controls the target, now or while your logon session lives
     /// there, can read the delegated password. Use CredSSP only toward hosts
     /// you trust as much as the account.
+    ///
+    /// Every request runs a new CredSSP exchange and delegates the password
+    /// again, so the target receives it for as long as you send it requests.
+    /// When you are done, call [`Shell::close`](crate::Shell::close) rather
+    /// than [`Shell::disconnect`](crate::Shell::disconnect), and set a short
+    /// [`WinrmConfig::idle_timeout_secs`] so the server reaps a shell this
+    /// client could not close (a dropped future, a failed upload). Where the
+    /// second hop allows it, Kerberos resource-based constrained delegation,
+    /// configured in Active Directory, avoids sending the password; it works
+    /// with [`AuthMethod::Kerberos`] to the first hop.
     ///
     /// Validated live against Windows Server 2025 (`credssp_run_command_whoami`
     /// in `tests/integration_real.rs`). Not validated on Windows Server 2012 R2:

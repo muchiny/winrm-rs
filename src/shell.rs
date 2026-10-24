@@ -460,6 +460,10 @@ impl<'a> Shell<'a> {
     /// consumed; calling [`close`](Self::close) on a disconnected shell
     /// is unnecessary because the server-side resources are still
     /// owned by the runspace.
+    ///
+    /// With [`AuthMethod::CredSsp`](crate::AuthMethod::CredSsp), a
+    /// disconnected shell keeps running on the server with your delegated
+    /// credentials; prefer [`close`](Self::close) unless you will reconnect.
     pub async fn disconnect(mut self) -> Result<String, WinrmError> {
         self.closed = true;
         let endpoint = self.client.endpoint(&self.host);

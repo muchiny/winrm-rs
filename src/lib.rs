@@ -56,6 +56,8 @@
 //!   (README, "`credssp` and the host OpenSSL").
 //!   Validated end-to-end against Windows Server 2025; not yet exercised
 //!   on other host generations.
+//!   Delegates your cleartext password to the target: use it only toward
+//!   hosts you trust as much as the account.
 //!
 //! # Re-exports
 //!

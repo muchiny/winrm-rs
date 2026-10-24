@@ -310,7 +310,7 @@ cargo test --test integration_real -- --ignored
 |---|---|---|
 | *(default)* | stable | NTLMv2, Basic, Certificate auth; no optional deps |
 | `kerberos` | stable | Pulls `cross-krb5`; requires a working `kinit` |
-| `credssp` | **experimental** | Double-hop delegation. Validated end-to-end against Windows Server 2025 (live `credssp_run_command_whoami`); not yet exercised on other host generations. Up to 1.4.1 it ignored `proxy`, `max_retries`, `connect_timeout_secs`, `operation_timeout_secs` and `user_agent`; since 1.4.2 it applies both timeouts and `user_agent`, and still ignores `proxy` and `max_retries` (see `AuthMethod::CredSsp`). Links the host OpenSSL; see below. |
+| `credssp` | **experimental** | Double-hop delegation. Validated end-to-end against Windows Server 2025 (live `credssp_run_command_whoami`); not yet exercised on other host generations. Up to 1.4.1 it ignored `proxy`, `max_retries`, `connect_timeout_secs`, `operation_timeout_secs` and `user_agent`; since 1.4.2 it applies both timeouts and `user_agent`, and still ignores `proxy` and `max_retries` (see `AuthMethod::CredSsp`). Delegates your cleartext password to the target: use it only toward hosts you trust as much as the account. Links the host OpenSSL; see below. |
 
 ### `credssp` and the host OpenSSL
 

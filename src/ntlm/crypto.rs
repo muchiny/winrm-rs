@@ -74,29 +74,83 @@ pub(crate) const AV_FLAG_CONSTRAINED: u32 = 0x0000_0001;
 pub(crate) const AV_FLAG_MIC: u32 = 0x0000_0002;
 
 /// NT Hash = MD4(UTF-16LE(password)) (MS-NLMP 3.3.1, NTOWFv1).
-pub(crate) fn compute_nt_hash(password: &str) -> [u8; 16] {
-    let utf16 = to_utf16le(password);
+///
+/// The result is password-equivalent, so it is wiped when dropped, as are the
+/// UTF-16 copy of the password and the digest's output buffer.
+pub(crate) fn compute_nt_hash(password: &str) -> Zeroizing<[u8; 16]> {
+    let utf16 = to_utf16le_secret(password);
     let mut hasher = Md4::new();
-    hasher.update(&utf16);
-    let result = hasher.finalize();
-    let mut hash = [0u8; 16];
+    hasher.update(utf16.as_slice());
+    let mut result = hasher.finalize();
+    let mut hash = Zeroizing::new([0u8; 16]);
     hash.copy_from_slice(&result);
+    result.as_mut_slice().zeroize();
     hash
 }
 
 /// NTLMv2 Hash = HMAC-MD5(NT_Hash, UTF-16LE(UPPER(username) + domain)) (MS-NLMP 3.3.2, NTOWFv2).
-pub(crate) fn compute_ntlmv2_hash(nt_hash: &[u8; 16], username: &str, domain: &str) -> [u8; 16] {
+///
+/// Password-equivalent: the result is wiped when dropped.
+pub(crate) fn compute_ntlmv2_hash(
+    nt_hash: &[u8; 16],
+    username: &str,
+    domain: &str,
+) -> Zeroizing<[u8; 16]> {
     let identity = Zeroizing::new(format!("{}{}", username.to_uppercase(), domain));
-    let identity_bytes = Zeroizing::new(to_utf16le(&identity));
-    hmac_md5(nt_hash, &identity_bytes)
+    let identity_bytes = to_utf16le_secret(&identity);
+    hmac_md5_secret(nt_hash, &identity_bytes)
 }
 
+/// HMAC-MD5 over public values (MIC, checksums, NTProofStr).
 pub(crate) fn hmac_md5(key: &[u8], data: &[u8]) -> [u8; 16] {
     let mut mac = HmacMd5::new_from_slice(key).expect("HMAC accepts any key size");
     mac.update(data);
     let result = mac.finalize();
     let mut out = [0u8; 16];
     out.copy_from_slice(&result.into_bytes());
+    out
+}
+
+/// HMAC-MD5 (RFC 2104) whose key or output is key material: the `key XOR pad`
+/// blocks, the inner digest and the output buffer are all wiped.
+///
+/// Written over `Md5` directly because `hmac` does not wipe the pad block it
+/// builds from the key.
+pub(crate) fn hmac_md5_secret(key: &[u8], data: &[u8]) -> Zeroizing<[u8; 16]> {
+    const BLOCK: usize = 64;
+    let hashed_key: Zeroizing<[u8; 16]>;
+    let key = if key.len() > BLOCK {
+        let mut digest = Md5::digest(key);
+        let mut copy = Zeroizing::new([0u8; 16]);
+        copy.copy_from_slice(&digest);
+        digest.as_mut_slice().zeroize();
+        hashed_key = copy;
+        hashed_key.as_slice()
+    } else {
+        key
+    };
+
+    let mut ipad = Zeroizing::new([0x36u8; BLOCK]);
+    let mut opad = Zeroizing::new([0x5cu8; BLOCK]);
+    for ((inner, outer), k) in ipad.iter_mut().zip(opad.iter_mut()).zip(key) {
+        *inner ^= k;
+        *outer ^= k;
+    }
+
+    let mut inner = Md5::new();
+    inner.update(ipad.as_slice());
+    inner.update(data);
+    let mut inner_digest = inner.finalize();
+
+    let mut outer = Md5::new();
+    outer.update(opad.as_slice());
+    outer.update(inner_digest.as_slice());
+    let mut digest = outer.finalize();
+
+    let mut out = Zeroizing::new([0u8; 16]);
+    out.copy_from_slice(&digest);
+    inner_digest.as_mut_slice().zeroize();
+    digest.as_mut_slice().zeroize();
     out
 }
 
@@ -166,6 +220,21 @@ pub(crate) fn write_security_buffer(buf: &mut Vec<u8>, len: u16, offset: u32) {
 
 pub(crate) fn to_utf16le(s: &str) -> Vec<u8> {
     s.encode_utf16().flat_map(|c| c.to_le_bytes()).collect()
+}
+
+/// [`to_utf16le`] into a buffer that is wiped on drop, for secrets.
+///
+/// UTF-16 code units never outnumber UTF-8 bytes, so `2 * s.len()` bytes
+/// always suffice and the buffer is never reallocated (a reallocation would
+/// leave an unwiped copy of the old buffer behind).
+pub(crate) fn to_utf16le_secret(s: &str) -> Zeroizing<Vec<u8>> {
+    let mut out = Zeroizing::new(Vec::with_capacity(s.len().saturating_mul(2)));
+    let capacity = out.capacity();
+    for unit in s.encode_utf16() {
+        out.extend_from_slice(&unit.to_le_bytes());
+    }
+    debug_assert_eq!(out.capacity(), capacity, "UTF-16 buffer was reallocated");
+    out
 }
 
 pub(crate) fn from_utf16le(data: &[u8]) -> String {
@@ -467,13 +536,63 @@ mod tests {
         assert_eq!(TYPE1_FLAGS_CREDSSP, 0xe208_8237);
     }
 
+    /// Compile-time proof the digest cores wipe on drop; fails to build if the
+    /// `zeroize` features are dropped from Cargo.toml.
+    #[test]
+    fn hash_states_wipe_on_drop() {
+        fn assert_zod<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zod::<md4::Md4>();
+        assert_zod::<md5::Md5>();
+    }
+
+    #[test]
+    fn to_utf16le_secret_matches_to_utf16le_without_growing() {
+        for s in ["", "ascii", "é-bmp", "a\u{1F600}b"] {
+            let v = to_utf16le_secret(s);
+            assert_eq!(v.as_slice(), to_utf16le(s).as_slice());
+            assert!(v.capacity() >= v.len());
+        }
+    }
+
+    #[test]
+    fn hmac_md5_secret_matches_rfc_2202_vectors() {
+        // RFC 2202 test case 1: key 0x0b * 16, data "Hi There".
+        let out = hmac_md5_secret(&[0x0b; 16], b"Hi There");
+        assert_eq!(
+            *out,
+            [
+                0x92, 0x94, 0x72, 0x7a, 0x36, 0x38, 0xbb, 0x1c, 0x13, 0xf4, 0x8e, 0xf8, 0x15, 0x8b,
+                0xfc, 0x9d
+            ]
+        );
+        // RFC 2202 test case 2: key "Jefe".
+        let out = hmac_md5_secret(b"Jefe", b"what do ya want for nothing?");
+        assert_eq!(
+            *out,
+            [
+                0x75, 0x0c, 0x78, 0x3e, 0x6a, 0xb0, 0xb5, 0x03, 0xea, 0xa8, 0x6e, 0x31, 0x0a, 0x5d,
+                0xb7, 0x38
+            ]
+        );
+    }
+
+    #[test]
+    fn hmac_md5_secret_matches_hmac_md5_for_long_keys() {
+        // A key longer than the 64-byte block is hashed first (RFC 2104).
+        for key_len in [0usize, 1, 16, 63, 64, 65, 200] {
+            let key = vec![0xAAu8; key_len];
+            let data = [0x5Cu8; 50];
+            assert_eq!(*hmac_md5_secret(&key, &data), hmac_md5(&key, &data));
+        }
+    }
+
     #[test]
     fn nt_hash_known_value() {
         // Known test vector: password "Password" -> MD4 of UTF-16LE
         let hash = compute_nt_hash("Password");
         assert_eq!(hash.len(), 16);
         // Verify it's not all zeros (actual computation happened)
-        assert_ne!(hash, [0u8; 16]);
+        assert_ne!(*hash, [0u8; 16]);
     }
 
     #[test]
@@ -482,7 +601,7 @@ mod tests {
         // Known value: A4F49C406510BDCAB6824EE7C30FD852
         let hash = compute_nt_hash("Password");
         assert_eq!(
-            hash,
+            *hash,
             [
                 0xA4, 0xF4, 0x9C, 0x40, 0x65, 0x10, 0xBD, 0xCA, 0xB6, 0x82, 0x4E, 0xE7, 0xC3, 0x0F,
                 0xD8, 0x52
@@ -496,8 +615,8 @@ mod tests {
         let h2 = compute_nt_hash("password2");
         assert_ne!(h1, h2);
         // Verify it's not the [1; 16] mutation replacement
-        assert_ne!(h1, [1u8; 16]);
-        assert_ne!(h2, [1u8; 16]);
+        assert_ne!(*h1, [1u8; 16]);
+        assert_ne!(*h2, [1u8; 16]);
     }
 
     #[test]

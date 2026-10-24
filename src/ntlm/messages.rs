@@ -327,20 +327,20 @@ pub(crate) fn create_authenticate_message_full(
     let mut proof_input = Vec::with_capacity(8 + blob.len());
     proof_input.extend_from_slice(&challenge.server_challenge);
     proof_input.extend_from_slice(&blob);
-    let nt_proof_str = hmac_md5(&ntlmv2_hash, &proof_input);
+    let nt_proof_str = *hmac_md5_secret(ntlmv2_hash.as_slice(), &proof_input);
 
     // SessionBaseKey = HMAC-MD5(NTLMv2_Hash, NTProofStr)  (MS-NLMP 3.3.2)
-    let session_base_key = hmac_md5(&ntlmv2_hash, &nt_proof_str);
+    let session_base_key = hmac_md5_secret(ntlmv2_hash.as_slice(), &nt_proof_str);
 
     // For NTLMv2 with EXTENDED_SESSIONSECURITY, KeyExchangeKey == SessionBaseKey
-    let key_exchange_key = session_base_key;
+    let key_exchange_key = &*session_base_key;
 
     // If NEGOTIATE_KEY_EXCH: generate random ExportedSessionKey, encrypt with RC4
     // Otherwise: ExportedSessionKey = KeyExchangeKey
     let (exported_session_key, encrypted_random_session_key) = if with_key_exch {
         // CREDSSP_FIXED_RSK is a deterministic-test backdoor — only honoured
         // in debug builds. Production binaries always use the CSPRNG.
-        let random_key: [u8; 16] = {
+        let random_key: Zeroizing<[u8; 16]> = {
             #[cfg(debug_assertions)]
             let from_env = std::env::var("CREDSSP_FIXED_RSK").ok().and_then(|s| {
                 let bytes = (0..s.len())
@@ -351,14 +351,21 @@ pub(crate) fn create_authenticate_message_full(
             });
             #[cfg(not(debug_assertions))]
             let from_env: Option<[u8; 16]> = None;
-            from_env.unwrap_or_else(rand::random)
+            match from_env {
+                Some(key) => Zeroizing::new(key),
+                None => {
+                    let mut key = Zeroizing::new([0u8; 16]);
+                    rand::fill(&mut *key);
+                    key
+                }
+            }
         };
-        let mut encrypted = random_key;
-        let mut rc4 = Rc4State::new(&key_exchange_key);
+        let mut encrypted = *random_key;
+        let mut rc4 = Rc4State::new(key_exchange_key);
         rc4.process(&mut encrypted);
         (random_key, encrypted.to_vec())
     } else {
-        (key_exchange_key, Vec::new())
+        (Zeroizing::new(*key_exchange_key), Vec::new())
     };
 
     // NT response = NTProofStr + blob
@@ -376,7 +383,7 @@ pub(crate) fn create_authenticate_message_full(
         let mut lm_input = Vec::with_capacity(16);
         lm_input.extend_from_slice(&challenge.server_challenge);
         lm_input.extend_from_slice(&client_challenge);
-        let lm_hash = hmac_md5(&ntlmv2_hash, &lm_input);
+        let lm_hash = *hmac_md5_secret(ntlmv2_hash.as_slice(), &lm_input);
         let mut v = Vec::with_capacity(24);
         v.extend_from_slice(&lm_hash);
         v.extend_from_slice(&client_challenge);
@@ -460,7 +467,7 @@ pub(crate) fn create_authenticate_message_full(
         input.extend_from_slice(type1);
         input.extend_from_slice(type2);
         input.extend_from_slice(&msg);
-        let mic = hmac_md5(&exported_session_key, &input);
+        let mic = *hmac_md5_secret(exported_session_key.as_slice(), &input);
         msg[mic_pos..mic_pos + 16].copy_from_slice(&mic);
 
         // CREDSSP_DEBUG dumps every secret in the handshake to stderr —
@@ -474,11 +481,11 @@ pub(crate) fn create_authenticate_message_full(
             eprintln!("[CREDSSP_DEBUG] nt_proof: {}", hex(&nt_proof_str));
             eprintln!(
                 "[CREDSSP_DEBUG] session_base_key: {}",
-                hex(&session_base_key)
+                hex(session_base_key.as_slice())
             );
             eprintln!(
                 "[CREDSSP_DEBUG] exported_session_key: {}",
-                hex(&exported_session_key)
+                hex(exported_session_key.as_slice())
             );
             eprintln!(
                 "[CREDSSP_DEBUG] enc_random_sk: {}",
@@ -493,7 +500,7 @@ pub(crate) fn create_authenticate_message_full(
         }
     }
 
-    Ok((msg, Zeroizing::new(exported_session_key)))
+    Ok((msg, exported_session_key))
 }
 
 // Only used inside the CREDSSP_DEBUG block, which is debug-only.

@@ -126,9 +126,10 @@ impl NtlmSession {
         let mut hasher = md5::Md5::new();
         hasher.update(session_key);
         hasher.update(magic);
-        let result = hasher.finalize();
+        let mut result = hasher.finalize();
         let mut key = [0u8; 16];
         key.copy_from_slice(&result);
+        result.as_mut_slice().zeroize();
         key
     }
 

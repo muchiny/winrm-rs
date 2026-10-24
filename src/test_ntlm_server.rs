@@ -187,7 +187,7 @@ pub(crate) fn exported_session_key(type3: &[u8]) -> [u8; 16] {
     assert!(nt_len >= 16 && key_len == 16, "unexpected Type 3 layout");
     let nt_proof = &type3[nt_off..nt_off + 16];
     let ntlmv2_hash = compute_ntlmv2_hash(&compute_nt_hash(PASS), USER, "");
-    let key_exchange_key = hmac_md5(&ntlmv2_hash, nt_proof);
+    let key_exchange_key = hmac_md5(ntlmv2_hash.as_slice(), nt_proof);
     let mut key = [0u8; 16];
     key.copy_from_slice(&type3[key_off..key_off + 16]);
     Rc4State::new(&key_exchange_key).process(&mut key);

@@ -141,12 +141,12 @@ pub fn to_utf16le(s: &str) -> Vec<u8> {
 
 /// NTOWFv1: MD4 of the UTF-16-LE password.
 pub fn compute_nt_hash(password: &str) -> [u8; 16] {
-    crate::ntlm::crypto::compute_nt_hash(password)
+    *crate::ntlm::crypto::compute_nt_hash(password)
 }
 
 /// NTOWFv2: HMAC-MD5 over uppercased user + domain.
 pub fn compute_ntlmv2_hash(nt_hash: &[u8; 16], username: &str, domain: &str) -> [u8; 16] {
-    crate::ntlm::crypto::compute_ntlmv2_hash(nt_hash, username, domain)
+    *crate::ntlm::crypto::compute_ntlmv2_hash(nt_hash, username, domain)
 }
 
 /// Build the NTLMv2 client blob (MS-NLMP 3.3.2).

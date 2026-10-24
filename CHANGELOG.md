@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+
+- NTLM: the UTF-16 password copy, the NT and NTLMv2 hashes, the session base
+  key and the random session key are now wiped from memory after use. The wire
+  output is unchanged.
+
 ### Changed
 
 - NTLM: the AUTHENTICATE message's workstation name now comes from

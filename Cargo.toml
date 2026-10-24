@@ -48,9 +48,9 @@ tokio = { version = "1", features = ["time", "macros", "sync"] }
 base64 = "0.23"
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
-md4 = "0.11"
-md-5 = "0.11"
-hmac = "0.13"
+md4 = { version = "0.11", features = ["zeroize"] }
+md-5 = { version = "0.11", features = ["zeroize"] }
+hmac = { version = "0.13", features = ["zeroize"] }
 rand = "0.10"
 secrecy = { version = "0.10", features = ["serde"] }
 tracing = "0.1"

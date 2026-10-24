@@ -34,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   while idle is now re-authenticated once, when the closure is seen before
   the request is sent, instead of failing.
 - Parsing a Receive response takes time linear in its size.
+- Decoding PowerShell CLIXML on stderr takes time linear in the record size.
 
 ## [1.4.1] - 2026-10-24
 

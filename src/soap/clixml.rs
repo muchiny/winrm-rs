@@ -23,6 +23,8 @@
 
 use std::fmt;
 
+use super::scan::NextMatch;
+
 /// Largest single record (or root start tag) held while waiting for its end.
 /// A record that runs past this is given up on: its bytes and the rest of
 /// the document are released raw, so a server that never closes a record
@@ -464,39 +466,56 @@ fn decode_record(record: &[u8]) -> Vec<u8> {
 /// Undo the XML escaping of element text: the five named entities and
 /// numeric character references. A reference that is malformed or names
 /// NUL stays as written.
+///
+/// Linear in `s`: the `;` that ends a name is looked up once per `;`, not
+/// once per `&`.
 fn decode_entities(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some((before, after_amp)) = rest.split_once('&') {
-        out.push_str(before);
-        let decoded = after_amp.split_once(';').and_then(|(name, after)| {
-            let c = match name {
-                "lt" => Some('<'),
-                "gt" => Some('>'),
-                "amp" => Some('&'),
-                "quot" => Some('"'),
-                "apos" => Some('\''),
-                _ => name
-                    .strip_prefix('#')
-                    .and_then(numeric_reference)
-                    .and_then(char::from_u32)
-                    .filter(|&c| c != '\0'),
-            }?;
-            Some((c, after))
+    let mut semi = NextMatch::new(s, ";");
+    let mut pos = 0usize;
+    while let Some(amp) = s
+        .get(pos..)
+        .and_then(|r| r.find('&'))
+        .and_then(|i| pos.checked_add(i))
+    {
+        out.push_str(s.get(pos..amp).unwrap_or_default());
+        let name_start = amp.saturating_add(1);
+        let decoded = semi.at_or_after(name_start).and_then(|end| {
+            Some((
+                reference_char(s.get(name_start..end)?)?,
+                end.saturating_add(1),
+            ))
         });
         match decoded {
             Some((c, after)) => {
                 out.push(c);
-                rest = after;
+                pos = after;
             }
             None => {
                 out.push('&');
-                rest = after_amp;
+                pos = name_start;
             }
         }
     }
-    out.push_str(rest);
+    out.push_str(s.get(pos..).unwrap_or_default());
     out
+}
+
+/// The character a reference name (the text between `&` and `;`) stands
+/// for, or `None` when it is unknown, malformed or NUL.
+fn reference_char(name: &str) -> Option<char> {
+    match name {
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "amp" => Some('&'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        _ => name
+            .strip_prefix('#')
+            .and_then(numeric_reference)
+            .and_then(char::from_u32)
+            .filter(|&c| c != '\0'),
+    }
 }
 
 /// The value of a numeric reference body (`x41`, `65`): digits only, no
@@ -978,5 +997,97 @@ mod tests {
             decode(b"#< CLIXML\r\n<Objs><S S=\"Error\">&#x+41;&#+65;&#0;&#x0;&#65;</S></Objs>"),
             "&#x+41;&#+65;&#0;&#x0;A"
         );
+    }
+
+    /// Each `&` used to search the rest of the record for `;`.
+    #[test]
+    fn decode_entities_is_linear_on_ampersand_runs() {
+        use std::time::{Duration, Instant};
+        let mib = 1 << 20;
+        let shapes: [(&str, String); 4] = [
+            ("ampersands", "&".repeat(mib)),
+            ("ampersands then ;", format!("{};", "&".repeat(mib))),
+            ("&# runs", format!("{};", "&#".repeat(mib / 2))),
+            ("&#0 runs", format!("{};", "&#0".repeat(350_000))),
+        ];
+        for (shape, s) in &shapes {
+            let started = Instant::now();
+            // None of these is a reference: the output is the input.
+            assert_eq!(&decode_entities(s), s, "{shape}");
+            let took = started.elapsed();
+            assert!(took < Duration::from_secs(5), "{shape}: {took:?}");
+        }
+    }
+
+    /// The same through the decoder: a 1 MiB error record of `&`, pushed in
+    /// 128 KiB slices.
+    #[test]
+    fn stderr_decoder_decodes_a_long_ampersand_record_in_linear_time() {
+        use std::time::{Duration, Instant};
+        let mut stream = b"#< CLIXML\r\n<Objs Version=\"1.1.0.1\"><S S=\"Error\">".to_vec();
+        stream.extend(std::iter::repeat_n(b'&', 1 << 20));
+        stream.extend_from_slice(b"</S></Objs>");
+        let started = Instant::now();
+        let mut decoder = ClixmlDecoder::new();
+        let mut out = Vec::new();
+        for chunk in stream.chunks(128 * 1024) {
+            out.extend(decoder.push(chunk));
+        }
+        out.extend(decoder.finish());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(out.len(), 1 << 20);
+        assert!(out.iter().all(|&b| b == b'&'));
+    }
+
+    /// The function as it was before the single-pass rewrite.
+    fn reference_decode_entities(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut rest = s;
+        while let Some((before, after_amp)) = rest.split_once('&') {
+            out.push_str(before);
+            let decoded = after_amp.split_once(';').and_then(|(name, after)| {
+                let c = match name {
+                    "lt" => Some('<'),
+                    "gt" => Some('>'),
+                    "amp" => Some('&'),
+                    "quot" => Some('"'),
+                    "apos" => Some('\''),
+                    _ => name
+                        .strip_prefix('#')
+                        .and_then(numeric_reference)
+                        .and_then(char::from_u32)
+                        .filter(|&c| c != '\0'),
+                }?;
+                Some((c, after))
+            });
+            match decoded {
+                Some((c, after)) => {
+                    out.push(c);
+                    rest = after;
+                }
+                None => {
+                    out.push('&');
+                    rest = after_amp;
+                }
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn decode_entities_matches_the_reference(
+            parts in proptest::collection::vec(
+                proptest::sample::select(vec![
+                    "&", ";", "#", "x", "X", "lt", "amp", "quot", "#65", "#x41",
+                    "#0", "#x10FFFF", "a", "é", "<",
+                ]),
+                0..24,
+            )
+        ) {
+            let s: String = parts.concat();
+            proptest::prop_assert_eq!(decode_entities(&s), reference_decode_entities(&s), "{:?}", s);
+        }
     }
 }

@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - NTLM: the AUTHENTICATE message now builds its own `TargetInfo` AV list
   (channel binding, target name, flags, single EOL) instead of copying the
   server's bytes. For a conformant Windows challenge the bytes are unchanged.
+- NTLM over HTTPS now sends a MIC, `MsvAvFlags`, the target name and a zero LM
+  response, as NTLM over HTTP already did.
 
 ## [1.4.1] - 2026-10-24
 

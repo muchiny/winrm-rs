@@ -181,7 +181,7 @@ fn security_buffer(msg: &[u8], at: usize) -> (usize, usize) {
 
 /// The exported session key a server derives from a Type 3 (NTLMv2 with key
 /// exchange), for the fake server's credentials.
-fn exported_session_key(type3: &[u8]) -> [u8; 16] {
+pub(crate) fn exported_session_key(type3: &[u8]) -> [u8; 16] {
     let (nt_off, nt_len) = security_buffer(type3, 20);
     let (key_off, key_len) = security_buffer(type3, 52);
     assert!(nt_len >= 16 && key_len == 16, "unexpected Type 3 layout");

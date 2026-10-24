@@ -250,7 +250,7 @@ fn authenticate_target_info(
 /// The session key is wrapped in `Zeroizing` so it is wiped from the caller's
 /// stack when dropped — closes the gap that compiler optimisation otherwise
 /// leaves at -O2 (no automatic wipe for plain `[u8; 16]` returns).
-fn create_authenticate_message_internal(
+pub(crate) fn create_authenticate_message_internal(
     challenge: &ChallengeMessage,
     username: &str,
     password: &str,
@@ -523,32 +523,21 @@ pub(crate) fn create_authenticate_message(
         .map(|(msg, _)| msg)
 }
 
-/// Like [`create_authenticate_message`] but with TLS Channel Binding Token,
-/// also returns the 16-byte exported session key needed for NTLM message
-/// sealing/signing.
-pub(crate) fn create_authenticate_message_with_cbt_and_key(
-    challenge: &ChallengeMessage,
-    username: &str,
-    password: &str,
-    domain: &str,
-    channel_bindings: [u8; 16],
-) -> Result<(Vec<u8>, Zeroizing<[u8; 16]>), NtlmError> {
-    create_authenticate_message_internal(
-        challenge,
-        username,
-        password,
-        domain,
-        Some(channel_bindings),
-        None,
-        None,
-    )
-}
-
-/// Create a Type 3 with MIC (Message Integrity Check) and return the session key.
+/// The NTLM Type 3 (Authenticate) message of the HTTP and HTTPS handshakes,
+/// with the 16-byte exported session key used for NTLM message sealing.
 ///
-/// The MIC = HMAC-MD5(ExportedSessionKey, Type1 || Type2 || Type3) ensures
-/// the handshake hasn't been tampered with. Required for NTLM message sealing.
-pub(crate) fn create_authenticate_message_with_key_and_mic(
+/// One shape for both transports: a MIC, computed as
+/// `HMAC-MD5(ExportedSessionKey, Type1 || Type2 || Type3)` with the MIC field
+/// zeroed (`type1` and `type2` are the raw messages exchanged before), an
+/// `MsvAvFlags` pair with the MIC bit (0x2), an `MsvAvTargetName` pair holding
+/// `target_name`, the `Workstation` field, and an LM response of 24 zero
+/// bytes. Over HTTPS the caller passes `channel_bindings`, which adds an
+/// `MsvAvChannelBindings` pair; over plain HTTP it passes `None`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the handshake inputs are distinct values"
+)]
+pub(crate) fn create_authenticate_message_http(
     challenge: &ChallengeMessage,
     username: &str,
     password: &str,
@@ -556,13 +545,14 @@ pub(crate) fn create_authenticate_message_with_key_and_mic(
     type1: &[u8],
     type2: &[u8],
     target_name: &str,
+    channel_bindings: Option<[u8; 16]>,
 ) -> Result<(Vec<u8>, Zeroizing<[u8; 16]>), NtlmError> {
     create_authenticate_message_internal(
         challenge,
         username,
         password,
         domain,
-        None,
+        channel_bindings,
         Some((type1, type2)),
         Some(target_name),
     )
@@ -1028,7 +1018,7 @@ mod tests {
     }
 
     #[test]
-    fn create_authenticate_message_with_cbt_produces_valid_type3() {
+    fn create_authenticate_message_http_with_cbt_produces_valid_type3() {
         let challenge = {
             let mut msg = vec![0u8; 32];
             msg[0..8].copy_from_slice(b"NTLMSSP\0");
@@ -1038,9 +1028,17 @@ mod tests {
             parse_challenge(&msg).unwrap()
         };
         let cbt = [0xAA; 16];
-        let (msg, _) =
-            create_authenticate_message_with_cbt_and_key(&challenge, "user", "pass", "DOMAIN", cbt)
-                .unwrap();
+        let (msg, _) = create_authenticate_message_http(
+            &challenge,
+            "user",
+            "pass",
+            "DOMAIN",
+            &create_negotiate_message(),
+            &[0u8; 32],
+            "HTTP/host",
+            Some(cbt),
+        )
+        .unwrap();
         // Should be a valid NTLM Type 3 message
         assert_eq!(&msg[0..8], SIGNATURE);
         let msg_type = u32::from_le_bytes([msg[8], msg[9], msg[10], msg[11]]);
@@ -1048,7 +1046,7 @@ mod tests {
     }
 
     #[test]
-    fn create_authenticate_message_with_cbt_differs_from_without() {
+    fn create_authenticate_message_http_with_cbt_differs_from_without() {
         let challenge = {
             let mut msg = vec![0u8; 32];
             msg[0..8].copy_from_slice(b"NTLMSSP\0");
@@ -1057,11 +1055,21 @@ mod tests {
             msg[24..32].copy_from_slice(&[0xCC; 8]);
             parse_challenge(&msg).unwrap()
         };
-        let without = create_authenticate_message(&challenge, "user", "pass", "DOMAIN").unwrap();
-        let (with_cbt, _) = create_authenticate_message_with_cbt_and_key(
-            &challenge, "user", "pass", "DOMAIN", [0xBB; 16],
-        )
-        .unwrap();
+        let http = |cb| {
+            create_authenticate_message_http(
+                &challenge,
+                "user",
+                "pass",
+                "DOMAIN",
+                &create_negotiate_message(),
+                &[0u8; 32],
+                "HTTP/host",
+                cb,
+            )
+            .unwrap()
+            .0
+        };
+        let (without, with_cbt) = (http(None), http(Some([0xBB; 16])));
         // Messages should differ because target_info is modified
         assert_ne!(without, with_cbt);
         // Both should be valid Type 3
@@ -1305,9 +1313,9 @@ mod tests {
         assert_eq!(hex(&[0x00, 0xFF]), "00ff");
     }
 
-    // Kills create_authenticate_message_with_key_and_mic returning replacement values
+    // Kills create_authenticate_message_http returning replacement values
     #[test]
-    fn create_authenticate_message_with_key_and_mic_produces_valid_type3() {
+    fn create_authenticate_message_http_produces_valid_type3() {
         let challenge = ChallengeMessage {
             server_challenge: [0x01; 8],
             negotiate_flags: TYPE1_FLAGS,
@@ -1316,7 +1324,7 @@ mod tests {
             timestamp: Some([0x42; 8]),
         };
         let type1 = create_negotiate_message();
-        let (msg, key) = create_authenticate_message_with_key_and_mic(
+        let (msg, key) = create_authenticate_message_http(
             &challenge,
             "user",
             "pass",
@@ -1324,6 +1332,7 @@ mod tests {
             &type1,
             &[0u8; 32], // fake type2
             "HTTP/host.domain.com",
+            None,
         )
         .unwrap();
         assert_eq!(&msg[0..8], b"NTLMSSP\0");
@@ -1486,6 +1495,31 @@ mod tests {
         uniq.dedup();
         assert_eq!(uniq.len(), ids.len(), "no duplicate AvId");
         out
+    }
+
+    #[test]
+    fn http_type3_av_order_with_a_timestamp_target_info() {
+        let mut ti = av(0x0001, &to_utf16le("WIN01")); // MsvAvNbComputerName
+        ti.extend(av(0x0002, &to_utf16le("CORP"))); // MsvAvNbDomainName
+        ti.extend(av(0x0007, &[0x11; 8])); // MsvAvTimestamp
+        ti.extend(av(0x0000, &[]));
+        let ch = challenge_with(ti);
+        let (type3, _) = create_authenticate_message_http(
+            &ch,
+            "user",
+            "pass",
+            "",
+            &create_negotiate_message(),
+            &[0u8; 32],
+            "HTTP/win01",
+            Some([0xAA; 16]),
+        )
+        .unwrap();
+        let ids: Vec<u16> = blob_av_pairs(&type3).iter().map(|(i, _)| *i).collect();
+        assert_eq!(
+            ids,
+            vec![0x0001, 0x0002, 0x0007, 0x000A, 0x0009, 0x0006, 0x0000]
+        );
     }
 
     fn ids(pairs: &[(u16, Vec<u8>)]) -> Vec<u16> {

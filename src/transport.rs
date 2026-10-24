@@ -3106,6 +3106,107 @@ mod tests {
         );
     }
 
+    /// The AV pairs of the NTLMv2 blob of a Type 3, read as
+    /// [`type3_channel_bindings`] reads them, up to and excluding `MsvAvEOL`.
+    fn parse_type3_av_pairs(type3: &[u8]) -> Vec<(u16, Vec<u8>)> {
+        let u16_at = |at: usize| u16::from_le_bytes([type3[at], type3[at + 1]]) as usize;
+        let (nt_len, nt_off) = (u16_at(20), u16_at(24) | (u16_at(26) << 16));
+        let nt = &type3[nt_off..nt_off + nt_len];
+        // NTProofStr (16) + blob header (28), then the AV pairs.
+        let mut pairs = &nt[16 + 28..];
+        let mut out = Vec::new();
+        while pairs.len() >= 4 {
+            let id = u16::from_le_bytes([pairs[0], pairs[1]]);
+            let len = u16::from_le_bytes([pairs[2], pairs[3]]) as usize;
+            if id == 0 {
+                break;
+            }
+            out.push((id, pairs[4..4 + len].to_vec()));
+            pairs = &pairs[4 + len..];
+        }
+        out
+    }
+
+    fn from_utf16le(bytes: &[u8]) -> String {
+        String::from_utf16(
+            &bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_le_bytes(*c))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+    }
+
+    /// Over TLS the Type 3 now carries a MIC, MsvAvFlags 0x2, the target name,
+    /// a zero LM response and the channel binding — as the plain-HTTP path does.
+    #[tokio::test]
+    async fn ntlm_over_tls_type3_carries_mic_flags_target_name_and_zero_lm() {
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
+        let (port, seen) = spawn_ntlm_tls_server(EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let transport = ntlm_tls_transport(port, spawn_connect_proxy());
+        let url = format!("https://127.0.0.1:{port}/wsman");
+        // Driven exactly like ntlm_cbt_binds_the_certificate_of_its_own_connection.
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            transport.send_ntlm_over_tls("127.0.0.1", &url, "<soap/>"),
+        )
+        .await
+        .expect("did not finish in 20 s")
+        .unwrap();
+        let type3 = seen.lock().unwrap().remove(0);
+        // LM security buffer (offset 12) is 24 bytes, all zero.
+        let lm_len = u16::from_le_bytes([type3[12], type3[13]]) as usize;
+        let lm_off = u32::from_le_bytes(type3[16..20].try_into().unwrap()) as usize;
+        assert_eq!(lm_len, 24);
+        assert!(type3[lm_off..lm_off + 24].iter().all(|&b| b == 0));
+        // MIC (bytes 72..88 after the version field) is non-zero.
+        assert!(type3[72..88].iter().any(|&b| b != 0));
+        // AV pairs: MsvAvFlags has 0x2, MsvAvTargetName equals the SPN, CB equals cbt_of(cert).
+        let avs = parse_type3_av_pairs(&type3);
+        let av = |id: u16| avs.iter().find(|(i, _)| *i == id).map(|(_, v)| v.clone());
+        assert_eq!(
+            av(0x0006).map(|v| u32::from_le_bytes(v[..4].try_into().unwrap())),
+            Some(0x2)
+        );
+        assert_eq!(
+            av(0x0009).map(|v| from_utf16le(&v)),
+            Some(format!("http/127.0.0.1:{port}"))
+        );
+        assert_eq!(av(0x000A), Some(cbt_of(EC_CERT_PEM).to_vec()));
+    }
+
+    /// The MIC covers Type1 || Type2 || Type3 (with the MIC field zeroed).
+    #[tokio::test]
+    async fn ntlm_over_tls_mic_covers_type1_type2_type3() {
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
+        use base64::Engine as _;
+        let (port, seen) = spawn_ntlm_tls_server(EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let transport = ntlm_tls_transport(port, spawn_connect_proxy());
+        let url = format!("https://127.0.0.1:{port}/wsman");
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            transport.send_ntlm_over_tls("127.0.0.1", &url, "<soap/>"),
+        )
+        .await
+        .expect("did not finish in 20 s")
+        .unwrap();
+        let type3 = seen.lock().unwrap().remove(0);
+        // The client's Type 1 is deterministic; the server sent challenge_header().
+        let type1 = crate::ntlm::messages::create_negotiate_message();
+        let header = crate::test_ntlm_server::challenge_header();
+        let type2 = base64::engine::general_purpose::STANDARD
+            .decode(header.strip_prefix("Negotiate ").unwrap())
+            .unwrap();
+        let mut zeroed = type3.clone();
+        zeroed[72..88].fill(0);
+        let key = crate::test_ntlm_server::exported_session_key(&type3);
+        let mic =
+            crate::ntlm::crypto::hmac_md5(&key, &[type1.as_slice(), &type2, &zeroed].concat());
+        assert_eq!(&type3[72..88], &mic[..]);
+    }
+
     /// Over TLS, a handshake whose connection reports no server certificate
     /// fails instead of authenticating without channel binding.
     #[tokio::test]

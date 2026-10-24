@@ -14,8 +14,8 @@
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use winrm_rs::__fuzz::{
-    ChallengeMessage, create_authenticate_message, create_authenticate_message_with_cbt_and_key,
-    create_authenticate_message_with_key_and_mic, create_negotiate_message,
+    ChallengeMessage, create_authenticate_message, create_authenticate_message_http,
+    create_negotiate_message,
 };
 
 #[derive(Arbitrary, Debug)]
@@ -148,31 +148,24 @@ fuzz_target!(|input: Input<'_>| {
     };
     check_type3(&msg);
 
-    let Ok((msg, key)) = create_authenticate_message_with_cbt_and_key(
-        &challenge,
-        input.username,
-        input.password,
-        input.domain,
-        input.channel_bindings,
-    ) else {
-        return;
-    };
-    check_type3(&msg);
-    check_av_list(&msg, true, false);
-    assert_eq!(key.len(), 16);
-
+    // The HTTP/HTTPS builder: over TLS (with a channel binding), then over
+    // plain HTTP (without one). Both carry a MIC.
     let type1 = create_negotiate_message();
-    let Ok((msg, _)) = create_authenticate_message_with_key_and_mic(
-        &challenge,
-        input.username,
-        input.password,
-        input.domain,
-        &type1,
-        input.type2_bytes,
-        input.target_name,
-    ) else {
-        return;
-    };
-    check_type3(&msg);
-    check_av_list(&msg, false, true);
+    for channel_bindings in [Some(input.channel_bindings), None] {
+        let Ok((msg, key)) = create_authenticate_message_http(
+            &challenge,
+            input.username,
+            input.password,
+            input.domain,
+            &type1,
+            input.type2_bytes,
+            input.target_name,
+            channel_bindings,
+        ) else {
+            return;
+        };
+        check_type3(&msg);
+        check_av_list(&msg, channel_bindings.is_some(), true);
+        assert_eq!(key.len(), 16);
+    }
 });

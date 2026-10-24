@@ -210,7 +210,7 @@ impl NtlmAuth {
         // TLS channel and are the mitigation against NTLM-over-TLS relay.
         // Over TLS, a connection that reports no server certificate fails
         // the handshake instead of authenticating unbound.
-        let (type3, session_key) = if over_tls {
+        let channel_bindings = if over_tls {
             let cert_der = peer_certificate.ok_or_else(|| {
                 WinrmError::Ntlm(NtlmError::InvalidMessage(
                     "NTLM over TLS: the connection reported no server certificate to bind \
@@ -218,28 +218,26 @@ impl NtlmAuth {
                         .into(),
                 ))
             })?;
-            let cbt = crate::ntlm::crypto::compute_channel_bindings(&cert_der)
-                .map_err(WinrmError::Ntlm)?;
-            ntlm::create_authenticate_message_with_cbt_and_key(
-                &challenge,
-                &self.username,
-                &self.password,
-                &domain,
-                cbt,
+            Some(
+                crate::ntlm::crypto::compute_channel_bindings(&cert_der)
+                    .map_err(WinrmError::Ntlm)?,
             )
-            .map_err(WinrmError::Ntlm)?
         } else {
-            ntlm::create_authenticate_message_with_key_and_mic(
-                &challenge,
-                &self.username,
-                &self.password,
-                &domain,
-                &type1,
-                &type2_raw,
-                &target_name,
-            )
-            .map_err(WinrmError::Ntlm)?
+            None
         };
+        // One Type 3 shape over HTTP and HTTPS: MIC, MsvAvFlags, target name,
+        // workstation and a zero LM response; plus the CBT over TLS.
+        let (type3, session_key) = ntlm::create_authenticate_message_http(
+            &challenge,
+            &self.username,
+            &self.password,
+            &domain,
+            &type1,
+            &type2_raw,
+            &target_name,
+            channel_bindings,
+        )
+        .map_err(WinrmError::Ntlm)?;
         // Copy the exported session key to the heap before the awaits below
         // and wipe this copy in place, so no unboxed copy of it lives in this
         // future while it waits on the network, and returning it moves a

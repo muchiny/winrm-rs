@@ -48,7 +48,36 @@ pub fn create_authenticate_message(
     crate::ntlm::messages::create_authenticate_message(challenge, username, password, domain)
 }
 
-/// Build a Type 3 with a channel binding token; also returns the session key.
+/// Build the Type 3 of the HTTP and HTTPS handshakes (MIC, `MsvAvFlags`,
+/// target name, zero LM; the channel binding when given); also returns the
+/// session key.
+#[allow(clippy::too_many_arguments, reason = "mirrors the wrapped builder")]
+pub fn create_authenticate_message_http(
+    challenge: &ChallengeMessage,
+    username: &str,
+    password: &str,
+    domain: &str,
+    type1: &[u8],
+    type2: &[u8],
+    target_name: &str,
+    channel_bindings: Option<[u8; 16]>,
+) -> Result<(Vec<u8>, [u8; 16]), NtlmError> {
+    crate::ntlm::messages::create_authenticate_message_http(
+        challenge,
+        username,
+        password,
+        domain,
+        type1,
+        type2,
+        target_name,
+        channel_bindings,
+    )
+    .map(|(msg, key)| (msg, *key))
+}
+
+/// Build a Type 3 with a channel binding token and no MIC; also returns the
+/// session key. No transport sends this shape any more; kept so the
+/// `TargetInfo` builder stays reachable with a channel binding and no MIC.
 pub fn create_authenticate_message_with_cbt_and_key(
     challenge: &ChallengeMessage,
     username: &str,
@@ -56,17 +85,20 @@ pub fn create_authenticate_message_with_cbt_and_key(
     domain: &str,
     channel_bindings: [u8; 16],
 ) -> Result<(Vec<u8>, [u8; 16]), NtlmError> {
-    crate::ntlm::messages::create_authenticate_message_with_cbt_and_key(
+    crate::ntlm::messages::create_authenticate_message_internal(
         challenge,
         username,
         password,
         domain,
-        channel_bindings,
+        Some(channel_bindings),
+        None,
+        None,
     )
     .map(|(msg, key)| (msg, *key))
 }
 
-/// Build a Type 3 with a MIC over Type1 || Type2 || Type3.
+/// Build a Type 3 with a MIC over Type1 || Type2 || Type3: the plain-HTTP
+/// shape, [`create_authenticate_message_http`] without a channel binding.
 pub fn create_authenticate_message_with_key_and_mic(
     challenge: &ChallengeMessage,
     username: &str,
@@ -76,7 +108,7 @@ pub fn create_authenticate_message_with_key_and_mic(
     type2: &[u8],
     target_name: &str,
 ) -> Result<(Vec<u8>, [u8; 16]), NtlmError> {
-    crate::ntlm::messages::create_authenticate_message_with_key_and_mic(
+    create_authenticate_message_http(
         challenge,
         username,
         password,
@@ -84,8 +116,8 @@ pub fn create_authenticate_message_with_key_and_mic(
         type1,
         type2,
         target_name,
+        None,
     )
-    .map(|(msg, key)| (msg, *key))
 }
 
 // ---------------------------------------------------------------------------

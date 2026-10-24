@@ -41,8 +41,8 @@ scripts/fuzz.sh smoke         # replay the committed seed corpora
 scripts/fuzz.sh run           # 60s per target
 scripts/fuzz.sh run fuzz_asn1_ts_request 900
 
-# Check what will be published to crates.io
-cargo package --list
+# Check what will be published to crates.io (fails on any file outside the allowlist)
+scripts/check-package.sh
 ```
 
 ## Pull Request guidelines

@@ -28,6 +28,8 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --all --check
+      - name: Package contents
+        run: scripts/check-package.sh
 
   clippy:
     name: Clippy

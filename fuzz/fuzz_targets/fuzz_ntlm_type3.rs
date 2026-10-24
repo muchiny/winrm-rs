@@ -84,6 +84,50 @@ fn check_type3(msg: &[u8]) {
     );
 }
 
+/// The AV list of the NTLMv2 blob in a Type 3 must be the client's canonical
+/// one: each id once, exactly one `MsvAvEOL` (last), a `MsvAvChannelBindings`
+/// iff `cb_expected`, a `MsvAvFlags` with the MIC bit (0x2) iff
+/// `mic_expected`, and never the untrusted-target-name bit (0x4).
+fn check_av_list(msg: &[u8], cb_expected: bool, mic_expected: bool) {
+    let nt_len = u16::from_le_bytes(msg[20..22].try_into().unwrap()) as usize;
+    let nt_off = u32::from_le_bytes(msg[24..28].try_into().unwrap()) as usize;
+    let nt = &msg[nt_off..nt_off + nt_len];
+    let mut p = &nt[16 + 28..]; // NTProofStr(16) + blob header(28)
+    let mut ids = Vec::new();
+    let mut flags = None;
+    loop {
+        assert!(p.len() >= 4, "AV list runs past the NTLMv2 blob");
+        let id = u16::from_le_bytes([p[0], p[1]]);
+        let len = u16::from_le_bytes([p[2], p[3]]) as usize;
+        assert!(
+            p.len() >= 4 + len,
+            "AV pair {id:#x} runs past the NTLMv2 blob"
+        );
+        let value = &p[4..4 + len];
+        assert!(!ids.contains(&id), "AV id {id:#x} appears twice");
+        ids.push(id);
+        if id == 0x0006 {
+            let v: [u8; 4] = value.try_into().expect("MsvAvFlags is 4 bytes");
+            flags = Some(u32::from_le_bytes(v));
+        }
+        p = &p[4 + len..];
+        if id == 0x0000 {
+            break;
+        }
+    }
+    assert_eq!(p, [0u8; 4], "MsvAvEOL is the last pair of the blob");
+    assert_eq!(ids.contains(&0x000A), cb_expected, "MsvAvChannelBindings");
+    assert_eq!(
+        flags.is_some_and(|f| f & 0x2 != 0),
+        mic_expected,
+        "MsvAvFlags MIC bit"
+    );
+    assert!(
+        flags.is_none_or(|f| f & 0x4 == 0),
+        "MsvAvFlags untrusted-target-name bit"
+    );
+}
+
 fuzz_target!(|input: Input<'_>| {
     let challenge = ChallengeMessage {
         server_challenge: input.server_challenge,
@@ -114,6 +158,7 @@ fuzz_target!(|input: Input<'_>| {
         return;
     };
     check_type3(&msg);
+    check_av_list(&msg, true, false);
     assert_eq!(key.len(), 16);
 
     let type1 = create_negotiate_message();
@@ -129,4 +174,5 @@ fuzz_target!(|input: Input<'_>| {
         return;
     };
     check_type3(&msg);
+    check_av_list(&msg, false, true);
 });

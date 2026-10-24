@@ -63,9 +63,13 @@ pub(crate) const AV_EOL: u16 = 0x0000;
 pub(crate) const AV_NB_DOMAIN_NAME: u16 = 0x0002;
 pub(crate) const AV_FLAGS_ID: u16 = 0x0006;
 pub(crate) const AV_TIMESTAMP: u16 = 0x0007;
+pub(crate) const AV_SINGLE_HOST: u16 = 0x0008;
 pub(crate) const AV_TARGET_NAME: u16 = 0x0009;
 pub(crate) const AV_CHANNEL_BINDINGS: u16 = 0x000A;
 
+/// Bit in AV_FLAGS indicating that the server's account authentication is
+/// constrained (MS-NLMP 2.2.2.1); the only server flag the client echoes.
+pub(crate) const AV_FLAG_CONSTRAINED: u32 = 0x0000_0001;
 /// Bit in AV_FLAGS indicating that a MIC is present in the AUTHENTICATE_MESSAGE.
 pub(crate) const AV_FLAG_MIC: u32 = 0x0000_0002;
 
@@ -114,40 +118,44 @@ pub(crate) fn build_ntlmv2_blob(
     blob
 }
 
+/// The `(AvId, Value)` pairs of a `TargetInfo` AV list (MS-NLMP 2.2.2.1), in
+/// wire order.
+///
+/// The walk ends before the first `MsvAvEOL`, or at a pair whose declared
+/// length runs past the end of `data`: a truncated trailing pair is dropped,
+/// never read.
+pub(crate) fn av_pairs(data: &[u8]) -> impl Iterator<Item = (u16, &[u8])> + '_ {
+    let mut rest = data;
+    std::iter::from_fn(move || {
+        let ([id_lo, id_hi, len_lo, len_hi], tail) = rest.split_first_chunk::<4>()?;
+        let id = u16::from_le_bytes([*id_lo, *id_hi]);
+        if id == AV_EOL {
+            return None;
+        }
+        let len = usize::from(u16::from_le_bytes([*len_lo, *len_hi]));
+        let (value, after) = tail.split_at_checked(len)?;
+        rest = after;
+        Some((id, value))
+    })
+}
+
 /// Parse AV_PAIRs from target info, extracting domain name and timestamp.
+///
+/// The first `MsvAvNbDomainName` wins, and the first `MsvAvTimestamp` whose
+/// value is 8 bytes wins.
 pub(crate) fn parse_av_pairs(data: &[u8]) -> (String, Option<[u8; 8]>) {
-    let mut domain = String::new();
+    let mut domain: Option<String> = None;
     let mut timestamp: Option<[u8; 8]> = None;
-    let mut offset = 0;
 
-    while offset + 4 <= data.len() {
-        let av_id = u16::from_le_bytes([data[offset], data[offset + 1]]);
-        let av_len = u16::from_le_bytes([data[offset + 2], data[offset + 3]]) as usize;
-        offset += 4;
-
-        if av_id == AV_EOL {
-            break;
-        }
-        if offset + av_len > data.len() {
-            break;
-        }
-
-        match av_id {
-            AV_NB_DOMAIN_NAME => {
-                domain = from_utf16le(&data[offset..offset + av_len]);
-            }
-            AV_TIMESTAMP if av_len == 8 => {
-                let mut ts = [0u8; 8];
-                ts.copy_from_slice(&data[offset..offset + 8]);
-                timestamp = Some(ts);
-            }
+    for (id, value) in av_pairs(data) {
+        match id {
+            AV_NB_DOMAIN_NAME if domain.is_none() => domain = Some(from_utf16le(value)),
+            AV_TIMESTAMP if timestamp.is_none() => timestamp = <[u8; 8]>::try_from(value).ok(),
             _ => {}
         }
-
-        offset += av_len;
     }
 
-    (domain, timestamp)
+    (domain.unwrap_or_default(), timestamp)
 }
 
 pub(crate) fn write_security_buffer(buf: &mut Vec<u8>, len: u16, offset: u32) {
@@ -599,6 +607,68 @@ mod tests {
 
         let (parsed_domain, _) = parse_av_pairs(&ti);
         assert_eq!(parsed_domain, "AB");
+    }
+
+    fn av(id: u16, value: &[u8]) -> Vec<u8> {
+        let mut v = id.to_le_bytes().to_vec();
+        v.extend_from_slice(&u16::try_from(value.len()).unwrap().to_le_bytes());
+        v.extend_from_slice(value);
+        v
+    }
+
+    #[test]
+    fn av_pairs_yields_pairs_in_order_up_to_the_first_eol() {
+        let ti = [
+            av(0x0002, b"ab"),
+            av(0x0005, b""),
+            av(0x0007, b"12345678"),
+            av(AV_EOL, b""),
+            av(0x0003, b"after"),
+        ]
+        .concat();
+        let pairs: Vec<(u16, &[u8])> = av_pairs(&ti).collect();
+        assert_eq!(
+            pairs,
+            [
+                (0x0002, &b"ab"[..]),
+                (0x0005, &b""[..]),
+                (0x0007, &b"12345678"[..])
+            ]
+        );
+    }
+
+    #[test]
+    fn av_pairs_drops_a_truncated_trailing_pair() {
+        let mut ti = av(0x0002, b"ab");
+        ti.extend_from_slice(&[0x03, 0x00, 40, 0x00, 1, 2, 3, 4]);
+        let pairs: Vec<(u16, &[u8])> = av_pairs(&ti).collect();
+        assert_eq!(pairs, [(0x0002, &b"ab"[..])]);
+        // A dangling partial header is no pair either.
+        let pairs: Vec<(u16, &[u8])> = av_pairs(&[0x02, 0x00, 0x00]).collect();
+        assert!(pairs.is_empty());
+    }
+
+    #[test]
+    fn av_pairs_reads_a_pair_that_ends_exactly_at_the_end() {
+        let ti = av(0x0004, b"xyz");
+        let pairs: Vec<(u16, &[u8])> = av_pairs(&ti).collect();
+        assert_eq!(pairs, [(0x0004, &b"xyz"[..])]);
+    }
+
+    #[test]
+    fn parse_av_pairs_first_domain_and_first_8_byte_timestamp_win() {
+        let ti = [
+            av(AV_NB_DOMAIN_NAME, &to_utf16le("FIRST")),
+            av(AV_TIMESTAMP, &[0x11; 4]),
+            av(AV_TIMESTAMP, &[0x22; 8]),
+            av(AV_NB_DOMAIN_NAME, &to_utf16le("SECOND")),
+            av(AV_TIMESTAMP, &[0x33; 8]),
+            av(AV_EOL, b""),
+        ]
+        .concat();
+        let (domain, timestamp) = parse_av_pairs(&ti);
+        assert_eq!(domain, "FIRST");
+        assert_eq!(timestamp, Some([0x22; 8]));
     }
 
     #[test]

@@ -17,6 +17,9 @@
 //! - NTLM-sealed responses (`unseal_body`): a server-sealed frame round-trips,
 //!   a flipped bit never yields other text, a truncated frame is rejected,
 //!   arbitrary bytes never panic
+//! - NTLM Type 3 `TargetInfo`: whatever the server's AV list, the client's is
+//!   canonical (each id once, its own channel binding, target name and flags,
+//!   one EOL, last)
 //!
 //! Run with: `cargo test --features __internal --test proptest_wire_format`
 
@@ -304,5 +307,161 @@ proptest! {
         let mut input = prefix;
         input.extend_from_slice(&data);
         let _ = winrm_rs::__fuzz::compute_channel_bindings(&input);
+    }
+}
+
+// P-NTLM-AV — the Type 3 `TargetInfo` is the client's own canonical AV list.
+
+/// AV ids the client never copies from the server: EOL, flags, single host,
+/// target name and channel bindings.
+const NOT_COPIED_AV_IDS: [u16; 5] = [0x0000, 0x0006, 0x0008, 0x0009, 0x000A];
+
+/// A server `TargetInfo`: raw bytes, or AV pairs (ids biased toward the ones
+/// the client writes itself, flags often 4 bytes long) then a few raw bytes.
+fn server_target_info() -> impl Strategy<Value = Vec<u8>> {
+    let id = prop_oneof![0u16..12, any::<u16>()];
+    let value = prop_oneof![
+        proptest::collection::vec(any::<u8>(), 0..40),
+        any::<[u8; 4]>().prop_map(|v| v.to_vec()),
+    ];
+    prop_oneof![
+        proptest::collection::vec(any::<u8>(), 0..8192),
+        (
+            proptest::collection::vec((id, value), 0..24),
+            proptest::collection::vec(any::<u8>(), 0..8),
+        )
+            .prop_map(|(pairs, tail)| {
+                let mut ti = Vec::new();
+                for (id, v) in pairs {
+                    ti.extend_from_slice(&id.to_le_bytes());
+                    ti.extend_from_slice(&u16::try_from(v.len()).unwrap().to_le_bytes());
+                    ti.extend_from_slice(&v);
+                }
+                ti.extend_from_slice(&tail);
+                ti
+            }),
+    ]
+}
+
+/// The server's AV pairs up to its first EOL; a truncated pair ends the walk.
+fn server_pairs(ti: &[u8]) -> Vec<(u16, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut p = ti;
+    while p.len() >= 4 {
+        let id = u16::from_le_bytes([p[0], p[1]]);
+        let len = usize::from(u16::from_le_bytes([p[2], p[3]]));
+        if id == 0 || p.len() - 4 < len {
+            break;
+        }
+        out.push((id, p[4..4 + len].to_vec()));
+        p = &p[4 + len..];
+    }
+    out
+}
+
+/// The AV list of a Type 3's NTLMv2 blob, EOL included. Asserts the list ends
+/// exactly where the blob's 4-byte trailing reserved field begins.
+fn type3_av_list(msg: &[u8]) -> Vec<(u16, Vec<u8>)> {
+    let nt_len = usize::from(u16::from_le_bytes([msg[20], msg[21]]));
+    let nt_off = usize::try_from(u32::from_le_bytes(msg[24..28].try_into().unwrap())).unwrap();
+    let nt = &msg[nt_off..nt_off + nt_len];
+    let mut p = &nt[16 + 28..]; // NTProofStr(16) + blob header(28)
+    let mut out = Vec::new();
+    loop {
+        let id = u16::from_le_bytes([p[0], p[1]]);
+        let len = usize::from(u16::from_le_bytes([p[2], p[3]]));
+        out.push((id, p[4..4 + len].to_vec()));
+        p = &p[4 + len..];
+        if id == 0 {
+            break;
+        }
+    }
+    assert_eq!(
+        p, [0u8; 4],
+        "the AV list ends right before the blob's last 4 bytes"
+    );
+    out
+}
+
+fn utf16le(s: &str) -> Vec<u8> {
+    s.encode_utf16().flat_map(u16::to_le_bytes).collect()
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    /// Whatever the server's `TargetInfo`, the Type 3 list is: the server's
+    /// pairs (first occurrence of each id, the client-written ids dropped),
+    /// then the client's channel binding, target name and flags, then one EOL.
+    #[test]
+    fn prop_type3_av_list_is_canonical(
+        ti in server_target_info(),
+        variant in 0u8..3,
+        cb in any::<[u8; 16]>(),
+        spn in "\\PC{0,32}",
+    ) {
+        let challenge = winrm_rs::__fuzz::ChallengeMessage {
+            server_challenge: [0x01; 8],
+            negotiate_flags: 0xe28a_8235,
+            target_info: ti.clone(),
+            target_domain: String::new(),
+            timestamp: Some([0x11; 8]),
+        };
+        let msg = match variant {
+            0 => winrm_rs::__fuzz::create_authenticate_message(&challenge, "user", "pass", "DOM")
+                .expect("an 8 KiB TargetInfo fits"),
+            1 => winrm_rs::__fuzz::create_authenticate_message_with_cbt_and_key(
+                &challenge, "user", "pass", "DOM", cb,
+            )
+            .expect("an 8 KiB TargetInfo fits")
+            .0,
+            _ => winrm_rs::__fuzz::create_authenticate_message_with_key_and_mic(
+                &challenge, "user", "pass", "DOM", &[0u8; 40], &[0u8; 32], &spn,
+            )
+            .expect("an 8 KiB TargetInfo fits")
+            .0,
+        };
+        let (cb_expected, mic_expected) = (variant == 1, variant == 2);
+        let got = type3_av_list(&msg);
+
+        // Model of the canonical list.
+        let mut want: Vec<(u16, Vec<u8>)> = Vec::new();
+        let mut server_flags: Option<u32> = None;
+        for (id, v) in server_pairs(&ti) {
+            if id == 0x0006 && server_flags.is_none() && v.len() == 4 {
+                server_flags = Some(u32::from_le_bytes(v[..].try_into().unwrap()));
+            }
+            if !NOT_COPIED_AV_IDS.contains(&id) && !want.iter().any(|(w, _)| *w == id) {
+                want.push((id, v));
+            }
+        }
+        if cb_expected {
+            want.push((0x000A, cb.to_vec()));
+        }
+        if mic_expected {
+            want.push((0x0009, utf16le(&spn)));
+        }
+        if mic_expected || server_flags.is_some() {
+            let flags = (server_flags.unwrap_or(0) & 0x1) | if mic_expected { 0x2 } else { 0 };
+            want.push((0x0006, flags.to_le_bytes().to_vec()));
+        }
+        want.push((0x0000, Vec::new()));
+        prop_assert_eq!(&got, &want);
+
+        // The invariants the model implies, stated directly.
+        let ids: Vec<u16> = got.iter().map(|(i, _)| *i).collect();
+        let mut uniq = ids.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        prop_assert_eq!(uniq.len(), ids.len(), "no duplicate AvId");
+        prop_assert_eq!(ids.iter().filter(|i| **i == 0).count(), 1, "exactly one EOL");
+        prop_assert_eq!(ids.last(), Some(&0), "EOL is last");
+        prop_assert_eq!(ids.contains(&0x000A), cb_expected);
+        let flags = got
+            .iter()
+            .find(|(i, _)| *i == 0x0006)
+            .map(|(_, v)| u32::from_le_bytes(v[..].try_into().unwrap()));
+        prop_assert_eq!(flags.is_some_and(|f| f & 0x2 != 0), mic_expected);
+        prop_assert!(flags.is_none_or(|f| f & 0x4 == 0), "never the untrusted-SPN bit");
     }
 }

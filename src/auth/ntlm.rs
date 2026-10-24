@@ -179,16 +179,18 @@ impl NtlmAuth {
         let _ = crate::auth::read_body_capped(resp, self.max_response_bytes).await;
 
         // Decode challenge and keep raw Type 2 bytes for MIC computation
+        let token = www_auth.strip_prefix("Negotiate ").ok_or_else(|| {
+            WinrmError::AuthFailed("missing Negotiate prefix in challenge".into())
+        })?;
         let type2_raw = {
-            let token = www_auth.strip_prefix("Negotiate ").ok_or_else(|| {
-                WinrmError::AuthFailed("missing Negotiate prefix in challenge".into())
-            })?;
             use base64::Engine;
             base64::engine::general_purpose::STANDARD
                 .decode(token.trim_ascii())
                 .map_err(|e| WinrmError::AuthFailed(format!("base64 decode: {e}")))?
         };
         let challenge = ntlm::decode_challenge_header(&www_auth).map_err(WinrmError::Ntlm)?;
+        // A Type 2 holds no secret (server challenge, names, timestamp).
+        tracing::trace!(target: "winrm_rs::ntlm::challenge", type2 = %token, "NTLM challenge received");
 
         // Step 3: Send Type 3 (Authenticate), with the SOAP body or none
         // The domain for NTLMv2Hash must match what the user provided.

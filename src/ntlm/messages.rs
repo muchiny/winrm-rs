@@ -21,8 +21,8 @@ pub struct ChallengeMessage {
     /// Negotiated capability flags (MS-NLMP 2.2.2.5).
     #[allow(dead_code)]
     pub negotiate_flags: u32,
-    /// Raw `AV_PAIR` list from the `TargetInfo` field, included verbatim in the
-    /// NTLMv2 client blob.
+    /// Raw `AV_PAIR` list from the `TargetInfo` field, parsed and rebuilt into
+    /// a canonical AV list by `authenticate_target_info`; never signed verbatim.
     pub target_info: Vec<u8>,
     /// NetBIOS domain name extracted from `AV_NB_DOMAIN_NAME` in the target info.
     /// Retained for diagnostics; not consumed by the authenticate-message builders.
@@ -160,6 +160,91 @@ fn place(offset: &mut usize, len: u16) -> Result<u32, NtlmError> {
     Ok(at)
 }
 
+/// AV ids never copied from the server's list: the client writes its own
+/// `MsvAvEOL`, `MsvAvFlags`, `MsvAvTargetName` and `MsvAvChannelBindings`, and
+/// sends no `MsvAvSingleHost`.
+const AV_IDS_NOT_COPIED: [u16; 5] = [
+    AV_EOL,
+    AV_FLAGS_ID,
+    AV_SINGLE_HOST,
+    AV_TARGET_NAME,
+    AV_CHANNEL_BINDINGS,
+];
+
+/// The `MsvAvFlags` bits the client sends when it includes a MIC.
+const AV_FLAGS_KEPT_WITH_MIC: u32 = AV_FLAG_CONSTRAINED | AV_FLAG_MIC;
+
+/// Appends one AV pair; `what` names it if its length does not fit 16 bits.
+fn push_av(out: &mut Vec<u8>, what: &'static str, id: u16, value: &[u8]) -> Result<(), NtlmError> {
+    out.extend_from_slice(&id.to_le_bytes());
+    out.extend_from_slice(&len16(what, value.len())?.to_le_bytes());
+    out.extend_from_slice(value);
+    Ok(())
+}
+
+/// The `TargetInfo` AV list of the NTLMv2 client blob (MS-NLMP 3.1.5.1.2),
+/// built by the client rather than copied from the server.
+///
+/// The server's pairs are copied in their order, each id once (the first
+/// occurrence), up to its first `MsvAvEOL`; its `MsvAvFlags`,
+/// `MsvAvSingleHost`, `MsvAvTargetName` and `MsvAvChannelBindings` are never
+/// copied. Then come, in this order: `MsvAvChannelBindings` when
+/// `channel_bindings` is given, `MsvAvTargetName` (UTF-16LE) when
+/// `target_name` is given, one `MsvAvFlags` when `mic` is set or the server
+/// sent a 4-byte flags value, and a single `MsvAvEOL`. The flags keep only the
+/// server's "authentication constrained" bit, plus the MIC bit when `mic` is
+/// set. For a Windows challenge, which carries no `MsvAvFlags`, the bytes are
+/// the server's list followed by the client's pairs.
+///
+/// Wrapped in `Zeroizing` because the bytes feed the HMAC over the NTLMv2
+/// blob and so are part of the cryptographic transcript.
+fn authenticate_target_info(
+    server_ti: &[u8],
+    channel_bindings: Option<&[u8; 16]>,
+    target_name: Option<&str>,
+    mic: bool,
+) -> Result<Zeroizing<Vec<u8>>, NtlmError> {
+    let mut out = Zeroizing::new(Vec::with_capacity(server_ti.len()));
+    let mut seen = std::collections::BTreeSet::new();
+    let mut server_flags: Option<u32> = None;
+
+    for (id, value) in av_pairs(server_ti) {
+        if id == AV_FLAGS_ID && server_flags.is_none() {
+            // A flags value that is not exactly 4 bytes counts as absent.
+            server_flags = <[u8; 4]>::try_from(value).ok().map(u32::from_le_bytes);
+        }
+        if AV_IDS_NOT_COPIED.contains(&id) || !seen.insert(id) {
+            continue;
+        }
+        push_av(&mut out, "AV pair", id, value)?;
+    }
+
+    if let Some(cb) = channel_bindings {
+        push_av(&mut out, "AV pair", AV_CHANNEL_BINDINGS, cb)?;
+    }
+    if let Some(spn) = target_name {
+        push_av(
+            &mut out,
+            "MsvAvTargetName",
+            AV_TARGET_NAME,
+            &to_utf16le(spn),
+        )?;
+    }
+    if mic || server_flags.is_some() {
+        // Set the MIC bit, then keep the server's "constrained" bit and, only
+        // when `mic` is set, the MIC bit; every other server bit is dropped.
+        let keep = if mic {
+            AV_FLAGS_KEPT_WITH_MIC
+        } else {
+            AV_FLAG_CONSTRAINED
+        };
+        let flags = (server_flags.unwrap_or(0) | AV_FLAG_MIC) & keep;
+        push_av(&mut out, "AV pair", AV_FLAGS_ID, &flags.to_le_bytes())?;
+    }
+    push_av(&mut out, "AV pair", AV_EOL, &[])?;
+    Ok(out)
+}
+
 /// Internal implementation -- returns both the Type 3 message and the exported session key.
 ///
 /// The session key is wrapped in `Zeroizing` so it is wiped from the caller's
@@ -230,43 +315,12 @@ pub(crate) fn create_authenticate_message_full(
     };
     let timestamp = challenge.timestamp.unwrap_or_else(current_windows_filetime);
 
-    // Build target_info: start from server's, optionally inject CBT,
-    // TARGET_NAME and AV_FLAGS, end with AV_EOL.
-    //
-    // Wrapped in `Zeroizing` because the bytes (server-supplied, plus the
-    // CBT and SPN we append) feed straight into the HMAC over the NTLMv2
-    // blob and so are part of the cryptographic transcript.
-    let mut target_info = Zeroizing::new(challenge.target_info.clone());
-    // Strip trailing AV_EOL (4 bytes) so we can append more AV_PAIRs
-    if target_info.len() >= 4 {
-        let new_len = target_info.len() - 4;
-        target_info.truncate(new_len);
-    }
-
-    if let Some(cb) = channel_bindings {
-        target_info.extend_from_slice(&AV_CHANNEL_BINDINGS.to_le_bytes());
-        target_info.extend_from_slice(&16u16.to_le_bytes());
-        target_info.extend_from_slice(&cb);
-    }
-
-    if mic_input.is_some() {
-        // AV_TARGET_NAME (0x0009): SPN of the target server (UTF-16LE)
-        if let Some(spn) = target_name {
-            let spn_utf16 = to_utf16le(spn);
-            target_info.extend_from_slice(&AV_TARGET_NAME.to_le_bytes());
-            target_info
-                .extend_from_slice(&len16("MsvAvTargetName", spn_utf16.len())?.to_le_bytes());
-            target_info.extend_from_slice(&spn_utf16);
-        }
-        // AV_FLAGS (0x0006): 4 bytes, bit 2 = MIC present
-        target_info.extend_from_slice(&AV_FLAGS_ID.to_le_bytes());
-        target_info.extend_from_slice(&4u16.to_le_bytes());
-        target_info.extend_from_slice(&AV_FLAG_MIC.to_le_bytes());
-    }
-
-    // Re-add AV_EOL
-    target_info.extend_from_slice(&AV_EOL.to_le_bytes());
-    target_info.extend_from_slice(&0u16.to_le_bytes());
+    let target_info = authenticate_target_info(
+        &challenge.target_info,
+        channel_bindings.as_ref(),
+        target_name,
+        mic_input.is_some(),
+    )?;
 
     let blob = build_ntlmv2_blob(&timestamp, &client_challenge, &target_info);
 
@@ -1399,5 +1453,346 @@ mod tests {
         let user = "U".repeat(40_000);
         let err = full(&challenge_with(av(0x0000, &[])), &user, "HTTP/h", None).unwrap_err();
         assert!(matches!(err, NtlmError::InvalidMessage(m) if m.contains("UserName")));
+    }
+
+    /// The AV list of a Type 3 (parsed back out of NtChallengeResponse): asserts
+    /// each id appears once and exactly one EOL, last.
+    fn blob_av_pairs(type3: &[u8]) -> Vec<(u16, Vec<u8>)> {
+        let nt_len = u16::from_le_bytes(type3[20..22].try_into().unwrap()) as usize;
+        let nt_off = u32::from_le_bytes(type3[24..28].try_into().unwrap()) as usize;
+        let nt = &type3[nt_off..nt_off + nt_len];
+        let ti = &nt[16 + 28..]; // NTProofStr(16) + blob header(28)
+        let mut out = Vec::new();
+        let mut p = ti;
+        loop {
+            let id = u16::from_le_bytes([p[0], p[1]]);
+            let len = u16::from_le_bytes([p[2], p[3]]) as usize;
+            if id == 0 {
+                out.push((0u16, Vec::new()));
+                break;
+            }
+            out.push((id, p[4..4 + len].to_vec()));
+            p = &p[4 + len..];
+        }
+        let ids: Vec<u16> = out.iter().map(|(i, _)| *i).collect();
+        assert_eq!(
+            ids.iter().filter(|i| **i == 0).count(),
+            1,
+            "exactly one EOL"
+        );
+        assert_eq!(*ids.last().unwrap(), 0, "EOL is last");
+        let mut uniq = ids.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), ids.len(), "no duplicate AvId");
+        out
+    }
+
+    fn ids(pairs: &[(u16, Vec<u8>)]) -> Vec<u16> {
+        pairs.iter().map(|(i, _)| *i).collect()
+    }
+
+    fn value(pairs: &[(u16, Vec<u8>)], id: u16) -> Option<Vec<u8>> {
+        pairs.iter().find(|(i, _)| *i == id).map(|(_, v)| v.clone())
+    }
+
+    fn concat(parts: &[Vec<u8>]) -> Vec<u8> {
+        parts.concat()
+    }
+
+    /// Type 3 built through `create_authenticate_message_full` with a MIC and
+    /// the SPN `HTTP/h`, its AV list parsed back out.
+    fn av_list_for(server_ti: Vec<u8>, cb: Option<[u8; 16]>) -> Vec<(u16, Vec<u8>)> {
+        let (type3, _) = full(&challenge_with(server_ti), "user", "HTTP/h", cb).unwrap();
+        blob_av_pairs(&type3)
+    }
+
+    const AV_SINGLE_HOST_ID: u16 = 0x0008;
+
+    #[test]
+    fn av_list_stops_at_first_server_eol() {
+        let ti = concat(&[
+            av(AV_NB_DOMAIN_NAME, &to_utf16le("CORP")),
+            av(AV_EOL, &[]),
+            av(AV_CHANNEL_BINDINGS, &[0xBB; 16]),
+            av(AV_EOL, &[]),
+        ]);
+        let pairs = av_list_for(ti, Some([0xAA; 16]));
+        assert_eq!(
+            ids(&pairs),
+            [
+                AV_NB_DOMAIN_NAME,
+                AV_CHANNEL_BINDINGS,
+                AV_TARGET_NAME,
+                AV_FLAGS_ID,
+                AV_EOL
+            ]
+        );
+        assert_eq!(
+            value(&pairs, AV_CHANNEL_BINDINGS),
+            Some([0xAA; 16].to_vec())
+        );
+    }
+
+    #[test]
+    fn av_list_replaces_server_channel_bindings() {
+        let ti = concat(&[
+            av(AV_NB_DOMAIN_NAME, &to_utf16le("CORP")),
+            av(AV_CHANNEL_BINDINGS, &[0xBB; 16]),
+            av(AV_EOL, &[]),
+        ]);
+        let pairs = av_list_for(ti, Some([0xAA; 16]));
+        assert_eq!(
+            value(&pairs, AV_CHANNEL_BINDINGS),
+            Some([0xAA; 16].to_vec())
+        );
+    }
+
+    #[test]
+    fn av_list_replaces_server_target_name() {
+        let ti = concat(&[av(AV_TARGET_NAME, &to_utf16le("evil")), av(AV_EOL, &[])]);
+        let pairs = av_list_for(ti, None);
+        assert_eq!(value(&pairs, AV_TARGET_NAME), Some(to_utf16le("HTTP/h")));
+    }
+
+    #[test]
+    fn av_list_ors_mic_into_server_flags_and_drops_untrusted_spn_bit() {
+        let ti = concat(&[av(AV_FLAGS_ID, &5u32.to_le_bytes()), av(AV_EOL, &[])]);
+        let pairs = av_list_for(ti, None);
+        assert_eq!(
+            value(&pairs, AV_FLAGS_ID),
+            Some(3u32.to_le_bytes().to_vec())
+        );
+    }
+
+    #[test]
+    fn av_list_keeps_last_pair_when_server_omits_eol() {
+        let ti = av(AV_NB_DOMAIN_NAME, &to_utf16le("CORP"));
+        let pairs = av_list_for(ti, None);
+        assert_eq!(pairs[0], (AV_NB_DOMAIN_NAME, to_utf16le("CORP")));
+        assert_eq!(
+            ids(&pairs),
+            [AV_NB_DOMAIN_NAME, AV_TARGET_NAME, AV_FLAGS_ID, AV_EOL]
+        );
+    }
+
+    #[test]
+    fn av_list_drops_truncated_trailing_pair() {
+        let mut ti = av(AV_NB_DOMAIN_NAME, &to_utf16le("CORP"));
+        ti.extend_from_slice(&0x0003u16.to_le_bytes());
+        ti.extend_from_slice(&40u16.to_le_bytes());
+        ti.extend_from_slice(&[0x41; 4]);
+        let pairs = av_list_for(ti, None);
+        assert_eq!(
+            ids(&pairs),
+            [AV_NB_DOMAIN_NAME, AV_TARGET_NAME, AV_FLAGS_ID, AV_EOL]
+        );
+        assert_eq!(pairs[0].1, to_utf16le("CORP"));
+    }
+
+    #[test]
+    fn av_list_keeps_first_of_duplicate_av_ids() {
+        let ti = concat(&[
+            av(AV_NB_DOMAIN_NAME, &to_utf16le("FIRST")),
+            av(AV_NB_DOMAIN_NAME, &to_utf16le("SECOND")),
+            av(AV_EOL, &[]),
+        ]);
+        let pairs = av_list_for(ti, None);
+        assert_eq!(value(&pairs, AV_NB_DOMAIN_NAME), Some(to_utf16le("FIRST")));
+    }
+
+    #[test]
+    fn av_list_drops_server_single_host() {
+        let ti = concat(&[
+            av(AV_NB_DOMAIN_NAME, &to_utf16le("CORP")),
+            av(AV_SINGLE_HOST_ID, &[0x5A; 48]),
+            av(AV_EOL, &[]),
+        ]);
+        let pairs = av_list_for(ti, None);
+        assert!(!ids(&pairs).contains(&AV_SINGLE_HOST_ID));
+        assert_eq!(
+            value(&pairs, AV_FLAGS_ID),
+            Some(2u32.to_le_bytes().to_vec())
+        );
+    }
+
+    #[test]
+    fn av_list_drops_malformed_server_flags() {
+        let ti = concat(&[av(AV_FLAGS_ID, &[0x01, 0x00]), av(AV_EOL, &[])]);
+        let pairs = av_list_for(ti, None);
+        assert_eq!(ids(&pairs).iter().filter(|i| **i == AV_FLAGS_ID).count(), 1);
+        assert_eq!(
+            value(&pairs, AV_FLAGS_ID),
+            Some(2u32.to_le_bytes().to_vec())
+        );
+    }
+
+    /// Differential oracle: a verbatim copy of the `TargetInfo` splice that
+    /// `create_authenticate_message_full` used before `authenticate_target_info`
+    /// replaced it (only the signature differs, `mic_input.is_some()` became
+    /// `mic`, `len16(..)?` became `.unwrap()`, and one comment word changed). For a conformant challenge
+    /// (no server `MsvAvFlags`, `MsvAvSingleHost`, `MsvAvTargetName` or
+    /// `MsvAvChannelBindings`, one EOL, last) both must give the same bytes.
+    fn reference_splice_target_info(
+        server_ti: &[u8],
+        channel_bindings: Option<[u8; 16]>,
+        target_name: Option<&str>,
+        mic: bool,
+    ) -> Vec<u8> {
+        // Build target_info: start from server's, optionally add CBT,
+        // TARGET_NAME and AV_FLAGS, end with AV_EOL.
+        //
+        // Wrapped in `Zeroizing` because the bytes (server-supplied, plus the
+        // CBT and SPN we append) feed straight into the HMAC over the NTLMv2
+        // blob and so are part of the cryptographic transcript.
+        let mut target_info = Zeroizing::new(server_ti.to_vec());
+        // Strip trailing AV_EOL (4 bytes) so we can append more AV_PAIRs
+        if target_info.len() >= 4 {
+            let new_len = target_info.len() - 4;
+            target_info.truncate(new_len);
+        }
+
+        if let Some(cb) = channel_bindings {
+            target_info.extend_from_slice(&AV_CHANNEL_BINDINGS.to_le_bytes());
+            target_info.extend_from_slice(&16u16.to_le_bytes());
+            target_info.extend_from_slice(&cb);
+        }
+
+        if mic {
+            // AV_TARGET_NAME (0x0009): SPN of the target server (UTF-16LE)
+            if let Some(spn) = target_name {
+                let spn_utf16 = to_utf16le(spn);
+                target_info.extend_from_slice(&AV_TARGET_NAME.to_le_bytes());
+                target_info.extend_from_slice(
+                    &len16("MsvAvTargetName", spn_utf16.len())
+                        .unwrap()
+                        .to_le_bytes(),
+                );
+                target_info.extend_from_slice(&spn_utf16);
+            }
+            // AV_FLAGS (0x0006): 4 bytes, bit 2 = MIC present
+            target_info.extend_from_slice(&AV_FLAGS_ID.to_le_bytes());
+            target_info.extend_from_slice(&4u16.to_le_bytes());
+            target_info.extend_from_slice(&AV_FLAG_MIC.to_le_bytes());
+        }
+
+        // Re-add AV_EOL
+        target_info.extend_from_slice(&AV_EOL.to_le_bytes());
+        target_info.extend_from_slice(&0u16.to_le_bytes());
+        target_info.to_vec()
+    }
+
+    /// A Windows-shaped `TargetInfo`: NetBIOS and DNS names, timestamp, EOL.
+    fn windows_shaped_target_info() -> Vec<u8> {
+        concat(&[
+            av(AV_NB_DOMAIN_NAME, &to_utf16le("WIN-TTSTANUQ08S")),
+            av(0x0001, &to_utf16le("WIN-TTSTANUQ08S")),
+            av(0x0004, &to_utf16le("WIN-TTSTANUQ08S")),
+            av(0x0003, &to_utf16le("WIN-TTSTANUQ08S")),
+            av(AV_TIMESTAMP, &[0x11; 8]),
+            av(AV_EOL, &[]),
+        ])
+    }
+
+    #[test]
+    fn av_list_of_a_conformant_type2_matches_the_reference_splice() {
+        let ti = windows_shaped_target_info();
+        for (cb, spn, mic) in [
+            (Some([0xAA; 16]), Some("HTTP/win01"), true),
+            (None, Some("HTTP/win01"), true),
+            (Some([0xAA; 16]), None, false),
+            (None, None, false),
+        ] {
+            let got = authenticate_target_info(&ti, cb.as_ref(), spn, mic).unwrap();
+            assert_eq!(
+                got.as_slice(),
+                reference_splice_target_info(&ti, cb, spn, mic).as_slice(),
+                "{cb:?} {spn:?} {mic}"
+            );
+        }
+    }
+
+    #[test]
+    fn av_list_without_mic_echoes_only_the_constrained_server_flag() {
+        let ti = concat(&[av(AV_FLAGS_ID, &7u32.to_le_bytes()), av(AV_EOL, &[])]);
+        let got = authenticate_target_info(&ti, None, None, false).unwrap();
+        assert_eq!(
+            got.as_slice(),
+            concat(&[av(AV_FLAGS_ID, &1u32.to_le_bytes()), av(AV_EOL, &[])])
+        );
+        let got = authenticate_target_info(&ti, None, None, true).unwrap();
+        assert_eq!(
+            got.as_slice(),
+            concat(&[av(AV_FLAGS_ID, &3u32.to_le_bytes()), av(AV_EOL, &[])])
+        );
+    }
+
+    #[test]
+    fn av_list_reads_flags_only_from_a_flags_pair() {
+        // A 4-byte pair of another id is not the server's flags.
+        let ti = concat(&[av(0x0005, &1u32.to_le_bytes()), av(AV_EOL, &[])]);
+        let got = authenticate_target_info(&ti, None, None, false).unwrap();
+        assert_eq!(
+            got.as_slice(),
+            concat(&[av(0x0005, &1u32.to_le_bytes()), av(AV_EOL, &[])])
+        );
+    }
+
+    #[test]
+    fn av_list_reads_the_first_4_byte_server_flags() {
+        let ti = concat(&[
+            av(AV_FLAGS_ID, &[0x01, 0x00]),
+            av(AV_FLAGS_ID, &1u32.to_le_bytes()),
+            av(AV_FLAGS_ID, &0u32.to_le_bytes()),
+            av(AV_EOL, &[]),
+        ]);
+        let got = authenticate_target_info(&ti, None, None, false).unwrap();
+        assert_eq!(
+            got.as_slice(),
+            concat(&[av(AV_FLAGS_ID, &1u32.to_le_bytes()), av(AV_EOL, &[])])
+        );
+    }
+
+    #[test]
+    fn av_list_of_an_empty_server_list_is_the_client_pairs() {
+        assert_eq!(
+            authenticate_target_info(&[], None, None, false)
+                .unwrap()
+                .as_slice(),
+            av(AV_EOL, &[])
+        );
+        let got = authenticate_target_info(&[], Some(&[0xAA; 16]), Some("h"), true).unwrap();
+        assert_eq!(
+            got.as_slice(),
+            concat(&[
+                av(AV_CHANNEL_BINDINGS, &[0xAA; 16]),
+                av(AV_TARGET_NAME, &to_utf16le("h")),
+                av(AV_FLAGS_ID, &2u32.to_le_bytes()),
+                av(AV_EOL, &[]),
+            ])
+        );
+    }
+
+    #[cfg(feature = "credssp")]
+    #[test]
+    fn credssp_type3_av_list_is_canonical() {
+        let challenge = build_test_challenge_for_credssp();
+        let type1 = create_negotiate_message_credssp();
+        let (msg, _) = create_authenticate_message_credssp(
+            &challenge,
+            "vagrant",
+            "vagrant",
+            "",
+            "HTTP/host",
+            &type1,
+            &[0u8; 32],
+        )
+        .unwrap();
+        let pairs = blob_av_pairs(&msg);
+        assert_eq!(value(&pairs, AV_TARGET_NAME), Some(to_utf16le("HTTP/host")));
+        assert_eq!(
+            value(&pairs, AV_FLAGS_ID),
+            Some(2u32.to_le_bytes().to_vec())
+        );
     }
 }

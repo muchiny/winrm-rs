@@ -142,6 +142,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Kerberos: the service principal now names the host the connection goes to
   (IDN, short or octal IPv4 and IPv6-literal endpoints). ASCII host names are
   unchanged.
+- `upload_file` to a long remote path no longer fails with a command line over
+  the Windows limit: the chunk size now shrinks to fit the path.
 
 ### Documentation
 

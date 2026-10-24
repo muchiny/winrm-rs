@@ -502,6 +502,61 @@ async fn upload_and_download_file() {
     let _ = std::fs::remove_file(&local_download);
 }
 
+/// One-off check that the chunk size shrinks with a long, quote-heavy path:
+/// a 10 000-byte file goes to a 200-character path holding four U+2019 and
+/// comes back identical.
+#[tokio::test]
+#[ignore]
+async fn upload_to_a_long_quoted_path() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+
+    // 200 characters: the temp directory, four U+2019, filler, ".bin".
+    let mut remote_path = String::from("C:\\Windows\\Temp\\winrm_rs_long_");
+    for _ in 0..4 {
+        remote_path.push('\u{2019}');
+        remote_path.push('q');
+    }
+    while remote_path.chars().count() < 196 {
+        remote_path.push('x');
+    }
+    remote_path.push_str(".bin");
+    assert_eq!(remote_path.chars().count(), 200);
+
+    let content: Vec<u8> = (0..10_000_u32)
+        .map(|i| u8::try_from(i % 251).expect("below 251"))
+        .collect();
+    let local_upload = std::env::temp_dir().join("winrm_rs_test_long_upload.bin");
+    let local_download = std::env::temp_dir().join("winrm_rs_test_long_download.bin");
+    std::fs::write(&local_upload, &content).expect("write local file");
+
+    let bytes_up = client
+        .upload_file(&host, &local_upload, &remote_path)
+        .await
+        .expect("upload file");
+    assert_eq!(bytes_up, content.len() as u64);
+
+    let bytes_down = client
+        .download_file(&host, &remote_path, &local_download)
+        .await
+        .expect("download file");
+    assert_eq!(bytes_down, content.len() as u64);
+    let downloaded = std::fs::read(&local_download).expect("read downloaded file");
+    assert_eq!(downloaded, content);
+
+    // Cleanup: double every single-quote character for the PowerShell literal.
+    let quoted = remote_path
+        .replace('\'', "''")
+        .replace('\u{2019}', "\u{2019}\u{2019}");
+    let _ = client
+        .run_powershell(
+            &host,
+            &format!("Remove-Item -LiteralPath '{quoted}' -Force"),
+        )
+        .await;
+    let _ = std::fs::remove_file(&local_upload);
+    let _ = std::fs::remove_file(&local_download);
+}
+
 // === CLIXML stderr parsing ===
 
 #[tokio::test]

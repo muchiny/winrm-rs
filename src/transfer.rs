@@ -19,7 +19,15 @@ use crate::error::WinrmError;
 /// script is UTF-16LE encoded and base64-encoded again for `-EncodedCommand`.
 /// This triple encoding yields ~3.5× expansion. WinRS enforces an ~8191-char
 /// command-line limit, so the raw chunk must stay under ~2 KB.
+///
+/// This is the cap: [`upload_chunk_len`] lowers it for a long remote path,
+/// whose escaped form takes room in every chunk's command line.
 const CHUNK_SIZE: usize = 2000;
+
+/// The command-line length a transfer command may reach: cmd.exe's
+/// 8191-character maximum minus a 91-character margin for the `cmd.exe /C `
+/// wrapper and the separators WinRS adds.
+const CMD_LINE_BUDGET: usize = 8100;
 
 /// Maximum allowed remote path length (Windows MAX_PATH).
 const MAX_REMOTE_PATH_LEN: usize = 260;
@@ -81,10 +89,12 @@ pub(crate) fn escape_ps_single_quoted(s: &str) -> String {
 impl WinrmClient {
     /// Upload a local file to a remote Windows host.
     ///
-    /// The file is chunked into ~2 KB pieces, base64-encoded, and written
-    /// via PowerShell `[IO.File]::WriteAllBytes` / `[IO.File]::Open('Append')`.
-    /// The small chunk size is dictated by the WinRS command-line limit
-    /// (~8191 chars) after triple encoding (base64 → UTF-16LE → base64).
+    /// The file is chunked into pieces of up to ~2 KB, base64-encoded, and
+    /// written via PowerShell `[IO.File]::WriteAllBytes` /
+    /// `[IO.File]::Open('Append')`. The small chunk size is dictated by the
+    /// WinRS command-line limit (~8191 chars) after triple encoding (base64
+    /// → UTF-16LE → base64); a long remote path shrinks it so that every
+    /// command line stays inside that limit.
     ///
     /// The transfer scripts run
     /// `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -NonInteractive`:
@@ -106,11 +116,13 @@ impl WinrmClient {
             ))
         })?;
 
+        let escaped_path = escape_ps_single_quoted(remote_path);
+        let chunk_len = upload_chunk_len(&escaped_path)?;
+
         let shell = self.open_shell(host).await?;
         let total = data.len() as u64;
-        let escaped_path = escape_ps_single_quoted(remote_path);
 
-        for (i, chunk) in data.chunks(CHUNK_SIZE).enumerate() {
+        for (i, chunk) in data.chunks(chunk_len).enumerate() {
             let b64 = B64.encode(chunk);
 
             let script = upload_script(&escaped_path, &b64, i == 0);
@@ -215,6 +227,49 @@ fn transfer_args(encoded: &str) -> [&str; 4] {
     [no_profile, non_interactive, "-EncodedCommand", encoded]
 }
 
+/// The length of the command line that launches `script`: the executable,
+/// then a space and each argument of [`transfer_args`].
+fn transfer_command_line_len(script: &str) -> usize {
+    let encoded = encode_powershell_command(script);
+    transfer_args(&encoded)
+        .iter()
+        .fold(POWERSHELL_EXE.len(), |len, arg| {
+            len.saturating_add(1).saturating_add(arg.len())
+        })
+}
+
+/// The length of the base64 text for `n` raw bytes.
+fn base64_len(n: usize) -> usize {
+    n.div_ceil(3).saturating_mul(4)
+}
+
+/// The largest chunk length, up to [`CHUNK_SIZE`], whose upload command line
+/// fits [`CMD_LINE_BUDGET`] for this (already escaped) remote path.
+///
+/// The append form of the script is the longer one, so it sets the limit.
+fn upload_chunk_len(escaped_path: &str) -> Result<usize, WinrmError> {
+    let fits = |n: usize| {
+        let b64 = "A".repeat(base64_len(n));
+        transfer_command_line_len(&upload_script(escaped_path, &b64, false)) <= CMD_LINE_BUDGET
+    };
+    if !fits(1) {
+        return Err(WinrmError::Transfer(
+            "remote path too long for a transfer command line".into(),
+        ));
+    }
+    // Invariant: `lo` fits; the answer is at most `hi`.
+    let (mut lo, mut hi) = (1_usize, CHUNK_SIZE);
+    while lo < hi {
+        let mid = lo.saturating_add(hi.saturating_sub(lo).div_ceil(2));
+        if fits(mid) {
+            lo = mid;
+        } else {
+            hi = mid.saturating_sub(1);
+        }
+    }
+    Ok(lo)
+}
+
 /// The remote script for one upload chunk: the first chunk creates the file,
 /// later chunks append to it.
 fn upload_script(escaped_path: &str, b64: &str, first: bool) -> String {
@@ -276,6 +331,56 @@ mod tests {
         assert_eq!(
             transfer_args("QQBB"),
             ["-NoProfile", "-NonInteractive", "-EncodedCommand", "QQBB"]
+        );
+    }
+
+    #[test]
+    fn short_paths_keep_2000_byte_chunks() {
+        assert_eq!(upload_chunk_len("C:\\dest.bin").unwrap(), 2000);
+    }
+
+    #[test]
+    fn every_valid_path_fits_the_command_line() {
+        // The longest escaped paths validate_remote_path admits: 260 ASCII
+        // quotes, and 86 U+2019 (3 bytes each), both doubled by the escape.
+        for raw in ["'".repeat(260), "\u{2019}".repeat(86), "a".repeat(260)] {
+            assert!(validate_remote_path(&raw).is_ok());
+            let escaped = escape_ps_single_quoted(&raw);
+            let n = upload_chunk_len(&escaped).unwrap();
+            let fits = |n: usize| {
+                transfer_command_line_len(&upload_script(
+                    &escaped,
+                    &"A".repeat(base64_len(n)),
+                    false,
+                )) <= CMD_LINE_BUDGET
+            };
+            assert!(fits(n), "{n} does not fit for {raw:?}");
+            assert!(
+                n == CHUNK_SIZE || !fits(n + 1),
+                "{n} is not the largest for {raw:?}"
+            );
+            assert!(n >= 1000, "{n} is too small to be useful");
+        }
+    }
+
+    #[test]
+    fn transfer_command_line_len_counts_the_full_launch() {
+        let script = "Write-Output x";
+        let encoded = crate::command::encode_powershell_command(script);
+        assert_eq!(
+            transfer_command_line_len(script),
+            crate::command::POWERSHELL_EXE.len()
+                + " -NoProfile -NonInteractive -EncodedCommand ".len()
+                + encoded.len()
+        );
+    }
+
+    #[test]
+    fn a_path_beyond_any_budget_is_refused() {
+        let err = upload_chunk_len(&"a".repeat(CMD_LINE_BUDGET)).unwrap_err();
+        assert!(
+            matches!(&err, WinrmError::Transfer(m) if m == "remote path too long for a transfer command line"),
+            "{err:?}"
         );
     }
 

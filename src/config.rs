@@ -15,7 +15,7 @@ use secrecy::SecretString;
 /// names of [`env_vars`](Self::env_vars), so it can be logged.
 #[derive(Clone)]
 pub struct WinrmConfig {
-    /// TCP port of the WinRM listener (default: 5985 for HTTP, 5986 for HTTPS).
+    /// TCP port of the WinRM listener (default: 5985). It does not follow [`use_tls`](Self::use_tls): with `use_tls = true`, set the HTTPS listener's port (5986 on a stock Windows host).
     pub port: u16,
     /// Whether to connect over HTTPS. When `true`, the endpoint URL uses `https://`.
     pub use_tls: bool,
@@ -385,6 +385,14 @@ pub enum AuthMethod {
     /// sealed (see [`EncryptionMode`]), the three-step handshake (negotiate,
     /// challenge, authenticate) runs once per connection and later requests on
     /// that connection reuse its session; otherwise it runs for every request.
+    ///
+    /// NTLM authenticates the client only. Over plain HTTP the server is not
+    /// authenticated and the handshake carries no channel binding, so a party
+    /// on the network path can relay it to another service, or guess the
+    /// password offline from it; sealing protects the SOAP bodies, not the
+    /// handshake. Where the network path is not trusted, use it only over
+    /// HTTPS with certificate validation, where NTLM carries a channel binding
+    /// to the server's certificate.
     Ntlm,
     /// Kerberos authentication (requires `kerberos` feature and prior `kinit`).
     ///

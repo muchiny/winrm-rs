@@ -73,6 +73,12 @@ callers can now stop a running pipeline.
 - `AuthMethod::CredSsp` lists the `WinrmConfig` settings CredSSP does not apply
   yet (timeouts, proxy, user agent, retries); the docs of those fields, and the
   README proxy lines, say so too.
+- `WinrmConfig::port` no longer claims to follow `use_tls` (it never did):
+  set the HTTPS port, usually 5986, together with `use_tls = true`.
+- `AuthMethod::Ntlm` states that over plain HTTP NTLM does not authenticate
+  the server and its handshake can be relayed.
+- SECURITY.md: supported versions, and a scope that covers every security
+  property the documentation promises.
 
 ## [1.4.0] - 2026-10-22
 

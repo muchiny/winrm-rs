@@ -1177,4 +1177,22 @@ mod tests {
         // First byte of TLS record is 0x16 (Handshake)
         assert_eq!(bytes[0], 0x16);
     }
+
+    #[tokio::test]
+    async fn credssp_outer_tls_refuses_an_impostor() {
+        for (label, versions) in [
+            ("TLS 1.3", &[&rustls::version::TLS13][..]),
+            ("TLS 1.2", &[&rustls::version::TLS12][..]),
+        ] {
+            let (port, _read) =
+                crate::test_pki::spawn_tls_sink(crate::test_pki::impostor_server_config(versions));
+            match CredSspConnection::connect("127.0.0.1", port, "/wsman", true, 1 << 20).await {
+                Err(WinrmError::AuthFailed(m)) => {
+                    assert!(m.starts_with("CredSSP outer TLS:"), "{label}: {m}");
+                }
+                Err(e) => panic!("{label}: {e:?}"),
+                Ok(_) => panic!("{label}: impostor accepted on the CredSSP outer TLS"),
+            }
+        }
+    }
 }

@@ -14,9 +14,14 @@
 //   openssl pkcs8 -topk8 -v2 aes-256-cbc -in ec-sec1.key -passout pass:throwaway \
 //       -out ec-pkcs8-enc.key
 //   openssl ec -in ec-sec1.key -aes128 -passout pass:throwaway -out ec-sec1-enc.key
+//   openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256   # impostor key
 //
 // One EC key in two encodings (SEC1, PKCS#8) and one RSA key in PKCS#1 cover
-// the three private-key formats Certificate auth accepts.
+// the three private-key formats Certificate auth accepts. The impostor key is
+// unrelated to any certificate here.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Self-signed P-256 certificate (`CN=winrm-rs throwaway EC test`, SAN `localhost`).
 pub(crate) const EC_CERT_PEM: &str = "\
@@ -493,3 +498,114 @@ FMUdXhzSEptwQ7Ek9PwpGn2IUp5gagaTVOz27r0uCCT2rn/BZkWY7xikYsuRzGFx
 l4ajI6Y8T8ESYeQWsO9O1S/7sDCpNmNLL72AuwY368biwO0=
 -----END CERTIFICATE-----
 ";
+
+/// Throwaway; signs a handshake with someone else's certificate.
+pub(crate) const IMPOSTOR_EC_KEY_PKCS8_PEM: &str = "\
+-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgo3vpmJqQd+dRjJ1A
+e8wB5ZKXW454BkvTzdUxB3SxLTihRANCAASMHHL9ze51gTZXP39HeGt0VYT5EoIL
+TZkzaJG8kyjjXD9Hm+4XvQoYWD7qDvK1xYymIr+F28TE4IV/nKG5Axfi
+-----END PRIVATE KEY-----
+";
+
+/// A TLS server config presenting `cert_pem` with its own key `key_pem`.
+pub(crate) fn server_config(cert_pem: &str, key_pem: &str) -> Arc<rustls::ServerConfig> {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let chain = vec![CertificateDer::from_pem_slice(cert_pem.as_bytes()).unwrap()];
+    let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).unwrap();
+    Arc::new(
+        rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(chain, key)
+            .unwrap(),
+    )
+}
+
+/// A TLS server config that presents [`EC_CERT_PEM`] but signs its handshake
+/// with [`IMPOSTOR_EC_KEY_PKCS8_PEM`], a key that is not the certificate's.
+pub(crate) fn impostor_server_config(
+    versions: &[&'static rustls::SupportedProtocolVersion],
+) -> Arc<rustls::ServerConfig> {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use rustls::server::{ClientHello, ResolvesServerCert};
+    use rustls::sign::CertifiedKey;
+
+    #[derive(Debug)]
+    struct Fixed(Arc<CertifiedKey>);
+
+    impl ResolvesServerCert for Fixed {
+        fn resolve(&self, _client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+            Some(Arc::clone(&self.0))
+        }
+    }
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let cert = CertificateDer::from_pem_slice(EC_CERT_PEM.as_bytes()).unwrap();
+    let key = PrivateKeyDer::from_pem_slice(IMPOSTOR_EC_KEY_PKCS8_PEM.as_bytes()).unwrap();
+    let signing_key = rustls::crypto::ring::sign::any_ecdsa_type(&key).unwrap();
+    let certified = Arc::new(CertifiedKey::new(vec![cert], signing_key));
+    Arc::new(
+        rustls::ServerConfig::builder_with_protocol_versions(versions)
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(Fixed(certified))),
+    )
+}
+
+/// A TLS endpoint that counts the application bytes clients send after a
+/// completed handshake. Each connection gets one read; if it returns data,
+/// the bytes are added to the counter and a bodyless `500` is sent back.
+/// Returns its port and the counter. Exits after 10 s without a connection.
+pub(crate) fn spawn_tls_sink(config: Arc<rustls::ServerConfig>) -> (u16, Arc<AtomicUsize>) {
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant};
+
+    const DEADLINE: Duration = Duration::from_secs(10);
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    let read = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&read);
+    std::thread::spawn(move || {
+        let start = Instant::now();
+        loop {
+            match listener.accept() {
+                Ok((tcp, _)) => {
+                    let (config, counter) = (Arc::clone(&config), Arc::clone(&counter));
+                    std::thread::spawn(move || {
+                        let _ = tcp.set_nonblocking(false);
+                        let _ = tcp.set_read_timeout(Some(DEADLINE));
+                        let _ = tcp.set_write_timeout(Some(DEADLINE));
+                        let Ok(conn) = rustls::ServerConnection::new(config) else {
+                            return;
+                        };
+                        let mut tls = rustls::StreamOwned::new(conn, tcp);
+                        let mut buf = [0u8; 4096];
+                        if let Ok(n) = tls.read(&mut buf)
+                            && n > 0
+                        {
+                            counter.fetch_add(n, Ordering::SeqCst);
+                            let _ = tls.write_all(
+                                b"HTTP/1.1 500 Internal Server Error\r\n\
+                                  Content-Length: 0\r\nConnection: close\r\n\r\n",
+                            );
+                            let _ = tls.flush();
+                        }
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if start.elapsed() > DEADLINE {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(_) => return,
+            }
+        }
+    });
+    (port, read)
+}

@@ -10,6 +10,8 @@ use base64::engine::general_purpose::STANDARD as B64;
 /// Returned by [`WinrmClient::run_command`](crate::WinrmClient::run_command) and
 /// [`WinrmClient::run_powershell`](crate::WinrmClient::run_powershell).
 /// Streams are raw bytes; use [`String::from_utf8_lossy`] for text conversion.
+/// `stdout` and `stderr` are returned exactly as the command wrote them:
+/// sanitise them before printing them to a terminal.
 #[derive(Debug)]
 pub struct CommandOutput {
     /// Standard output bytes accumulated from all Receive polls.

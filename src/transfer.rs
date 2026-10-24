@@ -357,6 +357,26 @@ mod tests {
         }
     }
 
+    /// The remote stderr quoted in a failed download holds no control character.
+    #[test]
+    fn transfer_error_quotes_stderr_without_control_characters() {
+        let output = CommandOutput {
+            stdout: Vec::new(),
+            stderr: b"Cannot find path\r\n\x1b[31mC:\\x\x1b[0m\r\n".to_vec(),
+            exit_code: 1,
+        };
+        let path = std::env::temp_dir().join(format!("winrm-rs-quote-{}", uuid::Uuid::new_v4()));
+        match write_download(&output, &path) {
+            Err(WinrmError::Transfer(msg)) => {
+                assert_eq!(
+                    msg,
+                    r"download failed: Cannot find path \u{1b}[31mC:\x\u{1b}[0m"
+                );
+            }
+            other => panic!("expected a transfer error, got {other:?}"),
+        }
+    }
+
     /// The remote stderr quoted in a failed download is bounded.
     #[test]
     fn download_failure_quotes_a_bounded_stderr() {

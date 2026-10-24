@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `HOSTNAME`, `/proc/sys/kernel/hostname` (Linux) or `COMPUTERNAME` (Windows),
   cut to its first label and 15 characters. The crate no longer runs the
   `hostname` program.
+- Server text quoted in errors (the `code` and `reason` of `SoapError::Fault`,
+  quoted HTTP bodies, remote stderr in transfer errors) is trimmed and kept on
+  one line. Tabs and line breaks become spaces, and other control and
+  bidirectional formatting characters are written as `\u{..}` escapes. The
+  `code` and `reason` fields hold the neutralised text.
 
 ### Fixed
 

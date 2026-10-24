@@ -64,9 +64,10 @@ pub(crate) fn authorization_value(value: &str) -> Result<reqwest::header::Header
 const EXCERPT_CHARS: usize = 512;
 
 /// A server body as quoted in an error message: at most [`EXCERPT_CHARS`]
-/// characters, with the full size noted when it is cut.
+/// characters, with the full size noted when it is cut, and with line breaks
+/// and control characters neutralised (see `quote_server_text`).
 pub(crate) fn excerpt(body: &str) -> String {
-    crate::error::excerpt_chars(body, EXCERPT_CHARS)
+    crate::error::quote_server_text(body, EXCERPT_CHARS)
 }
 
 /// Whether a response announces it closes its connection
@@ -186,6 +187,14 @@ pub(crate) const TIMED_OUT_FAULT: &str = r#"<s:Envelope xmlns:s="http://www.w3.o
 mod tests {
     use super::*;
     use crate::error::SoapError;
+
+    #[test]
+    fn auth_excerpt_neutralises_terminal_escapes() {
+        assert_eq!(
+            excerpt("HTTP body \x1b[2J\x1b]0;pwned\x07\nnext\u{202E}"),
+            r"HTTP body \u{1b}[2J\u{1b}]0;pwned\u{7} next\u{202e}"
+        );
+    }
 
     #[test]
     fn http_500_with_a_fault_is_a_soap_error() {

@@ -6,6 +6,10 @@
 ///
 /// Variants cover the full error surface: HTTP transport, authentication
 /// handshake, NTLM protocol, SOAP-level faults, and operation timeouts.
+///
+/// Codes, reasons and quoted bodies come from the server. Control and
+/// bidirectional formatting characters are neutralised (line breaks become
+/// spaces, the rest `\u{..}` escapes), but the text itself is not trustworthy.
 #[derive(Debug, thiserror::Error)]
 pub enum WinrmError {
     /// HTTP transport error from `reqwest` (connection refused, timeout, TLS, etc.).
@@ -59,6 +63,53 @@ pub(crate) fn excerpt_chars(text: &str, max_chars: usize) -> String {
     }
 }
 
+/// `text` from the server as quoted in an error message or a log line.
+///
+/// Leading and trailing ASCII whitespace is trimmed, the result is cut as
+/// [`excerpt_chars`] cuts it, and then made inert:
+/// - each run of `\t`, `\r`, `\n` becomes one space;
+/// - every other control character (C0, DEL, C1, so `char::is_control`) and
+///   the bidi and line-separator characters U+061C, U+200E, U+200F, U+2028,
+///   U+2029, U+202A-U+202E and U+2066-U+2069 are written with
+///   `char::escape_unicode` (`\u{1b}`).
+///
+/// The text is trimmed with `trim_ascii`, not `trim`, because the latter would
+/// also strip U+0085 and U+2028, which must show as escapes. The escaping runs
+/// after the cut, so the output stays within 10 times `max_chars` plus the
+/// suffix.
+pub(crate) fn quote_server_text(text: &str, max_chars: usize) -> String {
+    let cut = excerpt_chars(text.trim_ascii(), max_chars);
+    let mut out = String::with_capacity(cut.len());
+    let mut in_break = false;
+    for c in cut.chars() {
+        if matches!(c, '\t' | '\r' | '\n') {
+            if !in_break {
+                out.push(' ');
+            }
+            in_break = true;
+            continue;
+        }
+        in_break = false;
+        let inert = !c.is_control()
+            && !matches!(
+                c,
+                '\u{061C}'
+                    | '\u{200E}'
+                    | '\u{200F}'
+                    | '\u{2028}'
+                    | '\u{2029}'
+                    | '\u{202A}'..='\u{202E}'
+                    | '\u{2066}'..='\u{2069}'
+            );
+        if inert {
+            out.push(c);
+        } else {
+            out.extend(c.escape_unicode());
+        }
+    }
+    out
+}
+
 /// Errors from the CredSSP authentication protocol (MS-CSSP).
 #[derive(Debug, thiserror::Error)]
 pub enum CredSspError {
@@ -84,6 +135,11 @@ pub enum SoapError {
     #[error("parse error: {0}")]
     ParseError(String),
     /// The WinRM service returned a SOAP fault with the given code and reason.
+    ///
+    /// Codes, reasons and quoted bodies come from the server. Control and
+    /// bidirectional formatting characters are neutralised (line breaks become
+    /// spaces, the rest `\u{..}` escapes), but the text itself is not
+    /// trustworthy.
     #[error("SOAP fault [{code}]: {reason}")]
     Fault {
         /// Fault code, typically a WS-Addressing or WS-Management URI.
@@ -113,4 +169,23 @@ pub enum NtlmError {
     ///   algorithms).
     #[error("NTLM error: {0}")]
     InvalidMessage(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quote_server_text_neutralises_controls_and_bidi() {
+        assert_eq!(quote_server_text("a\tb\r\n\r\nc", 64), "a b c");
+        assert_eq!(
+            quote_server_text("  x\u{202E}y\u{7f}z\u{85}\u{2028}\n", 64),
+            r"x\u{202e}y\u{7f}z\u{85}\u{2028}"
+        );
+        assert_eq!(quote_server_text("plain é text", 64), "plain é text");
+        assert_eq!(
+            quote_server_text(&"\u{1b}".repeat(40), 32),
+            format!("{}… [40 bytes in total]", r"\u{1b}".repeat(32))
+        );
+    }
 }

@@ -385,10 +385,11 @@ fn extract_soap_fault(xml: &str) -> Option<SoapError> {
         .or_else(|| extract_element_text(xml, "faultstring"))
         .unwrap_or_else(|| "SOAP fault".into());
 
-    // Both come from the server and end up in error messages: bound them.
+    // Both come from the server and end up in error messages: bound them and
+    // make them inert.
     Some(SoapError::Fault {
-        code: crate::error::excerpt_chars(&code, FAULT_CODE_CHARS),
-        reason: crate::error::excerpt_chars(&reason, FAULT_REASON_CHARS),
+        code: crate::error::quote_server_text(&code, FAULT_CODE_CHARS),
+        reason: crate::error::quote_server_text(&reason, FAULT_REASON_CHARS),
     })
 }
 
@@ -448,6 +449,20 @@ pub(crate) fn check_relates_to(request: &str, response: &str) -> Result<(), Stri
 mod tests {
 
     use super::*;
+
+    #[test]
+    fn fault_reason_control_characters_are_neutralised() {
+        let xml = "<s:Envelope><s:Body><s:Fault><s:Code><s:Value>s:Receiver</s:Value></s:Code>\
+                   <s:Reason><s:Text>Access\x1b]52;c;QUJD\x07 denied\r\nforged</s:Text></s:Reason>\
+                   </s:Fault></s:Body></s:Envelope>";
+        match check_soap_fault(xml).unwrap_err() {
+            SoapError::Fault { code, reason } => {
+                assert_eq!(code, "s:Receiver");
+                assert_eq!(reason, r"Access\u{1b}]52;c;QUJD\u{7} denied forged");
+            }
+            other => panic!("expected a fault, got {other:?}"),
+        }
+    }
 
     // --- RelatesTo binding of a response to its request ---
 

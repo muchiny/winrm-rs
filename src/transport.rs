@@ -51,15 +51,17 @@ struct AuthConn {
     http: reqwest::Client,
     /// Certificates this client's verifier accepted (HTTPS). TLS session
     /// resumption is off, so every new connection of this client is
-    /// verified. Once [`Self::gate`] is locked the client never opens a
-    /// second connection; before that (the Kerberos-over-HTTPS probe and
-    /// AP-REQ, or NTLM over TLS, which never locks it) it may open several,
-    /// so the record is trusted only while it holds a single certificate.
-    /// Used for channel binding when the response does not report its TLS
-    /// details (connections through a proxy).
+    /// verified. Once [`Self::gate`] is locked (after the handshake has
+    /// completed) the client opens no new connection; while it is open (the
+    /// handshake legs, such as the Kerberos-over-HTTPS probe and AP-REQ, or
+    /// NTLM over TLS, which never locks it) it may open several, so the
+    /// record is trusted only while it holds a single certificate. Used for
+    /// channel binding when the response does not report its TLS details
+    /// (connections through a proxy).
     cert: Option<CertHandle>,
-    /// Gate on the client's connector: locked once the connection is
-    /// authenticated, so the client cannot open another (see [`ConnGate`]).
+    /// Gate on the client's connector: open during the handshake, locked
+    /// once it has completed, after which the client opens no new
+    /// connection (see [`ConnGate`]).
     gate: Option<Arc<ConnGate>>,
     /// Sealing session (sealed connections only).
     session: Option<Sealer>,
@@ -501,9 +503,10 @@ pub(crate) fn validate_host(host: &str) -> Result<(), WinrmError> {
 /// a dedicated connection (sealed, Kerberos over TLS, or NTLM over TLS).
 ///
 /// `gate` is `None` for the shared client and set for a dedicated one: its
-/// connector then sits behind the [`ConnGate`], and once the gate is locked
-/// the client never opens a second connection, so its requests stay on the
-/// authenticated connection.
+/// connector then sits behind the [`ConnGate`]. The gate is open during the
+/// handshake legs, which may open more than one connection; once it is
+/// locked (after the handshake has completed), the client opens no new
+/// connection, so its requests stay on the authenticated one.
 fn build_http_client(
     config: &WinrmConfig,
     tls_config: Option<rustls::ClientConfig>,
@@ -955,8 +958,8 @@ impl HttpTransport {
     ///
     /// The connection's [`ConnGate`] stays open through the handshake (the
     /// Kerberos-over-HTTPS probe and AP-REQ legitimately use two
-    /// connections) and is locked once it has succeeded: the client then
-    /// never opens another connection.
+    /// connections) and is locked once it has completed: from then on the
+    /// client opens no new connection.
     async fn open_authenticated_conn(
         &self,
         host: &str,
@@ -4136,6 +4139,9 @@ mod tests {
 
     /// On a current-thread runtime with no yields, a locked dedicated client
     /// keeps every sealed exchange on its one authenticated connection.
+    /// Wiremock does not reproduce the pool race (this passes without the
+    /// gate too): it guards against a regression, and the live bench session
+    /// is the real gate for the race.
     #[tokio::test(flavor = "current_thread")]
     async fn dedicated_client_never_opens_a_second_connection() {
         let server = MockServer::start().await;
@@ -4198,7 +4204,7 @@ mod tests {
         let server = MockServer::start().await;
         let fake = FakeNtlmServer::mount(&server).await;
         let (relay, accepts) =
-            spawn_closing_relay(server.address().port(), Duration::from_millis(200));
+            spawn_closing_relay(server.address().port(), Duration::from_millis(500));
         let transport = relayed_transport(relay);
         assert_eq!(
             transport
@@ -4208,7 +4214,7 @@ mod tests {
             "<ok/>"
         );
         // The relay closes the idle connection.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(1250)).await;
         assert_eq!(
             transport
                 .send_soap_with_retry("127.0.0.1", "<two/>".into())

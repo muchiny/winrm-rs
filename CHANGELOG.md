@@ -29,7 +29,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   response, as NTLM over HTTP already did.
 - A sealed or Kerberos-over-TLS request now stays on its authenticated
   connection instead of occasionally racing onto a fresh one and failing with
-  401.
+  401: once the handshake has completed, the dedicated client opens no new
+  connection (it may during the handshake). A connection the server closed
+  while idle is now re-authenticated once, when the closure is seen before
+  the request is sent, instead of failing.
 
 ## [1.4.1] - 2026-10-24
 

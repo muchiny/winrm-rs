@@ -4717,9 +4717,11 @@ async fn kerberos_over_https_with_dc_cbt_strict() {
 /// `AllowUnencrypted = false` on the DC and a current-thread runtime (this
 /// test's), a 200 KB download right after a small upload sent a sealed
 /// request on a fresh, unauthenticated connection (HTTP 401) in 10 runs out
-/// of 10, for Kerberos and NTLM alike, before the dedicated exchange yielded
-/// to the runtime first. Three rounds per method must now pass on one
-/// connection each.
+/// of 10, for Kerberos and NTLM alike, when the dedicated exchange did not
+/// yield to the runtime first. The connection gate now prevents it: once the
+/// handshake has completed, the dedicated client opens no new connection,
+/// so the request waits for the authenticated one. Three rounds per method
+/// must now pass on one connection each.
 #[cfg(feature = "kerberos")]
 #[tokio::test]
 #[ignore]

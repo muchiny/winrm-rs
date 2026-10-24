@@ -172,6 +172,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `AuthMethod::Kerberos`, the README and SECURITY.md say that over plain HTTP
   the authentication is not bound to the connection and can be relayed, and
   what prevents it (HTTPS, `AllowUnencrypted = false`).
+- Transfer docs say what the paths reach. `upload_file` and `download_file*`
+  gain a `# Security` section: the remote path may be a UNC or device path
+  reached with delegated credentials under CredSSP or Basic, upload content
+  is on the remote command line, and the local path follows symbolic links.
+  `run_powershell` says that its script text is on the command line.
 
 ## [1.4.1] - 2026-10-24
 

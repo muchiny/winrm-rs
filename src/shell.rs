@@ -203,6 +203,10 @@ impl<'a> Shell<'a> {
     ///
     /// The script is encoded as UTF-16LE base64 and executed via
     /// `powershell.exe -EncodedCommand`.
+    ///
+    /// The script is the `-EncodedCommand` argument of `powershell.exe`: hosts
+    /// that audit process command lines (event 4688, Sysmon event 1) or log
+    /// script blocks (event 4104) record its text. Do not embed secrets in it.
     pub async fn run_powershell(&self, script: &str) -> Result<CommandOutput, WinrmError> {
         let encoded = crate::command::encode_powershell_command(script);
         self.run_command("powershell.exe", &["-EncodedCommand", &encoded])

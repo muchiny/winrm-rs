@@ -267,6 +267,16 @@ let bytes = client.upload_file("win-server", Path::new("local.bin"), "C:\\remote
 let bytes = client.download_file("win-server", "C:\\remote\\file.bin", Path::new("local.bin")).await?;
 ```
 
+`remote_path` is opened as the remote account and may name a UNC share or a
+device path. Under CredSSP or Basic, a UNC path is reached with your
+credentials: never pass an untrusted path. On the host, blocking outbound
+SMB (445) and WebDAV, the "Network security: Restrict NTLM: Outgoing NTLM
+traffic to remote servers" policy, a disabled WebClient service and Kerberos
+constrained delegation instead of CredSSP all limit what such a path can
+reach. Uploads put the file content on the remote `powershell.exe` command
+line, which command-line auditing (event 4688) and script block logging
+(event 4104) record.
+
 ## Configuration
 
 `WinrmConfig` fields:

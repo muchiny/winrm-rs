@@ -33,7 +33,7 @@ const CMD_LINE_BUDGET: usize = 8100;
 /// Maximum allowed remote path length (Windows MAX_PATH).
 const MAX_REMOTE_PATH_LEN: usize = 260;
 
-/// Validate a remote file path for safety.
+/// Reject remote paths that are too long for Windows or contain control characters.
 ///
 /// Rejects paths containing control characters (`\x00`-`\x1F` except `\t`)
 /// or exceeding Windows MAX_PATH.
@@ -42,6 +42,9 @@ const MAX_REMOTE_PATH_LEN: usize = 260;
 /// least as strict as the 260-WCHAR limit Windows enforces: a non-ASCII path
 /// is rejected slightly earlier than the host would reject it. Deliberate —
 /// erring towards refusing a path is the safe direction here.
+///
+/// This is not a safety check: UNC, WebDAV and device paths pass (see the
+/// `# Security` section of [`WinrmClient::upload_file`]).
 pub(crate) fn validate_remote_path(path: &str) -> Result<(), WinrmError> {
     if path.len() > MAX_REMOTE_PATH_LEN {
         return Err(WinrmError::Transfer(format!(
@@ -121,6 +124,26 @@ impl WinrmClient {
     /// shutdown) until it returns.
     ///
     /// Returns the number of bytes uploaded.
+    ///
+    /// # Security
+    ///
+    /// - `remote_path` is opened by `[IO.File]` as the remote account. It can
+    ///   name any local path, a UNC or WebDAV share (`\\server\share\f`,
+    ///   `//server/share/f`) or a device path (`\\?\…`, `\\.\…`). Under CredSSP
+    ///   or Basic, and probably under Certificate auth, the remote session holds
+    ///   reusable credentials, so a UNC path makes the host authenticate as you
+    ///   to the server it names. Under NTLM or Kerberos the host forwards no
+    ///   credentials unless it is configured for constrained delegation, and
+    ///   then only to the targets that delegation allows. It is not a sandbox:
+    ///   never pass an untrusted `remote_path`.
+    /// - Each chunk of the file, up to 2000 bytes, travels as base64 inside the
+    ///   `powershell.exe -EncodedCommand` command line. A host that audits
+    ///   process command lines (Security event 4688, Sysmon event 1) or logs
+    ///   script blocks (PowerShell event 4104) records the file content. Do not
+    ///   upload secrets to such a host.
+    /// - `local_path` is opened with this process's privileges and follows
+    ///   symbolic links. Check an untrusted local path yourself before passing
+    ///   it.
     pub async fn upload_file(
         &self,
         host: &str,
@@ -199,6 +222,23 @@ impl WinrmClient {
     /// written after the caller gave up.
     ///
     /// Returns the number of bytes downloaded.
+    ///
+    /// # Security
+    ///
+    /// - `remote_path` is opened by `[IO.File]` as the remote account. It can
+    ///   name any local path, a UNC or WebDAV share (`\\server\share\f`,
+    ///   `//server/share/f`) or a device path (`\\?\…`, `\\.\…`). Under CredSSP
+    ///   or Basic, and probably under Certificate auth, the remote session holds
+    ///   reusable credentials, so a UNC path makes the host authenticate as you
+    ///   to the server it names. Under NTLM or Kerberos the host forwards no
+    ///   credentials unless it is configured for constrained delegation, and
+    ///   then only to the targets that delegation allows. It is not a sandbox:
+    ///   never pass an untrusted `remote_path`.
+    /// - The file comes back as base64 on the command's stdout. PowerShell
+    ///   transcription on the host, if enabled, records it.
+    /// - `local_path` is written with this process's privileges and follows
+    ///   symbolic links. Check an untrusted local path yourself before passing
+    ///   it.
     pub async fn download_file(
         &self,
         host: &str,
@@ -234,6 +274,23 @@ impl WinrmClient {
     /// written after the caller gave up.
     ///
     /// Returns the number of bytes downloaded.
+    ///
+    /// # Security
+    ///
+    /// - `remote_path` is opened by `[IO.File]` as the remote account. It can
+    ///   name any local path, a UNC or WebDAV share (`\\server\share\f`,
+    ///   `//server/share/f`) or a device path (`\\?\…`, `\\.\…`). Under CredSSP
+    ///   or Basic, and probably under Certificate auth, the remote session holds
+    ///   reusable credentials, so a UNC path makes the host authenticate as you
+    ///   to the server it names. Under NTLM or Kerberos the host forwards no
+    ///   credentials unless it is configured for constrained delegation, and
+    ///   then only to the targets that delegation allows. It is not a sandbox:
+    ///   never pass an untrusted `remote_path`.
+    /// - The file comes back as base64 on the command's stdout. PowerShell
+    ///   transcription on the host, if enabled, records it.
+    /// - `local_path` is written with this process's privileges and follows
+    ///   symbolic links. Check an untrusted local path yourself before passing
+    ///   it.
     ///
     /// # Example
     /// ```rust,no_run

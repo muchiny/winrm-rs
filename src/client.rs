@@ -606,6 +606,10 @@ impl WinrmClient {
     /// with [`run_powershell_with_timeout`](Self::run_powershell_with_timeout)
     /// (which also deletes the shell on expiry) or stop it from elsewhere
     /// with [`run_powershell_with_cancel`](Self::run_powershell_with_cancel).
+    ///
+    /// The script is the `-EncodedCommand` argument of `powershell.exe`: hosts
+    /// that audit process command lines (event 4688, Sysmon event 1) or log
+    /// script blocks (event 4104) record its text. Do not embed secrets in it.
     #[tracing::instrument(
         level = "debug",
         skip(self, script, host),

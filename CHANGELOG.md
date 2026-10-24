@@ -21,7 +21,18 @@ PSRP callers can now stop a running pipeline.
   that way by the protocol), the only one for which PowerShell's WSMan plugin
   stops a command instead of closing it. A `cmd` shell is unchanged. Checked
   live against Windows Server 2025: the signal is accepted and the pipeline
-  stops. Found from psrp-rs (muchiny/psrp-rs#35).
+  stops. Found from psrp-rs (muchiny/psrp-rs#35). Like every request, the
+  signal goes through a `before_send` hook; a hook that refuses it leaves the
+  pipeline running.
+
+### Documentation
+
+- **`WinrmClientBuilder::before_send`** now states what the hook counts (SOAP
+  messages, and the HTTP requests behind each one for every authentication
+  method), that a refusal also blocks the Signal and Delete that would stop a
+  running command, how long an approval may precede its request, and that one
+  hook covers every host of the client. Its example quota no longer re-opens
+  after 2^32 refused calls, and is now a tested doctest.
 
 ## [1.4.0] - 2026-10-22
 

@@ -253,6 +253,8 @@ impl<'a> Shell<'a> {
     /// `PipelineState` `Stopped`. The plain `cmd` signal used to be sent
     /// there, which the server answers with a fault because no such shell
     /// exists under `cmd`.
+    ///
+    /// Like every request, it goes through the client's [`before_send`](crate::WinrmClientBuilder::before_send) hook: a refusal fails with [`WinrmError::Cancelled`](crate::WinrmError::Cancelled) and the command keeps running.
     pub async fn signal_ctrl_c(&self, command_id: &str) -> Result<(), WinrmError> {
         let endpoint = self.client.endpoint(&self.host);
         let config = self.client.config();

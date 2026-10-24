@@ -29,6 +29,9 @@ use crate::transport::HttpTransport;
 ///
 /// The client is cheaply cloneable via the inner `reqwest::Client` connection
 /// pool but is **not** `Clone` itself -- create one per logical session.
+///
+/// What the client logs at each level, and what `trace` exposes, is described
+/// in the crate-level *Logging* section.
 pub struct WinrmClient {
     pub(crate) transport: HttpTransport,
 }
@@ -137,8 +140,8 @@ impl WinrmClient {
     /// [`receive_output`](Self::receive_output) to poll for results.
     #[tracing::instrument(
         level = "debug",
-        skip(self, host),
-        fields(host = %crate::transport::redact_userinfo(host))
+        skip(self, host, command, args),
+        fields(host = %crate::transport::redact_userinfo(host), args_len = args.len())
     )]
     pub async fn execute_command(
         &self,
@@ -315,8 +318,8 @@ impl WinrmClient {
     /// `2 * operation_timeout_secs`.
     #[tracing::instrument(
         level = "debug",
-        skip(self, host),
-        fields(host = %crate::transport::redact_userinfo(host))
+        skip(self, host, command, args),
+        fields(host = %crate::transport::redact_userinfo(host), args_len = args.len())
     )]
     pub async fn run_command(
         &self,
@@ -381,8 +384,8 @@ impl WinrmClient {
     /// ```
     #[tracing::instrument(
         level = "debug",
-        skip(self, host),
-        fields(host = %crate::transport::redact_userinfo(host))
+        skip(self, host, command, args),
+        fields(host = %crate::transport::redact_userinfo(host), args_len = args.len())
     )]
     pub async fn run_command_with_timeout(
         &self,
@@ -586,7 +589,7 @@ impl WinrmClient {
     #[tracing::instrument(
         level = "debug",
         skip(self, script, host),
-        fields(host = %crate::transport::redact_userinfo(host))
+        fields(host = %crate::transport::redact_userinfo(host), script_len = script.len())
     )]
     pub async fn run_powershell(
         &self,
@@ -623,7 +626,7 @@ impl WinrmClient {
     #[tracing::instrument(
         level = "debug",
         skip(self, script, host),
-        fields(host = %crate::transport::redact_userinfo(host))
+        fields(host = %crate::transport::redact_userinfo(host), script_len = script.len())
     )]
     pub async fn run_powershell_with_timeout(
         &self,
@@ -718,8 +721,8 @@ impl WinrmClient {
     /// ```
     #[tracing::instrument(
         level = "debug",
-        skip(self, host),
-        fields(host = %crate::transport::redact_userinfo(host))
+        skip(self, host, query),
+        fields(host = %crate::transport::redact_userinfo(host), query_len = query.len())
     )]
     pub async fn run_wql(
         &self,
@@ -3917,6 +3920,95 @@ mod tests {
         shell.close().await.unwrap();
         assert!(logs_contain(r#"shell_id="S\r\nforged-shell""#));
         assert!(logs_contain(r#"command_id="C\r\nforged-cmd""#));
+    }
+
+    /// Debug spans name the host and count arguments; they never carry the
+    /// command, its arguments, a PowerShell script or a WQL query.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn command_spans_do_not_record_command_text_or_arguments() {
+        // Bound then released: every request fails to connect right after its
+        // debug line "sending WinRM SOAP request", which prints the span fields.
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let client = WinrmClient::new(
+            WinrmConfig {
+                port,
+                auth_method: AuthMethod::Basic,
+                connect_timeout_secs: 2,
+                max_retries: 0,
+                ..Default::default()
+            },
+            test_creds(),
+        )
+        .unwrap();
+        let h = "127.0.0.1";
+        let script = "Write-Output 'SECRET-E'";
+        let t = Duration::from_secs(5);
+        assert!(
+            client
+                .run_command(h, "cmd-SECRET-A", &["arg-SECRET-B"])
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .run_command_with_timeout(h, "cmd-SECRET-C", &["arg-SECRET-D"], t)
+                .await
+                .is_err()
+        );
+        assert!(client.run_powershell(h, script).await.is_err());
+        assert!(
+            client
+                .run_powershell_with_timeout(h, script, t)
+                .await
+                .is_err()
+        );
+        let token = tokio_util::sync::CancellationToken::new;
+        assert!(
+            client
+                .run_command_with_cancel(h, "cmd-SECRET-I", &["arg-SECRET-J"], token())
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .run_powershell_with_cancel(h, script, token())
+                .await
+                .is_err()
+        );
+        // Called directly: run_command fails in create_shell and never gets here.
+        assert!(
+            client
+                .execute_command(h, "SHELL-1", "cmd-SECRET-G", &["arg-SECRET-H"])
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .run_wql(h, "SELECT SECRET-F FROM Win32_OS", None)
+                .await
+                .is_err()
+        );
+        let encoded = encode_powershell_command(script);
+        logs_assert(|lines: &[&str]| {
+            // Until bodies leave `trace` by default, the body lines carry them.
+            for line in lines.iter().filter(|l| !l.contains("SOAP request body")) {
+                for marker in ["SECRET-", encoded.as_str()] {
+                    if line.contains(marker) {
+                        return Err(format!("{marker} in: {line}"));
+                    }
+                }
+            }
+            Ok(())
+        });
+        assert!(logs_contain("sending WinRM SOAP request"));
+        assert!(logs_contain("args_len=1"));
+        assert!(logs_contain("args_len=2"));
+        assert!(logs_contain("script_len=23"));
+        assert!(logs_contain("query_len=29"));
     }
 
     fn silent_poll() -> ResponseTemplate {

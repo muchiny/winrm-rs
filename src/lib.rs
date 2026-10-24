@@ -45,6 +45,30 @@
 //! to create a [`Shell`] that persists across commands, avoiding the overhead of
 //! shell creation and deletion per command.
 //!
+//! # Logging
+//!
+//! The crate logs through `tracing`. What each level records:
+//!
+//! - `warn`: settings that weaken security, at each client construction
+//!   (`accept_invalid_certs`, Basic or NTLM over plain HTTP,
+//!   `EncryptionMode::Always` with a method that cannot seal), and runtime
+//!   anomalies (a host string that had to be sanitised, a shell dropped
+//!   without `close`, a retry). The NTLM one has its own target,
+//!   `winrm_rs::ntlm_over_http`, so a deliberate plain-HTTP deployment can
+//!   silence it alone.
+//! - `info`: no request content.
+//! - `debug`: spans with the host (userinfo replaced by `<redacted>`), shell
+//!   and command ids, `args_len`, `script_len`, `query_len`, the WQL
+//!   namespace, the PSRP `resource_uri`, the `download_file` remote and local
+//!   paths, and the errors of best-effort clean-up requests. Never command
+//!   text, arguments, scripts or queries. An error message can quote up to
+//!   512 characters of a failed answer (an HTTP error body, a transfer's
+//!   stderr) and up to 2048 characters of a SOAP fault reason.
+//! - `trace`: every SOAP request and response body, in plaintext (before
+//!   sealing and after unsealing): commands and their arguments, `env_vars`
+//!   values, stdin, uploaded file contents, command output. Keep `winrm_rs`
+//!   below `trace` wherever commands carry secrets.
+//!
 //! # Cargo features
 //!
 //! - **`kerberos`** -- Enables Kerberos authentication via `cross-krb5`.

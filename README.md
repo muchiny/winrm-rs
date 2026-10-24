@@ -276,6 +276,10 @@ let bytes = client.download_file("win-server", "C:\\remote\\file.bin", Path::new
 | `encryption` | `Auto` | Message sealing for NTLM and Kerberos: `Auto` (over HTTP only), `Always`, `Never`. No effect with Basic, Certificate or CredSSP, `Always` included (Basic over HTTP stays plaintext; a WARN is logged) |
 | `max_output_bytes` | `Some(64 MiB)` | Cap on a command's stdout+stderr; `None` removes it |
 
+## Logging
+
+winrm-rs logs through `tracing`. Below `trace` it logs no command text, arguments, scripts or WQL queries; `debug` adds the host (userinfo redacted), ids and argument counts. `trace` logs every SOAP body in plaintext (before sealing, after unsealing): commands and arguments, `env_vars` values, stdin, uploaded file contents and output. Keep `winrm_rs` below `trace` wherever commands carry secrets. The WARN about NTLM over plain HTTP has its own target, so it can be silenced alone: `RUST_LOG=info,winrm_rs::ntlm_over_http=error`.
+
 ## Roadmap
 
 | Version | Milestone | Status |

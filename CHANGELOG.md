@@ -26,6 +26,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   exist only with the `credssp` feature. The other three are on the default
   NTLM path. The fixed-value parsers no longer panic on odd-length or
   non-ASCII values.
+- **Command text no longer reaches debug spans.** The spans of
+  `execute_command`, `run_command`, `run_command_with_timeout` and `run_wql`
+  recorded the command, its arguments and the WQL query, and
+  `run_powershell`'s encoded script appeared through `run_command`'s span.
+  They now record `args_len`, `query_len` and, for `run_powershell` and
+  `run_powershell_with_timeout`, `script_len`. This replaces the 1.3.0 advice
+  to keep `winrm_rs` at `info`: `debug` no longer carries command content,
+  but `trace` still logs SOAP bodies. The crate docs gain a *Logging*
+  section.
 
 ### Changed
 

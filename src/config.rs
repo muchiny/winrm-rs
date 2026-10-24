@@ -15,9 +15,9 @@ use secrecy::SecretString;
 ///
 /// The default, NTLM over plain HTTP, protects the SOAP bodies (sealing, see
 /// [`EncryptionMode`]) but not the authentication. NTLM authenticates the
-/// client only, and over plain HTTP its handshake is bound neither to the
-/// server nor to the TCP connection. A party on the network path can
-/// relay it, before this client notices, to a service that accepts NTLM
+/// client only, and over plain HTTP its handshake does not authenticate the
+/// server and is not bound to the TCP connection. A party on the network path
+/// can relay it, before this client notices, to a service that accepts NTLM
 /// without signing or channel binding (an SMB server without signing, LDAP
 /// without channel binding, AD CS web enrollment without Extended
 /// Protection, a WinRM listener that allows unencrypted messages, this one
@@ -201,9 +201,6 @@ pub struct WinrmConfig {
     /// enables `hyper-util/client-proxy-system`, as the default features of
     /// `reqwest` 0.13 do (its `system-proxy` feature). Set this field, or
     /// `NO_PROXY`, to choose the route.
-    ///
-    /// [`accept_invalid_certs`](Self::accept_invalid_certs) also turns off
-    /// verification of an `https://` proxy's certificate; see there.
     ///
     /// Kerberos over HTTPS pins the server certificate in the connection's
     /// verifier and refuses a TLS handshake for any other server name than

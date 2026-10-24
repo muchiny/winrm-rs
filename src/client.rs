@@ -39,9 +39,10 @@ use crate::transport::HttpTransport;
 /// header (MS-WSMV), to every host it talks to: Windows binds each shell
 /// to the session that created it. Hosts that compare their logs can
 /// therefore tell that requests came from one client instance, as they can
-/// from the source address, the user name, the NTLM workstation name and the
-/// `User-Agent`. To keep hosts from linking requests at this level, use one
-/// client per host.
+/// from the source address, the user name, the NTLM workstation name (this
+/// machine's name, which the Type 3 message carries whenever it includes a
+/// MIC, as this client's NTLM messages do) and the `User-Agent`. To keep
+/// hosts from linking requests at this level, use one client per host.
 pub struct WinrmClient {
     pub(crate) transport: HttpTransport,
 }

@@ -682,7 +682,7 @@ impl HttpTransport {
             tracing::warn!(
                 target: "winrm_rs::ntlm_over_http",
                 sealed = config.encryption != EncryptionMode::Never,
-                "NTLM over plain HTTP: the handshake is bound neither to the server nor to the \
+                "NTLM over plain HTTP: the handshake does not authenticate the server and is not bound to the \
                  connection, so a party on the network path can relay it, or record it to \
                  guess the password offline; sealing protects only the SOAP bodies. Use HTTPS \
                  (use_tls = true, port = 5986) or Kerberos"
@@ -835,7 +835,10 @@ impl HttpTransport {
         let url = self
             .checked_endpoint(host)
             .inspect_err(|e| debug!(error = %e, "request not sent: invalid host"))?;
-        debug!(url = %url, "sending WinRM SOAP request");
+        debug!(
+            url = %crate::error::quote_server_text(&url, 256),
+            "sending WinRM SOAP request"
+        );
         trace!(body = %body, "SOAP request body");
 
         let response_text: String = match &self.config.auth_method {
@@ -3009,6 +3012,23 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains('\u{1b}'), "{text}");
+    }
+
+    /// `validate_host` accepts a bidi override character, so the URL of the
+    /// request event is escaped like the host field is. (A line break is
+    /// refused by `validate_host`, see the test above.)
+    #[tokio::test]
+    async fn request_url_log_field_escapes_bidi_characters() {
+        let (logs, _guard) = capture_logs();
+        let (_socket, port) = refused_port();
+        let transport = basic_transport_retrying(port, 0);
+        let _ = transport
+            .send_soap_raw("win\u{202E}01.test", "<a/>".into())
+            .await;
+        let text = logs.text();
+        assert!(text.contains("sending WinRM SOAP request"), "{text}");
+        assert!(text.contains("win\\u{202e}01.test"), "{text}");
+        assert!(!text.contains('\u{202E}'), "{text}");
     }
 
     #[tokio::test]

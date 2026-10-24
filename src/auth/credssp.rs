@@ -755,17 +755,22 @@ impl AuthTransport for CredSspAuth {
         let host_only = host_part.split(':').next().unwrap_or(host_part);
         let spn = format!("HTTP/{host_only}");
 
-        let (type3, session_key) = ntlm::create_authenticate_message_credssp(
-            &challenge,
-            &self.username,
-            &self.password,
-            &domain,
-            &spn,
-            &type1,
-            &type2,
-        )
-        .map_err(WinrmError::Ntlm)?;
-        let mut ntlm_session = NtlmSession::boxed_from_auth(&session_key);
+        // No `.await` inside this block: the exported session key never becomes
+        // part of the future's state, and `Zeroizing` wipes it when the block
+        // ends. Keep awaits out of it.
+        let (type3, mut ntlm_session) = {
+            let (type3, session_key) = ntlm::create_authenticate_message_credssp(
+                &challenge,
+                &self.username,
+                &self.password,
+                &domain,
+                &spn,
+                &type1,
+                &type2,
+            )
+            .map_err(WinrmError::Ntlm)?;
+            (type3, NtlmSession::boxed_from_auth(&session_key))
+        };
         // Compute mechListMIC over the SPNEGO mech_type_list. This MUST happen
         // before sealing pubKeyAuth so that the latter uses seq=1 (matches
         // pyspnego/Windows expectations). Without mechListMIC the server
@@ -921,8 +926,13 @@ impl AuthTransport for CredSspAuth {
         }
 
         // === Step 8: Send encrypted TSCredentials ===
-        let ts_creds = asn1::encode_ts_credentials(&domain, &self.username, &self.password);
-        let encrypted_creds = ntlm_session.seal(&ts_creds);
+        // Same rule: the cleartext TSCredentials are wiped before the final
+        // POST, which can last as long as the WS-Man operation
+        // (`operation_timeout_secs`). No `.await` inside this block.
+        let encrypted_creds = {
+            let ts_creds = asn1::encode_ts_credentials(&domain, &self.username, &self.password);
+            ntlm_session.seal(&ts_creds)
+        };
         let ts_req5 =
             asn1::encode_ts_request(CREDSSP_VERSION, None, None, Some(&encrypted_creds), None);
         inner_tls.write_plaintext(&ts_req5)?;

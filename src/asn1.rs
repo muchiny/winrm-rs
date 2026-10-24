@@ -142,11 +142,58 @@ pub(crate) fn encode_ts_request(
     encode_sequence(&contents)
 }
 
+/// Size of a TLV whose content is `content_len` bytes long.
+fn tlv_len(content_len: usize) -> usize {
+    1usize
+        .saturating_add(encode_length(content_len).len())
+        .saturating_add(content_len)
+}
+
+/// Push the tag and length of a TLV, leaving the content to the caller.
+fn push_tlv_header(out: &mut Vec<u8>, tag: u8, content_len: usize) {
+    out.push(tag);
+    out.extend_from_slice(&encode_length(content_len));
+}
+
+/// Number of bytes `s` takes in UTF-16LE.
+fn utf16le_len(s: &str) -> usize {
+    s.encode_utf16().count().saturating_mul(2)
+}
+
+/// Append `s` to `out` as UTF-16LE, without an intermediate buffer.
+fn push_utf16le(out: &mut Vec<u8>, s: &str) {
+    for unit in s.encode_utf16() {
+        out.extend_from_slice(&unit.to_le_bytes());
+    }
+}
+
+/// Sizes of the nested TSCredentials parts, outermost last:
+/// `(pwd_content, pwd_seq, octet, outer_content)`.
+fn ts_credentials_sizes(domain: &str, username: &str, password: &str) -> [usize; 4] {
+    // Each field is `[n] { OCTET STRING { utf16 } }`.
+    let field = |s: &str| tlv_len(tlv_len(utf16le_len(s)));
+    let pwd_content = field(domain)
+        .saturating_add(field(username))
+        .saturating_add(field(password));
+    let pwd_seq = tlv_len(pwd_content);
+    let octet = tlv_len(pwd_seq);
+    // `[0] { INTEGER 1 }` is 5 bytes, then `[1] { OCTET STRING { SEQUENCE } }`.
+    let outer_content = 5usize.saturating_add(tlv_len(octet));
+    [pwd_content, pwd_seq, octet, outer_content]
+}
+
+/// Exact size of the DER encoding of the TSCredentials.
+fn ts_credentials_len(domain: &str, username: &str, password: &str) -> usize {
+    let [_, _, _, outer_content] = ts_credentials_sizes(domain, username, password);
+    tlv_len(outer_content)
+}
+
 /// Encode TSCredentials (MS-CSSP 2.2.1.2).
 ///
-/// Returns a [`Zeroizing`] buffer so the cleartext-credentials DER blob is
-/// wiped from memory once the caller drops it (typically right after the
-/// blob is sealed by NTLM).
+/// The DER is written once, in a buffer of its exact size, so it is never
+/// reallocated and no intermediate copy of the credentials is left behind.
+/// The returned [`Zeroizing`] buffer is wiped when the caller drops it
+/// (typically right after the blob is sealed by NTLM).
 pub(crate) fn encode_ts_credentials(
     domain: &str,
     username: &str,
@@ -154,25 +201,29 @@ pub(crate) fn encode_ts_credentials(
 ) -> zeroize::Zeroizing<Vec<u8>> {
     use zeroize::Zeroizing;
 
-    let domain_bytes = Zeroizing::new(crate::ntlm::crypto::to_utf16le(domain));
-    let user_bytes = Zeroizing::new(crate::ntlm::crypto::to_utf16le(username));
-    let pass_bytes = Zeroizing::new(crate::ntlm::crypto::to_utf16le(password));
-
-    // TSPasswordCreds
-    let mut pwd_contents = Zeroizing::new(Vec::new());
-    pwd_contents.extend_from_slice(&encode_context_tag(0, &encode_octet_string(&domain_bytes)));
-    pwd_contents.extend_from_slice(&encode_context_tag(1, &encode_octet_string(&user_bytes)));
-    pwd_contents.extend_from_slice(&encode_context_tag(2, &encode_octet_string(&pass_bytes)));
-    let ts_password_creds = Zeroizing::new(encode_sequence(&pwd_contents));
+    let [pwd_content, pwd_seq, octet, outer_content] =
+        ts_credentials_sizes(domain, username, password);
+    let total = tlv_len(outer_content);
+    let mut out = Zeroizing::new(Vec::with_capacity(total));
+    let cap0 = out.capacity();
 
     // TSCredentials { credType: 1, credentials: DER(TSPasswordCreds) }
-    let mut cred_contents = Zeroizing::new(Vec::new());
-    cred_contents.extend_from_slice(&encode_context_tag(0, &encode_integer_value(1)));
-    cred_contents.extend_from_slice(&encode_context_tag(
-        1,
-        &encode_octet_string(&ts_password_creds),
-    ));
-    Zeroizing::new(encode_sequence(&cred_contents))
+    push_tlv_header(&mut out, TAG_SEQUENCE, outer_content);
+    out.extend_from_slice(&[0xA0, 0x03, 0x02, 0x01, 0x01]);
+    push_tlv_header(&mut out, 0xA1, octet);
+    push_tlv_header(&mut out, TAG_OCTET_STRING, pwd_seq);
+    // TSPasswordCreds
+    push_tlv_header(&mut out, TAG_SEQUENCE, pwd_content);
+    for (ctx, text) in [(0xA0, domain), (0xA1, username), (0xA2, password)] {
+        let n = utf16le_len(text);
+        push_tlv_header(&mut out, ctx, tlv_len(n));
+        push_tlv_header(&mut out, TAG_OCTET_STRING, n);
+        push_utf16le(&mut out, text);
+    }
+
+    debug_assert_eq!(out.capacity(), cap0, "TSCredentials buffer reallocated");
+    debug_assert_eq!(out.len(), total, "TSCredentials size mismatch");
+    out
 }
 
 /// Wrap an NTLM Type 1 message in SPNEGO NegTokenInit (RFC 4178).
@@ -632,6 +683,74 @@ mod tests {
         assert_eq!(creds[0], TAG_SEQUENCE);
         // Should contain UTF-16LE encoded strings
         assert!(creds.len() > 20);
+    }
+
+    /// The previous nested encoder, kept verbatim as the byte oracle.
+    fn nested_ts_credentials(d: &str, u: &str, p: &str) -> Vec<u8> {
+        let domain_bytes = crate::ntlm::crypto::to_utf16le(d);
+        let user_bytes = crate::ntlm::crypto::to_utf16le(u);
+        let pass_bytes = crate::ntlm::crypto::to_utf16le(p);
+
+        let mut pwd_contents = Vec::new();
+        pwd_contents.extend_from_slice(&encode_context_tag(0, &encode_octet_string(&domain_bytes)));
+        pwd_contents.extend_from_slice(&encode_context_tag(1, &encode_octet_string(&user_bytes)));
+        pwd_contents.extend_from_slice(&encode_context_tag(2, &encode_octet_string(&pass_bytes)));
+        let ts_password_creds = encode_sequence(&pwd_contents);
+
+        let mut cred_contents = Vec::new();
+        cred_contents.extend_from_slice(&encode_context_tag(0, &encode_integer_value(1)));
+        cred_contents.extend_from_slice(&encode_context_tag(
+            1,
+            &encode_octet_string(&ts_password_creds),
+        ));
+        encode_sequence(&cred_contents)
+    }
+
+    #[test]
+    fn ts_credentials_matches_nested_encoder_across_length_forms() {
+        for n in (0..=140).chain([0x7f00, 0x7ff8, 0x7fff, 0x8000, 0x8001]) {
+            let long = "p".repeat(n);
+            for (d, u, p) in [
+                ("", "u", long.as_str()),
+                ("DOMAIN", "üser", long.as_str()),
+                ("d", long.as_str(), "\u{1d11e}"),
+            ] {
+                assert_eq!(
+                    *encode_ts_credentials(d, u, p),
+                    nested_ts_credentials(d, u, p),
+                    "{d:?} {u:?} n={n}"
+                );
+            }
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn ts_credentials_matches_nested_encoder(
+            d in "\\PC{0,40}",
+            u in "\\PC{0,40}",
+            p in "\\PC{0,300}",
+        ) {
+            proptest::prop_assert_eq!(
+                encode_ts_credentials(&d, &u, &p).to_vec(),
+                nested_ts_credentials(&d, &u, &p)
+            );
+        }
+    }
+
+    #[test]
+    fn ts_credentials_buffer_is_sized_exactly() {
+        let long = "p".repeat(0x8000);
+        for (d, u, p) in [
+            ("", "", ""),
+            ("DOMAIN", "user", "pass"),
+            ("", "u", long.as_str()),
+        ] {
+            assert_eq!(
+                encode_ts_credentials(d, u, p).len(),
+                ts_credentials_len(d, u, p)
+            );
+        }
     }
 
     #[test]

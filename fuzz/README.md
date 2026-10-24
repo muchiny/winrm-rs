@@ -52,7 +52,7 @@ drives; "invariant" is what it asserts beyond *must not panic*.
 |---|---|---|
 | `fuzz_soap_parse` | `soap/parser.rs` response parsers | decoded streams fit in the response; a fault is never read as success |
 | `fuzz_soap_enumerate` | `parse_enumerate_response` | an `EndOfSequence` element after the document clears the context; escaped item text never does and is never a fault; the context cannot add XML elements to the next `Pull` |
-| `fuzz_soap_envelope` | all envelope builders | **no input can add XML markup** — tag counts match an empty-input baseline |
+| `fuzz_soap_envelope` | all envelope builders, the five PSRP ones included (shell creation with `creationXml`, command, receive, send, signal) | **no input can add XML markup** — tag counts match an empty-input baseline |
 | `fuzz_xml_escape` | `envelope::xml_escape` | complete (no raw markup survives) and reversible |
 | `fuzz_clixml_stderr` | `soap/clixml.rs::ClixmlDecoder` | output does not depend on how stderr is sliced; plain stderr passes through; output ≤ 3× input |
 

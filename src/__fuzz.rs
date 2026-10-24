@@ -360,6 +360,99 @@ pub fn delete_shell_request(
     )
 }
 
+pub fn create_psrp_shell_request(
+    endpoint: &str,
+    config: &crate::config::WinrmConfig,
+    creation_xml_b64: &str,
+    ps_resource_uri: &str,
+    shell_id: &str,
+) -> String {
+    crate::soap::envelope::create_psrp_shell_request(
+        endpoint,
+        config,
+        creation_xml_b64,
+        ps_resource_uri,
+        shell_id,
+    )
+}
+
+#[allow(clippy::too_many_arguments, reason = "mirrors the wrapped builder")]
+pub fn execute_command_with_id_request(
+    endpoint: &str,
+    shell_id: &str,
+    command: &str,
+    args: &[&str],
+    command_id: &str,
+    timeout_secs: u64,
+    max_envelope_size: u32,
+    resource_uri: &str,
+) -> String {
+    crate::soap::envelope::execute_command_with_id_request(
+        endpoint,
+        shell_id,
+        command,
+        args,
+        command_id,
+        timeout_secs,
+        max_envelope_size,
+        resource_uri,
+    )
+}
+
+pub fn receive_psrp_request(
+    endpoint: &str,
+    shell_id: &str,
+    command_id: Option<&str>,
+    timeout_secs: u64,
+    max_envelope_size: u32,
+    resource_uri: &str,
+) -> String {
+    crate::soap::envelope::receive_psrp_request(
+        endpoint,
+        shell_id,
+        command_id,
+        timeout_secs,
+        max_envelope_size,
+        resource_uri,
+    )
+}
+
+pub fn send_psrp_request(
+    endpoint: &str,
+    shell_id: &str,
+    data: &[u8],
+    timeout_secs: u64,
+    max_envelope_size: u32,
+    resource_uri: &str,
+) -> String {
+    crate::soap::envelope::send_psrp_request(
+        endpoint,
+        shell_id,
+        data,
+        timeout_secs,
+        max_envelope_size,
+        resource_uri,
+    )
+}
+
+pub fn signal_psrp_ctrl_c_request(
+    endpoint: &str,
+    shell_id: &str,
+    command_id: &str,
+    resource_uri: &str,
+    timeout_secs: u64,
+    max_envelope_size: u32,
+) -> String {
+    crate::soap::envelope::signal_psrp_ctrl_c_request(
+        endpoint,
+        shell_id,
+        command_id,
+        resource_uri,
+        timeout_secs,
+        max_envelope_size,
+    )
+}
+
 pub fn send_input_request(
     endpoint: &str,
     shell_id: &str,

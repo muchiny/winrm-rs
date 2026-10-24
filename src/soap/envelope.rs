@@ -229,6 +229,9 @@ pub(crate) fn create_psrp_shell_request(
     // [0-9a-f-], but escaping costs nothing and survives future
     // refactors that might let a caller-supplied id leak into here.
     let escaped_shell_id = xml_escape(shell_id);
+    // Valid base64 has no character that `xml_escape` changes, so the wire
+    // bytes of a well-formed value are identical.
+    let escaped_creation_xml = xml_escape(creation_xml_b64);
     format!(
         r#"<s:Envelope {NS_DECL_WITH_RSP}>
 {header_with_options}
@@ -236,7 +239,7 @@ pub(crate) fn create_psrp_shell_request(
     <rsp:Shell ShellId="{escaped_shell_id}">
       <rsp:InputStreams>stdin pr</rsp:InputStreams>
       <rsp:OutputStreams>stdout</rsp:OutputStreams>{idle_timeout}
-      <creationXml xmlns="http://schemas.microsoft.com/powershell">{creation_xml_b64}</creationXml>
+      <creationXml xmlns="http://schemas.microsoft.com/powershell">{escaped_creation_xml}</creationXml>
     </rsp:Shell>
   </s:Body>
 </s:Envelope>"#
@@ -1315,6 +1318,27 @@ mod tests {
         assert!(xml.contains("stdin pr"));
         assert!(xml.contains("protocolversion"));
         assert!(xml.contains("<rsp:IdleTimeOut>PT120S</rsp:IdleTimeOut>"));
+    }
+
+    #[test]
+    fn creation_xml_is_escaped() {
+        let config = crate::config::WinrmConfig::default();
+        let xml = create_psrp_shell_request(
+            "http://h:5985/wsman",
+            &config,
+            "AAA</creationXml><rsp:Environment/>",
+            "uri",
+            "ID",
+        );
+        assert!(
+            xml.contains("AAA&lt;/creationXml&gt;&lt;rsp:Environment/&gt;</creationXml>"),
+            "{xml}"
+        );
+        let b64 = "PE9ianM+AA==";
+        assert!(
+            create_psrp_shell_request("http://h:5985/wsman", &config, b64, "uri", "ID")
+                .contains(&format!(">{b64}</creationXml>"))
+        );
     }
 
     #[test]

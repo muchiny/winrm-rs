@@ -154,6 +154,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   async worker thread; they now run on tokio's blocking pool, so a slow disk
   or a FIFO no longer stalls other tasks and a deadline around `upload_file`
   fires.
+- `open_psrp_shell` XML-escapes `creation_xml_b64` like every other value it
+  puts in the envelope (valid base64 is unchanged).
 
 ### Documentation
 

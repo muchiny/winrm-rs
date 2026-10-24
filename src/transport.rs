@@ -187,10 +187,49 @@ const MAX_IDLE_CONNS: usize = 8;
 /// HTTP.sys, so a reused connection is normally still the authenticated one.
 const CONN_MAX_IDLE: Duration = Duration::from_secs(60);
 
-/// Exchanges a transport runs at once on dedicated connections (sealed, or
-/// NTLM over TLS): a bound on the sockets and server sessions one client can
-/// open. Further requests wait for a slot, within the request timeout.
-const MAX_CONNS_IN_FLIGHT: usize = 32;
+/// Dedicated-connection exchanges (sealed, NTLM over TLS, Kerberos over TLS)
+/// in flight: 32 per host and 128 per client. Signal and Delete use 2 more
+/// per host, outside both limits, so clean-up never queues behind data
+/// requests. At most 128 + 2 × hosts sockets in total. Hosts are keyed by
+/// their string, ASCII case aside: `win01` and its address get separate
+/// budgets. Further requests wait for a slot, within the request timeout.
+const MAX_CONNS_PER_HOST: usize = 32;
+
+/// Clean-up (Signal, Delete) exchanges in flight per host, on top of
+/// [`MAX_CONNS_PER_HOST`] (see there).
+const CLEANUP_SLOTS_PER_HOST: usize = 2;
+
+/// Data exchanges in flight per client, all hosts together (see
+/// [`MAX_CONNS_PER_HOST`]).
+const MAX_CONNS_IN_FLIGHT_TOTAL: usize = 128;
+
+/// Which slots an exchange on a dedicated connection takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Lane {
+    /// Every request but clean-up: a slot of the host and one of the client.
+    Data,
+    /// Signal and Delete: a clean-up slot of the host only.
+    Cleanup,
+}
+
+/// The slot semaphores of one host.
+struct HostSlots {
+    data: Arc<tokio::sync::Semaphore>,
+    cleanup: Arc<tokio::sync::Semaphore>,
+}
+
+/// Slots held for one exchange, released on drop: the host's data or
+/// clean-up permit, and for data exchanges the client's.
+#[derive(Debug)]
+pub(crate) struct SlotGuard {
+    _host: tokio::sync::OwnedSemaphorePermit,
+    _all: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+/// Key of `host` in the slot map: [`sanitize_host`], ASCII-lowercased.
+pub(crate) fn host_key(host: &str) -> String {
+    sanitize_host(host).to_ascii_lowercase()
+}
 
 /// The security context that seals a connection's messages.
 enum Sealer {
@@ -321,8 +360,12 @@ pub(crate) struct HttpTransport {
         reason = "boxed so pool moves copy a pointer, not key material"
     )]
     conn_pool: Mutex<Vec<Box<AuthConn>>>,
-    /// Slots for exchanges in flight on dedicated connections.
-    conn_slots: tokio::sync::Semaphore,
+    /// Per-host slots for exchanges in flight on dedicated connections,
+    /// keyed by [`host_key`]. The lock is only held to look up, insert or
+    /// prune an entry, never across an await.
+    conn_slots: Mutex<std::collections::HashMap<String, HostSlots>>,
+    /// Client-wide slots for data exchanges on dedicated connections.
+    all_slots: Arc<tokio::sync::Semaphore>,
     /// `wsmv:SessionId` value stamped on every request (`uuid:<UPPERCASE>`),
     /// one per transport. See [`crate::soap::envelope::with_session_id`].
     session_id: String,
@@ -713,7 +756,8 @@ impl HttpTransport {
             #[cfg(feature = "credssp")]
             credssp_tls,
             conn_pool: Mutex::new(Vec::new()),
-            conn_slots: tokio::sync::Semaphore::new(MAX_CONNS_IN_FLIGHT),
+            conn_slots: Mutex::new(std::collections::HashMap::new()),
+            all_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONNS_IN_FLIGHT_TOTAL)),
             session_id: format!("uuid:{}", uuid::Uuid::new_v4().to_string().to_uppercase()),
             before_send: None,
         })
@@ -774,7 +818,7 @@ impl HttpTransport {
         skip(self, host, body),
         fields(host = %log_host(host))
     )]
-    async fn send_soap(&self, host: &str, body: String) -> Result<String, WinrmError> {
+    async fn send_soap(&self, host: &str, body: String, lane: Lane) -> Result<String, WinrmError> {
         let url = self
             .checked_endpoint(host)
             .inspect_err(|e| debug!(error = %e, "request not sent: invalid host"))?;
@@ -792,16 +836,16 @@ impl HttpTransport {
             }
             AuthMethod::Ntlm => {
                 if self.seals() {
-                    self.send_sealed(host, &url, &body).await?
+                    self.send_sealed(host, &url, &body, lane).await?
                 } else if self.config.use_tls {
-                    self.send_ntlm_over_tls(host, &url, &body).await?
+                    self.send_ntlm_over_tls(host, &url, &body, lane).await?
                 } else {
                     self.ntlm_auth()
                         .send_authenticated(&self.http, &url, body)
                         .await?
                 }
             }
-            AuthMethod::Kerberos => self.send_kerberos(host, &url, body).await?,
+            AuthMethod::Kerberos => self.send_kerberos(host, &url, body, lane).await?,
             AuthMethod::Certificate => {
                 let auth = CertificateAuth {
                     max_response_bytes: self.max_response_bytes(),
@@ -843,11 +887,12 @@ impl HttpTransport {
         host: &str,
         url: &str,
         body: String,
+        lane: Lane,
     ) -> Result<String, WinrmError> {
         if self.seals() {
-            self.send_sealed(host, url, &body).await
+            self.send_sealed(host, url, &body, lane).await
         } else if self.config.use_tls {
-            self.send_kerberos_over_tls(host, url, &body).await
+            self.send_kerberos_over_tls(host, url, &body, lane).await
         } else {
             self.kerberos_auth(url)
                 .send_authenticated(&self.http, url, body)
@@ -863,6 +908,7 @@ impl HttpTransport {
         _host: &str,
         url: &str,
         body: String,
+        _lane: Lane,
     ) -> Result<String, WinrmError> {
         self.kerberos_auth(url)
             .send_authenticated(&self.http, url, body)
@@ -948,14 +994,79 @@ impl HttpTransport {
         pool.drain(..excess);
     }
 
-    /// Wait for a slot to run an exchange on a dedicated connection, at
-    /// most as long as one request may take.
-    async fn conn_slot(&self) -> Result<tokio::sync::SemaphorePermit<'_>, WinrmError> {
-        let wait = self.config.operation_timeout_secs.saturating_add(10);
-        match tokio::time::timeout(Duration::from_secs(wait), self.conn_slots.acquire()).await {
-            Ok(Ok(permit)) => Ok(permit),
-            // The semaphore is never closed.
-            Ok(Err(_)) | Err(_) => Err(WinrmError::Timeout(wait)),
+    /// How long one request may take: the operation timeout plus 10 s.
+    fn request_budget(&self) -> Duration {
+        Duration::from_secs(self.config.operation_timeout_secs.saturating_add(10))
+    }
+
+    fn slot_map(&self) -> MutexGuard<'_, std::collections::HashMap<String, HostSlots>> {
+        // The guard is only held for map operations, which do not leave the
+        // map inconsistent if they panic.
+        self.conn_slots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The data and clean-up semaphores of `host` (keyed by [`host_key`]),
+    /// cloned under the map lock. Adding a new host first drops the entries
+    /// nobody uses: no permit out and no waiter (each holds a clone of a
+    /// semaphore, so a used entry has a count above 1).
+    pub(crate) fn host_slots(
+        &self,
+        host: &str,
+    ) -> (Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>) {
+        let key = host_key(host);
+        let mut map = self.slot_map();
+        if !map.contains_key(&key) {
+            map.retain(|_, slots| {
+                Arc::strong_count(&slots.data) > 1 || Arc::strong_count(&slots.cleanup) > 1
+            });
+        }
+        let slots = map.entry(key).or_insert_with(|| HostSlots {
+            data: Arc::new(tokio::sync::Semaphore::new(MAX_CONNS_PER_HOST)),
+            cleanup: Arc::new(tokio::sync::Semaphore::new(CLEANUP_SLOTS_PER_HOST)),
+        });
+        (Arc::clone(&slots.data), Arc::clone(&slots.cleanup))
+    }
+
+    /// Hosts in the slot map.
+    #[cfg(test)]
+    fn host_slot_entries(&self) -> usize {
+        self.slot_map().len()
+    }
+
+    /// Wait for the slots to run an exchange on a dedicated connection to
+    /// `host`, at most [`Self::request_budget`]. [`Lane::Data`] takes a slot
+    /// of the host, then one of the client: a request queued for a busy host
+    /// holds no client slot. [`Lane::Cleanup`] takes a clean-up slot of the
+    /// host only. Dropped while waiting, it leaves no slot taken.
+    async fn conn_slot(&self, host: &str, lane: Lane) -> Result<SlotGuard, WinrmError> {
+        let budget = self.request_budget();
+        let (data, cleanup) = self.host_slots(host);
+        let acquire = async move {
+            match lane {
+                Lane::Data => {
+                    drop(cleanup);
+                    let host_permit = data.acquire_owned().await?;
+                    let all = Arc::clone(&self.all_slots).acquire_owned().await?;
+                    Ok::<_, tokio::sync::AcquireError>(SlotGuard {
+                        _host: host_permit,
+                        _all: Some(all),
+                    })
+                }
+                Lane::Cleanup => {
+                    drop(data);
+                    Ok(SlotGuard {
+                        _host: cleanup.acquire_owned().await?,
+                        _all: None,
+                    })
+                }
+            }
+        };
+        match tokio::time::timeout(budget, acquire).await {
+            Ok(Ok(guard)) => Ok(guard),
+            // The semaphores are never closed.
+            Ok(Err(_)) | Err(_) => Err(WinrmError::Timeout(budget.as_secs())),
         }
     }
 
@@ -1078,8 +1189,14 @@ impl HttpTransport {
     /// Send a request sealed (NTLM or Kerberos), failing closed: no request
     /// body is ever sent unsealed, and no request is ever sent twice (see
     /// [`Self::send_on_dedicated`]).
-    async fn send_sealed(&self, host: &str, url: &str, body: &str) -> Result<String, WinrmError> {
-        self.send_on_dedicated(host, url, body, true).await
+    async fn send_sealed(
+        &self,
+        host: &str,
+        url: &str,
+        body: &str,
+        lane: Lane,
+    ) -> Result<String, WinrmError> {
+        self.send_on_dedicated(host, url, body, true, lane).await
     }
 
     /// Send a request with Kerberos over HTTPS, unsealed (TLS protects it),
@@ -1092,8 +1209,9 @@ impl HttpTransport {
         host: &str,
         url: &str,
         body: &str,
+        lane: Lane,
     ) -> Result<String, WinrmError> {
-        self.send_on_dedicated(host, url, body, false).await
+        self.send_on_dedicated(host, url, body, false, lane).await
     }
 
     /// Run one exchange on a dedicated authenticated connection to `host`:
@@ -1121,8 +1239,9 @@ impl HttpTransport {
         url: &str,
         body: &str,
         sealed: bool,
+        lane: Lane,
     ) -> Result<String, WinrmError> {
-        let _slot = self.conn_slot().await?;
+        let _slot = self.conn_slot(host, lane).await?;
         let (mut conn, reused) = match self.take_conn(host, sealed) {
             Some(conn) => (conn, true),
             None => (self.open_dedicated_conn(host, url, sealed).await?, false),
@@ -1348,8 +1467,9 @@ impl HttpTransport {
         host: &str,
         url: &str,
         body: &str,
+        lane: Lane,
     ) -> Result<String, WinrmError> {
-        let _slot = self.conn_slot().await?;
+        let _slot = self.conn_slot(host, lane).await?;
         let conn = match self.take_conn(host, false) {
             Some(conn) => conn,
             None => self.new_conn(host)?,
@@ -1388,6 +1508,29 @@ impl HttpTransport {
         host: &str,
         body: String,
     ) -> Result<String, WinrmError> {
+        self.send_soap_with_retry_on(host, body, Lane::Data).await
+    }
+
+    /// [`Self::send_soap_with_retry`] on the clean-up lane (Signal, Delete):
+    /// on a dedicated connection it takes a clean-up slot of the host, so it
+    /// does not wait behind data requests.
+    pub(crate) async fn send_soap_cleanup(
+        &self,
+        host: &str,
+        body: String,
+    ) -> Result<String, WinrmError> {
+        self.send_soap_with_retry_on(host, body, Lane::Cleanup)
+            .await
+    }
+
+    /// [`Self::send_soap_with_retry`], taking the slots of `lane` on a
+    /// dedicated connection.
+    async fn send_soap_with_retry_on(
+        &self,
+        host: &str,
+        body: String,
+        lane: Lane,
+    ) -> Result<String, WinrmError> {
         let body = crate::soap::envelope::with_session_id(&body, &self.session_id);
         let max = self.config.max_retries;
         for attempt in 0..=max {
@@ -1397,7 +1540,7 @@ impl HttpTransport {
                 debug!("request refused by the before_send hook");
                 return Err(WinrmError::Cancelled);
             }
-            match self.send_soap(host, body.clone()).await {
+            match self.send_soap(host, body.clone(), lane).await {
                 Ok(r) => return Ok(r),
                 Err(e) if attempt < max && Self::is_retryable(&e) => {
                     let delay = retry_delay(attempt);
@@ -2620,7 +2763,9 @@ mod tests {
             transport.endpoint(host),
             format!("http://127.0.0.1:{port}/wsman")
         );
-        let sent = transport.send_soap(host, "<s:Envelope/>".into()).await;
+        let sent = transport
+            .send_soap(host, "<s:Envelope/>".into(), Lane::Data)
+            .await;
         assert!(sent.is_err(), "nothing listens on port {port}");
         assert!(logs_contain("<redacted>@127.0.0.1"));
         assert!(logs_contain("sending WinRM SOAP request"));
@@ -3577,7 +3722,7 @@ mod tests {
             let url = format!("https://{host}:{port}/wsman");
             let reply = tokio::time::timeout(
                 Duration::from_secs(20),
-                transport.send_ntlm_over_tls(host, &url, "<soap/>"),
+                transport.send_ntlm_over_tls(host, &url, "<soap/>", Lane::Data),
             )
             .await
             .expect("NTLM exchange did not finish in 20 s")
@@ -3647,7 +3792,7 @@ mod tests {
         // Driven exactly like ntlm_cbt_binds_the_certificate_of_its_own_connection.
         tokio::time::timeout(
             Duration::from_secs(20),
-            transport.send_ntlm_over_tls("127.0.0.1", &url, "<soap/>"),
+            transport.send_ntlm_over_tls("127.0.0.1", &url, "<soap/>", Lane::Data),
         )
         .await
         .expect("did not finish in 20 s")
@@ -3684,7 +3829,7 @@ mod tests {
         let url = format!("https://127.0.0.1:{port}/wsman");
         tokio::time::timeout(
             Duration::from_secs(20),
-            transport.send_ntlm_over_tls("127.0.0.1", &url, "<soap/>"),
+            transport.send_ntlm_over_tls("127.0.0.1", &url, "<soap/>", Lane::Data),
         )
         .await
         .expect("did not finish in 20 s")
@@ -3786,7 +3931,7 @@ mod tests {
             if via_proxy {
                 // Dedicated connection: CertCapturingVerifier -> NoVerifier.
                 transport
-                    .send_ntlm_over_tls("127.0.0.1", &url, "<soap/>")
+                    .send_ntlm_over_tls("127.0.0.1", &url, "<soap/>", Lane::Data)
                     .await
             } else {
                 // Direct, as in `ntlm_cbt_comes_from_the_response_tls_details`.
@@ -4020,22 +4165,158 @@ mod tests {
     // --- Bounded in-flight NTLM connections ---
 
     #[tokio::test]
-    async fn conn_slots_default_to_32() {
-        let (_server, _fake, transport, _host) = sealed_setup().await;
+    async fn slot_limits_are_32_per_host_2_cleanup_and_128_per_client() {
         assert_eq!(
-            transport.conn_slots.available_permits(),
-            MAX_CONNS_IN_FLIGHT
+            (
+                MAX_CONNS_PER_HOST,
+                CLEANUP_SLOTS_PER_HOST,
+                MAX_CONNS_IN_FLIGHT_TOTAL
+            ),
+            (32, 2, 128)
         );
-        assert_eq!(MAX_CONNS_IN_FLIGHT, 32);
+        let (_server, _fake, transport, host) = sealed_setup().await;
+        let (data, cleanup) = transport.host_slots(&host);
+        assert_eq!(
+            (data.available_permits(), cleanup.available_permits()),
+            (32, 2)
+        );
+        assert_eq!(transport.all_slots.available_permits(), 128);
     }
 
-    /// With every slot taken, a request waits, and gets a slot once one is
-    /// released.
+    #[tokio::test]
+    async fn slots_of_one_host_do_not_block_another_host() {
+        let (_server, _fake, transport, _host) = sealed_setup().await;
+        let _held = transport
+            .host_slots("a")
+            .0
+            .try_acquire_many_owned(32)
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            transport.conn_slot("b", Lane::Data),
+        )
+        .await
+        .expect("host b waited for host a")
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cleanup_requests_do_not_wait_behind_data_exchanges() {
+        let (_server, _fake, transport, _host) = sealed_setup().await;
+        let _host_full = transport
+            .host_slots("a")
+            .0
+            .try_acquire_many_owned(32)
+            .unwrap();
+        let _client_full = Arc::clone(&transport.all_slots)
+            .try_acquire_many_owned(128)
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            transport.conn_slot("a", Lane::Cleanup),
+        )
+        .await
+        .expect("clean-up waited behind data")
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn waiters_for_a_full_host_take_no_client_slot() {
+        let (_server, _fake, transport, _host) = sealed_setup().await;
+        let transport = Arc::new(transport);
+        let _held = transport
+            .host_slots("a")
+            .0
+            .try_acquire_many_owned(32)
+            .unwrap();
+        let waiters: Vec<_> = (0..10)
+            .map(|_| {
+                let t = Arc::clone(&transport);
+                tokio::spawn(async move { t.conn_slot("a", Lane::Data).await.map(drop) })
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            transport.all_slots.available_permits(),
+            128,
+            "queued waiters hold client slots"
+        );
+        waiters.iter().for_each(|w| w.abort());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn waiting_for_the_client_cap_respects_the_request_timeout() {
+        let config = WinrmConfig {
+            auth_method: AuthMethod::Ntlm,
+            operation_timeout_secs: 5,
+            ..Default::default()
+        };
+        let transport = HttpTransport::new(config, WinrmCredentials::new(USER, PASS, "")).unwrap();
+        let _full = Arc::clone(&transport.all_slots)
+            .try_acquire_many_owned(128)
+            .unwrap();
+        let err = transport
+            .conn_slot("c", Lane::Data)
+            .await
+            .expect_err("timed out");
+        assert!(matches!(err, WinrmError::Timeout(15)), "{err:?}");
+        assert_eq!(
+            transport.host_slots("c").0.available_permits(),
+            32,
+            "the host permit is released"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_host_slot_entries_are_pruned() {
+        let (_server, _fake, transport, _host) = sealed_setup().await;
+        for h in ["h0", "h1", "h2"] {
+            drop(transport.conn_slot(h, Lane::Data).await.unwrap());
+        }
+        let held = transport.conn_slot("h3", Lane::Data).await.unwrap();
+        assert_eq!(
+            transport.host_slot_entries(),
+            1,
+            "h0..h2 pruned when the next host came in"
+        );
+        drop(transport.conn_slot("h4", Lane::Data).await.unwrap());
+        assert_eq!(
+            transport.host_slot_entries(),
+            2,
+            "h3 has a permit out and is kept"
+        );
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn cleanup_lane_carries_a_sealed_request_while_data_slots_are_full() {
+        let (_server, fake, transport, host) = sealed_setup().await;
+        let _held = transport
+            .host_slots(&host)
+            .0
+            .try_acquire_many_owned(32)
+            .unwrap();
+        let reply = tokio::time::timeout(
+            Duration::from_secs(2),
+            transport.send_soap_cleanup(&host, "<signal/>".into()),
+        )
+        .await
+        .expect("clean-up queued behind data")
+        .unwrap();
+        assert_eq!(reply, "<ok/>");
+        assert_eq!(fake.plaintext_bodies(), 0, "log: {:?}", fake.log());
+    }
+
+    /// With every slot of the host taken, a request waits, and gets a slot
+    /// once they are released.
     #[tokio::test]
     async fn a_request_waits_for_a_free_conn_slot() {
-        let (_server, fake, mut transport, host) = sealed_setup().await;
-        transport.conn_slots = tokio::sync::Semaphore::new(1);
-        let held = transport.conn_slots.try_acquire().unwrap();
+        let (_server, fake, transport, host) = sealed_setup().await;
+        let held = transport
+            .host_slots(&host)
+            .0
+            .try_acquire_many_owned(32)
+            .unwrap();
         let start = std::time::Instant::now();
         let (reply, ()) = tokio::join!(
             transport.send_soap_with_retry(&host, "<a/>".into()),
@@ -4058,24 +4339,34 @@ mod tests {
             operation_timeout_secs: 5,
             ..Default::default()
         };
-        let mut transport =
-            HttpTransport::new(config, WinrmCredentials::new(USER, PASS, "")).unwrap();
-        transport.conn_slots = tokio::sync::Semaphore::new(1);
-        let _held = transport.conn_slots.try_acquire().unwrap();
-        let err = transport.conn_slot().await.unwrap_err();
+        let transport = HttpTransport::new(config, WinrmCredentials::new(USER, PASS, "")).unwrap();
+        let _held = transport
+            .host_slots("h")
+            .0
+            .try_acquire_many_owned(32)
+            .unwrap();
+        let err = transport.conn_slot("h", Lane::Data).await.unwrap_err();
         assert!(matches!(err, WinrmError::Timeout(15)), "{err:?}");
     }
 
     /// A waiting request dropped (cancelled) leaves no slot taken.
     #[tokio::test]
     async fn a_cancelled_wait_for_a_conn_slot_takes_no_slot() {
-        let (_server, _fake, mut transport, _host) = sealed_setup().await;
-        transport.conn_slots = tokio::sync::Semaphore::new(1);
-        let held = transport.conn_slots.try_acquire().unwrap();
-        let waited = tokio::time::timeout(Duration::from_millis(50), transport.conn_slot()).await;
+        let (_server, _fake, transport, host) = sealed_setup().await;
+        let held = transport
+            .host_slots(&host)
+            .0
+            .try_acquire_many_owned(32)
+            .unwrap();
+        let waited = tokio::time::timeout(
+            Duration::from_millis(50),
+            transport.conn_slot(&host, Lane::Data),
+        )
+        .await;
         assert!(waited.is_err(), "the wait should still be pending");
         drop(held);
-        assert_eq!(transport.conn_slots.available_permits(), 1);
+        assert_eq!(transport.host_slots(&host).0.available_permits(), 32);
+        assert_eq!(transport.all_slots.available_permits(), 128);
     }
 
     /// Through a proxy (no TLS details on the response), a dedicated NTLM
@@ -4311,7 +4602,7 @@ mod tests {
         let url = format!("https://127.0.0.1:{port}/wsman");
         let reply = tokio::time::timeout(
             Duration::from_secs(20),
-            transport.send_ntlm_over_tls("127.0.0.1", &url, "<soap/>"),
+            transport.send_ntlm_over_tls("127.0.0.1", &url, "<soap/>", Lane::Data),
         )
         .await
         .expect("did not finish in 20 s")

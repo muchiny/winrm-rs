@@ -84,6 +84,16 @@ impl WinrmClient {
         self.transport.send_soap_raw(host, body).await
     }
 
+    /// Send a clean-up request (Signal, Delete): it does not wait behind data
+    /// requests for a connection slot of the host.
+    pub(crate) async fn send_soap_cleanup(
+        &self,
+        host: &str,
+        body: String,
+    ) -> Result<String, WinrmError> {
+        self.transport.send_soap_cleanup(host, body).await
+    }
+
     // --- Shell lifecycle ---
 
     /// Create a new remote shell on the given host. Returns the shell ID.
@@ -278,7 +288,7 @@ impl WinrmClient {
             config.operation_timeout_secs,
             config.max_envelope_size,
         );
-        self.transport.send_soap_with_retry(host, envelope).await?;
+        self.send_soap_cleanup(host, envelope).await?;
         Ok(())
     }
 
@@ -834,7 +844,7 @@ impl WinrmClient {
             config.operation_timeout_secs,
             config.max_envelope_size,
         );
-        self.transport.send_soap_with_retry(host, envelope).await?;
+        self.send_soap_cleanup(host, envelope).await?;
         Ok(())
     }
 

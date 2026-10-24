@@ -298,7 +298,7 @@ impl<'a> Shell<'a> {
                 config.max_envelope_size,
             )
         };
-        self.client.send_soap_raw(&self.host, envelope).await?;
+        self.client.send_soap_cleanup(&self.host, envelope).await?;
         Ok(())
     }
 
@@ -1686,5 +1686,57 @@ mod tests {
         }
         assert_eq!(polls, 3, "partial document, empty poll, then the rest");
         assert_eq!(String::from_utf8_lossy(&stderr), "denied\r\n");
+    }
+
+    #[tokio::test]
+    async fn cleanup_requests_go_through_while_data_slots_are_full() {
+        use std::time::Duration;
+        let server = MockServer::start().await;
+        let _fake = crate::test_ntlm_server::FakeNtlmServer::mount(&server).await;
+        let config = WinrmConfig {
+            auth_method: AuthMethod::Ntlm,
+            port: server.address().port(),
+            operation_timeout_secs: 10,
+            ..Default::default()
+        };
+        let client = WinrmClient::new(
+            config,
+            WinrmCredentials::new(
+                crate::test_ntlm_server::USER,
+                crate::test_ntlm_server::PASS,
+                "",
+            ),
+        )
+        .unwrap();
+        let host = server.address().ip().to_string();
+        let _held = client
+            .transport
+            .host_slots(&host)
+            .0
+            .try_acquire_many_owned(32)
+            .unwrap();
+        let quick = Duration::from_secs(2);
+        tokio::time::timeout(quick, client.signal_terminate(&host, "S", "C"))
+            .await
+            .expect("signal waited")
+            .unwrap();
+        let shell = super::Shell::new(&client, host.clone(), "S".into());
+        tokio::time::timeout(quick, shell.signal_ctrl_c("C"))
+            .await
+            .expect("ctrl_c waited")
+            .unwrap();
+        tokio::time::timeout(quick, shell.close())
+            .await
+            .expect("delete waited")
+            .unwrap();
+        // Control: a data request does wait.
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(300),
+                client.receive_output(&host, "S", "C")
+            )
+            .await
+            .is_err()
+        );
     }
 }

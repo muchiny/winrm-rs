@@ -114,6 +114,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Host strings are escaped in log fields. A control character in a host passed
   to the client (a line break, an ANSI sequence) can no longer start a new log
   line or recolour one.
+- A client that talks to several hosts no longer lets one host's slow requests
+  hold up another's. Dedicated connections (sealed NTLM/Kerberos, NTLM and
+  Kerberos over HTTPS) allow 32 exchanges in flight per host and 128 per
+  client, instead of 32 per client. Signal and Delete requests get 2 more per
+  host of their own, so clean-up never waits behind data requests. For fleets,
+  one client per host is still the recommendation.
 
 ### Documentation
 

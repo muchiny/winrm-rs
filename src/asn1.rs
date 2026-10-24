@@ -475,6 +475,64 @@ pub(crate) fn extract_subject_public_key(cert_der: &[u8]) -> Result<Vec<u8>, Cre
     ))
 }
 
+// --- Acceptor-side helpers for the in-process CredSSP test server ---
+
+/// A TSRequest that carries only a version and an error code
+/// (`SEQUENCE { [0] version, [4] errorCode }`), as Windows sends on failure.
+#[cfg(test)]
+pub(crate) fn encode_ts_request_error(version: u32, error_code: u32) -> Vec<u8> {
+    let mut contents = encode_context_tag(0, &encode_integer_value(version));
+    contents.extend_from_slice(&encode_context_tag(4, &encode_integer_value(error_code)));
+    encode_sequence(&contents)
+}
+
+/// The server's final SPNEGO NegTokenResp: a negState and an optional
+/// mechListMIC, no responseToken (the shape Server 2025 sends).
+#[cfg(test)]
+pub(crate) fn encode_spnego_final(neg_state: u8, mech_list_mic: Option<&[u8]>) -> Vec<u8> {
+    let mut contents = encode_context_tag(0, &[TAG_ENUM, 0x01, neg_state]);
+    if let Some(mic) = mech_list_mic {
+        contents.extend_from_slice(&encode_context_tag(3, &encode_octet_string(mic)));
+    }
+    encode_context_tag(1, &encode_sequence(&contents))
+}
+
+/// Decode TSCredentials holding TSPasswordCreds into
+/// `(domain, user, password)`, the inverse of [`encode_ts_credentials`].
+#[cfg(test)]
+pub(crate) fn decode_ts_credentials(der: &[u8]) -> Result<(String, String, String), CredSspError> {
+    let missing = |what: &str| CredSspError::Asn1Decode(format!("TSCredentials: no {what}"));
+    let (tag, creds, _) = read_tlv(der)?;
+    if tag != TAG_SEQUENCE {
+        return Err(CredSspError::Asn1Decode(
+            "TSCredentials: expected SEQUENCE".into(),
+        ));
+    }
+    let cred_type = decode_integer(find_context_tag(creds, 0).ok_or_else(|| missing("credType"))?)?;
+    if cred_type != 1 {
+        return Err(CredSspError::Asn1Decode(format!(
+            "TSCredentials: credType {cred_type}, expected 1"
+        )));
+    }
+    let password_creds =
+        decode_octet_string(find_context_tag(creds, 1).ok_or_else(|| missing("credentials"))?)?;
+    let (tag, fields, _) = read_tlv(password_creds)?;
+    if tag != TAG_SEQUENCE {
+        return Err(CredSspError::Asn1Decode(
+            "TSPasswordCreds: expected SEQUENCE".into(),
+        ));
+    }
+    let field = |n: u8, what: &str| -> Result<String, CredSspError> {
+        let value = decode_octet_string(find_context_tag(fields, n).ok_or_else(|| missing(what))?)?;
+        Ok(crate::ntlm::crypto::from_utf16le(value))
+    };
+    Ok((
+        field(0, "domainName")?,
+        field(1, "userName")?,
+        field(2, "password")?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -933,5 +991,40 @@ mod tests {
         assert_eq!(encoded[0], 0xA3); // 0xA0 | 3
         assert_eq!(encoded[1], 1); // length
         assert_eq!(encoded[2], 0x42); // content
+    }
+
+    #[test]
+    fn ts_request_error_decodes_to_its_error_code() {
+        let req = decode_ts_request(&encode_ts_request_error(6, 0xC000_006D)).unwrap();
+        assert_eq!(req.version, 6);
+        assert_eq!(req.error_code, Some(0xC000_006D));
+        assert!(req.nego_token.is_none() && req.pub_key_auth.is_none());
+    }
+
+    #[test]
+    fn spnego_final_matches_the_server_2025_capture() {
+        let mic = [
+            0x01, 0x00, 0x00, 0x00, 0x7c, 0x04, 0x2c, 0xe7, 0x3e, 0x8f, 0x62, 0x15, 0x00, 0x00,
+            0x00, 0x00,
+        ];
+        let captured: &[u8] = &[
+            0xa1, 0x1b, 0x30, 0x19, 0xa0, 0x03, 0x0a, 0x01, 0x00, 0xa3, 0x12, 0x04, 0x10, 0x01,
+            0x00, 0x00, 0x00, 0x7c, 0x04, 0x2c, 0xe7, 0x3e, 0x8f, 0x62, 0x15, 0x00, 0x00, 0x00,
+            0x00,
+        ];
+        assert_eq!(encode_spnego_final(0, Some(&mic)), captured);
+        let bare = encode_spnego_final(2, None);
+        assert_eq!(bare, [0xa1, 0x07, 0x30, 0x05, 0xa0, 0x03, 0x0a, 0x01, 0x02]);
+        assert_eq!(decode_spnego_mech_list_mic(&bare).unwrap(), None);
+    }
+
+    #[test]
+    fn ts_credentials_roundtrip() {
+        let der = encode_ts_credentials("DOM", "user", "pässword");
+        assert_eq!(
+            decode_ts_credentials(&der).unwrap(),
+            ("DOM".into(), "user".into(), "pässword".into())
+        );
+        assert!(decode_ts_credentials(&[0x04, 0x00]).is_err());
     }
 }

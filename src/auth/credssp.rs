@@ -81,6 +81,9 @@ use crate::ntlm;
 #[cfg(feature = "credssp")]
 use crate::ntlm::NtlmSession;
 
+#[cfg(test)]
+pub(crate) mod test_server;
+
 /// CredSSP protocol version (v6 = modern Windows 10+).
 #[cfg(feature = "credssp")]
 const CREDSSP_VERSION: u32 = 6;
@@ -1197,5 +1200,208 @@ mod tests {
                 Ok(_) => panic!("{label}: impostor accepted on the CredSSP outer TLS"),
             }
         }
+    }
+
+    // --- Full exchanges against the in-process acceptor (`test_server`) ---
+
+    use super::test_server::{self, Event, Fault, delegations, rounds};
+    use crate::test_ntlm_server::{PASS, USER};
+    use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
+    use std::time::Duration;
+
+    const BODY: &str = "<s:Envelope>mock request</s:Envelope>";
+
+    /// The client the acceptor knows: `USER` / `PASS`, empty domain.
+    fn mock_auth(accept_invalid_certs: bool, max_response_bytes: usize) -> CredSspAuth {
+        CredSspAuth {
+            username: USER.into(),
+            password: Zeroizing::new(PASS.into()),
+            domain: String::new(),
+            accept_invalid_certs,
+            max_response_bytes,
+        }
+    }
+
+    /// One CredSSP exchange posting `body` to the acceptor on `port`.
+    async fn run(auth: &CredSspAuth, port: u16, body: &str) -> Result<String, WinrmError> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = reqwest::Client::builder().build().unwrap();
+        let url = format!("https://127.0.0.1:{port}/wsman");
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            auth.send_authenticated(&http, &url, body.to_string()),
+        )
+        .await
+        .expect("CredSSP exchange did not finish in 20 s")
+    }
+
+    /// Run an exchange against `fault`, which must fail before any password
+    /// is delegated. Returns the error and the acceptor's log.
+    async fn refused(fault: Fault, max: usize) -> (WinrmError, Vec<Event>) {
+        let (port, log) = test_server::spawn(fault, EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let err = run(&mock_auth(true, max), port, BODY).await.unwrap_err();
+        let log = log.lock().unwrap().clone();
+        assert_eq!(delegations(&log), 0, "password delegated despite {err:?}");
+        (err, log)
+    }
+
+    #[tokio::test]
+    async fn mock_happy_path_delegates_once() {
+        let (port, log) = test_server::spawn(Fault::Honest, EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let out = run(&mock_auth(true, 1 << 20), port, BODY).await.unwrap();
+        assert_eq!(out, test_server::MOCK_REPLY);
+        let log = log.lock().unwrap().clone();
+        assert_eq!(
+            log.iter()
+                .filter(|e| **e == Event::Delegated { user: USER.into() })
+                .count(),
+            1
+        );
+        assert!(log.contains(&Event::Executed { body: BODY.into() }));
+    }
+
+    #[tokio::test]
+    async fn server_pubkeyauth_mismatch_is_refused_before_delegation() {
+        let (err, _) = refused(Fault::WrongServerHash, 1 << 20).await;
+        assert!(
+            matches!(err, WinrmError::CredSsp(CredSspError::PublicKeyMismatch)),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_server_pubkeyauth_is_refused_before_delegation() {
+        let (err, _) = refused(Fault::NoPubKeyAuth, 1 << 20).await;
+        assert!(
+            matches!(&err, WinrmError::AuthFailed(m) if m.contains("no pubKeyAuth")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn error_code_in_challenge_round_is_server_error() {
+        let (err, _) = refused(Fault::ErrorCodeAtChallenge(0xC000_006D), 1 << 20).await;
+        assert!(
+            matches!(
+                err,
+                WinrmError::CredSsp(CredSspError::ServerError(0xC000_006D))
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn error_code_in_pubkey_round_is_server_error() {
+        let (err, _) = refused(Fault::ErrorCodeAtPubKey(0x8009_030C), 1 << 20).await;
+        assert!(
+            matches!(
+                err,
+                WinrmError::CredSsp(CredSspError::ServerError(0x8009_030C))
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tampered_mech_list_mic_is_refused_before_delegation() {
+        let (err, _) = refused(Fault::TamperedMechListMic, 1 << 20).await;
+        assert!(
+            matches!(
+                &err,
+                WinrmError::Ntlm(crate::error::NtlmError::InvalidMessage(m))
+                    if m == "mechListMIC checksum mismatch"
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_content_length_is_refused() {
+        let (err, _) = refused(Fault::OversizedContentLength(4097), 4096).await;
+        assert!(
+            matches!(
+                &err,
+                WinrmError::Soap(crate::error::SoapError::ParseError(m))
+                    if m == "response body exceeds 4096 bytes"
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn body_of_exactly_the_cap_is_accepted() {
+        let (port, _) = test_server::spawn(Fault::Honest, EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let max = test_server::MOCK_REPLY.len();
+        let out = run(&mock_auth(true, max), port, BODY).await.unwrap();
+        assert_eq!(out, test_server::MOCK_REPLY);
+    }
+
+    #[tokio::test]
+    async fn oversized_head_is_refused() {
+        let (err, _) = refused(Fault::OversizedHead, 1 << 20).await;
+        assert!(
+            matches!(&err, WinrmError::AuthFailed(m) if m == "CredSSP: response head too large"),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn untrusted_outer_cert_is_refused_by_default() {
+        let (port, log) = test_server::spawn(Fault::Honest, EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let err = run(&mock_auth(false, 1 << 20), port, BODY)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, WinrmError::AuthFailed(m) if m.starts_with("CredSSP outer TLS")),
+            "{err:?}"
+        );
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    async fn impostor_outer_cert_is_refused(
+        versions: &[&'static rustls::SupportedProtocolVersion],
+    ) {
+        let (port, log) = test_server::spawn_with(
+            Fault::Honest,
+            crate::test_pki::impostor_server_config(versions),
+        );
+        let err = run(&mock_auth(true, 1 << 20), port, BODY)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, WinrmError::AuthFailed(m) if m.starts_with("CredSSP outer TLS")),
+            "{err:?}"
+        );
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn impostor_outer_cert_is_refused_tls13() {
+        impostor_outer_cert_is_refused(&[&rustls::version::TLS13]).await;
+    }
+
+    #[tokio::test]
+    async fn impostor_outer_cert_is_refused_tls12() {
+        impostor_outer_cert_is_refused(&[&rustls::version::TLS12]).await;
+    }
+
+    /// The inner-TLS loop never awaits, so a tokio timeout cannot stop it:
+    /// the exchange runs on its own thread, watched from this one.
+    #[test]
+    fn stalled_inner_tls_hits_the_round_bound() {
+        let (port, log) = test_server::spawn(Fault::StalledInnerTls, EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let _ = tx.send(rt.block_on(run(&mock_auth(true, 1 << 20), port, BODY)));
+        });
+        let out = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("handshake loop did not stop: round bound missing");
+        assert!(matches!(out, Err(WinrmError::AuthFailed(_))), "{out:?}");
+        assert_eq!(rounds(&log.lock().unwrap()).len(), 1);
     }
 }

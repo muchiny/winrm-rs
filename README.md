@@ -33,7 +33,7 @@ async fn main() -> Result<(), winrm_rs::WinrmError> {
 - **Kerberos authentication** -- via `cross-krb5`, feature-gated (`--features kerberos`); raw Kerberos GSS-API tokens under the `Negotiate` scheme, messages sealed with the Kerberos context over HTTP
 - **Certificate authentication** -- TLS client certificate auth
 - **PowerShell execution** -- scripts auto-encoded as UTF-16LE Base64 (`-EncodedCommand`)
-- **Raw command execution** -- `cmd.exe` or any executable with arbitrary arguments
+- **Raw command execution** -- `cmd.exe` command lines (the host runs every command through `cmd.exe /C`; arguments are not quoted)
 - **Full shell lifecycle** -- create, execute, receive, signal, delete
 - **Streaming output** -- `start_command` + `receive_next` for incremental polling
 - **File transfer** -- upload/download files via PowerShell base64 chunking
@@ -241,6 +241,8 @@ match client
 let output = client.run_command("win-server", "ipconfig", &["/all"]).await?;
 println!("{}", String::from_utf8_lossy(&output.stdout));
 ```
+
+`args` are joined into one `cmd.exe` command line on the host: never put untrusted text in them. See `WinrmClient::run_command`.
 
 ### Streaming output
 

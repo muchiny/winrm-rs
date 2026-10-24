@@ -116,6 +116,9 @@ impl<'a> Shell<'a> {
     ///
     /// Runs the command, polls for output until completion or timeout, and
     /// returns the collected stdout, stderr, and exit code.
+    ///
+    /// See [`WinrmClient::run_command`](crate::WinrmClient::run_command) (Arguments) for
+    /// how `args` reach the host.
     pub async fn run_command(
         &self,
         command: &str,
@@ -211,6 +214,9 @@ impl<'a> Shell<'a> {
     /// [`signal_ctrl_c`](Self::signal_ctrl_c) (via
     /// [`start_command`](Self::start_command)) or the shell's deletion stops
     /// it.
+    ///
+    /// See [`WinrmClient::run_command`](crate::WinrmClient::run_command) (Arguments) for
+    /// how `args` reach the host.
     pub async fn run_command_with_cancel(
         &self,
         command: &str,
@@ -238,6 +244,12 @@ impl<'a> Shell<'a> {
     /// The script is the `-EncodedCommand` argument of `powershell.exe`: hosts
     /// that audit process command lines (event 4688, Sysmon event 1) or log
     /// script blocks (event 4104) record its text. Do not embed secrets in it.
+    ///
+    /// The host's PowerShell profile scripts run first, and a prompt waits for
+    /// input until the call is bounded or cancelled;
+    /// [`upload_file`](crate::WinrmClient::upload_file) and
+    /// [`download_file`](crate::WinrmClient::download_file) start PowerShell
+    /// with `-NoProfile -NonInteractive`.
     pub async fn run_powershell(&self, script: &str) -> Result<CommandOutput, WinrmError> {
         let encoded = crate::command::encode_powershell_command(script);
         self.run_command("powershell.exe", &["-EncodedCommand", &encoded])
@@ -360,6 +372,9 @@ impl<'a> Shell<'a> {
     /// specify the `CommandId` that the server should assign to the
     /// command. Used by PSRP where the pipeline UUID must match the
     /// CommandId.
+    ///
+    /// See [`WinrmClient::run_command`](crate::WinrmClient::run_command) (Arguments) for
+    /// how `args` reach the host.
     pub async fn start_command_with_id(
         &self,
         command: &str,
@@ -384,6 +399,8 @@ impl<'a> Shell<'a> {
         Ok(returned_id)
     }
 
+    /// See [`WinrmClient::run_command`](crate::WinrmClient::run_command) (Arguments) for
+    /// how `args` reach the host.
     pub async fn start_command(&self, command: &str, args: &[&str]) -> Result<String, WinrmError> {
         let endpoint = self.client.endpoint(&self.host);
         let config = self.client.config();

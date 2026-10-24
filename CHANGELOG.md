@@ -182,6 +182,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   reached with delegated credentials under CredSSP or Basic, upload content
   is on the remote command line, and the local path follows symbolic links.
   `run_powershell` says that its script text is on the command line.
+- The command-running methods say how `args` reach the host (one `cmd.exe`
+  command line, unquoted), and `working_directory` and `env_vars` say how
+  they affect which program runs. `run_powershell` says that the host's
+  PowerShell profile scripts run first.
 
 ## [1.4.1] - 2026-10-24
 

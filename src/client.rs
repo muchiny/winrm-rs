@@ -159,6 +159,8 @@ impl WinrmClient {
     ///
     /// The caller is responsible for subsequently calling
     /// [`receive_output`](Self::receive_output) to poll for results.
+    ///
+    /// See [`WinrmClient::run_command`] (Arguments) for how `args` reach the host.
     #[tracing::instrument(
         level = "debug",
         skip(self, host, command, args),
@@ -337,6 +339,19 @@ impl WinrmClient {
     /// shell, which the server then reaps after its idle timeout.
     /// [`Shell::run_command`] has a total deadline of
     /// `2 * operation_timeout_secs`.
+    ///
+    /// # Arguments
+    ///
+    /// `args` is not an argv array. Windows joins `command` and `args` with
+    /// spaces into one command line and runs it with `cmd.exe /C`, whatever
+    /// the command is. cmd.exe then interprets `& | < > ^`, `%NAME%` and
+    /// double quotes in any argument, and the program splits the line again
+    /// with its own rules, so an argument that holds a space or a quote can
+    /// become several arguments. This crate does not quote `args`, and no
+    /// quoting is safe for every value: never put untrusted text in
+    /// `command` or `args`. Pass untrusted values to PowerShell as data
+    /// instead, for example with [`run_powershell`](Self::run_powershell)
+    /// and a single-quoted literal.
     #[tracing::instrument(
         level = "debug",
         skip(self, host, command, args),
@@ -361,6 +376,8 @@ impl WinrmClient {
     /// [`WinrmError::Timeout`] carrying `timeout` rounded **up** to whole
     /// seconds, at least 1: `1500 ms` and `2 s` both give `Timeout(2)`, and
     /// `Duration::ZERO` gives `Timeout(1)` without sending anything.
+    ///
+    /// See [`WinrmClient::run_command`] (Arguments) for how `args` reach the host.
     ///
     /// The limit counts wall-clock time of the command itself: empty polls
     /// (the `w:TimedOut` fault a silent command provokes every
@@ -611,6 +628,12 @@ impl WinrmClient {
     /// The script is the `-EncodedCommand` argument of `powershell.exe`: hosts
     /// that audit process command lines (event 4688, Sysmon event 1) or log
     /// script blocks (event 4104) record its text. Do not embed secrets in it.
+    ///
+    /// The host's PowerShell profile scripts run first, and a prompt waits for
+    /// input until the call is bounded or cancelled;
+    /// [`upload_file`](crate::WinrmClient::upload_file) and
+    /// [`download_file`](crate::WinrmClient::download_file) start PowerShell
+    /// with `-NoProfile -NonInteractive`.
     #[tracing::instrument(
         level = "debug",
         skip(self, script, host),
@@ -686,6 +709,8 @@ impl WinrmClient {
     /// arrives after the command has finished is ignored (its output is
     /// returned). Dropping this future cannot delete the shell (that needs an
     /// `async` drop); the server reaps it after its idle timeout.
+    ///
+    /// See [`WinrmClient::run_command`] (Arguments) for how `args` reach the host.
     pub async fn run_command_with_cancel(
         &self,
         host: &str,

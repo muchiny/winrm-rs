@@ -227,11 +227,27 @@ pub struct WinrmConfig {
     ///
     /// When set, the shell starts in this directory. Equivalent to running
     /// `cd <path>` before any command.
+    ///
+    /// # Security
+    ///
+    /// cmd.exe looks for a bare command name (`whoami`, `powershell.exe`) in
+    /// the working directory before `PATH`. If anyone but the account you
+    /// connect as can write to this directory, they choose which program a
+    /// bare command name runs. Leave it `None` (the user profile directory),
+    /// or name a directory only that account can write.
     pub working_directory: Option<String>,
     /// Environment variables to set in the remote shell (default: empty).
     ///
     /// Each `(key, value)` pair is injected into the shell's environment
     /// at creation time via `<rsp:Environment>`.
+    ///
+    /// # Security
+    ///
+    /// `PATH` and `PATHEXT` decide which program a bare command name runs,
+    /// and `PSModulePath` decides which PowerShell modules load by name.
+    /// Values that come from untrusted input can therefore redirect what
+    /// runs. The transfer scripts start PowerShell by its full path, so
+    /// `PATH` does not change their interpreter.
     pub env_vars: Vec<(String, String)>,
     /// Message encryption mode for NTLM and Kerberos (default:
     /// [`EncryptionMode::Auto`]).

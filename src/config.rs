@@ -182,7 +182,7 @@ pub struct WinrmConfig {
     /// with the NTLM session or the Kerberos context.
     pub encryption: EncryptionMode,
     /// Custom HTTP `User-Agent` header (default: `None` = `winrm-rs/<version>`).
-    /// Not sent by [`AuthMethod::CredSsp`] in this release.
+    /// CredSSP sends it too.
     pub user_agent: Option<String>,
     /// Shell idle timeout in seconds (default: `None` = server default).
     ///
@@ -499,12 +499,11 @@ pub enum AuthMethod {
     /// # Limitations in this release
     ///
     /// CredSSP runs on a TLS connection of its own, outside the HTTP client
-    /// of the other methods. It applies `connect_timeout_secs` and
-    /// `operation_timeout_secs`, and does not apply these [`WinrmConfig`]
-    /// fields:
+    /// of the other methods. It applies `connect_timeout_secs`,
+    /// `operation_timeout_secs` and `user_agent`, and does not apply these
+    /// [`WinrmConfig`] fields:
     /// - `proxy`, and the `HTTPS_PROXY` / `ALL_PROXY` environment variables:
     ///   CredSSP connects directly to the endpoint.
-    /// - `user_agent`: CredSSP sends `Python WinRM client`.
     /// - `max_retries`: a CredSSP connection error is
     ///   [`WinrmError::AuthFailed`](crate::WinrmError::AuthFailed) or
     ///   [`WinrmError::Timeout`](crate::WinrmError::Timeout), never

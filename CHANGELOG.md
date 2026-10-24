@@ -80,6 +80,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - CredSSP builds its TLS configuration and its OpenSSL context once per client
   instead of once per request, so the system CA bundle is no longer read for
   every request.
+- CredSSP reads each response strictly by its `Content-Length`: a chunked,
+  compressed or unframed response, or a short body, is now an error instead
+  of being misread. CredSSP requests send `Accept-Encoding: identity`, and
+  send `WinrmConfig::user_agent` (default `winrm-rs/<version>`) like the
+  other methods.
 
 ## [1.4.1] - 2026-10-24
 

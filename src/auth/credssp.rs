@@ -360,6 +360,8 @@ struct CredSspConnection<S = tokio_rustls::client::TlsStream<tokio::net::TcpStre
     host_header: String,
     path: String,
     opts: CredSspConnOptions,
+    /// Largest response head accepted ([`MAX_RESPONSE_HEAD_BYTES`]).
+    max_head_bytes: usize,
 }
 
 /// What the transport derives from `WinrmConfig` for every CredSSP connection.
@@ -371,11 +373,14 @@ pub(crate) struct CredSspConnOptions {
     pub(crate) connect_timeout: std::time::Duration,
     /// Each HTTP exchange (request written, response read).
     pub(crate) exchange_timeout: std::time::Duration,
+    /// `User-Agent` header of every request.
+    pub(crate) user_agent: String,
 }
 
 impl CredSspConnOptions {
     /// `connect_timeout_secs`; `operation_timeout_secs.saturating_add(10)`;
-    /// `transport::max_response_bytes(config)`.
+    /// `transport::max_response_bytes(config)`; `user_agent`, by default
+    /// `winrm-rs/<version>` like the other methods.
     pub(crate) fn from_config(config: &crate::config::WinrmConfig) -> Self {
         Self {
             max_response_bytes: crate::transport::max_response_bytes(config),
@@ -383,6 +388,10 @@ impl CredSspConnOptions {
             exchange_timeout: std::time::Duration::from_secs(
                 config.operation_timeout_secs.saturating_add(10),
             ),
+            user_agent: config
+                .user_agent
+                .clone()
+                .unwrap_or_else(|| concat!("winrm-rs/", env!("CARGO_PKG_VERSION")).to_string()),
         }
     }
 }
@@ -446,11 +455,13 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> CredSspConn
             host_header,
             path,
             opts,
+            max_head_bytes: MAX_RESPONSE_HEAD_BYTES,
         }
     }
 
-    /// Send one POST and return (status, headers, body bytes). Writes raw
-    /// HTTP/1.1 onto the persistent TLS stream.
+    /// Send one POST and return the final response, framed by its
+    /// `Content-Length` (see [`ResponseReader`]). Writes raw HTTP/1.1 onto
+    /// the persistent TLS stream.
     ///
     /// The whole exchange (request written, response read) is bounded by
     /// `opts.exchange_timeout`; its expiry is [`WinrmError::Timeout`].
@@ -458,7 +469,7 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> CredSspConn
         &mut self,
         auth_header: Option<&str>,
         body: &str,
-    ) -> Result<(u16, std::collections::HashMap<String, String>, Vec<u8>), WinrmError> {
+    ) -> Result<HttpResponse, WinrmError> {
         let exchange_timeout = self.opts.exchange_timeout;
         tokio::time::timeout(exchange_timeout, self.post_inner(auth_header, body))
             .await
@@ -469,33 +480,41 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> CredSspConn
         &mut self,
         auth_header: Option<&str>,
         body: &str,
-    ) -> Result<(u16, std::collections::HashMap<String, String>, Vec<u8>), WinrmError> {
+    ) -> Result<HttpResponse, WinrmError> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        // ---- Build the request bytes ----
-        let mut req = String::with_capacity(512 + body.len() + auth_header.map_or(0, |a| a.len()));
-        use std::fmt::Write as _;
+        // ---- Build the request head ----
         // pywinrm/urllib3 puts Authorization BEFORE Content-Type/Content-Length.
         // Microsoft HTTPAPI may rely on this ordering for CredSSP context tracking.
-        write!(req, "POST {} HTTP/1.1\r\n", self.path).unwrap();
-        write!(req, "Host: {}\r\n", self.host_header).unwrap();
-        write!(req, "User-Agent: Python WinRM client\r\n").unwrap();
-        write!(req, "Accept-Encoding: gzip, deflate, zstd\r\n").unwrap();
-        write!(req, "Accept: */*\r\n").unwrap();
-        write!(req, "Connection: Keep-Alive\r\n").unwrap();
-        if let Some(av) = auth_header {
-            write!(req, "Authorization: {av}\r\n").unwrap();
+        let mut req = String::with_capacity(512);
+        for part in ["POST ", self.path.as_str(), " HTTP/1.1\r\n"] {
+            req.push_str(part);
         }
-        write!(req, "Content-Type: application/soap+xml;charset=UTF-8\r\n").unwrap();
-        write!(req, "Content-Length: {}\r\n", body.len()).unwrap();
-        req.push_str("\r\n");
+        for part in ["Host: ", self.host_header.as_str(), "\r\n"] {
+            req.push_str(part);
+        }
+        for part in ["User-Agent: ", self.opts.user_agent.as_str(), "\r\n"] {
+            req.push_str(part);
+        }
+        req.push_str("Accept-Encoding: identity\r\n");
+        req.push_str("Accept: */*\r\n");
+        req.push_str("Connection: Keep-Alive\r\n");
+        if let Some(av) = auth_header {
+            for part in ["Authorization: ", av, "\r\n"] {
+                req.push_str(part);
+            }
+        }
+        req.push_str("Content-Type: application/soap+xml;charset=UTF-8\r\n");
+        req.push_str("Content-Length: ");
+        req.push_str(&body.len().to_string());
+        req.push_str("\r\n\r\n");
 
         tracing::trace!(target: "winrm_rs::credssp", head_len = req.len(), "POST {}", self.path);
 
         // ---- Send headers + body in a single write so the entire HTTP
         // request lands in one TLS record (matches what Python ssl + urllib3
         // do; helps Microsoft HTTPAPI parse the auth context correctly). ----
-        let mut wire = Vec::with_capacity(req.len() + body.len());
+        let mut wire = Vec::with_capacity(req.len().saturating_add(body.len()));
         wire.extend_from_slice(req.as_bytes());
         wire.extend_from_slice(body.as_bytes());
         self.stream
@@ -507,113 +526,423 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> CredSspConn
             .await
             .map_err(|e| WinrmError::AuthFailed(format!("CredSSP flush: {e}")))?;
 
-        // ---- Read the response: status line + headers + body (Content-Length) ----
-        let mut buf = Vec::with_capacity(8192);
-        let head_end = loop {
-            let mut chunk = [0u8; 4096];
+        // ---- Read the response ----
+        let mut reader = ResponseReader::new(self.max_head_bytes, self.opts.max_response_bytes);
+        let mut chunk = vec![0u8; 16 * 1024];
+        loop {
             let n = self
                 .stream
                 .read(&mut chunk)
                 .await
                 .map_err(|e| WinrmError::AuthFailed(format!("CredSSP read: {e}")))?;
             if n == 0 {
-                return Err(WinrmError::AuthFailed(
-                    "CredSSP: server closed connection mid-response".into(),
-                ));
+                return Err(reader.eof_error());
             }
-            buf.extend_from_slice(&chunk[..n]);
-            if let Some(pos) = find_double_crlf(&buf) {
-                break pos + 4;
-            }
-            if buf.len() > 1024 * 1024 {
-                return Err(WinrmError::AuthFailed(
-                    "CredSSP: response head too large".into(),
-                ));
-            }
-        };
-
-        let head_str = std::str::from_utf8(&buf[..head_end])
-            .map_err(|_| WinrmError::AuthFailed("CredSSP: non-UTF8 response head".into()))?;
-        let mut lines = head_str.split("\r\n");
-        let status_line = lines.next().unwrap_or("");
-        let status: u16 = status_line
-            .split_whitespace()
-            .nth(1)
-            .and_then(|s| s.parse().ok())
-            .ok_or_else(|| {
-                WinrmError::AuthFailed(format!(
-                    "CredSSP: bad status line: {}",
-                    crate::auth::excerpt(status_line)
-                ))
-            })?;
-
-        let mut headers: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-        for line in lines {
-            if line.is_empty() {
-                break;
-            }
-            if let Some((k, v)) = line.split_once(':') {
-                let key = k.trim().to_ascii_lowercase();
-                let val = v.trim().to_string();
-                // Append for repeated headers (e.g. WWW-Authenticate)
-                headers
-                    .entry(key)
-                    .and_modify(|e| {
-                        e.push_str(", ");
-                        e.push_str(&val);
-                    })
-                    .or_insert(val);
+            if let Some(resp) = reader.feed(chunk.get(..n).unwrap_or_default())? {
+                tracing::trace!(
+                    target: "winrm_rs::credssp",
+                    status = resp.status,
+                    body = resp.body.len(),
+                    "credssp response"
+                );
+                return Ok(resp);
             }
         }
-
-        // Body length: Content-Length only; Transfer-Encoding and Content-Encoding are not handled.
-        let content_length: usize = headers
-            .get("content-length")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-        if content_length > self.opts.max_response_bytes {
-            return Err(crate::auth::body_too_large(self.opts.max_response_bytes));
-        }
-        let mut body_bytes: Vec<u8> = buf[head_end..].to_vec();
-        while body_bytes.len() < content_length {
-            let mut chunk = [0u8; 4096];
-            let n = self
-                .stream
-                .read(&mut chunk)
-                .await
-                .map_err(|e| WinrmError::AuthFailed(format!("CredSSP read body: {e}")))?;
-            if n == 0 {
-                break;
-            }
-            body_bytes.extend_from_slice(&chunk[..n]);
-        }
-        body_bytes.truncate(content_length);
-
-        tracing::trace!(target: "winrm_rs::credssp", %status, body = body_bytes.len(), "credssp response");
-
-        Ok((status, headers, body_bytes))
     }
 }
 
+/// Largest response head accepted, interim (1xx) heads included.
 #[cfg(feature = "credssp")]
-fn find_double_crlf(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n")
+pub(crate) const MAX_RESPONSE_HEAD_BYTES: usize = 1024 * 1024;
+
+/// Interim (1xx) responses accepted before the final one.
+#[cfg(feature = "credssp")]
+const MAX_INTERIM_RESPONSES: u8 = 8;
+
+/// A parsed response head: status line and header lines.
+#[cfg(feature = "credssp")]
+#[derive(Debug)]
+pub(crate) struct ResponseHead {
+    /// `0` for HTTP/1.0, `1` for HTTP/1.1.
+    minor_version: u8,
+    status: u16,
+    /// Header names as received, values trimmed of SP and HTAB, in order.
+    headers: Vec<(String, String)>,
 }
 
-/// Get the value of a header from a CredSspConnection response map (case-insensitive).
 #[cfg(feature = "credssp")]
-fn header_get<'a>(
-    headers: &'a std::collections::HashMap<String, String>,
-    name: &str,
-) -> Option<&'a str> {
-    headers.get(&name.to_ascii_lowercase()).map(|s| s.as_str())
+impl ResponseHead {
+    /// Values of every header named `name` (ASCII case-insensitive), joined with ", ".
+    fn header(&self, name: &str) -> Option<String> {
+        let mut values = self.header_values(name);
+        let mut joined = values.next()?.to_string();
+        for value in values {
+            joined.push_str(", ");
+            joined.push_str(value);
+        }
+        Some(joined)
+    }
+
+    /// Values of every header named `name` (ASCII case-insensitive), in order.
+    fn header_values<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+        self.headers
+            .iter()
+            .filter(move |(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// Whether a `Connection` header lists `token` (ASCII case-insensitive).
+    fn connection_has(&self, token: &str) -> bool {
+        self.header_values("connection")
+            .flat_map(|v| v.split(','))
+            .any(|t| trim_ows(t).eq_ignore_ascii_case(token))
+    }
+}
+
+/// One final HTTP response read off a CredSSP connection.
+#[cfg(feature = "credssp")]
+#[derive(Debug)]
+pub(crate) struct HttpResponse {
+    pub(crate) status: u16,
+    pub(crate) head: ResponseHead,
+    pub(crate) body: Vec<u8>,
+    /// `Connection: close`, HTTP/1.0 without `keep-alive`, or a 401 without Content-Length.
+    pub(crate) closing: bool,
+    /// Bytes arrived after the framed body.
+    pub(crate) leftover: bool,
+}
+
+/// How the body of a final response is delimited.
+#[cfg(feature = "credssp")]
+enum BodyFraming {
+    /// No body: the response ends with its head.
+    Empty,
+    /// Exactly this many bytes follow the head.
+    Length(usize),
+}
+
+/// Trim the optional whitespace (SP, HTAB) of RFC 7230 around a value.
+#[cfg(feature = "credssp")]
+fn trim_ows(value: &str) -> &str {
+    value.trim_matches([' ', '\t'])
+}
+
+/// RFC 7230 `tchar`, the characters of a header name.
+#[cfg(feature = "credssp")]
+fn is_tchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
+}
+
+/// Absolute index just past the first CRLFCRLF at or after `from`.
+#[cfg(feature = "credssp")]
+fn find_head_end(buf: &[u8], from: usize) -> Option<usize> {
+    let pos = buf.get(from..)?.windows(4).position(|w| w == b"\r\n\r\n")?;
+    from.checked_add(pos)?.checked_add(4)
+}
+
+/// `HTTP/1.0` or `HTTP/1.1`, one space, a status in `100..=599`, then
+/// nothing or a space and a reason phrase. Returns the minor version and the
+/// status.
+#[cfg(feature = "credssp")]
+fn parse_status_line(line: &str) -> Option<(u8, u16)> {
+    let rest = line.strip_prefix("HTTP/1.")?;
+    let (minor_version, rest) = if let Some(rest) = rest.strip_prefix("0 ") {
+        (0, rest)
+    } else {
+        (1, rest.strip_prefix("1 ")?)
+    };
+    let code = rest.get(..3)?;
+    let reason = rest.get(3..)?;
+    if !code.bytes().all(|b| b.is_ascii_digit())
+        || !(reason.is_empty() || reason.starts_with(' '))
+        || reason.contains(['\r', '\n'])
+    {
+        return None;
+    }
+    let status: u16 = code.parse().ok()?;
+    (100..=599)
+        .contains(&status)
+        .then_some((minor_version, status))
+}
+
+/// Parse a response head: the bytes up to and including its CRLFCRLF.
+#[cfg(feature = "credssp")]
+fn parse_response_head(head: &[u8]) -> Result<ResponseHead, WinrmError> {
+    let text = std::str::from_utf8(head)
+        .map_err(|_| WinrmError::AuthFailed("CredSSP: non-UTF8 response head".into()))?;
+    let text = text.strip_suffix("\r\n\r\n").unwrap_or(text);
+    let mut lines = text.split("\r\n");
+    let status_line = lines.next().unwrap_or_default();
+    let (minor_version, status) = parse_status_line(status_line).ok_or_else(|| {
+        WinrmError::AuthFailed(format!(
+            "CredSSP: bad status line: {}",
+            crate::auth::excerpt(status_line)
+        ))
+    })?;
+    let mut headers = Vec::new();
+    for line in lines {
+        if line.starts_with([' ', '\t']) {
+            return Err(WinrmError::AuthFailed("CredSSP: folded header line".into()));
+        }
+        let (name, value) = line
+            .split_once(':')
+            .filter(|(name, value)| {
+                !name.is_empty() && name.bytes().all(is_tchar) && !value.contains(['\r', '\n'])
+            })
+            .ok_or_else(|| {
+                WinrmError::AuthFailed(format!(
+                    "CredSSP: bad header line: {}",
+                    crate::auth::excerpt(line)
+                ))
+            })?;
+        headers.push((name.to_string(), trim_ows(value).to_string()));
+    }
+    Ok(ResponseHead {
+        minor_version,
+        status,
+        headers,
+    })
+}
+
+/// How the body of the final response `head` is delimited (RFC 7230 §3.3.3,
+/// without chunked or close-delimited bodies).
+#[cfg(feature = "credssp")]
+fn body_framing(head: &ResponseHead, max_body_bytes: usize) -> Result<BodyFraming, WinrmError> {
+    if head.header_values("transfer-encoding").next().is_some() {
+        return Err(WinrmError::AuthFailed(
+            "CredSSP: Transfer-Encoding is not supported".into(),
+        ));
+    }
+    if let Some(coding) = head
+        .header_values("content-encoding")
+        .find(|v| !v.eq_ignore_ascii_case("identity"))
+    {
+        return Err(WinrmError::AuthFailed(format!(
+            "CredSSP: Content-Encoding is not supported: {}",
+            crate::auth::excerpt(coding)
+        )));
+    }
+    let invalid = || WinrmError::AuthFailed("CredSSP: invalid Content-Length".into());
+    let mut length: Option<&str> = None;
+    for part in head
+        .header_values("content-length")
+        .flat_map(|v| v.split(','))
+    {
+        let part = trim_ows(part);
+        if part.is_empty()
+            || !part.bytes().all(|b| b.is_ascii_digit())
+            || length.is_some_and(|l| l != part)
+        {
+            return Err(invalid());
+        }
+        length = Some(part);
+    }
+    match length {
+        Some(digits) => {
+            let n: usize = digits
+                .parse()
+                .map_err(|_| crate::auth::body_too_large(max_body_bytes))?;
+            if n > max_body_bytes {
+                return Err(crate::auth::body_too_large(max_body_bytes));
+            }
+            Ok(BodyFraming::Length(n))
+        }
+        None => match head.status {
+            204 | 304 | 401 => Ok(BodyFraming::Empty),
+            status => Err(WinrmError::AuthFailed(format!(
+                "CredSSP: response {status} without Content-Length"
+            ))),
+        },
+    }
+}
+
+/// A final head read, its body still arriving.
+#[cfg(feature = "credssp")]
+struct PendingBody {
+    head: ResponseHead,
+    want: usize,
+    body: Vec<u8>,
+    closing: bool,
+    leftover: bool,
+}
+
+#[cfg(feature = "credssp")]
+impl PendingBody {
+    /// Take the body bytes still missing from `bytes`; whether the body is
+    /// complete. Bytes past the body are dropped and flagged.
+    fn fill(&mut self, bytes: &[u8]) -> bool {
+        let missing = self.want.saturating_sub(self.body.len());
+        let (take, extra) = bytes
+            .split_at_checked(missing.min(bytes.len()))
+            .unwrap_or((bytes, &[]));
+        self.body.extend_from_slice(take);
+        if !extra.is_empty() {
+            self.leftover = true;
+        }
+        self.body.len() >= self.want
+    }
+
+    fn into_response(self) -> HttpResponse {
+        HttpResponse {
+            status: self.head.status,
+            head: self.head,
+            body: self.body,
+            closing: self.closing,
+            leftover: self.leftover,
+        }
+    }
+}
+
+/// Reads one HTTP/1.1 response from the bytes of a stream, fed as they
+/// arrive. The head is scanned once, interim (1xx) responses are skipped,
+/// and the body is framed by `Content-Length` only.
+#[cfg(feature = "credssp")]
+pub(crate) struct ResponseReader {
+    /// Head bytes received so far, interim heads included.
+    buf: Vec<u8>,
+    /// Start of the head being read in `buf` (after the interim ones).
+    head_start: usize,
+    /// Where the next CRLFCRLF search starts in `buf`.
+    scan_from: usize,
+    interim: u8,
+    max_head_bytes: usize,
+    max_body_bytes: usize,
+    /// Set once the final head is read.
+    pending: Option<PendingBody>,
+    /// Bytes `find_head_end` examined.
+    #[cfg(test)]
+    scanned: usize,
+}
+
+#[cfg(feature = "credssp")]
+impl ResponseReader {
+    pub(crate) fn new(max_head_bytes: usize, max_body_bytes: usize) -> Self {
+        Self {
+            buf: Vec::new(),
+            head_start: 0,
+            scan_from: 0,
+            interim: 0,
+            max_head_bytes,
+            max_body_bytes,
+            pending: None,
+            #[cfg(test)]
+            scanned: 0,
+        }
+    }
+
+    /// Feed bytes read from the stream; `Ok(Some(..))` once one final response is complete.
+    pub(crate) fn feed(&mut self, bytes: &[u8]) -> Result<Option<HttpResponse>, WinrmError> {
+        if self.pending.is_some() {
+            return Ok(self.fill_pending(bytes));
+        }
+        self.buf.extend_from_slice(bytes);
+        let too_large = || WinrmError::AuthFailed("CredSSP: response head too large".into());
+        loop {
+            let from = self.scan_from.max(self.head_start);
+            #[cfg(test)]
+            {
+                self.scanned = self
+                    .scanned
+                    .saturating_add(self.buf.len().saturating_sub(from));
+            }
+            let Some(head_end) = find_head_end(&self.buf, from) else {
+                if self.buf.len() > self.max_head_bytes {
+                    return Err(too_large());
+                }
+                self.scan_from = self.buf.len().saturating_sub(3);
+                return Ok(None);
+            };
+            // The same cap whatever the chunking: a head that ends past it is
+            // refused even when it arrives in one read.
+            if head_end > self.max_head_bytes {
+                return Err(too_large());
+            }
+            let head =
+                parse_response_head(self.buf.get(self.head_start..head_end).unwrap_or_default())?;
+            if head.status == 101 {
+                return Err(WinrmError::AuthFailed(
+                    "CredSSP: unexpected 101 Switching Protocols".into(),
+                ));
+            }
+            if head.status < 200 {
+                self.interim = self.interim.saturating_add(1);
+                if self.interim > MAX_INTERIM_RESPONSES {
+                    return Err(WinrmError::AuthFailed(
+                        "CredSSP: too many interim responses".into(),
+                    ));
+                }
+                self.head_start = head_end;
+                self.scan_from = head_end;
+                continue;
+            }
+            let framing = body_framing(&head, self.max_body_bytes)?;
+            let (want, unframed_challenge) = match framing {
+                BodyFraming::Empty => (0, head.status == 401),
+                BodyFraming::Length(n) => (n, false),
+            };
+            let closing = head.connection_has("close")
+                || (head.minor_version == 0 && !head.connection_has("keep-alive"))
+                || unframed_challenge;
+            // The head bytes are no longer needed: the reader starts over
+            // once this response is complete.
+            let rest = std::mem::take(&mut self.buf);
+            self.head_start = 0;
+            self.scan_from = 0;
+            self.interim = 0;
+            self.pending = Some(PendingBody {
+                head,
+                want,
+                body: Vec::new(),
+                closing,
+                leftover: false,
+            });
+            return Ok(self.fill_pending(rest.get(head_end..).unwrap_or_default()));
+        }
+    }
+
+    /// Add `bytes` to the pending body; the response once it is complete.
+    fn fill_pending(&mut self, bytes: &[u8]) -> Option<HttpResponse> {
+        let done = self.pending.as_mut().is_some_and(|p| p.fill(bytes));
+        if done {
+            self.pending.take().map(PendingBody::into_response)
+        } else {
+            None
+        }
+    }
+
+    /// The error for an EOF at the current point.
+    pub(crate) fn eof_error(&self) -> WinrmError {
+        match &self.pending {
+            Some(p) => WinrmError::AuthFailed(format!(
+                "CredSSP: connection closed after {} of {} body bytes",
+                p.body.len(),
+                p.want
+            )),
+            None => WinrmError::AuthFailed("CredSSP: server closed connection mid-response".into()),
+        }
+    }
+}
+
+/// Call after a handshake round's status and token checks, only when another round follows.
+#[cfg(feature = "credssp")]
+fn handshake_round_ok(resp: &HttpResponse, round: &str) -> Result<(), WinrmError> {
+    if resp.closing {
+        return Err(WinrmError::AuthFailed(format!(
+            "CredSSP: server closed the connection during {round}"
+        )));
+    }
+    if resp.leftover {
+        return Err(WinrmError::AuthFailed(format!(
+            "CredSSP: unexpected bytes after the response during {round}"
+        )));
+    }
+    Ok(())
 }
 
 /// Extract the CredSSP token from the WWW-Authenticate header (handles
 /// "CredSSP <b64>" possibly mixed with other schemes).
 #[cfg(feature = "credssp")]
-fn extract_credssp_token_str(www_auth: &str) -> Option<String> {
+pub(crate) fn extract_credssp_token_str(www_auth: &str) -> Option<String> {
     // ASCII-only case folding keeps every byte offset of `www_auth` valid:
     // `to_uppercase` can change the byte length of non-ASCII characters
     // (`ɐ` is 2 bytes, `Ɐ` is 3), so its offsets would slice the original
@@ -727,8 +1056,6 @@ impl AuthTransport for CredSspAuth {
 
         let encode_auth = |bytes: &[u8]| format!("CredSSP {}", B64.encode(bytes));
 
-        let _ = &header_get;
-
         // === Step 1: Initialize the INNER TLS connection (memory-only) ===
         // Use OpenSSL via in-memory BIO — pyspnego does the same and rustls
         // produces a TLS state Microsoft's CredSSP server silently rejects.
@@ -760,21 +1087,26 @@ impl AuthTransport for CredSspAuth {
                 continue;
             }
 
-            let (status, headers, _) = conn
+            let resp = conn
                 .post(Some(&encode_auth(&outgoing)), body_for_auth)
                 .await?;
-            if status != 401 {
+            if resp.status != 401 {
                 return Err(WinrmError::AuthFailed(format!(
-                    "CredSSP: TLS handshake round {round}: expected 401, got {status}"
+                    "CredSSP: TLS handshake round {round}: expected 401, got {}",
+                    resp.status
                 )));
             }
-            let server_token = header_get(&headers, "www-authenticate")
+            let server_token = resp
+                .head
+                .header("www-authenticate")
+                .as_deref()
                 .and_then(extract_credssp_token_str)
                 .ok_or_else(|| {
                     WinrmError::AuthFailed(format!(
                         "CredSSP: TLS handshake round {round}: no CredSSP token in response"
                     ))
                 })?;
+            handshake_round_ok(&resp, &format!("TLS handshake round {round}"))?;
             let server_bytes = B64.decode(server_token.trim_ascii()).map_err(|e| {
                 WinrmError::AuthFailed(format!("CredSSP: bad base64 in handshake: {e}"))
             })?;
@@ -811,17 +1143,22 @@ impl AuthTransport for CredSspAuth {
         let outgoing = Ok::<_, WinrmError>(inner_tls.drain_outgoing())?;
 
         // Send through HTTP
-        let (status, headers, _) = conn
+        let resp = conn
             .post(Some(&encode_auth(&outgoing)), body_for_auth)
             .await?;
-        if status != 401 {
+        if resp.status != 401 {
             return Err(WinrmError::AuthFailed(format!(
-                "CredSSP: NTLM negotiate: expected 401, got {status}"
+                "CredSSP: NTLM negotiate: expected 401, got {}",
+                resp.status
             )));
         }
-        let server_token = header_get(&headers, "www-authenticate")
+        let server_token = resp
+            .head
+            .header("www-authenticate")
+            .as_deref()
             .and_then(extract_credssp_token_str)
             .ok_or_else(|| WinrmError::AuthFailed("CredSSP: NTLM nego: no CredSSP token".into()))?;
+        handshake_round_ok(&resp, "NTLM negotiate")?;
         let server_bytes = B64
             .decode(server_token.trim_ascii())
             .map_err(|e| WinrmError::AuthFailed(format!("CredSSP: bad b64 NTLM nego: {e}")))?;
@@ -940,19 +1277,26 @@ impl AuthTransport for CredSspAuth {
         inner_tls.write_plaintext(&ts_req3)?;
         let outgoing = Ok::<_, WinrmError>(inner_tls.drain_outgoing())?;
 
-        let (status, headers, _) = conn
+        let resp = conn
             .post(Some(&encode_auth(&outgoing)), body_for_auth)
             .await?;
-        if status != 401 {
+        if resp.status != 401 {
             return Err(WinrmError::AuthFailed(format!(
-                "CredSSP: NTLM authenticate: expected 401, got {status}"
+                "CredSSP: NTLM authenticate: expected 401, got {}",
+                resp.status
             )));
         }
         #[cfg(all(debug_assertions, feature = "__internal"))]
         if std::env::var("CREDSSP_DUMP").is_ok() {
-            eprintln!("[CREDSSP_DUMP] step6 response status={status} headers={headers:?}");
+            eprintln!(
+                "[CREDSSP_DUMP] step6 response status={} headers={:?}",
+                resp.status, resp.head.headers
+            );
         }
-        let server_token = header_get(&headers, "www-authenticate")
+        let server_token = resp
+            .head
+            .header("www-authenticate")
+            .as_deref()
             .and_then(extract_credssp_token_str)
             .ok_or_else(|| {
                 WinrmError::AuthFailed(
@@ -961,6 +1305,7 @@ impl AuthTransport for CredSspAuth {
                         .into(),
                 )
             })?;
+        handshake_round_ok(&resp, "NTLM authenticate")?;
         let server_bytes = B64
             .decode(server_token.trim_ascii())
             .map_err(|e| WinrmError::AuthFailed(format!("CredSSP: bad b64 auth: {e}")))?;
@@ -1031,7 +1376,11 @@ impl AuthTransport for CredSspAuth {
         inner_tls.write_plaintext(&ts_req5)?;
         let outgoing = Ok::<_, WinrmError>(inner_tls.drain_outgoing())?;
 
-        let (status, _headers, resp_body) = conn.post(Some(&encode_auth(&outgoing)), &body).await?;
+        let HttpResponse {
+            status,
+            body: resp_body,
+            ..
+        } = conn.post(Some(&encode_auth(&outgoing)), &body).await?;
         if status == 401 {
             return Err(WinrmError::AuthFailed(
                 "CredSSP: credentials rejected after delegation".into(),
@@ -1069,6 +1418,7 @@ impl AuthTransport for CredSspAuth {
 #[cfg(all(test, feature = "credssp"))]
 mod tests {
     use super::*;
+    use crate::config::WinrmConfig;
     use reqwest::header::{HeaderMap, HeaderValue};
 
     fn make_headers(values: &[&str]) -> HeaderMap {
@@ -1256,27 +1606,365 @@ mod tests {
         assert_eq!(extract_credssp_token_str("CredSSP "), None);
     }
 
-    #[test]
-    fn find_double_crlf_locates_separator() {
-        let buf = b"GET / HTTP/1.1\r\nHost: x\r\n\r\nbody";
-        let pos = find_double_crlf(buf).unwrap();
-        assert_eq!(&buf[pos..pos + 4], b"\r\n\r\n");
+    fn read_all(chunks: &[&[u8]]) -> Result<Option<HttpResponse>, WinrmError> {
+        let mut r = ResponseReader::new(1024, 64);
+        for c in chunks {
+            if let Some(resp) = r.feed(c)? {
+                return Ok(Some(resp));
+            }
+        }
+        Ok(None)
+    }
+
+    fn err_text(input: &[u8]) -> String {
+        match read_all(&[input]) {
+            Err(WinrmError::AuthFailed(m)) => m,
+            other => panic!(
+                "expected AuthFailed for {:?}, got {other:?}",
+                String::from_utf8_lossy(input)
+            ),
+        }
     }
 
     #[test]
-    fn find_double_crlf_returns_none_when_absent() {
-        assert!(find_double_crlf(b"no separator here").is_none());
-        // Single CRLF only is not enough
-        assert!(find_double_crlf(b"a\r\nb").is_none());
+    fn find_head_end_resumes_where_it_stopped() {
+        let buf = b"HTTP/1.1 200 OK\r\nA: b\r\n\r\nrest";
+        assert_eq!(find_head_end(buf, 0), Some(25));
+        assert_eq!(find_head_end(buf, 21), Some(25));
+        assert_eq!(find_head_end(buf, 22), None);
     }
 
     #[test]
-    fn header_get_is_case_insensitive() {
-        let mut h = std::collections::HashMap::new();
-        h.insert("content-length".to_string(), "42".to_string());
-        assert_eq!(header_get(&h, "Content-Length"), Some("42"));
-        assert_eq!(header_get(&h, "CONTENT-LENGTH"), Some("42"));
-        assert_eq!(header_get(&h, "missing"), None);
+    fn head_scan_is_linear_in_the_bytes_fed() {
+        let mut r = ResponseReader::new(1024 * 1024, 64);
+        for _ in 0..65_536 {
+            assert!(r.feed(b"a").unwrap().is_none());
+        }
+        assert!(
+            r.scanned <= 4 * 65_536,
+            "scanned {} bytes for 65536 fed",
+            r.scanned
+        );
+        let mut small = ResponseReader::new(64, 64);
+        assert!(
+            matches!(small.feed(&[b'a'; 65]), Err(WinrmError::AuthFailed(m)) if m == "CredSSP: response head too large")
+        );
+    }
+
+    #[test]
+    fn reader_frames_by_content_length() {
+        let resp = read_all(&[b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                resp.status,
+                resp.body.as_slice(),
+                resp.closing,
+                resp.leftover
+            ),
+            (200, &b"hello"[..], false, false)
+        );
+        for dup in [
+            &b"Content-Length: 5\r\nContent-Length: 5"[..],
+            b"Content-Length: 5, 5",
+        ] {
+            let input = [&b"HTTP/1.1 200 OK\r\n"[..], dup, b"\r\n\r\nhello"].concat();
+            assert_eq!(read_all(&[&input]).unwrap().unwrap().body, b"hello");
+        }
+        for bad in ["5\r\nContent-Length: 6", "5, 6", "+5", "5 5", "", "0x5"] {
+            let input = format!("HTTP/1.1 200 OK\r\nContent-Length: {bad}\r\n\r\nhello");
+            assert_eq!(
+                err_text(input.as_bytes()),
+                "CredSSP: invalid Content-Length",
+                "{bad:?}"
+            );
+        }
+        let too_large = crate::auth::body_too_large(64).to_string();
+        for big in ["65", "99999999999999999999999"] {
+            let input = format!("HTTP/1.1 200 OK\r\nContent-Length: {big}\r\n\r\n");
+            assert_eq!(
+                read_all(&[input.as_bytes()]).unwrap_err().to_string(),
+                too_large,
+                "{big}"
+            );
+        }
+    }
+
+    #[test]
+    fn reader_refuses_transfer_and_content_codings() {
+        assert_eq!(
+            err_text(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"
+            ),
+            "CredSSP: Transfer-Encoding is not supported"
+        );
+        assert_eq!(
+            err_text(b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 0\r\n\r\n"),
+            "CredSSP: Content-Encoding is not supported: gzip"
+        );
+        assert!(
+            read_all(&[
+                b"HTTP/1.1 200 OK\r\nContent-Encoding: Identity\r\nContent-Length: 0\r\n\r\n"
+            ])
+            .unwrap()
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn reader_requires_a_length_on_success() {
+        assert_eq!(
+            err_text(b"HTTP/1.1 200 OK\r\n\r\nbody"),
+            "CredSSP: response 200 without Content-Length"
+        );
+        let no_content = read_all(&[b"HTTP/1.1 204 No Content\r\n\r\n"])
+            .unwrap()
+            .unwrap();
+        assert!(no_content.body.is_empty() && !no_content.closing);
+        let challenge = read_all(&[b"HTTP/1.1 401 \r\nWWW-Authenticate: CredSSP AAA\r\n\r\n"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (challenge.status, challenge.body.len(), challenge.closing),
+            (401, 0, true)
+        );
+    }
+
+    #[test]
+    fn reader_skips_interim_responses() {
+        let resp = read_all(&[
+            b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!((resp.status, resp.body.as_slice()), (200, &b"ok"[..]));
+        let nine = "HTTP/1.1 100 Continue\r\n\r\n".repeat(9);
+        assert_eq!(
+            err_text(nine.as_bytes()),
+            "CredSSP: too many interim responses"
+        );
+        assert_eq!(
+            err_text(b"HTTP/1.1 101 Switching Protocols\r\n\r\n"),
+            "CredSSP: unexpected 101 Switching Protocols"
+        );
+    }
+
+    #[test]
+    fn reader_reports_a_short_body_at_eof() {
+        let mut r = ResponseReader::new(1024, 64);
+        assert!(
+            r.feed(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            r.eof_error().to_string(),
+            WinrmError::AuthFailed("CredSSP: connection closed after 3 of 10 body bytes".into())
+                .to_string()
+        );
+        let mut early = ResponseReader::new(1024, 64);
+        assert!(early.feed(b"HTTP/1.1 200").unwrap().is_none());
+        assert!(
+            matches!(early.eof_error(), WinrmError::AuthFailed(m) if m == "CredSSP: server closed connection mid-response")
+        );
+    }
+
+    #[test]
+    fn reader_flags_leftover_bytes() {
+        let resp = read_all(&[b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nokEXTRA"])
+            .unwrap()
+            .unwrap();
+        assert_eq!((resp.body.as_slice(), resp.leftover), (&b"ok"[..], true));
+    }
+
+    #[test]
+    fn reader_reads_connection_close_and_http_1_0() {
+        let close = read_all(&[
+            b"HTTP/1.1 200 OK\r\nConnection: keep-alive, Close\r\nContent-Length: 0\r\n\r\n",
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(close.closing);
+        assert!(
+            read_all(&[b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n"])
+                .unwrap()
+                .unwrap()
+                .closing
+        );
+        assert!(
+            !read_all(&[b"HTTP/1.0 200 OK\r\nConnection: Keep-Alive\r\nContent-Length: 0\r\n\r\n"])
+                .unwrap()
+                .unwrap()
+                .closing
+        );
+    }
+
+    #[test]
+    fn reader_refuses_bad_lines() {
+        assert_eq!(
+            err_text(b"HTTP/1.1 200 OK\r\nA: b\r\n c\r\nContent-Length: 0\r\n\r\n"),
+            "CredSSP: folded header line"
+        );
+        assert!(
+            err_text(b"HTTP/1.1 200 OK\r\nBad Name: x\r\nContent-Length: 0\r\n\r\n")
+                .starts_with("CredSSP: bad header line: ")
+        );
+        assert!(
+            err_text(b"HTTP/1.1 200 OK\r\nNoColon\r\nContent-Length: 0\r\n\r\n")
+                .starts_with("CredSSP: bad header line: ")
+        );
+        for line in [
+            "HTTP/2 200 OK",
+            "HTTP/1.1 600 X",
+            "HTTP/1.1 20 X",
+            "HTTP/1.1 abc OK",
+            "HTTP/1.1  200 OK",
+        ] {
+            let input = format!("{line}\r\nContent-Length: 0\r\n\r\n");
+            assert!(
+                err_text(input.as_bytes()).starts_with("CredSSP: bad status line: "),
+                "{line}"
+            );
+        }
+        assert_eq!(
+            err_text(b"HTTP/1.1 200 OK\r\nX: \xff\r\n\r\n"),
+            "CredSSP: non-UTF8 response head"
+        );
+    }
+
+    #[test]
+    fn reader_joins_repeated_headers() {
+        let resp = read_all(&[b"HTTP/1.1 401 \r\nWWW-Authenticate: CredSSP AAA\r\nwww-authenticate: Negotiate\r\nContent-Length: 0\r\n\r\n"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            resp.head.header("WWW-Authenticate").as_deref(),
+            Some("CredSSP AAA, Negotiate")
+        );
+        assert_eq!(
+            resp.head
+                .header_values("www-authenticate")
+                .collect::<Vec<_>>(),
+            ["CredSSP AAA", "Negotiate"]
+        );
+    }
+
+    #[test]
+    fn reader_result_does_not_depend_on_chunking() {
+        let input: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 401 \r\nWWW-Authenticate: CredSSP QUJD\r\nContent-Length: 3\r\n\r\nabc";
+        let one = read_all(&[input]).unwrap().unwrap();
+        let key = |r: &HttpResponse| {
+            (
+                r.status,
+                r.body.clone(),
+                r.closing,
+                r.leftover,
+                r.head.header("www-authenticate"),
+            )
+        };
+        for i in 0..=input.len() {
+            assert_eq!(
+                key(&read_all(&[&input[..i], &input[i..]]).unwrap().unwrap()),
+                key(&one),
+                "split at {i}"
+            );
+        }
+        let bytes: Vec<&[u8]> = input.chunks(1).collect();
+        assert_eq!(key(&read_all(&bytes).unwrap().unwrap()), key(&one));
+    }
+
+    #[test]
+    fn handshake_round_ok_refuses_closing_and_leftover() {
+        let resp = |closing, leftover| HttpResponse {
+            status: 401,
+            head: ResponseHead {
+                minor_version: 1,
+                status: 401,
+                headers: Vec::new(),
+            },
+            body: Vec::new(),
+            closing,
+            leftover,
+        };
+        assert!(handshake_round_ok(&resp(false, false), "NTLM negotiate").is_ok());
+        assert!(
+            matches!(handshake_round_ok(&resp(true, false), "NTLM negotiate"),
+            Err(WinrmError::AuthFailed(m)) if m == "CredSSP: server closed the connection during NTLM negotiate")
+        );
+        assert!(
+            matches!(handshake_round_ok(&resp(false, true), "NTLM negotiate"),
+            Err(WinrmError::AuthFailed(m)) if m == "CredSSP: unexpected bytes after the response during NTLM negotiate")
+        );
+    }
+
+    #[tokio::test]
+    async fn post_sends_identity_and_the_configured_user_agent() {
+        let (conn, mut peer) = duplex_conn();
+        let mut conn = CredSspConnection {
+            opts: CredSspConnOptions {
+                user_agent: "probe-agent/1".into(),
+                ..test_opts()
+            },
+            ..conn
+        };
+        let server = tokio::spawn(async move {
+            let req = read_request(&mut peer).await;
+            tokio::io::AsyncWriteExt::write_all(
+                &mut peer,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+            )
+            .await
+            .unwrap();
+            req
+        });
+        let resp = conn.post(None, "<s:Envelope/>").await.unwrap();
+        assert_eq!(resp.body, b"ok");
+        let req = server.await.unwrap();
+        assert!(req.contains("\r\nUser-Agent: probe-agent/1\r\n"), "{req}");
+        assert!(req.contains("\r\nAccept-Encoding: identity\r\n"), "{req}");
+        assert!(
+            !req.contains("Python WinRM client") && !req.contains("gzip"),
+            "{req}"
+        );
+    }
+
+    #[test]
+    fn credssp_options_default_user_agent_is_the_crate_name() {
+        let config = WinrmConfig::default();
+        assert_eq!(
+            CredSspConnOptions::from_config(&config).user_agent,
+            concat!("winrm-rs/", env!("CARGO_PKG_VERSION"))
+        );
+        let config = WinrmConfig {
+            user_agent: Some("ops-tool/2".into()),
+            ..WinrmConfig::default()
+        };
+        assert_eq!(
+            CredSspConnOptions::from_config(&config).user_agent,
+            "ops-tool/2"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_fails_on_a_short_body() {
+        let (mut conn, mut peer) = duplex_conn();
+        tokio::spawn(async move {
+            read_request(&mut peer).await;
+            tokio::io::AsyncWriteExt::write_all(
+                &mut peer,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc",
+            )
+            .await
+            .unwrap();
+            drop(peer);
+        });
+        let err = conn.post(None, "<s:Envelope/>").await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("connection closed after 3 of 10 body bytes"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1424,8 +2112,8 @@ mod tests {
                     loop {
                         // One request: the head up to CRLFCRLF, then its body.
                         let head_end = loop {
-                            if let Some(pos) = find_double_crlf(&pending) {
-                                break pos;
+                            if let Some(end) = find_head_end(&pending, 0) {
+                                break end - 4;
                             }
                             match tls.read(&mut buf) {
                                 Ok(0) | Err(_) => return,
@@ -1530,7 +2218,7 @@ mod tests {
                 .await
                 .unwrap();
             // Reading a response makes the client process any NewSessionTicket.
-            assert_eq!(first.post(None, "<a/>").await.unwrap().0, 401);
+            assert_eq!(first.post(None, "<a/>").await.unwrap().status, 401);
             drop(first);
             let second = CredSspConnection::connect(&endpoint, &tls, test_opts())
                 .await
@@ -1575,6 +2263,7 @@ mod tests {
                 max_response_bytes,
                 connect_timeout: Duration::from_secs(20),
                 exchange_timeout: Duration::from_secs(20),
+                user_agent: "winrm-rs/test".into(),
             },
         }
     }
@@ -1584,6 +2273,7 @@ mod tests {
             max_response_bytes: 512 * 1024,
             connect_timeout: Duration::from_secs(30),
             exchange_timeout: Duration::from_secs(70),
+            user_agent: "winrm-rs/test".into(),
         }
     }
 
@@ -1612,8 +2302,8 @@ mod tests {
             let n = peer.read(&mut chunk).await.unwrap();
             assert!(n > 0, "client closed before finishing the request");
             buf.extend_from_slice(&chunk[..n]);
-            if let Some(pos) = find_double_crlf(&buf) {
-                break pos + 4;
+            if let Some(end) = find_head_end(&buf, 0) {
+                break end;
             }
         };
         let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();

@@ -2657,6 +2657,41 @@ async fn credssp_run_command_whoami() {
     assert!(!stdout.trim().is_empty());
 }
 
+/// A response body of several hundred kilobytes, read over CredSSP strictly
+/// by its `Content-Length` (identity coding, no chunked framing).
+#[cfg(feature = "credssp")]
+#[tokio::test]
+#[ignore]
+async fn credssp_reads_a_large_framed_response() {
+    if is_server_2012_r2().await {
+        eprintln!(
+            "SKIP credssp_reads_a_large_framed_response: no TLS cipher suite shared \
+             with Server 2012 R2 (see credssp_run_command_whoami)"
+        );
+        return;
+    }
+    let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    let pass = std::env::var("WINRM_TEST_PASS").expect("WINRM_TEST_PASS");
+    let config = WinrmConfig {
+        auth_method: AuthMethod::CredSsp,
+        use_tls: true,
+        accept_invalid_certs: true,
+        port: https_test_port(),
+        ..Default::default()
+    };
+    let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
+    let output = client
+        .run_powershell(&host, "'x' * 300000")
+        .await
+        .expect("credssp large output");
+    assert_eq!(output.exit_code, 0);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = stdout.trim();
+    assert_eq!(stdout.len(), 300_000);
+    assert!(stdout.bytes().all(|b| b == b'x'));
+}
+
 #[tokio::test]
 #[ignore]
 async fn ntlm_over_https_with_cbt() {

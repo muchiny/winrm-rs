@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   one line. Tabs and line breaks become spaces, and other control and
   bidirectional formatting characters are written as `\u{..}` escapes. The
   `code` and `reason` fields hold the neutralised text.
+- Debug logs print shell and command ids quoted and escaped (`shell_id="…"`).
 
 ### Fixed
 

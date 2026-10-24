@@ -122,7 +122,7 @@ impl WinrmClient {
         );
         let response = self.transport.send_soap_with_retry(host, envelope).await?;
         let shell_id = soap::parse_shell_id(&response).map_err(WinrmError::Soap)?;
-        debug!(shell_id = %shell_id, "PSRP shell opened");
+        debug!(shell_id = ?shell_id, "PSRP shell opened");
         Ok(Shell::new_with_resource_uri(
             self,
             host.to_string(),
@@ -442,7 +442,7 @@ impl WinrmClient {
             }
             created = &mut create => created?,
         };
-        debug!(shell_id = %shell_id, "WinRM shell created");
+        debug!(shell_id = ?shell_id, "WinRM shell created");
 
         let mut command_id = None;
         let polled = {
@@ -514,7 +514,7 @@ impl WinrmClient {
         started: &mut Option<String>,
     ) -> Result<CommandOutput, WinrmError> {
         let command_id = self.execute_command(host, shell_id, command, args).await?;
-        debug!(command_id = %command_id, "WinRM command started");
+        debug!(command_id = ?command_id, "WinRM command started");
         let command_id: &str = started.insert(command_id);
 
         let max_output = self.transport.config().max_output_bytes;
@@ -771,7 +771,7 @@ impl WinrmClient {
     )]
     pub async fn open_shell(&self, host: &str) -> Result<Shell<'_>, WinrmError> {
         let shell_id = self.create_shell(host).await?;
-        debug!(shell_id = %shell_id, "WinRM shell opened for reuse");
+        debug!(shell_id = ?shell_id, "WinRM shell opened for reuse");
         Ok(Shell::new(self, host.to_string(), shell_id))
     }
 
@@ -824,7 +824,7 @@ impl WinrmClient {
             resource_uri,
         );
         self.transport.send_soap_with_retry(host, envelope).await?;
-        debug!(shell_id = %shell_id, "WinRM shell reconnected");
+        debug!(shell_id = ?shell_id, "WinRM shell reconnected");
         Ok(Shell::new_with_resource_uri(
             self,
             host.to_string(),
@@ -3796,6 +3796,21 @@ mod tests {
 
     fn count_containing(bodies: &[String], needle: &str) -> usize {
         bodies.iter().filter(|b| b.contains(needle)).count()
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn server_ids_are_logged_escaped() {
+        let server = MockServer::start().await;
+        mount_ok(&server, "<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>S\r\nforged-shell</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>", 1).await;
+        mount_ok(&server, "<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>C\r\nforged-cmd</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>", 1).await;
+        mount_ok(&server, EMPTY_BODY, u64::MAX).await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        let shell = client.open_shell("127.0.0.1").await.unwrap();
+        shell.start_command("x", &[]).await.unwrap();
+        shell.close().await.unwrap();
+        assert!(logs_contain(r#"shell_id="S\r\nforged-shell""#));
+        assert!(logs_contain(r#"command_id="C\r\nforged-cmd""#));
     }
 
     fn silent_poll() -> ResponseTemplate {

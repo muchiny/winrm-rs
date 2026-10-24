@@ -88,7 +88,7 @@ impl<'a> Shell<'a> {
             .client
             .execute_command(&self.host, &self.shell_id, command, args)
             .await?;
-        debug!(command_id = %command_id, "shell command started");
+        debug!(command_id = ?command_id, "shell command started");
 
         let timeout_duration = Duration::from_secs(self.client.config().operation_timeout_secs * 2);
         let max_output = self.client.config().max_output_bytes;
@@ -325,7 +325,7 @@ impl<'a> Shell<'a> {
         );
         let response = self.client.send_soap_raw(&self.host, envelope).await?;
         let returned_id = soap::parse_command_id(&response).map_err(WinrmError::Soap)?;
-        debug!(command_id = %returned_id, "shell command started with specified ID");
+        debug!(command_id = ?returned_id, "shell command started with specified ID");
         Ok(returned_id)
     }
 
@@ -343,7 +343,7 @@ impl<'a> Shell<'a> {
         );
         let response = self.client.send_soap_raw(&self.host, envelope).await?;
         let command_id = soap::parse_command_id(&response).map_err(WinrmError::Soap)?;
-        debug!(command_id = %command_id, "shell command started (streaming)");
+        debug!(command_id = ?command_id, "shell command started (streaming)");
         Ok(command_id)
     }
 
@@ -459,7 +459,7 @@ impl<'a> Shell<'a> {
                 .await
             {
                 tracing::debug!(
-                    shell_id = %self.shell_id,
+                    shell_id = ?self.shell_id,
                     error = %delete_err,
                     "shell delete after failed disconnect also failed"
                 );
@@ -525,7 +525,7 @@ impl StderrDecoders {
             .min_by_key(|(_, (last_poll, _))| *last_poll)
             .map(|(id, _)| id.clone());
         if let Some(id) = stale {
-            debug!(command_id = %id, "dropping stderr decoder of a command never polled to Done");
+            debug!(command_id = ?id, "dropping stderr decoder of a command never polled to Done");
             self.by_command.remove(&id);
         }
     }
@@ -540,7 +540,7 @@ impl Drop for Shell<'_> {
     fn drop(&mut self) {
         if !self.closed {
             tracing::warn!(
-                shell_id = %self.shell_id,
+                shell_id = ?self.shell_id,
                 "shell dropped without close -- resources may leak on server"
             );
         }

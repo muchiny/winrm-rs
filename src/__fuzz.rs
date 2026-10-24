@@ -44,7 +44,7 @@ pub fn create_authenticate_message(
     username: &str,
     password: &str,
     domain: &str,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, NtlmError> {
     crate::ntlm::messages::create_authenticate_message(challenge, username, password, domain)
 }
 
@@ -55,15 +55,15 @@ pub fn create_authenticate_message_with_cbt_and_key(
     password: &str,
     domain: &str,
     channel_bindings: [u8; 16],
-) -> (Vec<u8>, [u8; 16]) {
-    let (msg, key) = crate::ntlm::messages::create_authenticate_message_with_cbt_and_key(
+) -> Result<(Vec<u8>, [u8; 16]), NtlmError> {
+    crate::ntlm::messages::create_authenticate_message_with_cbt_and_key(
         challenge,
         username,
         password,
         domain,
         channel_bindings,
-    );
-    (msg, *key)
+    )
+    .map(|(msg, key)| (msg, *key))
 }
 
 /// Build a Type 3 with a MIC over Type1 || Type2 || Type3.
@@ -75,8 +75,8 @@ pub fn create_authenticate_message_with_key_and_mic(
     type1: &[u8],
     type2: &[u8],
     target_name: &str,
-) -> (Vec<u8>, [u8; 16]) {
-    let (msg, key) = crate::ntlm::messages::create_authenticate_message_with_key_and_mic(
+) -> Result<(Vec<u8>, [u8; 16]), NtlmError> {
+    crate::ntlm::messages::create_authenticate_message_with_key_and_mic(
         challenge,
         username,
         password,
@@ -84,8 +84,8 @@ pub fn create_authenticate_message_with_key_and_mic(
         type1,
         type2,
         target_name,
-    );
-    (msg, *key)
+    )
+    .map(|(msg, key)| (msg, *key))
 }
 
 // ---------------------------------------------------------------------------

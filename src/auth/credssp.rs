@@ -760,7 +760,8 @@ impl AuthTransport for CredSspAuth {
             &spn,
             &type1,
             &type2,
-        );
+        )
+        .map_err(WinrmError::Ntlm)?;
         let mut ntlm_session = NtlmSession::from_auth(&session_key);
         // Compute mechListMIC over the SPNEGO mech_type_list. This MUST happen
         // before sealing pubKeyAuth so that the latter uses seq=1 (matches

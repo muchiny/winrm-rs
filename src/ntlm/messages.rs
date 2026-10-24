@@ -129,6 +129,37 @@ pub fn parse_challenge(data: &[u8]) -> Result<ChallengeMessage, NtlmError> {
     })
 }
 
+/// A length as the 16-bit value an NTLM security buffer or AV pair holds.
+///
+/// `what` names the part of the Type 3 message, so an input that does not fit
+/// is reported with the field that overflowed instead of being truncated.
+fn len16(what: &'static str, n: usize) -> Result<u16, NtlmError> {
+    u16::try_from(n).map_err(|_| {
+        NtlmError::InvalidMessage(format!(
+            "NTLM Type 3: {what} is {n} bytes, more than a 16-bit length (65535) can hold"
+        ))
+    })
+}
+
+/// A byte position as the 32-bit offset an NTLM security buffer holds.
+fn to_u32(what: &'static str, n: usize) -> Result<u32, NtlmError> {
+    u32::try_from(n).map_err(|_| {
+        NtlmError::InvalidMessage(format!(
+            "NTLM Type 3: {what} is {n} bytes, more than a 32-bit offset can hold"
+        ))
+    })
+}
+
+/// Returns the offset of the next payload field, then moves `offset` past a
+/// field of `len` bytes.
+fn place(offset: &mut usize, len: u16) -> Result<u32, NtlmError> {
+    let at = to_u32("message", *offset)?;
+    *offset = offset.checked_add(usize::from(len)).ok_or_else(|| {
+        NtlmError::InvalidMessage("NTLM Type 3: message is too large to lay out".into())
+    })?;
+    Ok(at)
+}
+
 /// Internal implementation -- returns both the Type 3 message and the exported session key.
 ///
 /// The session key is wrapped in `Zeroizing` so it is wiped from the caller's
@@ -142,7 +173,7 @@ fn create_authenticate_message_internal(
     channel_bindings: Option<[u8; 16]>,
     mic_input: Option<(&[u8], &[u8])>,
     target_name: Option<&str>,
-) -> (Vec<u8>, Zeroizing<[u8; 16]>) {
+) -> Result<(Vec<u8>, Zeroizing<[u8; 16]>), NtlmError> {
     // Use the server's negotiated flags (from Type 2) for the Type 3 response,
     // augmented with KEY_EXCH and VERSION to enable message sealing.
     let flags = challenge.negotiate_flags | NEGOTIATE_KEY_EXCH | NEGOTIATE_VERSION;
@@ -178,7 +209,7 @@ pub(crate) fn create_authenticate_message_full(
     mic_input: Option<(&[u8], &[u8])>,
     target_name: Option<&str>,
     display_domain: Option<&str>,
-) -> (Vec<u8>, Zeroizing<[u8; 16]>) {
+) -> Result<(Vec<u8>, Zeroizing<[u8; 16]>), NtlmError> {
     let nt_hash = compute_nt_hash(password);
     let ntlmv2_hash = compute_ntlmv2_hash(&nt_hash, username, domain);
 
@@ -223,7 +254,8 @@ pub(crate) fn create_authenticate_message_full(
         if let Some(spn) = target_name {
             let spn_utf16 = to_utf16le(spn);
             target_info.extend_from_slice(&AV_TARGET_NAME.to_le_bytes());
-            target_info.extend_from_slice(&(spn_utf16.len() as u16).to_le_bytes());
+            target_info
+                .extend_from_slice(&len16("MsvAvTargetName", spn_utf16.len())?.to_le_bytes());
             target_info.extend_from_slice(&spn_utf16);
         }
         // AV_FLAGS (0x0006): 4 bytes, bit 2 = MIC present
@@ -315,38 +347,42 @@ pub(crate) fn create_authenticate_message_full(
     //   - +16 bytes for MIC if mic_input is provided
     let include_version = flags & NEGOTIATE_VERSION != 0;
     let include_mic = mic_input.is_some();
-    let header_size: u32 =
+    let header_size: usize =
         64 + (if include_version { 8 } else { 0 }) + (if include_mic { 16 } else { 0 });
 
-    let mut offset = header_size;
-    let lm_offset = offset;
-    offset += lm_response.len() as u32;
-    let nt_offset = offset;
-    offset += nt_response.len() as u32;
-    let domain_offset = offset;
-    offset += domain_bytes.len() as u32;
-    let user_offset = offset;
-    offset += user_bytes.len() as u32;
-    let ws_offset = offset;
-    offset += workstation_bytes.len() as u32;
-    let session_offset = offset;
-    offset += encrypted_random_session_key.len() as u32;
+    // Every length is checked against the 16-bit field first; the offsets are
+    // then summed in `usize` and each is checked against the 32-bit field.
+    let lm_len = len16("LmChallengeResponse", lm_response.len())?;
+    let nt_len = len16("NtChallengeResponse", nt_response.len())?;
+    let domain_len = len16("DomainName", domain_bytes.len())?;
+    let user_len = len16("UserName", user_bytes.len())?;
+    let ws_len = len16("Workstation", workstation_bytes.len())?;
+    let session_len = len16(
+        "EncryptedRandomSessionKey",
+        encrypted_random_session_key.len(),
+    )?;
 
-    let mut msg = Vec::with_capacity(offset as usize);
+    let mut offset = header_size;
+    let lm_offset = place(&mut offset, lm_len)?;
+    let nt_offset = place(&mut offset, nt_len)?;
+    let domain_offset = place(&mut offset, domain_len)?;
+    let user_offset = place(&mut offset, user_len)?;
+    let ws_offset = place(&mut offset, ws_len)?;
+    let session_offset = place(&mut offset, session_len)?;
+    // The end of the payload is the message length, which has to fit too.
+    to_u32("message", offset)?;
+
+    let mut msg = Vec::with_capacity(offset);
 
     // Header
     msg.extend_from_slice(SIGNATURE);
     msg.extend_from_slice(&3u32.to_le_bytes());
-    write_security_buffer(&mut msg, lm_response.len() as u16, lm_offset);
-    write_security_buffer(&mut msg, nt_response.len() as u16, nt_offset);
-    write_security_buffer(&mut msg, domain_bytes.len() as u16, domain_offset);
-    write_security_buffer(&mut msg, user_bytes.len() as u16, user_offset);
-    write_security_buffer(&mut msg, workstation_bytes.len() as u16, ws_offset);
-    write_security_buffer(
-        &mut msg,
-        encrypted_random_session_key.len() as u16,
-        session_offset,
-    );
+    write_security_buffer(&mut msg, lm_len, lm_offset);
+    write_security_buffer(&mut msg, nt_len, nt_offset);
+    write_security_buffer(&mut msg, domain_len, domain_offset);
+    write_security_buffer(&mut msg, user_len, user_offset);
+    write_security_buffer(&mut msg, ws_len, ws_offset);
+    write_security_buffer(&mut msg, session_len, session_offset);
     msg.extend_from_slice(&flags.to_le_bytes());
     if include_version {
         msg.extend_from_slice(&[0, 12, 1, 0, 0, 0, 0, 15]);
@@ -403,7 +439,7 @@ pub(crate) fn create_authenticate_message_full(
         }
     }
 
-    (msg, Zeroizing::new(exported_session_key))
+    Ok((msg, Zeroizing::new(exported_session_key)))
 }
 
 // Only used inside the CREDSSP_DEBUG block, which is debug-only.
@@ -428,8 +464,9 @@ pub(crate) fn create_authenticate_message(
     username: &str,
     password: &str,
     domain: &str,
-) -> Vec<u8> {
-    create_authenticate_message_internal(challenge, username, password, domain, None, None, None).0
+) -> Result<Vec<u8>, NtlmError> {
+    create_authenticate_message_internal(challenge, username, password, domain, None, None, None)
+        .map(|(msg, _)| msg)
 }
 
 /// Like [`create_authenticate_message`] but with TLS Channel Binding Token,
@@ -441,7 +478,7 @@ pub(crate) fn create_authenticate_message_with_cbt_and_key(
     password: &str,
     domain: &str,
     channel_bindings: [u8; 16],
-) -> (Vec<u8>, Zeroizing<[u8; 16]>) {
+) -> Result<(Vec<u8>, Zeroizing<[u8; 16]>), NtlmError> {
     create_authenticate_message_internal(
         challenge,
         username,
@@ -465,7 +502,7 @@ pub(crate) fn create_authenticate_message_with_key_and_mic(
     type1: &[u8],
     type2: &[u8],
     target_name: &str,
-) -> (Vec<u8>, Zeroizing<[u8; 16]>) {
+) -> Result<(Vec<u8>, Zeroizing<[u8; 16]>), NtlmError> {
     create_authenticate_message_internal(
         challenge,
         username,
@@ -495,7 +532,7 @@ pub fn create_authenticate_message_credssp(
     spn: &str,
     type1_bytes: &[u8],
     type2_bytes: &[u8],
-) -> (Vec<u8>, Zeroizing<[u8; 16]>) {
+) -> Result<(Vec<u8>, Zeroizing<[u8; 16]>), NtlmError> {
     let flags = challenge.negotiate_flags
         | NEGOTIATE_KEY_EXCH
         | NEGOTIATE_SEAL
@@ -733,7 +770,7 @@ mod tests {
             timestamp: Some([0x42; 8]),
         };
 
-        let msg = create_authenticate_message(&challenge, "user", "password", "DOMAIN");
+        let msg = create_authenticate_message(&challenge, "user", "password", "DOMAIN").unwrap();
 
         assert_eq!(&msg[0..8], b"NTLMSSP\0");
         assert_eq!(u32::from_le_bytes(msg[8..12].try_into().unwrap()), 3);
@@ -750,7 +787,7 @@ mod tests {
             timestamp: None,
         };
 
-        let msg = create_authenticate_message(&challenge, "admin", "pass", "DOM");
+        let msg = create_authenticate_message(&challenge, "admin", "pass", "DOM").unwrap();
         assert_eq!(&msg[0..8], b"NTLMSSP\0");
         assert!(msg.len() > 64);
     }
@@ -764,7 +801,7 @@ mod tests {
             target_domain: "DOM".to_string(),
             timestamp: Some([0x42; 8]),
         };
-        let msg = create_authenticate_message(&challenge, "user", "pass", "DOM");
+        let msg = create_authenticate_message(&challenge, "user", "pass", "DOM").unwrap();
 
         let lm_len = u16::from_le_bytes(msg[12..14].try_into().unwrap()) as usize;
         let lm_offset = u32::from_le_bytes(msg[16..20].try_into().unwrap()) as usize;
@@ -851,7 +888,8 @@ mod tests {
 
         let (msg, session_key) = create_authenticate_message_internal(
             &challenge, "user", "password", "DOMAIN", None, None, None,
-        );
+        )
+        .unwrap();
 
         assert_eq!(&msg[0..8], b"NTLMSSP\0");
         assert_eq!(u32::from_le_bytes(msg[8..12].try_into().unwrap()), 3);
@@ -872,10 +910,12 @@ mod tests {
 
         let (_, key1) = create_authenticate_message_internal(
             &challenge, "admin", "pass", "DOM", None, None, None,
-        );
+        )
+        .unwrap();
         let (_, key2) = create_authenticate_message_internal(
             &challenge, "admin", "pass", "DOM", None, None, None,
-        );
+        )
+        .unwrap();
 
         assert_ne!(*key1, [0u8; 16]);
         assert_ne!(*key2, [0u8; 16]);
@@ -892,7 +932,8 @@ mod tests {
         };
         let (msg, key) = create_authenticate_message_internal(
             &challenge, "user", "pass", "DOM", None, None, None,
-        );
+        )
+        .unwrap();
 
         let lm_len = u16::from_le_bytes(msg[12..14].try_into().unwrap()) as usize;
         let lm_offset = u32::from_le_bytes(msg[16..20].try_into().unwrap()) as usize;
@@ -944,7 +985,8 @@ mod tests {
         };
         let cbt = [0xAA; 16];
         let (msg, _) =
-            create_authenticate_message_with_cbt_and_key(&challenge, "user", "pass", "DOMAIN", cbt);
+            create_authenticate_message_with_cbt_and_key(&challenge, "user", "pass", "DOMAIN", cbt)
+                .unwrap();
         // Should be a valid NTLM Type 3 message
         assert_eq!(&msg[0..8], SIGNATURE);
         let msg_type = u32::from_le_bytes([msg[8], msg[9], msg[10], msg[11]]);
@@ -961,10 +1003,11 @@ mod tests {
             msg[24..32].copy_from_slice(&[0xCC; 8]);
             parse_challenge(&msg).unwrap()
         };
-        let without = create_authenticate_message(&challenge, "user", "pass", "DOMAIN");
+        let without = create_authenticate_message(&challenge, "user", "pass", "DOMAIN").unwrap();
         let (with_cbt, _) = create_authenticate_message_with_cbt_and_key(
             &challenge, "user", "pass", "DOMAIN", [0xBB; 16],
-        );
+        )
+        .unwrap();
         // Messages should differ because target_info is modified
         assert_ne!(without, with_cbt);
         // Both should be valid Type 3
@@ -1036,7 +1079,8 @@ mod tests {
             "HTTP/host",
             &type1,
             &type2_bytes,
-        );
+        )
+        .unwrap();
         let (msg2, key2) = create_authenticate_message_credssp(
             &challenge,
             "vagrant",
@@ -1045,7 +1089,8 @@ mod tests {
             "HTTP/host",
             &type1,
             &type2_bytes,
-        );
+        )
+        .unwrap();
         // Random session keys must differ between calls
         assert_ne!(key1, key2, "session keys should be random");
         // But messages should have same structure (different content)
@@ -1067,7 +1112,8 @@ mod tests {
             "HTTP/host",
             &type1,
             &type2_bytes,
-        );
+        )
+        .unwrap();
         // Session SB at offset 52: should have len=16
         let sk_len = u16::from_le_bytes([msg[52], msg[53]]);
         assert_eq!(sk_len, 16, "EncryptedRandomSessionKey is 16 bytes");
@@ -1088,7 +1134,8 @@ mod tests {
             "HTTP/host",
             &type1,
             &type2_bytes,
-        );
+        )
+        .unwrap();
         // Type 3 flags at offset 60
         let flags = u32::from_le_bytes([msg[60], msg[61], msg[62], msg[63]]);
         // Should include the server's flags + required CredSSP bits
@@ -1111,7 +1158,8 @@ mod tests {
             "HTTP/host",
             &type1,
             &type2_bytes,
-        );
+        )
+        .unwrap();
         // Version field at offset 64-71
         // NTLMRevision = 15 (0x0f) at byte 71
         assert_eq!(msg[71], 0x0f, "NTLMRevision should be 15");
@@ -1132,7 +1180,8 @@ mod tests {
             "HTTP/host",
             &type1,
             &type2_bytes,
-        );
+        )
+        .unwrap();
         // MIC at offset 72-87 (after version field)
         let mic = &msg[72..88];
         // MIC should not be all zeros (it was computed)
@@ -1154,7 +1203,8 @@ mod tests {
             "HTTP/somehost",
             &type1,
             &type2_bytes,
-        );
+        )
+        .unwrap();
         // The NT response contains the blob with AV pairs including AV_TARGET_NAME
         // Just check that "somehost" UTF-16LE bytes appear somewhere in the message
         let target_utf16 = to_utf16le("somehost");
@@ -1178,7 +1228,8 @@ mod tests {
             "HTTP/host",
             &type1,
             &type2_bytes,
-        );
+        )
+        .unwrap();
         // Domain SB at offset 28: should be 0 because display_domain is empty
         let dom_len = u16::from_le_bytes([msg[28], msg[29]]);
         assert_eq!(dom_len, 0, "Type 3 Domain SB should be empty for CredSSP");
@@ -1219,7 +1270,8 @@ mod tests {
             &type1,
             &[0u8; 32], // fake type2
             "HTTP/host.domain.com",
-        );
+        )
+        .unwrap();
         assert_eq!(&msg[0..8], b"NTLMSSP\0");
         assert_eq!(u32::from_le_bytes(msg[8..12].try_into().unwrap()), 3);
         assert!(msg.len() > 64);
@@ -1283,5 +1335,69 @@ mod tests {
         };
         assert_eq!(workstation(), expected.as_slice());
         assert!(!expected.is_empty(), "this Linux box has a kernel hostname");
+    }
+
+    const TEST_FLAGS: u32 = 0xe28a_8235;
+
+    fn challenge_with(target_info: Vec<u8>) -> ChallengeMessage {
+        ChallengeMessage {
+            server_challenge: [0x01; 8],
+            negotiate_flags: TEST_FLAGS,
+            target_info,
+            target_domain: String::new(),
+            timestamp: Some([0x11; 8]),
+        }
+    }
+
+    fn av(id: u16, value: &[u8]) -> Vec<u8> {
+        let mut v = id.to_le_bytes().to_vec();
+        v.extend_from_slice(&u16::try_from(value.len()).unwrap().to_le_bytes());
+        v.extend_from_slice(value);
+        v
+    }
+
+    fn full(
+        ch: &ChallengeMessage,
+        user: &str,
+        spn: &str,
+        cb: Option<[u8; 16]>,
+    ) -> Result<(Vec<u8>, Zeroizing<[u8; 16]>), NtlmError> {
+        create_authenticate_message_full(
+            ch,
+            user,
+            "pass",
+            "",
+            cb,
+            TEST_FLAGS,
+            true,
+            Some((&create_negotiate_message(), &[0u8; 32])),
+            Some(spn),
+            Some(""),
+        )
+    }
+
+    #[test]
+    fn type3_with_oversized_target_info_is_an_error() {
+        // One AV pair of 65500 bytes (its own length still fits in 16 bits)
+        // plus the EOL pair. With the client blob header, the channel binding
+        // and the SPN pairs, the NtChallengeResponse exceeds 65535 bytes.
+        let mut ti = av(0x0003, &vec![0u8; 65_500]);
+        ti.extend_from_slice(&av(0x0000, &[]));
+        let err = full(&challenge_with(ti), "user", "HTTP/h", Some([0xAA; 16])).unwrap_err();
+        assert!(matches!(err, NtlmError::InvalidMessage(m) if m.contains("NtChallengeResponse")));
+    }
+
+    #[test]
+    fn type3_with_spn_over_32767_utf16_units_is_an_error() {
+        let spn = "A".repeat(40_000);
+        let err = full(&challenge_with(av(0x0000, &[])), "user", &spn, None).unwrap_err();
+        assert!(matches!(err, NtlmError::InvalidMessage(m) if m.contains("MsvAvTargetName")));
+    }
+
+    #[test]
+    fn type3_with_oversized_username_is_an_error() {
+        let user = "U".repeat(40_000);
+        let err = full(&challenge_with(av(0x0000, &[])), &user, "HTTP/h", None).unwrap_err();
+        assert!(matches!(err, NtlmError::InvalidMessage(m) if m.contains("UserName")));
     }
 }

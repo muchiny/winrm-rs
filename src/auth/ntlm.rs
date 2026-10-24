@@ -225,6 +225,7 @@ impl NtlmAuth {
                 &domain,
                 cbt,
             )
+            .map_err(WinrmError::Ntlm)?
         } else {
             ntlm::create_authenticate_message_with_key_and_mic(
                 &challenge,
@@ -235,6 +236,7 @@ impl NtlmAuth {
                 &type2_raw,
                 &target_name,
             )
+            .map_err(WinrmError::Ntlm)?
         };
         // Copy the exported session key to the heap before the awaits below
         // and wipe this copy in place, so no unboxed copy of it lives in this

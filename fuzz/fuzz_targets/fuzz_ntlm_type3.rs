@@ -64,6 +64,24 @@ fn check_type3(msg: &[u8]) {
             msg.len()
         );
     }
+
+    // The smallest buffer offset is where the payload starts (header +
+    // version + MIC); the declared lengths must fill the message exactly.
+    // A wrapped `as u16` length would shrink `sum`, so the equality fails.
+    let sum: usize = SECURITY_BUFFERS
+        .iter()
+        .map(|(at, _)| u16::from_le_bytes(msg[*at..at + 2].try_into().unwrap()) as usize)
+        .sum();
+    let first_off = SECURITY_BUFFERS
+        .iter()
+        .map(|(at, _)| u32::from_le_bytes(msg[at + 4..at + 8].try_into().unwrap()) as usize)
+        .min()
+        .unwrap();
+    assert_eq!(
+        first_off + sum,
+        msg.len(),
+        "declared buffer lengths must fill the message exactly"
+    );
 }
 
 fuzz_target!(|input: Input<'_>| {
@@ -75,25 +93,31 @@ fuzz_target!(|input: Input<'_>| {
         timestamp: Some(input.timestamp),
     };
 
-    check_type3(&create_authenticate_message(
+    // An input that does not fit a 16-bit length is refused, never wrapped.
+    let Ok(msg) = create_authenticate_message(
         &challenge,
         input.username,
         input.password,
         input.domain,
-    ));
+    ) else {
+        return;
+    };
+    check_type3(&msg);
 
-    let (msg, key) = create_authenticate_message_with_cbt_and_key(
+    let Ok((msg, key)) = create_authenticate_message_with_cbt_and_key(
         &challenge,
         input.username,
         input.password,
         input.domain,
         input.channel_bindings,
-    );
+    ) else {
+        return;
+    };
     check_type3(&msg);
     assert_eq!(key.len(), 16);
 
     let type1 = create_negotiate_message();
-    let (msg, _) = create_authenticate_message_with_key_and_mic(
+    let Ok((msg, _)) = create_authenticate_message_with_key_and_mic(
         &challenge,
         input.username,
         input.password,
@@ -101,6 +125,8 @@ fuzz_target!(|input: Input<'_>| {
         &type1,
         input.type2_bytes,
         input.target_name,
-    );
+    ) else {
+        return;
+    };
     check_type3(&msg);
 });

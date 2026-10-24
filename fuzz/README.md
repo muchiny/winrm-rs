@@ -34,7 +34,7 @@ drives; "invariant" is what it asserts beyond *must not panic*.
 | `fuzz_ntlm_challenge_header` | same, magic-prefixed inputs | — |
 | `fuzz_ntlm_header_decode` | `decode_challenge_header` | base64 framing does not change message validity |
 | `fuzz_ntlm_av_pairs` | `crypto::parse_av_pairs`, `from_utf16le` | decoded text never exceeds its code-unit count |
-| `fuzz_ntlm_type3` | `create_authenticate_message*` | every Type 3 security buffer stays inside the message |
+| `fuzz_ntlm_type3` | `create_authenticate_message*` | every Type 3 security buffer stays inside the message, and the declared lengths fill it exactly |
 
 ### NTLM crypto and session state
 

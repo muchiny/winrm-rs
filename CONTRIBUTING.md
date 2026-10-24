@@ -36,7 +36,7 @@ cargo +nightly fmt --check
 
 # Fuzzing (requires the nightly toolchain and cargo-fuzz).
 # See fuzz/README.md for the full target list.
-scripts/fuzz.sh list          # 21 targets and their dictionaries
+scripts/fuzz.sh list          # 22 targets and their dictionaries
 scripts/fuzz.sh smoke         # replay the committed seed corpora
 scripts/fuzz.sh run           # 60s per target
 scripts/fuzz.sh run fuzz_asn1_ts_request 900

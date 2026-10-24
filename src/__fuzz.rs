@@ -538,6 +538,37 @@ pub fn extract_subject_public_key(cert_der: &[u8]) -> Result<Vec<u8>, crate::err
     crate::asn1::extract_subject_public_key(cert_der)
 }
 
+// ---------------------------------------------------------------------------
+// CredSSP HTTP (`src/auth/credssp.rs`)
+// ---------------------------------------------------------------------------
+
+/// Feed `chunks` one by one to the CredSSP response reader (head cap of the
+/// connection, body cap `max_body`). Returns the status and body of the first
+/// complete final response, `Ok(None)` when the input ends before one, or the
+/// error text.
+#[cfg(feature = "credssp")]
+pub fn credssp_parse_response(
+    chunks: &[&[u8]],
+    max_body: usize,
+) -> Result<Option<(u16, Vec<u8>)>, String> {
+    use crate::auth::credssp::{MAX_RESPONSE_HEAD_BYTES, ResponseReader};
+    let mut reader = ResponseReader::new(MAX_RESPONSE_HEAD_BYTES, max_body);
+    for chunk in chunks {
+        match reader.feed(chunk) {
+            Ok(Some(resp)) => return Ok(Some((resp.status, resp.body))),
+            Ok(None) => {}
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(None)
+}
+
+/// Extract the CredSSP token from a `WWW-Authenticate` value.
+#[cfg(feature = "credssp")]
+pub fn credssp_extract_token(www_auth: &str) -> Option<String> {
+    crate::auth::credssp::extract_credssp_token_str(www_auth)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

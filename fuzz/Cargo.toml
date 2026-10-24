@@ -177,6 +177,15 @@ test = false
 doc = false
 bench = false
 
+# --- CredSSP HTTP ------------------------------------------------------------
+
+[[bin]]
+name = "fuzz_credssp_http"
+path = "fuzz_targets/fuzz_credssp_http.rs"
+test = false
+doc = false
+bench = false
+
 [[bin]]
 name = "fuzz_kerberos_sealed"
 path = "fuzz_targets/fuzz_kerberos_sealed.rs"

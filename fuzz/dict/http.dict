@@ -1,0 +1,24 @@
+# libFuzzer dictionary for the HTTP/1.1 responses CredSSP reads by hand.
+# Used by: fuzz_credssp_http
+
+# Status lines
+http11="HTTP/1.1 "
+http10="HTTP/1.0 "
+interim="100 Continue"
+
+# Line and head terminators
+crlf="\x0d\x0a"
+crlfcrlf="\x0d\x0a\x0d\x0a"
+
+# Framing headers
+content_length="Content-Length:"
+content_length_lower="content-length"
+transfer_encoding="Transfer-Encoding:"
+content_encoding="Content-Encoding:"
+connection_close="Connection: close"
+
+# Authentication challenge
+www_authenticate="WWW-Authenticate:"
+scheme_credssp="CredSSP "
+scheme_negotiate="Negotiate"
+list_sep=", "

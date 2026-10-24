@@ -60,6 +60,7 @@ TARGETS=(
   "fuzz_asn1_ts_request:asn1"
   "fuzz_asn1_spnego:asn1"
   "fuzz_asn1_cert:asn1"
+  "fuzz_credssp_http:http"
 )
 
 target_names() { printf '%s\n' "${TARGETS[@]}" | cut -d: -f1; }

@@ -1,6 +1,6 @@
 # Fuzzing `winrm-rs`
 
-21 libFuzzer targets covering everything the crate parses off the network and
+22 libFuzzer targets covering everything the crate parses off the network and
 everything it splices into an outgoing request. Driven through
 [`scripts/fuzz.sh`](../scripts/fuzz.sh).
 
@@ -71,13 +71,14 @@ drives; "invariant" is what it asserts beyond *must not panic*.
 | `fuzz_asn1_ts_request` | `decode_ts_request`, `encode_ts_request`, `encode_ts_credentials` | encode → decode is the identity for every field |
 | `fuzz_asn1_spnego` | `decode_spnego_token`, `decode_spnego_mech_list_mic`, `encode_spnego_init/response` | both wrappers roundtrip; the `mechListMIC` does not disturb the token and comes back out unchanged; a `NegTokenInit` is refused by the MIC extractor |
 | `fuzz_asn1_cert` | `extract_subject_public_key` | extracted key fits inside the certificate |
+| `fuzz_credssp_http` | `ResponseReader`, `extract_credssp_token_str` | never panics; same result for any chunking; a single all-digit `Content-Length` frames the body exactly; an extracted token is non-empty, has no whitespace or comma, and occurs in the header |
 
 ## Layout
 
 ```
 fuzz/
   fuzz_targets/     one file per target
-  dict/             libFuzzer dictionaries: ntlm, soap, asn1, shell
+  dict/             libFuzzer dictionaries: ntlm, soap, asn1, shell, http
   seeds/            committed starting corpus (regenerate: scripts/gen-fuzz-seeds.py)
   corpus/           evolving corpus, git-ignored, cached in CI
   artifacts/        crash reproducers, git-ignored

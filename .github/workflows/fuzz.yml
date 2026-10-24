@@ -57,6 +57,7 @@ jobs:
           - fuzz_asn1_ts_request
           - fuzz_asn1_spnego
           - fuzz_asn1_cert
+          - fuzz_credssp_http
         include:
           # ASan hides integer/UB classes behind its own allocator poisoning,
           # so the DER and NTLM parsers also get a sanitizer-free pass where

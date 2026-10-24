@@ -1640,6 +1640,36 @@ mod tests {
         }
     }
 
+    /// A `user_agent` that is not a valid header value is refused when the
+    /// client is built, for CredSSP too, which writes it into a request head
+    /// by hand.
+    #[test]
+    fn user_agent_with_a_line_break_is_refused() {
+        let mut methods = vec![(AuthMethod::Basic, false), (AuthMethod::Ntlm, false)];
+        if cfg!(feature = "credssp") {
+            methods.push((AuthMethod::CredSsp, true));
+        }
+        for (auth_method, use_tls) in methods {
+            let build = |user_agent: &str| {
+                let config = WinrmConfig {
+                    auth_method: auth_method.clone(),
+                    use_tls,
+                    accept_invalid_certs: use_tls,
+                    user_agent: Some(user_agent.into()),
+                    ..Default::default()
+                };
+                HttpTransport::new(config, WinrmCredentials::new("u", "p", ""))
+            };
+            for bad in ["agent\r\nX-Extra: 1", "agent\rx", "agent\nx"] {
+                assert!(
+                    matches!(build(bad), Err(WinrmError::Http(_))),
+                    "{auth_method:?} accepted {bad:?}"
+                );
+            }
+            assert!(build("ops-tool/2").is_ok(), "{auth_method:?}");
+        }
+    }
+
     #[test]
     fn certificate_auth_nonexistent_cert_file_returns_error() {
         let config = WinrmConfig {

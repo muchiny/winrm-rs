@@ -608,7 +608,8 @@ pub(crate) struct HttpResponse {
     pub(crate) body: Vec<u8>,
     /// `Connection: close`, HTTP/1.0 without `keep-alive`, or a 401 without Content-Length.
     pub(crate) closing: bool,
-    /// Bytes arrived after the framed body.
+    /// Bytes arrived after the framed body, in the same read as its end.
+    /// Bytes the server sends later are not read, so they are not reported.
     pub(crate) leftover: bool,
 }
 
@@ -1847,6 +1848,114 @@ mod tests {
                 .header_values("www-authenticate")
                 .collect::<Vec<_>>(),
             ["CredSSP AAA", "Negotiate"]
+        );
+    }
+
+    #[test]
+    fn missing_header_is_absent() {
+        let resp = read_all(&[b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(resp.head.header("missing"), None);
+        assert_eq!(resp.head.header_values("missing").count(), 0);
+    }
+
+    /// Feed `input` in one read, then byte by byte, to a reader whose head
+    /// cap is `max_head`; both must give the same `AuthFailed` text.
+    fn capped_err_text(input: &[u8], max_head: usize) -> String {
+        let mut texts = Vec::new();
+        for chunk_len in [input.len(), 1] {
+            let mut r = ResponseReader::new(max_head, 64);
+            let mut out = Ok(None);
+            for c in input.chunks(chunk_len) {
+                out = r.feed(c);
+                if !matches!(out, Ok(None)) {
+                    break;
+                }
+            }
+            match out {
+                Err(WinrmError::AuthFailed(m)) => texts.push(m),
+                other => panic!("chunk {chunk_len}: expected AuthFailed, got {other:?}"),
+            }
+        }
+        assert_eq!(texts[0], texts[1]);
+        texts.remove(0)
+    }
+
+    #[test]
+    fn head_ending_past_the_cap_in_one_read_is_refused() {
+        let input = b"HTTP/1.1 200 OK\r\nX-Pad: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\nContent-Length: 0\r\n\r\n";
+        assert!(input.len() > 64);
+        let mut r = ResponseReader::new(64, 64);
+        assert!(
+            matches!(r.feed(input), Err(WinrmError::AuthFailed(m)) if m == "CredSSP: response head too large")
+        );
+        assert_eq!(
+            capped_err_text(input, 64),
+            "CredSSP: response head too large"
+        );
+        // The same head fits a cap of its own length.
+        assert!(
+            ResponseReader::new(input.len(), 64)
+                .feed(input)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn interim_heads_count_against_the_head_cap() {
+        let interim = "HTTP/1.1 100 Continue\r\n\r\n".repeat(2);
+        let input = format!("{interim}HTTP/1.1 204 No Content\r\n\r\n");
+        // Each head alone fits in 64 bytes; together they do not.
+        assert!(input.len() > 64 && interim.len() < 64);
+        assert_eq!(
+            capped_err_text(input.as_bytes(), 64),
+            "CredSSP: response head too large"
+        );
+        assert!(
+            ResponseReader::new(input.len(), 64)
+                .feed(input.as_bytes())
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn bare_cr_or_lf_in_a_head_line_is_refused() {
+        assert_eq!(
+            err_text(b"HTTP/1.1 200 OK\r\nX: a\rb\r\nContent-Length: 0\r\n\r\n"),
+            "CredSSP: bad header line: X: a b"
+        );
+        assert_eq!(
+            err_text(b"HTTP/1.1 200 OK\r\nX: a\nb\r\nContent-Length: 0\r\n\r\n"),
+            "CredSSP: bad header line: X: a b"
+        );
+        assert_eq!(
+            err_text(b"HTTP/1.1 200 O\rK\r\nContent-Length: 0\r\n\r\n"),
+            "CredSSP: bad status line: HTTP/1.1 200 O K"
+        );
+        assert_eq!(
+            err_text(b"HTTP/1.1 200 O\nK\r\nContent-Length: 0\r\n\r\n"),
+            "CredSSP: bad status line: HTTP/1.1 200 O K"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_applies_the_connection_head_cap() {
+        let (conn, peer) = duplex_conn();
+        let mut conn = CredSspConnection {
+            max_head_bytes: 64,
+            ..conn
+        };
+        tokio::spawn(answer_then_hang(
+            peer,
+            b"HTTP/1.1 200 OK\r\nX-Pad: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\nContent-Length: 0\r\n\r\n",
+        ));
+        let res = conn.post(None, "<a/>").await;
+        assert!(
+            matches!(&res, Err(WinrmError::AuthFailed(m)) if m == "CredSSP: response head too large"),
+            "{res:?}"
         );
     }
 

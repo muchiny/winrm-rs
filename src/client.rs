@@ -526,8 +526,15 @@ impl WinrmClient {
         let mut received = 0usize;
         let mut exit_code: Option<i32> = None;
 
+        let mut pacer = PollPacer::default();
+
         loop {
+            let polled_at = tokio::time::Instant::now();
             let output = self.receive_output_raw(host, shell_id, command_id).await?;
+            let progressed = !output.stdout.is_empty()
+                || !output.stderr.is_empty()
+                || output.exit_code.is_some()
+                || output.done;
             received = received
                 .saturating_add(output.stdout.len())
                 .saturating_add(output.stderr.len());
@@ -549,6 +556,11 @@ impl WinrmClient {
 
             if output.done {
                 break;
+            }
+
+            if let Some(d) = pacer.delay_after(polled_at.elapsed(), progressed) {
+                debug!(delay = ?d, "pacing a quick empty poll");
+                tokio::time::sleep(d).await;
             }
         }
         stderr.extend(stderr_decoder.finish());
@@ -733,7 +745,9 @@ impl WinrmClient {
         let max_output = config.max_output_bytes;
 
         // Phase 2: Pull remaining items if enumeration is not complete
+        let mut pacer = PollPacer::default();
         while let Some(ctx) = context {
+            let polled_at = tokio::time::Instant::now();
             let pull_envelope = soap::pull_request(
                 &endpoint,
                 &ctx,
@@ -746,6 +760,7 @@ impl WinrmClient {
                 .await?;
             let (more_items, next_ctx) =
                 soap::parse_enumerate_response(&pull_response).map_err(WinrmError::Soap)?;
+            let progressed = !more_items.is_empty() || next_ctx.is_none();
             items.push_str(&more_items);
             context = next_ctx;
 
@@ -755,6 +770,13 @@ impl WinrmClient {
                 return Err(WinrmError::Transfer(format!(
                     "WQL enumeration exceeded max_output_bytes ({cap})"
                 )));
+            }
+
+            if context.is_some()
+                && let Some(d) = pacer.delay_after(polled_at.elapsed(), progressed)
+            {
+                debug!(delay = ?d, "pacing a quick empty poll");
+                tokio::time::sleep(d).await;
             }
         }
 
@@ -898,8 +920,13 @@ pub(crate) fn timeout_secs(timeout: Duration) -> u64 {
 ///
 /// The server sends that fault when a command stays silent for
 /// `OperationTimeout`; the command is still running and the caller should
-/// poll again. The wait already happened server-side, so a loop over this
-/// does not spin. Every other result passes through untouched.
+/// poll again. An honest server holds the Receive that long before
+/// answering. The crate's own loops still wait (see `PollPacer`) after the
+/// third answer in a row that brought nothing in under 250 ms, so a server
+/// or proxy that answers at once cannot make them spin. They cannot stop a
+/// server that answers at once with a byte at a time: only a caller deadline
+/// or `max_output_bytes` ends that. Every other result passes through
+/// untouched.
 pub(crate) fn empty_poll_on_timeout(
     polled: Result<soap::ReceiveOutput, WinrmError>,
 ) -> Result<soap::ReceiveOutput, WinrmError> {
@@ -914,6 +941,38 @@ pub(crate) fn empty_poll_on_timeout(
             })
         }
         other => other,
+    }
+}
+
+/// Paces a polling loop against a server that answers at once with nothing.
+#[derive(Debug, Default)]
+pub(crate) struct PollPacer {
+    quick_empty: u32,
+}
+
+impl PollPacer {
+    /// A poll that came back faster than this with nothing is a quick empty poll.
+    pub(crate) const QUICK: Duration = Duration::from_millis(250);
+    /// Quick empty polls in a row that are not delayed.
+    const FREE: u32 = 2;
+    /// The first delay.
+    const FIRST: Duration = Duration::from_millis(50);
+    /// The longest delay.
+    const MAX: Duration = Duration::from_secs(1);
+
+    /// The delay to wait before the next poll. A poll that `progressed`, or
+    /// took [`QUICK`](Self::QUICK) or longer, resets the count and gets
+    /// `None`. The first two quick empty polls in a row get `None`, then
+    /// 50 ms, doubling, at most 1 s.
+    pub(crate) fn delay_after(&mut self, elapsed: Duration, progressed: bool) -> Option<Duration> {
+        if progressed || elapsed >= Self::QUICK {
+            self.quick_empty = 0;
+            return None;
+        }
+        self.quick_empty = self.quick_empty.saturating_add(1);
+        let over = self.quick_empty.checked_sub(Self::FREE.saturating_add(1))?;
+        let doublings = 2u32.saturating_pow(over.min(16));
+        Some(Self::FIRST.saturating_mul(doublings).min(Self::MAX))
     }
 }
 
@@ -3866,6 +3925,151 @@ mod tests {
         ResponseTemplate::new(500)
             .set_body_string(timed_out_fault("w"))
             .set_delay(std::time::Duration::from_millis(100))
+    }
+
+    #[test]
+    fn poll_pacer_waits_only_after_repeated_quick_empty_polls() {
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+        let mut pacer = PollPacer::default();
+        let got: Vec<_> = (0..9).map(|_| pacer.delay_after(ms(10), false)).collect();
+        assert_eq!(
+            got,
+            vec![
+                None,
+                None,
+                Some(ms(50)),
+                Some(ms(100)),
+                Some(ms(200)),
+                Some(ms(400)),
+                Some(ms(800)),
+                Some(ms(1000)),
+                Some(ms(1000))
+            ]
+        );
+    }
+
+    #[test]
+    fn poll_pacer_resets_on_progress_or_slow_poll() {
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+        let mut pacer = PollPacer::default();
+        for _ in 0..2 {
+            assert_eq!(pacer.delay_after(ms(10), false), None);
+        }
+        assert_eq!(pacer.delay_after(ms(249), false), Some(ms(50)));
+        assert_eq!(pacer.delay_after(ms(10), true), None);
+        for _ in 0..2 {
+            assert_eq!(pacer.delay_after(ms(10), false), None);
+        }
+        assert_eq!(pacer.delay_after(ms(250), false), None);
+        for _ in 0..2 {
+            assert_eq!(pacer.delay_after(ms(10), false), None);
+        }
+        assert_eq!(pacer.delay_after(ms(10), false), Some(ms(50)));
+    }
+
+    #[test]
+    fn poll_pacer_never_overflows_on_a_very_long_run() {
+        use std::time::Duration;
+        let mut pacer = PollPacer::default();
+        for _ in 0..200 {
+            let d = pacer.delay_after(Duration::ZERO, false);
+            assert!(d.is_none_or(|d| d <= Duration::from_secs(1)));
+        }
+        assert_eq!(
+            pacer.delay_after(Duration::ZERO, false),
+            Some(Duration::from_secs(1))
+        );
+    }
+
+    #[tokio::test]
+    async fn run_command_paces_a_server_answering_receive_instantly() {
+        use std::time::{Duration, Instant};
+        let server = MockServer::start().await;
+        mount_ok(&server, SHELL_S1, 1).await;
+        mount_ok(&server, COMMAND_C1, 1).await;
+        mount_timed_out_faults(&server, "w", 6).await; // instant empty polls
+        mount_ok(&server, DONE_HELLO, 1).await;
+        mount_ok(&server, EMPTY_BODY, u64::MAX).await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        let started = Instant::now();
+        let out = client.run_command("127.0.0.1", "x", &[]).await.unwrap();
+        let took = started.elapsed();
+        assert_eq!((out.stdout.as_slice(), out.exit_code), (&b"hello"[..], 7));
+        // 50 + 100 + 200 + 400 ms after the 3rd to 6th quick empty polls.
+        assert!(
+            took >= Duration::from_millis(700) && took < Duration::from_secs(5),
+            "{took:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_command_adds_no_delay_for_slow_empty_polls() {
+        use std::time::{Duration, Instant};
+        let server = MockServer::start().await;
+        mount_ok(&server, SHELL_S1, 1).await;
+        mount_ok(&server, COMMAND_C1, 1).await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_string(timed_out_fault("w"))
+                    .set_delay(Duration::from_millis(260)),
+            )
+            .up_to_n_times(8)
+            .mount(&server)
+            .await;
+        mount_ok(&server, DONE_HELLO, 1).await;
+        mount_ok(&server, EMPTY_BODY, u64::MAX).await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        let started = Instant::now();
+        client.run_command("127.0.0.1", "x", &[]).await.unwrap();
+        // 8 x 260 ms = 2.08 s; wrongly paced, it would add 2.55 s.
+        assert!(
+            started.elapsed() < Duration::from_millis(3500),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_wql_paces_instant_empty_pages() {
+        use std::time::{Duration, Instant};
+        let server = MockServer::start().await;
+        let empty_page = "<s:Envelope><s:Body><n:PullResponse><n:EnumerationContext>ctx-1</n:EnumerationContext>\
+                          <n:Items></n:Items></n:PullResponse></s:Body></s:Envelope>";
+        Mock::given(method("POST"))
+            .and(body_string_contains("enumeration/Enumerate"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(empty_page))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("enumeration/Pull"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(empty_page))
+            .up_to_n_times(5)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("enumeration/Pull"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<s:Envelope><s:Body><n:PullResponse><n:Items><p:X>last</p:X></n:Items>\
+                 <n:EndOfSequence/></n:PullResponse></s:Body></s:Envelope>",
+            ))
+            .mount(&server)
+            .await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        let started = Instant::now();
+        let items = client
+            .run_wql("127.0.0.1", "SELECT * FROM X", None)
+            .await
+            .unwrap();
+        assert!(items.contains("last"));
+        // 50 + 100 + 200 ms after the 3rd to 5th empty Pulls.
+        assert!(
+            started.elapsed() >= Duration::from_millis(330),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

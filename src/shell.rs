@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use tracing::debug;
 
-use crate::client::{WinrmClient, empty_poll_on_timeout};
+use crate::client::{PollPacer, WinrmClient, empty_poll_on_timeout};
 use crate::command::CommandOutput;
 use crate::error::WinrmError;
 use crate::soap::clixml::ClixmlDecoder;
@@ -110,11 +110,18 @@ impl<'a> Shell<'a> {
             let mut received = 0usize;
             let mut exit_code: Option<i32> = None;
 
+            let mut pacer = PollPacer::default();
+
             loop {
+                let polled_at = tokio::time::Instant::now();
                 let output: ReceiveOutput = self
                     .client
                     .receive_output_raw(&self.host, &self.shell_id, &command_id)
                     .await?;
+                let progressed = !output.stdout.is_empty()
+                    || !output.stderr.is_empty()
+                    || output.exit_code.is_some()
+                    || output.done;
                 received = received
                     .saturating_add(output.stdout.len())
                     .saturating_add(output.stderr.len());
@@ -133,6 +140,11 @@ impl<'a> Shell<'a> {
 
                 if output.done {
                     break;
+                }
+
+                if let Some(d) = pacer.delay_after(polled_at.elapsed(), progressed) {
+                    debug!(delay = ?d, "pacing a quick empty poll");
+                    tokio::time::sleep(d).await;
                 }
             }
             stderr.extend(stderr_decoder.finish());
@@ -379,6 +391,12 @@ impl<'a> Shell<'a> {
     /// A `TimedOut` fault (the command stayed silent for
     /// `operation_timeout_secs`) is not an error: it is returned as an empty,
     /// not-done poll, and the caller should poll again.
+    ///
+    /// This sends one Receive and never waits. In a loop, the caller sets the
+    /// pace: a server that answers at once with nothing makes such a loop
+    /// spin, so back off after a few empty polls in a row, as
+    /// [`run_command`](Self::run_command) does (50 ms after the third poll
+    /// that brought nothing in under 250 ms, doubling up to 1 s).
     pub async fn receive_next(&self, command_id: &str) -> Result<ReceiveOutput, WinrmError> {
         let endpoint = self.client.endpoint(&self.host);
         let config = self.client.config();
@@ -1513,6 +1531,32 @@ mod tests {
         let out = shell.run_command("slow", &[]).await.unwrap();
         assert_eq!(out.stdout, b"ok");
         assert_eq!(out.exit_code, 3);
+    }
+
+    #[tokio::test]
+    async fn shell_run_command_paces_a_server_answering_receive_instantly() {
+        use std::time::{Duration, Instant};
+        let server = MockServer::start().await;
+        mount_open_shell_and_command(&server).await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(TIMED_OUT_FAULT))
+            .up_to_n_times(6)
+            .mount(&server)
+            .await;
+        mount_ok(&server, DONE_OK, 1).await;
+        mount_ok(&server, "<s:Envelope><s:Body/></s:Envelope>", u64::MAX).await;
+
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        let shell = client.open_shell("127.0.0.1").await.unwrap();
+        let started = Instant::now();
+        let out = shell.run_command("x", &[]).await.unwrap();
+        let took = started.elapsed();
+        assert_eq!(out.exit_code, 3);
+        // 50 + 100 + 200 + 400 ms after the 3rd to 6th quick empty polls.
+        assert!(
+            took >= Duration::from_millis(700) && took < Duration::from_secs(5),
+            "{took:?}"
+        );
     }
 
     #[tokio::test]

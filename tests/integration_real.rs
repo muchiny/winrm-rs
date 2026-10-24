@@ -5061,3 +5061,115 @@ async fn before_send_refusal_leaves_a_kerberos_session_usable() {
     .expect("build Kerberos client");
     assert_refusal_leaves_session_usable(&client, &host, &gate).await;
 }
+
+// --- Poll pacing ---
+//
+// Run each test alone, so that its debug lines are its own:
+// `cargo test --test integration_real <name> -- --ignored --nocapture 2>&1 | grep -c "pacing a quick empty poll"`
+// The count must be 0 for every test but the last, which decides one doc line.
+
+fn init_debug_log() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("winrm_rs=debug")
+        .with_test_writer()
+        .try_init();
+}
+
+#[tokio::test]
+#[ignore]
+async fn poll_pacing_bench_cmd_ping() {
+    init_debug_log();
+    let Some((client, host)) = test_client_with(|c| c.operation_timeout_secs = 60) else {
+        eprintln!("SKIP poll_pacing_bench_cmd_ping: set WINRM_TEST_HOST and WINRM_TEST_PASS");
+        return;
+    };
+    let out = client
+        .run_command(&host, "cmd", &["/c", "ping -n 30 127.0.0.1"])
+        .await
+        .expect("run ping");
+    assert_eq!(out.exit_code, 0);
+}
+
+#[tokio::test]
+#[ignore]
+async fn poll_pacing_bench_powershell_times_out_once() {
+    init_debug_log();
+    let Some((client, host)) = test_client_with(|c| c.operation_timeout_secs = 60) else {
+        eprintln!(
+            "SKIP poll_pacing_bench_powershell_times_out_once: set WINRM_TEST_HOST and WINRM_TEST_PASS"
+        );
+        return;
+    };
+    // The 70 s sleep outlasts one 60 s OperationTimeout: one TimedOut fault.
+    let out = client
+        .run_powershell(&host, "Start-Sleep 70; Write-Output done")
+        .await
+        .expect("run sleep");
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "done");
+}
+
+#[tokio::test]
+#[ignore]
+async fn poll_pacing_bench_stderr_trickle() {
+    init_debug_log();
+    let Some((client, host)) = test_client_with(|c| c.operation_timeout_secs = 60) else {
+        eprintln!("SKIP poll_pacing_bench_stderr_trickle: set WINRM_TEST_HOST and WINRM_TEST_PASS");
+        return;
+    };
+    let out = client
+        .run_powershell(
+            &host,
+            "1..5 | % { [Console]::Error.WriteLine('e'); Start-Sleep 1 }",
+        )
+        .await
+        .expect("run stderr trickle");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let lines: Vec<&str> = stderr.lines().collect();
+    assert_eq!(lines, vec!["e"; 5], "stderr: {stderr:?}");
+}
+
+#[tokio::test]
+#[ignore]
+async fn poll_pacing_bench_wql_pages() {
+    init_debug_log();
+    let Some((client, host)) = test_client_with(|c| {
+        c.operation_timeout_secs = 60;
+        c.max_envelope_size = 8192;
+    }) else {
+        eprintln!("SKIP poll_pacing_bench_wql_pages: set WINRM_TEST_HOST and WINRM_TEST_PASS");
+        return;
+    };
+    let items = client
+        .run_wql(&host, "SELECT * FROM Win32_Process", None)
+        .await
+        .expect("run wql");
+    // Each item ends with a closing `...:Win32_Process>` tag.
+    assert!(
+        items.matches(":Win32_Process>").count() > 1,
+        "expected more than one item"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn poll_pacing_bench_zero_operation_timeout() {
+    init_debug_log();
+    let Some((client, host)) = test_client_with(|c| c.operation_timeout_secs = 0) else {
+        eprintln!(
+            "SKIP poll_pacing_bench_zero_operation_timeout: set WINRM_TEST_HOST and WINRM_TEST_PASS"
+        );
+        return;
+    };
+    match client
+        .run_command(&host, "cmd", &["/c", "ping -n 5 127.0.0.1"])
+        .await
+    {
+        Ok(o) => {
+            assert_eq!(o.exit_code, 0);
+            println!("PT0S accepted");
+        }
+        Err(WinrmError::Soap(e)) => println!("PT0S refused: {e}"),
+        Err(e) => panic!("unexpected error: {e}"),
+    }
+}

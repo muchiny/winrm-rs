@@ -49,6 +49,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   into an error.
 - A very large `operation_timeout_secs` no longer panics, or wraps to a short
   timeout, when the client is built or in `Shell::run_command`.
+- `run_command`, `run_powershell`, `Shell::run_command` and `run_wql` wait
+  before polling again when the server answers three or more times in a row,
+  at once, with nothing (50 ms doubling to 1 s).
 
 ## [1.4.1] - 2026-10-24
 

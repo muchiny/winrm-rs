@@ -49,11 +49,9 @@ impl<S> WinrmClientBuilder<S> {
     /// client: the HTTPS transport, the CredSSP outer TLS and the leg to an
     /// `https://` proxy. Both choices offer TLS 1.3 and 1.2.
     ///
-    /// Without this call, the client keeps the 1.x behaviour: building it
-    /// installs `ring` as the process-wide default when no provider is
-    /// installed yet, so a later `install_default` in the application returns
-    /// `Err`, and then it uses the process-wide provider. 2.0 stops installing
-    /// it.
+    /// Without this call, the client uses the process-wide provider when the
+    /// application installed one, else a private `ring` provider; it never
+    /// installs one.
     ///
     /// A missing process provider with [`TlsProvider::ProcessDefault`] is
     /// reported as [`WinrmError::AuthFailed`], like the other TLS setup

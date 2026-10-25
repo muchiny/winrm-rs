@@ -86,9 +86,9 @@ impl WinrmClient {
     /// [`WinrmClientBuilder::build`], which also covers the options that only
     /// the builder sets.
     ///
-    /// TLS uses the process-wide rustls provider, and installs `ring` as that
-    /// default first when none is installed. Use [`WinrmClient::builder`] with
-    /// `tls_provider` to leave the process default alone.
+    /// TLS uses the process-wide rustls provider when the application
+    /// installed one, else a private `ring` provider; it never installs one.
+    /// Use [`WinrmClient::builder`] with `tls_provider` to choose the provider.
     #[tracing::instrument(level = "debug", skip(config, credentials))]
     pub fn new(config: WinrmConfig, credentials: WinrmCredentials) -> Result<Self, WinrmError> {
         Self::with_options(config, credentials, TransportOptions::default())

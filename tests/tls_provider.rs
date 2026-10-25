@@ -33,6 +33,11 @@ fn tls_provider_ring_leaves_the_process_default_alone() {
         }
         other => panic!("expected AuthFailed, got {:?}", other.err()),
     }
+    WinrmClient::new(WinrmConfig::https(), WinrmCredentials::new("u", "p", "")).unwrap();
+    assert!(
+        CryptoProvider::get_default().is_none(),
+        "WinrmClient::new installed a process default"
+    );
     #[expect(
         clippy::disallowed_methods,
         reason = "the host installs its provider after building clients"

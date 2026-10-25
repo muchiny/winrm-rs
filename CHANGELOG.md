@@ -223,6 +223,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `PSCredential` and `SecureString` values), which reached logs only
   through these traces. Migration: a caller who reads the bodies from the
   traces builds the client with `WinrmClientBuilder::log_soap_bodies(true)`.
+- Building a client no longer installs ring as the process-wide rustls
+  provider. The client uses the application's provider when one is installed,
+  else a private ring provider. Migration: an application that relied on
+  winrm-rs installing it must now call `CryptoProvider::install_default`
+  itself, or its own rustls configs built from the process default panic or
+  fail.
 
 ### Added
 

@@ -562,9 +562,9 @@ const NO_PROCESS_PROVIDER: &str = "no process-wide rustls CryptoProvider is inst
 
 /// The crypto provider of every TLS configuration of a client.
 ///
-/// - `None` (no choice, the 1.x behaviour): installs `ring` as the
-///   process-wide default when none is installed yet, then uses the
-///   process-wide default.
+/// - `None` (no choice): the process-wide default when the application
+///   installed one, else a `ring` provider private to the client. It never
+///   installs a process-wide default.
 /// - [`TlsProvider::Ring`]: a `ring` provider private to the client; the
 ///   process-wide default is neither read nor installed.
 /// - [`TlsProvider::ProcessDefault`]: the process-wide default, or
@@ -578,15 +578,9 @@ pub(crate) fn crypto_provider(
             .ok_or_else(|| WinrmError::AuthFailed(NO_PROCESS_PROVIDER.into()))
     };
     match choice {
-        None => {
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "1.x installs ring process-wide for callers that choose no provider; \
-                          removed in 2.0"
-            )]
-            let _ = rustls::crypto::ring::default_provider().install_default();
-            process_default()
-        }
+        None => Ok(CryptoProvider::get_default()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()))),
         Some(TlsProvider::Ring) => Ok(Arc::new(rustls::crypto::ring::default_provider())),
         Some(TlsProvider::ProcessDefault) => process_default(),
     }

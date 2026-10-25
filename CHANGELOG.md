@@ -323,6 +323,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   stays in process memory, unwiped, inside `rustls` and `ring`.
   `CommandOutput` says that `stdout` and `stderr` are returned as the command
   wrote them, and `Shell::receive_next` how to pace a polling loop.
+- `before_send_with` documents a kill switch that still lets `Signal` and
+  `Delete` through, so running commands and PSRP pipelines can be stopped,
+  and `Shell::disconnect` documents its Delete fallback under a refusing hook.
 
 ## [1.4.1] - 2026-10-24
 

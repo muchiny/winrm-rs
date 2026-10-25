@@ -324,6 +324,8 @@ impl<'a> Shell<'a> {
     /// exists under `cmd`.
     ///
     /// Like every request, it goes through the client's [`before_send`](crate::WinrmClientBuilder::before_send) hook: a refusal fails with [`WinrmError::Cancelled`](crate::WinrmError::Cancelled) and the command keeps running.
+    /// A [`before_send_with`](crate::WinrmClientBuilder::before_send_with) hook
+    /// can let it through by its kind, [`RequestKind::Signal`](crate::RequestKind::Signal).
     pub async fn signal_ctrl_c(&self, command_id: &str) -> Result<(), WinrmError> {
         let endpoint = self.client.endpoint(&self.host);
         let config = self.client.config();
@@ -516,6 +518,13 @@ impl<'a> Shell<'a> {
     /// With [`AuthMethod::CredSsp`](crate::AuthMethod::CredSsp), a
     /// disconnected shell keeps running on the server with your delegated
     /// credentials; prefer [`close`](Self::close) unless you will reconnect.
+    ///
+    /// If the Disconnect fails, a refusal by the client's `before_send` hook
+    /// included, the shell is deleted instead (that Delete goes through the
+    /// hook too) and the Disconnect's error is returned: the runspace is gone.
+    /// A hook that refuses [`RequestKind::Disconnect`](crate::RequestKind::Disconnect)
+    /// but lets [`RequestKind::Delete`](crate::RequestKind::Delete) through
+    /// therefore deletes the shell.
     pub async fn disconnect(mut self) -> Result<String, WinrmError> {
         self.closed = true;
         let endpoint = self.client.endpoint(&self.host);
@@ -926,6 +935,116 @@ mod tests {
             .await
             .unwrap();
         shell.signal_ctrl_c("CMD-Z").await.unwrap();
+    }
+
+    /// A kill switch that lets Signal and Delete through still stops the running
+    /// command and deletes its shell; the Receive after the switch is refused.
+    #[tokio::test]
+    async fn a_kind_aware_hook_lets_the_stop_and_delete_through() {
+        use crate::RequestKind;
+        use crate::soap::envelope::request_action;
+        use crate::soap::namespaces::{
+            ACTION_COMMAND, ACTION_CREATE, ACTION_DELETE, ACTION_SIGNAL, SIGNAL_CTRL_C,
+        };
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let server = MockServer::start().await;
+        mount_open_shell_and_command(&server).await;
+        mount_ok(&server, "<s:Envelope><s:Body/></s:Envelope>", u64::MAX).await;
+        let stopped = Arc::new(AtomicBool::new(false));
+        let s = Arc::clone(&stopped);
+        let client = WinrmClient::builder(basic_config(server.address().port()))
+            .credentials(test_creds())
+            .before_send_with(move |req| {
+                !s.load(Ordering::SeqCst)
+                    || matches!(req.kind(), RequestKind::Signal | RequestKind::Delete)
+            })
+            .build()
+            .unwrap();
+        let shell = client.open_shell("127.0.0.1").await.unwrap();
+        let command_id = shell
+            .start_command("ping", &["-t", "localhost"])
+            .await
+            .unwrap();
+        stopped.store(true, Ordering::SeqCst);
+
+        assert!(matches!(
+            shell.receive_next(&command_id).await,
+            Err(WinrmError::Cancelled)
+        ));
+        shell.signal_ctrl_c(&command_id).await.unwrap();
+        shell.close().await.unwrap();
+
+        let bodies: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| String::from_utf8(r.body).unwrap())
+            .collect();
+        let actions: Vec<Option<&str>> = bodies.iter().map(|b| request_action(b)).collect();
+        assert_eq!(
+            actions,
+            [
+                Some(ACTION_CREATE),
+                Some(ACTION_COMMAND),
+                Some(ACTION_SIGNAL),
+                Some(ACTION_DELETE)
+            ]
+        );
+        assert!(bodies[2].contains(&format!("<rsp:Code>{SIGNAL_CTRL_C}</rsp:Code>")));
+    }
+
+    /// The same hook lets the PSRP stop through (PowerShell ResourceURI, PSRP code).
+    #[tokio::test]
+    async fn a_kind_aware_hook_lets_the_psrp_stop_through() {
+        use crate::RequestKind;
+        use crate::soap::envelope::request_action;
+        use crate::soap::namespaces::{
+            ACTION_DELETE, ACTION_RECONNECT, ACTION_SIGNAL, RESOURCE_URI_PSRP, SIGNAL_PSRP_CTRL_C,
+        };
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let server = MockServer::start().await;
+        mount_ok(&server, "<s:Envelope><s:Body/></s:Envelope>", u64::MAX).await;
+        let stopped = Arc::new(AtomicBool::new(false));
+        let s = Arc::clone(&stopped);
+        let client = WinrmClient::builder(basic_config(server.address().port()))
+            .credentials(test_creds())
+            .before_send_with(move |req| {
+                !s.load(Ordering::SeqCst)
+                    || matches!(req.kind(), RequestKind::Signal | RequestKind::Delete)
+            })
+            .build()
+            .unwrap();
+        let shell = client
+            .reconnect_shell("127.0.0.1", "PSRP-SHELL", RESOURCE_URI_PSRP)
+            .await
+            .unwrap();
+        stopped.store(true, Ordering::SeqCst);
+        shell.signal_ctrl_c("CMD-Z").await.unwrap();
+        shell.close().await.unwrap();
+
+        let bodies: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| String::from_utf8(r.body).unwrap())
+            .collect();
+        let actions: Vec<Option<&str>> = bodies.iter().map(|b| request_action(b)).collect();
+        assert_eq!(
+            actions,
+            [
+                Some(ACTION_RECONNECT),
+                Some(ACTION_SIGNAL),
+                Some(ACTION_DELETE)
+            ]
+        );
+        assert!(bodies[1].contains(&format!("<rsp:Code>{SIGNAL_PSRP_CTRL_C}</rsp:Code>")));
+        assert!(bodies[1].contains(RESOURCE_URI_PSRP));
     }
 
     #[test]

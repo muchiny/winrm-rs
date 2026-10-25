@@ -1663,6 +1663,31 @@ mod tests {
         assert!(server.received_requests().await.unwrap().is_empty());
     }
 
+    /// The 1.4 hook is unchanged: `false` refuses the stop and the Delete too.
+    #[tokio::test]
+    async fn the_legacy_hook_still_refuses_signal_and_delete() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let client = WinrmClient::builder(basic_config(server.address().port()))
+            .credentials(test_creds())
+            .before_send(|| false)
+            .build()
+            .unwrap();
+        assert!(matches!(
+            client.signal_terminate("127.0.0.1", "S", "C").await,
+            Err(WinrmError::Cancelled)
+        ));
+        assert!(matches!(
+            client.delete_shell("127.0.0.1", "S").await,
+            Err(WinrmError::Cancelled)
+        ));
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
     /// One client, two hosts: the hook refuses one and serves the other. The
     /// refused host is never contacted, not even resolved.
     #[tokio::test]

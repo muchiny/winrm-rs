@@ -243,7 +243,8 @@ impl WinrmClientBuilder<Ready> {
     /// PowerShell pipeline then keeps running, not only the shell, until the
     /// server reaps the shell. A refused Disconnect makes
     /// [`Shell::disconnect`](crate::Shell::disconnect) fall back to a Delete,
-    /// which the hook sees too.
+    /// which the hook sees too. To let them through while refusing the rest,
+    /// use [`Self::before_send_with`] (its second example).
     ///
     /// # When it runs
     ///
@@ -370,6 +371,56 @@ impl WinrmClientBuilder<Ready> {
     ///     .unwrap();
     /// # drop(client);
     /// ```
+    ///
+    /// # Example: a kill switch that still stops running work
+    ///
+    /// A hook that returns `false` also refuses the Signal and the Delete that
+    /// would stop a running command (see [`before_send`](Self::before_send)).
+    /// This switch lets them through, except to a host cut off as hostile,
+    /// which gets nothing at all: a Delete on a new connection would run a
+    /// fresh NTLM or Kerberos handshake with it.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use std::sync::atomic::{AtomicBool, Ordering};
+    /// use winrm_rs::{RequestKind, WinrmClient, WinrmConfig, WinrmCredentials};
+    ///
+    /// let stopped = Arc::new(AtomicBool::new(false));
+    /// let switch = Arc::clone(&stopped);
+    /// let hostile = ["10.0.0.66"];
+    /// let client = WinrmClient::builder(WinrmConfig::default())
+    ///     .credentials(WinrmCredentials::new("admin", "pass", ""))
+    ///     .before_send_with(move |req| {
+    ///         if hostile.iter().any(|h| req.host().eq_ignore_ascii_case(h)) {
+    ///             return false;
+    ///         }
+    ///         !switch.load(Ordering::Relaxed)
+    ///             || matches!(
+    ///                 req.kind(),
+    ///                 RequestKind::Signal | RequestKind::Delete | RequestKind::Disconnect
+    ///             )
+    ///     })
+    ///     .build()
+    ///     .unwrap();
+    /// // Later: refuse new work, but still stop and clean up what runs.
+    /// stopped.store(true, Ordering::Relaxed);
+    /// # drop(client);
+    /// ```
+    ///
+    /// - `Signal` carries [`Shell::signal_ctrl_c`](crate::Shell::signal_ctrl_c)
+    ///   (the PSRP stop included) and
+    ///   [`WinrmClient::signal_terminate`](crate::WinrmClient::signal_terminate).
+    /// - `Delete` carries [`Shell::close`](crate::Shell::close),
+    ///   [`WinrmClient::delete_shell`](crate::WinrmClient::delete_shell) and the
+    ///   clean-up of `run_command*` and `run_powershell*`. When the switch
+    ///   refuses a Receive there, the call fails with `Cancelled` and its
+    ///   clean-up sends only the shell Delete, no Signal: deleting the shell is
+    ///   what ends the command.
+    /// - `Disconnect` is allowed because a refused Disconnect makes
+    ///   [`Shell::disconnect`](crate::Shell::disconnect) delete the shell
+    ///   instead, losing the runspace. Leave it out if a stopped client must not
+    ///   keep shells alive on the server. Allow `Reconnect` too only if you
+    ///   reconnect to shells after stopping.
     ///
     /// [`OutgoingRequest::host`]: crate::OutgoingRequest::host
     /// [`RequestKind`]: crate::RequestKind

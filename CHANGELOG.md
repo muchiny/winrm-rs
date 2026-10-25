@@ -265,6 +265,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `WinrmClientBuilder::log_soap_bodies(true)` logs every SOAP body at
   `trace`, target `winrm_rs::wire`, in plaintext. For debugging only.
   Clients built with `WinrmClient::new` cannot turn it on; use the builder.
+- `WinrmConfig::https()` (HTTPS on 5986, NTLM, certificate validated) and `WinrmConfig::http()` (plain HTTP on 5985, today's default). The default becomes HTTPS on 5986 in 2.0; `WinrmConfig::http()` keeps plain HTTP.
 
 ### Fixed
 

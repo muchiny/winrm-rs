@@ -11,6 +11,9 @@ use secrecy::SecretString;
 /// listener (`Enable-PSRemoting`, `winrm quickconfig`): HTTP on port 5985,
 /// NTLM, sealed SOAP bodies, 30 s connect / 60 s operation timeouts.
 ///
+/// Planned for 2.0: the default becomes HTTPS on 5986, the settings of
+/// [`WinrmConfig::https()`]; [`WinrmConfig::http()`] keeps plain HTTP on 5985.
+///
 /// # Security
 ///
 /// The default, NTLM over plain HTTP, protects the SOAP bodies (sealing, see
@@ -327,6 +330,62 @@ impl Default for WinrmConfig {
             env_vars: Vec::new(),
             idle_timeout_secs: None,
             max_output_bytes: Some(64 * 1024 * 1024),
+        }
+    }
+}
+
+impl WinrmConfig {
+    /// HTTPS on port 5986, NTLM, certificate validated, every other field as
+    /// in [`Default`]. TLS authenticates the server by its certificate and
+    /// NTLM carries a channel binding to it: the recommended setting on a
+    /// network you do not trust. A listener with a self-signed certificate
+    /// does not pass validation; do not reach for `accept_invalid_certs` (see
+    /// its Security section). Trust its CA with
+    /// [`add_root_certificates_pem`](crate::WinrmClientBuilder::add_root_certificates_pem).
+    ///
+    /// ```no_run
+    /// use winrm_rs::{WinrmClient, WinrmConfig, WinrmCredentials};
+    ///
+    /// # fn main() -> Result<(), winrm_rs::WinrmError> {
+    /// let client = WinrmClient::new(
+    ///     WinrmConfig::https(),
+    ///     WinrmCredentials::new("administrator", "secret", ""),
+    /// )?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn https() -> Self {
+        Self {
+            use_tls: true,
+            port: 5986,
+            ..Self::default()
+        }
+    }
+
+    /// Plain HTTP on port 5985, NTLM, sealed bodies: the settings of a
+    /// Windows host's stock listener, and today's [`Default`]. Read the
+    /// Security section of [`WinrmConfig`] first: over plain HTTP NTLM does
+    /// not authenticate the server. It keeps port 5985 when the default
+    /// changes in 2.0.
+    ///
+    /// ```no_run
+    /// use winrm_rs::{WinrmClient, WinrmConfig, WinrmCredentials};
+    ///
+    /// # fn main() -> Result<(), winrm_rs::WinrmError> {
+    /// let client = WinrmClient::new(
+    ///     WinrmConfig::http(),
+    ///     WinrmCredentials::new("administrator", "secret", ""),
+    /// )?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn http() -> Self {
+        Self {
+            use_tls: false,
+            port: 5985,
+            ..Self::default()
         }
     }
 }
@@ -777,6 +836,31 @@ impl std::fmt::Debug for WinrmCredentials {
 mod tests {
     use super::*;
     use secrecy::ExposeSecret;
+
+    #[test]
+    fn https_preset_is_tls_on_5986() {
+        let c = WinrmConfig::https();
+        assert!(c.use_tls);
+        assert_eq!(c.port, 5986);
+        assert!(!c.accept_invalid_certs);
+        assert!(matches!(c.auth_method, AuthMethod::Ntlm));
+        assert_eq!(c.encryption, EncryptionMode::Auto);
+        assert_eq!(
+            crate::transport::endpoint_url(c.use_tls, "h", c.port),
+            "https://h:5986/wsman"
+        );
+    }
+
+    #[test]
+    fn http_preset_equals_default() {
+        // `WinrmConfig` has no `PartialEq`; its `Debug` lists every field.
+        assert_eq!(
+            format!("{:?}", WinrmConfig::http()),
+            format!("{:?}", WinrmConfig::default())
+        );
+        assert!(!WinrmConfig::http().use_tls);
+        assert_eq!(WinrmConfig::http().port, 5985);
+    }
 
     #[test]
     fn default_config_uses_http_and_ntlm() {

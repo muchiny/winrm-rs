@@ -389,6 +389,8 @@ winrm-rs logs through `tracing`. Below `trace` it logs no command text, argument
 | **v0.5** | File transfer, streaming output, proxy | Done |
 | **v1.0** | Stable public API, TLS channel binding, CI/CD | Done |
 | **v1.4** | `before_send` request hook | **Current** |
+| **v1.5** | `WinrmConfig::https()` / `http()` presets, opt-in SOAP body logging | Planned |
+| **v2.0** | HTTPS on 5986 by default | Planned |
 | **v1.x** | CredSSP stabilization (`--features credssp`) | Planned |
 
 ## Comparison

@@ -175,7 +175,9 @@ impl<S> WinrmClientBuilder<S> {
     /// [`WinrmConfig::proxy`] for how they apply). CredSSP then follows them
     /// too, per request (`NO_PROXY` is matched against each host); it
     /// refuses an `https://` or `socks4://` proxy from the environment for
-    /// the requests that proxy applies to.
+    /// the requests that proxy applies to. That refusal comes after the
+    /// [`before_send`](WinrmClientBuilder::before_send) hook, which has
+    /// already approved the request when it is refused.
     ///
     /// With `false` (the default since 2.0), no variable is read: only
     /// [`WinrmConfig::proxy`] applies, and with it `None` every request goes

@@ -753,7 +753,11 @@ impl WinrmClient {
     /// # let client = WinrmClient::new(WinrmConfig::default(), WinrmCredentials::new("u","p",""))?;
     /// // A long wait would block a plain `run_powershell` until it ends.
     /// let err = client
-    ///     .run_powershell_with_timeout("server", "Start-Sleep -Seconds 3600", Duration::from_secs(10))
+    ///     .run_powershell_with_timeout(
+    ///         "server",
+    ///         "Start-Sleep -Seconds 3600",
+    ///         Duration::from_secs(10),
+    ///     )
     ///     .await
     ///     .unwrap_err();
     /// assert!(matches!(err, WinrmError::Timeout(10)));

@@ -263,9 +263,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `use_tls`, 5985 without. Migration: `port: 5986` becomes
   `port: Some(5986)`, and a read of the port in use calls
   `WinrmConfig::effective_port()`.
-- `WinrmConfig::proxy` is an `Option<SecretString>`: build it with
-  `SecretString::from(url)`. The crate's copy of the proxy URL, which can
-  hold credentials, is wiped on drop.
+- `WinrmConfig::proxy` is an `Option<SecretString>`, since the proxy URL
+  can hold credentials. Migration: import `winrm_rs::SecretString` and
+  build it with `SecretString::from(url)`. The copy held by `WinrmConfig`
+  and by the proxy route is wiped on drop.
 - `RemotePathPolicy::LocalDrive` also refuses DOS device names (`CON`,
   `NUL`, `COM1`, `LPT1`, ...) as the last path component, with or without
   an extension. Migration: `RemotePathPolicy::Any` accepts them.

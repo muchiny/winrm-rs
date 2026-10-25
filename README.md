@@ -462,6 +462,7 @@ environment variables and use `--ignored`:
 | `WINRM_TEST_PASS` | yes | — | Password for the test account |
 | `WINRM_TEST_USER` | no | `vagrant` | Username |
 | `WINRM_TEST_PORT` | no | `5985` | WinRM port (`5985` = HTTP, `5986` = HTTPS) |
+| `WINRM_TEST_HTTPS_CERT_SHA256` | for the HTTPS legs | — | SHA-256 fingerprint of the HTTPS listener certificate, pinned by the tests that verify it; required for the HTTPS legs (`basic_over_https_works`, `http_proxy_connect_carries_https`, the CredSSP tests) |
 
 ```sh
 WINRM_TEST_HOST=192.0.2.10 \

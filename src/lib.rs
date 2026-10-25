@@ -27,7 +27,7 @@
 //!
 //! | Method | Enum variant | Notes |
 //! |--------|-------------|-------|
-//! | HTTP Basic | [`AuthMethod::Basic`] | Credentials sent base64-encoded per request. Use only over HTTPS; over plain HTTP the client is refused unless `encryption` is [`EncryptionMode::Never`]. |
+//! | HTTP Basic | [`AuthMethod::Basic`] | Credentials sent base64-encoded per request. Use only over HTTPS with a verified certificate: refused with `accept_invalid_certs` over HTTPS, and over plain HTTP unless `encryption` is [`EncryptionMode::Never`]. |
 //! | `NTLMv2` | [`AuthMethod::Ntlm`] | Three-step handshake (negotiate / challenge / authenticate). Default. Authenticates the client only: over plain HTTP the handshake can be relayed, or recorded to guess the password offline (sealing protects the bodies, not the handshake); on untrusted networks use HTTPS with certificate validation (channel binding) or Kerberos. See [`WinrmConfig`] (Security). |
 //! | Kerberos | [`AuthMethod::Kerberos`] | Raw Kerberos GSS-API tokens (not SPNEGO) under the `Negotiate` HTTP scheme, via the system Kerberos library. Messages sealed with the Kerberos context over HTTP (see [`EncryptionMode`]); over HTTPS, channel binding to the probe's certificate, pinned for the connection's life. Requires `kerberos` feature + `kinit`. Windows clients: SSPI path built by the `kerberos-windows` CI job, not tested live; `EncryptionMode::Never` is the way back. |
 //! | Certificate | [`AuthMethod::Certificate`] | TLS client certificate; requires `use_tls = true` (building the client fails with `AuthFailed` otherwise). Set `client_cert_pem` and `client_key_pem` on config. |
@@ -54,13 +54,17 @@
 //! - `warn`: at each client construction, settings that weaken security
 //!   (`accept_invalid_certs`, `danger_accept_invalid_proxy_certs` when an
 //!   `https://` proxy applies, Basic over plain HTTP (`EncryptionMode::Never`)
-//!   or NTLM over plain HTTP) and proxy settings that may surprise (a plain-HTTP client that may
-//!   follow a proxy from the environment, an environment variable that is
-//!   not a usable proxy URL, which is ignored). At run time: a proxy that
-//!   does not announce session-based authentication (once per endpoint), a
-//!   shell dropped without `close`, a retry. The NTLM one has its own target,
-//!   `winrm_rs::ntlm_over_http`, so a deliberate plain-HTTP deployment can
-//!   silence it alone.
+//!   or NTLM over plain HTTP) and proxy settings that may surprise (a
+//!   plain-HTTP client that opted in with
+//!   [`use_env_proxy`](WinrmClientBuilder::use_env_proxy), an environment
+//!   variable that is not a usable proxy URL, which is ignored). At run time:
+//!   a proxy that does not announce session-based authentication (once per
+//!   endpoint), a shell dropped without `close`, a retry, and, on a client
+//!   that left the port to its HTTPS default and goes through no proxy, a
+//!   hint naming `WinrmConfig::http()` once per call that fails to connect
+//!   (a host name that does not resolve included). The NTLM one has its own
+//!   target, `winrm_rs::ntlm_over_http`, so a deliberate plain-HTTP
+//!   deployment can silence it alone.
 //! - `info`: no request content.
 //! - `debug`: spans with the host (userinfo replaced by `<redacted>`), shell
 //!   and command ids, `args_len`, `script_len`, `query_len`, the WQL
@@ -94,7 +98,8 @@
 //! re-exported for convenience:
 //!
 //! - [`SecretString`] / [`ExposeSecret`] from the `secrecy` crate —
-//!   used for the `password` field of [`WinrmCredentials`].
+//!   used for the `password` field of [`WinrmCredentials`] and for
+//!   [`WinrmConfig::proxy`].
 //! - [`CancellationToken`] from `tokio_util` — used as a parameter to
 //!   the `*_with_cancel` methods of [`WinrmClient`] so callers can
 //!   cooperatively cancel in-flight operations.

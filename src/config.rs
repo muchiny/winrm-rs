@@ -177,8 +177,11 @@ pub struct WinrmConfig {
     pub client_key_pem: Option<String>,
     /// Proxy URL (e.g. `"http://proxy:8080"`), held as a [`SecretString`]
     /// because it can carry credentials: the crate's copy is wiped on drop
-    /// and never shown by `Debug`. Build it with
-    /// `SecretString::from("http://proxy:8080")`.
+    /// and its user info is never shown by `Debug`. Build it with
+    /// `SecretString::from("http://proxy:8080")`. Build it from a `&str`, or
+    /// from a `String` whose length equals its capacity, so that converting
+    /// it leaves no spare buffer behind (a `String` with spare capacity is
+    /// reallocated, and its old buffer is freed without being wiped).
     ///
     /// When set, WinRM requests go through this proxy.
     /// [`AuthMethod::CredSsp`] uses this proxy through an HTTP `CONNECT` or

@@ -66,10 +66,9 @@ pub(crate) fn validate_remote_path(path: &str) -> Result<(), WinrmError> {
 ///
 /// [`LocalDrive`](Self::LocalDrive), the default since 2.0, accepts only
 /// drive-absolute paths (`C:\…` or `C:/…`) and refuses, before anything is
-/// sent: every path that
-/// starts with two separators (`\\host\share`, `//host/share`,
-/// `\\?\UNC\…`, `\\.\pipe\…`, and also `\\?\C:\…`), `\??\…`, drive-relative
-/// (`C:x`), root-relative (`\x`) and relative paths.
+/// sent: every path that starts with two separators (`\\host\share`,
+/// `//host/share`, `\\?\UNC\…`, `\\.\pipe\…`, and also `\\?\C:\…`),
+/// `\??\…`, drive-relative (`C:x`), root-relative (`\x`) and relative paths.
 /// [`Any`](Self::Any) accepts every path Windows can open, including UNC and
 /// WebDAV shares and device paths: CredSSP double-hop users need it to reach
 /// `\\fileserver\share`.

@@ -19,8 +19,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
-# No cache anywhere in this workflow: a tag run could restore a cache written
-# by another ref.
+# No cache step in this workflow: a tag run could restore a cache written by
+# another ref. The semver-checks action keeps its own baseline cache; it only
+# affects the `verify` job.
 jobs:
   verify:
     name: Verify the commit

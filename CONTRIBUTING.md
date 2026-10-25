@@ -105,10 +105,10 @@ a production host.
 
 ## Releasing (maintainers)
 
-1. Merge the release PR (version bump, CHANGELOG) into `main`, and wait until the `CI` run of that merge commit is green. Push runs on `main` are never cancelled.
+1. Merge the release PR (version bump, CHANGELOG) into `main`, and wait until the `CI` run of that merge commit is green. Each push run on `main` has its own concurrency group, so a later merge does not cancel it.
 2. Tag that commit: `git tag -a vX.Y.Z -m vX.Y.Z <sha> && git push origin vX.Y.Z`. The tag must equal `v` + the `Cargo.toml` version and point to a commit on `main` whose push-to-main `CI` run succeeded. Published tags cannot be moved or deleted: fix a bad release with a new patch version.
 3. The Release workflow checks both points, then runs `cargo deny` advisories and `cargo semver-checks`, and packages the crate. It then waits for approval of the `crates-io` environment. Approve it, and the job publishes through crates.io Trusted Publishing, with no stored token.
-4. Never run `cargo publish` by hand: crates.io accepts only Trusted Publishing for this crate.
+4. Never run `cargo publish` by hand: releases go through Trusted Publishing only (crates.io enforces this once trusted-publishing-only is enabled for the crate).
 5. Dry run: `gh workflow run release.yml --ref main` runs `verify` and `package` without publishing. A manual run never publishes, even on a tag ref: only a tag push does.
 6. A new advisory on any dependency blocks `verify`, even for an urgent fix. Add a `deny.toml` `ignore` entry with a reason and `revue avant AAAA-MM-JJ` in a PR; never skip the job.
 

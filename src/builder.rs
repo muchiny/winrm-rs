@@ -523,10 +523,12 @@ impl WinrmClientBuilder<Ready> {
         self
     }
 
-    /// Restrict the `remote_path` of every transfer method; see
-    /// [`RemotePathPolicy`](crate::RemotePathPolicy). Use
-    /// [`RemotePathPolicy::LocalDrive`](crate::RemotePathPolicy::LocalDrive)
-    /// when remote paths come from anyone but you.
+    /// Choose which `remote_path` forms the transfer methods accept; see
+    /// [`RemotePathPolicy`](crate::RemotePathPolicy). The default since 2.0 is
+    /// [`RemotePathPolicy::LocalDrive`](crate::RemotePathPolicy::LocalDrive):
+    /// drive-absolute paths only. Pass
+    /// [`RemotePathPolicy::Any`](crate::RemotePathPolicy::Any) to reach UNC
+    /// shares on purpose, typically CredSSP double-hop.
     pub fn remote_path_policy(mut self, policy: RemotePathPolicy) -> Self {
         self.remote_path_policy = policy;
         self
@@ -676,6 +678,19 @@ mod tests {
         assert_eq!(on_again.powershell_args("E"), flags_on);
         let via_new = WinrmClient::new(WinrmConfig::default(), creds()).unwrap();
         assert_eq!(via_new.powershell_args("E"), flags_on);
+    }
+
+    /// The builder and `WinrmClient::new` both start with `LocalDrive`.
+    #[test]
+    fn builder_and_new_both_default_to_local_drive() {
+        let built = WinrmClient::builder(WinrmConfig::default())
+            .credentials(WinrmCredentials::new("u", "p", ""))
+            .build()
+            .unwrap();
+        assert_eq!(built.remote_path_policy, RemotePathPolicy::LocalDrive);
+        let new =
+            WinrmClient::new(WinrmConfig::default(), WinrmCredentials::new("u", "p", "")).unwrap();
+        assert_eq!(new.remote_path_policy, RemotePathPolicy::LocalDrive);
     }
 
     /// `remote_path_policy` reaches the client; without the call, and

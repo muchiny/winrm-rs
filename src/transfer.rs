@@ -45,8 +45,9 @@ const MAX_REMOTE_PATH_LEN: usize = 260;
 /// erring towards refusing a path is the safe direction here.
 ///
 /// This is not a safety check: UNC, WebDAV and device paths pass (see the
-/// `# Security` section of [`WinrmClient::upload_file`]).
-/// [`validate_remote_path_for`] adds the client's [`RemotePathPolicy`].
+/// `# Security` section of [`WinrmClient::upload_file`]); the client's
+/// [`RemotePathPolicy`], added by [`validate_remote_path_for`], refuses them
+/// by default.
 pub(crate) fn validate_remote_path(path: &str) -> Result<(), WinrmError> {
     if path.len() > MAX_REMOTE_PATH_LEN {
         return Err(WinrmError::Transfer(format!(
@@ -63,30 +64,32 @@ pub(crate) fn validate_remote_path(path: &str) -> Result<(), WinrmError> {
 
 /// Which `remote_path` forms the transfer methods accept.
 ///
-/// [`Any`](Self::Any), the default in 1.x, accepts every path Windows can
-/// open, including UNC and WebDAV shares and device paths: CredSSP
-/// double-hop users need it to reach `\\fileserver\share`.
-/// [`LocalDrive`](Self::LocalDrive) accepts only drive-absolute paths
-/// (`C:\…` or `C:/…`) and refuses, before anything is sent: every path that
+/// [`LocalDrive`](Self::LocalDrive), the default since 2.0, accepts only
+/// drive-absolute paths (`C:\…` or `C:/…`) and refuses, before anything is
+/// sent: every path that
 /// starts with two separators (`\\host\share`, `//host/share`,
 /// `\\?\UNC\…`, `\\.\pipe\…`, and also `\\?\C:\…`), `\??\…`, drive-relative
 /// (`C:x`), root-relative (`\x`) and relative paths.
+/// [`Any`](Self::Any) accepts every path Windows can open, including UNC and
+/// WebDAV shares and device paths: CredSSP double-hop users need it to reach
+/// `\\fileserver\share`.
 ///
 /// This is a lexical check. A symbolic link, junction, `subst` drive or
 /// mapped network drive on the host can still lead a drive-absolute path to
 /// a share.
 ///
-/// Set it with
-/// [`WinrmClientBuilder::remote_path_policy`](crate::WinrmClientBuilder::remote_path_policy).
+/// Only the builder chooses the policy, with
+/// [`WinrmClientBuilder::remote_path_policy`](crate::WinrmClientBuilder::remote_path_policy);
+/// [`WinrmClient::new`](crate::WinrmClient::new) always uses the default.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RemotePathPolicy {
     /// Accept every remote path the base checks admit (length, no control
-    /// characters): the behaviour of every release before this type.
-    #[default]
+    /// characters): the behaviour of every release before 2.0.
     Any,
     /// Accept only drive-absolute remote paths: a letter, `:`, then `\` or
-    /// `/`.
+    /// `/`. The default since 2.0.
+    #[default]
     LocalDrive,
 }
 
@@ -156,9 +159,11 @@ impl WinrmClient {
     ///   credentials unless it is configured for constrained delegation, and
     ///   then only to the targets that delegation allows. It is not a sandbox:
     ///   never pass an untrusted `remote_path`.
-    ///   With [`RemotePathPolicy::LocalDrive`](crate::RemotePathPolicy::LocalDrive),
-    ///   UNC, WebDAV and device paths are refused before anything is sent; it
-    ///   does not limit which local files a path names.
+    ///   By default ([`RemotePathPolicy::LocalDrive`](crate::RemotePathPolicy::LocalDrive),
+    ///   since 2.0) UNC, WebDAV and device paths are refused before anything
+    ///   is sent; it does not limit which local files a path names. A client
+    ///   built with `.remote_path_policy(RemotePathPolicy::Any)` lets them
+    ///   through.
     /// - Each chunk of the file, up to 2000 bytes, travels as base64 inside the
     ///   `powershell.exe -EncodedCommand` command line. A host that audits
     ///   process command lines (Security event 4688, Sysmon event 1) or logs
@@ -275,9 +280,11 @@ impl WinrmClient {
     ///   credentials unless it is configured for constrained delegation, and
     ///   then only to the targets that delegation allows. It is not a sandbox:
     ///   never pass an untrusted `remote_path`.
-    ///   With [`RemotePathPolicy::LocalDrive`](crate::RemotePathPolicy::LocalDrive),
-    ///   UNC, WebDAV and device paths are refused before anything is sent; it
-    ///   does not limit which local files a path names.
+    ///   By default ([`RemotePathPolicy::LocalDrive`](crate::RemotePathPolicy::LocalDrive),
+    ///   since 2.0) UNC, WebDAV and device paths are refused before anything
+    ///   is sent; it does not limit which local files a path names. A client
+    ///   built with `.remote_path_policy(RemotePathPolicy::Any)` lets them
+    ///   through.
     /// - The file comes back as base64 on the command's stdout. PowerShell
     ///   transcription on the host, if enabled, records it.
     /// - `local_path` is written with this process's privileges. A symbolic
@@ -1018,8 +1025,9 @@ mod tests {
     }
 
     #[test]
-    fn default_policy_still_accepts_unc_paths() {
-        assert_eq!(RemotePathPolicy::default(), RemotePathPolicy::Any);
+    fn default_policy_refuses_unc_paths() {
+        assert_eq!(RemotePathPolicy::default(), RemotePathPolicy::LocalDrive);
+        assert!(validate_remote_path_for(r"\\h\s\f", RemotePathPolicy::default()).is_err());
         assert!(validate_remote_path_for(r"\\h\s\f", RemotePathPolicy::Any).is_ok());
     }
 

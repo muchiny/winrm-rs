@@ -3938,12 +3938,16 @@ mod tests {
         assert!(server.received_requests().await.unwrap().is_empty());
     }
 
-    /// Without the builder call, a UNC remote path goes to the host as
-    /// before.
+    /// With `RemotePathPolicy::Any` chosen on the builder, a UNC remote path
+    /// goes to the host.
     #[tokio::test]
-    async fn default_policy_sends_a_unc_path_to_the_host() {
+    async fn any_policy_sends_a_unc_path_to_the_host() {
         let server = MockServer::start().await;
-        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        let client = WinrmClient::builder(basic_config(server.address().port()))
+            .credentials(test_creds())
+            .remote_path_policy(crate::RemotePathPolicy::Any)
+            .build()
+            .unwrap();
         let local = unique_temp_path("winrm-rs-test-policy-default");
         let result = client
             .download_file("127.0.0.1", r"\\other\share\f", &local)

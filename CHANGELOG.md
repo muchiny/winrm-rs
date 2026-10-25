@@ -238,6 +238,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   that rely on a profile, or that prompt, call
   `.non_interactive_powershell(false)` on the builder (builder only;
   `WinrmClient::new` clients always use the flags).
+- Transfers accept only drive-absolute remote paths by default
+  (`RemotePathPolicy::LocalDrive`): UNC, WebDAV and device paths, `\\?\` long
+  paths and relative paths are refused before anything is sent. Migration:
+  callers that reach shares on purpose, typically a CredSSP double-hop, build
+  the client with `.remote_path_policy(RemotePathPolicy::Any)`; the builder
+  is the only way to choose, since `WinrmClient::new` has no knob.
 
 ### Added
 

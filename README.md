@@ -328,32 +328,35 @@ let bytes = client.upload_file("win-server", Path::new("local.bin"), "C:\\remote
 let bytes = client.download_file("win-server", "C:\\remote\\file.bin", Path::new("local.bin")).await?;
 ```
 
-`remote_path` is opened as the remote account and may name a UNC share or a
-device path. Under CredSSP or Basic, a UNC path is reached with your
-credentials: never pass an untrusted path. On the host, blocking outbound
-SMB (445) and WebDAV, the "Network security: Restrict NTLM: Outgoing NTLM
-traffic to remote servers" policy, a disabled WebClient service and Kerberos
-constrained delegation instead of CredSSP all limit what such a path can
-reach. Uploads put the file content on the remote `powershell.exe` command
-line, which command-line auditing (event 4688) and script block logging
-(event 4104) record.
+`remote_path` is opened as the remote account. Since 2.0 the client accepts
+only drive-absolute remote paths (`C:\...`) and refuses UNC, WebDAV and
+device paths, `\\?\` long paths and relative paths before anything is sent
+(`RemotePathPolicy::LocalDrive`, the default). With the `Any` policy, a path
+may name a UNC share or a device path, and under CredSSP or Basic a UNC path
+is reached with your credentials: never pass an untrusted path. On the host,
+blocking outbound SMB (445) and WebDAV, the "Network security: Restrict NTLM:
+Outgoing NTLM traffic to remote servers" policy, a disabled WebClient service
+and Kerberos constrained delegation instead of CredSSP all limit what such a
+path can reach. Uploads put the file content on the remote `powershell.exe`
+command line, which command-line auditing (event 4688) and script block
+logging (event 4104) record.
 
-To accept only drive-absolute remote paths (`C:\...`), and refuse UNC,
-WebDAV and `\\.\` / `\\?\` device paths before anything is sent, build the
-client with `RemotePathPolicy::LocalDrive`:
+To reach shares on purpose, typically a CredSSP double-hop, build the client
+with `RemotePathPolicy::Any`. Only the builder chooses the policy:
+`WinrmClient::new` always uses `LocalDrive`.
 
 ```rust
 use winrm_rs::{RemotePathPolicy, WinrmClient};
 
 let client = WinrmClient::builder(config)
     .credentials(credentials)
-    .remote_path_policy(RemotePathPolicy::LocalDrive)
+    .remote_path_policy(RemotePathPolicy::Any)
     .build()?;
 ```
 
-Use it when remote paths come from anyone but you. The check is lexical: a
-link, junction or mapped drive on the host can still lead to a share. It does
-not limit which local files a path names.
+Leave the default when remote paths come from anyone but you. The default
+check is lexical: a link, junction or mapped drive on the host can still lead
+to a share. It does not limit which local files a path names.
 
 ## Configuration
 
@@ -474,7 +477,7 @@ cargo test --test integration_real -- --ignored
 |---|---|---|
 | *(default)* | stable | NTLMv2, Basic, Certificate auth; no optional deps |
 | `kerberos` | stable | Pulls `cross-krb5`; requires a working `kinit` |
-| `credssp` | **experimental** | Double-hop delegation. Needs `use_tls = true` with a verified certificate: it refuses `accept_invalid_certs = true`, so pin the listener certificate with `pin_server_certificate_sha256` or trust its CA with `add_root_certificates_pem`. Reaches the host through no proxy, or an `http://` or `socks5://` one set in `WinrmConfig::proxy`; it reads no proxy environment variable. It does not apply `max_retries` (see `AuthMethod::CredSsp`). Each request holds one of the connection slots shared with the other connection-bound methods for its whole exchange (32 per host, 128 per client). Validated end-to-end against Windows Server 2025; not yet exercised on other host generations. Delegates your cleartext password to the target: use it only toward hosts you trust as much as the account. Links the host OpenSSL; see below. |
+| `credssp` | **experimental** | Double-hop delegation. Needs `use_tls = true` with a verified certificate: it refuses `accept_invalid_certs = true`, so pin the listener certificate with `pin_server_certificate_sha256` or trust its CA with `add_root_certificates_pem`. Reaches the host through no proxy, or an `http://` or `socks5://` one set in `WinrmConfig::proxy`; it reads no proxy environment variable. It does not apply `max_retries` (see `AuthMethod::CredSsp`). Each request holds one of the connection slots shared with the other connection-bound methods for its whole exchange (32 per host, 128 per client). Validated end-to-end against Windows Server 2025; not yet exercised on other host generations. Delegates your cleartext password to the target: use it only toward hosts you trust as much as the account. Transfers refuse UNC paths by default since 2.0, so a double-hop to a share needs `.remote_path_policy(RemotePathPolicy::Any)` on the builder. Links the host OpenSSL; see below. |
 
 ### `credssp` and the host OpenSSL
 

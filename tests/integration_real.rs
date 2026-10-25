@@ -6,7 +6,7 @@
 //! ```bash
 //! export WINRM_TEST_HOST=192.168.x.x     # Windows host IP
 //! export WINRM_TEST_USER=vagrant          # WinRM username
-//! export WINRM_TEST_PASS=vagrant          # WinRM password
+//! export WINRM_TEST_PASS=...              # WinRM password
 //! cargo test --test integration_real -- --ignored
 //! ```
 //!

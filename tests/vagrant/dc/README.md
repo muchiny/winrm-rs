@@ -10,12 +10,15 @@ live. It does not touch the Server 2025 workgroup bench (`winrm-rs-test`).
 | Domain | `winrm.test`, NetBIOS `WINRM`, realm `WINRM.TEST`, host `dc` |
 | Vagrant dir (Windows) | `C:\winrm-rs-dc-vagrant` |
 | Host ports | WinRM HTTP `57985` → VM `5985`; WinRM HTTPS `57986` → VM `5986`; KDC TCP `57088` → VM `88` |
-| Test account | `WINRM\vagrant` / `vagrant` (Domain Admins, password never expires) |
+| Test account | `WINRM\vagrant` (Domain Admins, password never expires) |
 
-All credentials are throwaway values for this lab VM only:
-`WINRM\vagrant` / `vagrant`, `WINRM\Administrator` / `Vagrant-DC-2025!`,
-DSRM `Vagrant-DSRM-2025!`. The domain password policy is relaxed (no
-complexity, no minimum length, no expiry) so that `vagrant` is accepted.
+The account passwords (`WINRM\vagrant`, `WINRM\Administrator`, DSRM) are
+throwaway values for this lab VM only and are not kept in the repository:
+they live in the Vagrantfile and provisioning scripts that stay on the
+machine that runs the bench (both are git-ignored), and `vm-connect-dc.sh`
+exports the test account's one as `WINRM_TEST_KRB_PASS`. The domain password
+policy is relaxed (no complexity, no minimum length, no expiry) so that a
+short lab password is accepted.
 
 The `Vagrantfile` and the `tests/scripts/vm-*.sh` scripts are local only:
 `.gitignore` lists `Vagrantfile` and `tests/scripts/vm-*.sh`, like the other
@@ -103,7 +106,7 @@ false`) and points `KRB5_CONFIG` at it; the ticket cache is
 
 ```bash
 eval "$(tests/scripts/vm-connect-dc.sh)"
-kinit vagrant@WINRM.TEST                  # password: vagrant
+kinit vagrant@WINRM.TEST                  # password: $WINRM_TEST_KRB_PASS
 klist                                      # krbtgt/WINRM.TEST@WINRM.TEST
 kvno HTTP/dc.winrm.test@WINRM.TEST         # service ticket for the SPN
 cargo test --features kerberos --test integration_real setup_dc_https_listener -- --ignored   # once
@@ -137,7 +140,7 @@ even when the body panicked; the panic is re-raised after the restore. They
 change state the other Kerberos tests see, hence `--test-threads=1` and the
 `--skip` above. If a run is killed in between, restore by hand (NTLM sealing
 works whatever the setting), for instance with pypsrp:
-`Client("127.0.0.1", port=57985, username="WINRM\\vagrant", password="vagrant",
+`Client("127.0.0.1", port=57985, username="WINRM\\vagrant", password=os.environ["WINRM_TEST_KRB_PASS"],
 ssl=False, auth="ntlm", encryption="always").execute_ps("Set-Item
 WSMan:\\localhost\\Service\\AllowUnencrypted $true")`.
 
@@ -167,7 +170,7 @@ it with `Stop-Process` when done.
 
 While the bench is up, any machine that can reach the host on those ports can
 talk to an unencrypted WinRM endpoint (`AllowUnencrypted = true`) and try the
-lab Domain Admin `vagrant` / `vagrant`. This mirrors what the Server 2025
+lab Domain Admin `vagrant`. This mirrors what the Server 2025
 bench already does. Tear the bench down (below) when you are not testing. If
 you want to narrow it, restrict the firewall rules to the WSL subnet or to
 localhost (`Set-NetFirewallRule -DisplayName 'WinRM DC HTTP','WinRM DC HTTPS','WinRM DC KDC'

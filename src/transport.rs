@@ -497,6 +497,9 @@ pub(crate) struct HttpTransport {
     /// Called before each attempt of [`Self::send_soap_with_retry`]; `false`
     /// refuses the request.
     before_send: Option<BeforeSend>,
+    /// Log the SOAP bodies at `trace` (target `winrm_rs::wire`); otherwise
+    /// only their lengths. Off by default.
+    log_soap_bodies: bool,
     /// With `pin_server_certificate_sha256` or
     /// `danger_accept_invalid_proxy_certs` over HTTPS, the server names of
     /// the `https://` proxy of [`Self::route`]
@@ -1038,6 +1041,7 @@ impl HttpTransport {
             kdc_slots: Arc::new(tokio::sync::Semaphore::new(MAX_KDC_IN_FLIGHT)),
             session_id: format!("uuid:{}", uuid::Uuid::new_v4().to_string().to_uppercase()),
             before_send: None,
+            log_soap_bodies: false,
             shared_proxy_names,
             route,
             options: opts,
@@ -1061,6 +1065,11 @@ impl HttpTransport {
     /// Install the gate checked before every request attempt.
     pub(crate) fn set_before_send(&mut self, hook: BeforeSend) {
         self.before_send = Some(hook);
+    }
+
+    /// Turn the plaintext trace logging of SOAP bodies on or off.
+    pub(crate) fn set_log_soap_bodies(&mut self, on: bool) {
+        self.log_soap_bodies = on;
     }
 
     /// The rustls configuration of the shared client, for tests.
@@ -1152,7 +1161,11 @@ impl HttpTransport {
             url = %crate::error::quote_server_text(&url, 256),
             "sending WinRM SOAP request"
         );
-        trace!(body = %body, "SOAP request body");
+        if self.log_soap_bodies {
+            trace!(target: "winrm_rs::wire", body = %body, "SOAP request body");
+        } else {
+            trace!(body_len = body.len(), "SOAP request body");
+        }
 
         #[cfg(feature = "kerberos")]
         if matches!(self.config.auth_method, AuthMethod::Kerberos) {
@@ -1220,7 +1233,11 @@ impl HttpTransport {
             }
         };
 
-        trace!(response = %response_text, "SOAP response body");
+        if self.log_soap_bodies {
+            trace!(target: "winrm_rs::wire", response = %response_text, "SOAP response body");
+        } else {
+            trace!(response_len = response_text.len(), "SOAP response body");
+        }
         soap::check_soap_fault(&response_text).map_err(WinrmError::Soap)?;
         Ok(response_text)
     }
@@ -2134,6 +2151,31 @@ mod tests {
         };
         let creds = WinrmCredentials::new("admin", "pass", "");
         HttpTransport::new(config, creds).unwrap()
+    }
+
+    /// By default the transport logs body lengths, never the bodies.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn soap_bodies_are_not_logged_by_default() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("<s:Envelope><s:Body>SECRET-OUT</s:Body></s:Envelope>"),
+            )
+            .mount(&server)
+            .await;
+        let transport = basic_transport(server.address().port());
+        let body = "<s:Envelope><s:Body>SECRET-IN</s:Body></s:Envelope>";
+        let answer = transport
+            .send_soap_with_retry("127.0.0.1", body.into())
+            .await
+            .unwrap();
+        assert!(answer.contains("SECRET-OUT"));
+        assert!(!logs_contain("SECRET-IN"));
+        assert!(!logs_contain("SECRET-OUT"));
+        assert!(logs_contain(&format!("body_len={}", body.len())));
+        assert!(logs_contain(&format!("response_len={}", answer.len())));
     }
 
     #[test]

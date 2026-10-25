@@ -5051,17 +5051,8 @@ mod tests {
                 .is_err()
         );
         let encoded = encode_powershell_command(script);
-        logs_assert(|lines: &[&str]| {
-            // Until bodies leave `trace` by default, the body lines carry them.
-            for line in lines.iter().filter(|l| !l.contains("SOAP request body")) {
-                for marker in ["SECRET-", encoded.as_str()] {
-                    if line.contains(marker) {
-                        return Err(format!("{marker} in: {line}"));
-                    }
-                }
-            }
-            Ok(())
-        });
+        assert!(!logs_contain("SECRET-"));
+        assert!(!logs_contain(&encoded));
         assert!(logs_contain("sending WinRM SOAP request"));
         assert!(logs_contain("args_len=1"));
         assert!(logs_contain("args_len=2"));

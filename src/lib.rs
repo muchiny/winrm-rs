@@ -66,10 +66,9 @@
 //!   text, arguments, scripts or queries. An error message can quote up to
 //!   512 characters of a failed answer (an HTTP error body, a transfer's
 //!   stderr) and up to 2048 characters of a SOAP fault reason.
-//! - `trace`: every SOAP request and response body, in plaintext (before
-//!   sealing and after unsealing): commands and their arguments, `env_vars`
-//!   values, stdin, uploaded file contents, command output. Keep `winrm_rs`
-//!   below `trace` wherever commands carry secrets.
+//! - `trace`: request and response body lengths (`body_len`, `response_len`).
+//!   The bodies themselves, in plaintext, only on a client built with
+//!   [`WinrmClientBuilder::log_soap_bodies`], under the target `winrm_rs::wire`.
 //!
 //! # Cargo features
 //!

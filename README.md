@@ -376,7 +376,7 @@ link, junction or mapped drive on the host can still lead to a share.
 
 ## Logging
 
-winrm-rs logs through `tracing`. Below `trace` it logs no command text, arguments, scripts or WQL queries; `debug` adds the host (userinfo redacted), ids and argument counts. `trace` logs every SOAP body in plaintext (before sealing, after unsealing): commands and arguments, `env_vars` values, stdin, uploaded file contents and output. Keep `winrm_rs` below `trace` wherever commands carry secrets. The WARN about NTLM over plain HTTP has its own target, so it can be silenced alone: `RUST_LOG=info,winrm_rs::ntlm_over_http=error`.
+winrm-rs logs through `tracing`. Below `trace` it logs no command text, arguments, scripts or WQL queries; `debug` adds the host (userinfo redacted), ids and argument counts. `trace` logs body lengths; the bodies, in plaintext, only on a client built with `WinrmClientBuilder::log_soap_bodies(true)` (target `winrm_rs::wire`), for debugging. The WARN about NTLM over plain HTTP has its own target, so it can be silenced alone: `RUST_LOG=info,winrm_rs::ntlm_over_http=error`.
 
 ## Roadmap
 

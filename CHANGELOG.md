@@ -209,6 +209,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   runs its full path (for example
   `%SystemRoot%\SysWOW64\WindowsPowerShell\v1.0\powershell.exe`) through
   `run_command` with `-EncodedCommand`.
+- **SOAP bodies are no longer logged by default.** At `trace` the transport
+  now logs body lengths (`body_len`, `response_len`). This also covers
+  psrp-rs payloads (PSRP fragments, `send_input` data including
+  `PSCredential` and `SecureString` values), which reached logs only
+  through these traces. Migration: a caller who reads the bodies from the
+  traces builds the client with `WinrmClientBuilder::log_soap_bodies(true)`.
 
 ### Added
 
@@ -256,6 +262,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **`RemotePathPolicy` and `WinrmClientBuilder::remote_path_policy`.** With `RemotePathPolicy::LocalDrive`, the transfer methods accept only drive-absolute remote paths and refuse UNC, WebDAV and device paths before anything is sent. The default, `Any`, keeps today's behaviour.
 - `quote_powershell_string`: quote a value as a PowerShell single-quoted literal, for passing untrusted values to `run_powershell` scripts.
 - `WinrmClientBuilder::non_interactive_powershell(true)` starts `run_powershell` scripts with `-NoProfile -NonInteractive`.
+- `WinrmClientBuilder::log_soap_bodies(true)` logs every SOAP body at
+  `trace`, target `winrm_rs::wire`, in plaintext. For debugging only.
+  Clients built with `WinrmClient::new` cannot turn it on; use the builder.
 
 ### Fixed
 

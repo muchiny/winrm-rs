@@ -95,8 +95,8 @@ We will credit reporters in the release notes and CHANGELOG (unless you prefer t
 - Security issues in the OpenSSL library that the `credssp` feature links from
   the host: report them to OpenSSL or to your distribution. A way this crate
   uses OpenSSL that weakens it is in scope.
-- SOAP bodies logged in plaintext at `trace` level (before sealing, after
-  unsealing); see *Logging* in the crate documentation.
+- SOAP bodies logged by a client built with
+  `WinrmClientBuilder::log_soap_bodies(true)`.
 - Resource use within the bounds the rustdoc documents. Each HTTP response
   body is capped at 4 × max(`max_envelope_size`, 512 KiB). The stdout and
   stderr of `run_command`, `run_powershell`, `Shell::run_command`, `run_wql`

@@ -39,6 +39,8 @@ pub struct WinrmClientBuilder<S = NeedsCredentials> {
     options: TransportOptions,
     /// Which `remote_path` forms the transfer methods accept.
     remote_path_policy: RemotePathPolicy,
+    /// Log SOAP bodies at `trace` (off by default).
+    log_soap_bodies: bool,
     _state: std::marker::PhantomData<S>,
 }
 
@@ -184,6 +186,7 @@ impl WinrmClientBuilder<NeedsCredentials> {
             before_send: None,
             options: TransportOptions::default(),
             remote_path_policy: RemotePathPolicy::default(),
+            log_soap_bodies: false,
             _state: std::marker::PhantomData,
         }
     }
@@ -196,6 +199,7 @@ impl WinrmClientBuilder<NeedsCredentials> {
             before_send: self.before_send,
             options: self.options,
             remote_path_policy: self.remote_path_policy,
+            log_soap_bodies: self.log_soap_bodies,
             _state: std::marker::PhantomData,
         }
     }
@@ -494,6 +498,22 @@ impl WinrmClientBuilder<Ready> {
         self
     }
 
+    /// Log every SOAP request and response body at `trace` level, target
+    /// `winrm_rs::wire`, in plaintext: before sealing and after unsealing. The
+    /// bodies hold commands and their arguments, `env_vars` values, stdin
+    /// (psrp-rs payloads included, such as `PSCredential` and `SecureString`
+    /// data), uploaded file contents, command output and decrypted answers.
+    ///
+    /// Off by default: the client then logs body lengths only. The bodies also
+    /// need a subscriber that enables `trace` for `winrm_rs::wire` (a
+    /// `winrm_rs=trace` directive does). Error values are not affected: an
+    /// error message can still quote up to 512 characters of a failed answer.
+    /// For debugging only; never enable it in production.
+    pub fn log_soap_bodies(mut self, enabled: bool) -> Self {
+        self.log_soap_bodies = enabled;
+        self
+    }
+
     /// Restrict the `remote_path` of every transfer method; see
     /// [`RemotePathPolicy`](crate::RemotePathPolicy). Use
     /// [`RemotePathPolicy::LocalDrive`](crate::RemotePathPolicy::LocalDrive)
@@ -519,6 +539,7 @@ impl WinrmClientBuilder<Ready> {
         if let Some(hook) = self.before_send {
             client.transport.set_before_send(hook.0);
         }
+        client.transport.set_log_soap_bodies(self.log_soap_bodies);
         client.remote_path_policy = self.remote_path_policy;
         Ok(client)
     }
@@ -527,6 +548,9 @@ impl WinrmClientBuilder<Ready> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{AuthMethod, EncryptionMode};
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// Holding a hook must not cost the builder its auto traits: losing them
     /// is a breaking change.
@@ -546,6 +570,39 @@ mod tests {
         assert_send_sync::<WinrmClientBuilder<NeedsCredentials>>();
         assert_send_sync::<WinrmClientBuilder<Ready>>();
         assert_send_sync::<WinrmClient>();
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn log_soap_bodies_opt_in_logs_both_bodies() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("<s:Envelope><s:Body>SECRET-OUT</s:Body></s:Envelope>"),
+            )
+            .mount(&server)
+            .await;
+        let config = WinrmConfig {
+            port: server.address().port(),
+            auth_method: AuthMethod::Basic,
+            encryption: EncryptionMode::Never,
+            ..Default::default()
+        };
+        let client = WinrmClient::builder(config)
+            .credentials(WinrmCredentials::new("admin", "pass", ""))
+            .log_soap_bodies(true)
+            .build()
+            .unwrap();
+        let body = "<s:Envelope><s:Body>SECRET-IN</s:Body></s:Envelope>";
+        client
+            .transport
+            .send_soap_with_retry("127.0.0.1", body.into())
+            .await
+            .unwrap();
+        assert!(logs_contain("SECRET-IN"));
+        assert!(logs_contain("SECRET-OUT"));
+        assert!(logs_contain("winrm_rs::wire"));
     }
 
     /// `powershell_args` adds the non-interactive flags only when the option

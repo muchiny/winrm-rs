@@ -37,7 +37,7 @@ async fn main() -> Result<(), winrm_rs::WinrmError> {
 - **Full shell lifecycle** -- create, execute, receive, signal, delete
 - **Streaming output** -- `start_command` + `receive_next` for incremental polling
 - **File transfer** -- upload/download files via PowerShell base64 chunking
-- **Proxy support** -- HTTP(S) and SOCKS proxies (`WinrmConfig::proxy` or the environment) for every authentication method except CredSSP, which connects directly
+- **Proxy support** -- HTTP(S) and SOCKS proxies (`WinrmConfig::proxy` or the environment); CredSSP is tunnelled through `http://` and `socks5://` proxies (`WinrmConfig::proxy` only)
 - **Async/await** -- built on `tokio` and `reqwest`
 - **TLS support** -- `rustls` backend, optional invalid cert acceptance
 - **Cross-platform** -- runs from Linux, macOS, or Windows
@@ -340,13 +340,13 @@ line, which command-line auditing (event 4688) and script block logging
 | `max_retries` | `0` | Retries for transient HTTP errors (exponential backoff) |
 | `client_cert_pem` | `None` | Path to client cert PEM (Certificate auth) |
 | `client_key_pem` | `None` | Path to client key PEM (Certificate auth) |
-| `proxy` | `None` | Proxy URL (e.g. `http://proxy:8080`); not used by CredSSP |
+| `proxy` | `None` | Proxy URL (e.g. `http://proxy:8080`); CredSSP takes `http://` and `socks5://` only |
 | `encryption` | `Auto` | Message sealing for NTLM and Kerberos: `Auto` (over HTTP only), `Always`, `Never`. Basic over plain HTTP requires `Never`; `Always` with Basic, Certificate or CredSSP is refused |
 | `max_output_bytes` | `Some(64 MiB)` | Cap on a command's stdout+stderr; `None` removes it |
 
 ### Proxies
 
-- `proxy` takes `http://`, `https://`, `socks4://`, `socks4a://`, `socks5://` or `socks5h://` URLs; one without a scheme is taken as `http://`, and any other scheme is refused when the client is built. CredSSP never uses a proxy: it always connects directly.
+- `proxy` takes `http://`, `https://`, `socks4://`, `socks4a://`, `socks5://` or `socks5h://` URLs; one without a scheme is taken as `http://`, and any other scheme is refused when the client is built. CredSSP is tunnelled through `http://` (`CONNECT`) and `socks5://` / `socks5h://` proxies, with TLS end-to-end to the host; it refuses an `https://` or `socks4://` proxy when the client is built, and it does not read the proxy environment variables.
 - With `proxy` unset, the environment applies: `HTTP_PROXY` for `http://` endpoints, `HTTPS_PROXY` for `https://` endpoints, `ALL_PROXY` for both when the specific one is unset or unusable, and `NO_PROXY` for exclusions (names, domain suffixes, IP addresses, CIDR ranges, and `*` for every host name but no IP address; list `0.0.0.0/0,::/0` to leave every address out). Upper case is read before lower case, and a set but empty value counts as set; none applies when `REQUEST_METHOD` is set (CGI). A non-empty value that is not a usable proxy URL is ignored with a WARN. The operating system's proxy settings are never read. `WinrmClientBuilder::ignore_env_proxy` turns environment proxies off for one client; `NO_PROXY=*` does it for the whole process (for host names, not IP addresses). Plain-HTTP traffic that follows an environment proxy is logged with a WARN when the client is built.
 - Over plain HTTP, an `http://` or `https://` proxy forwards each request and keeps the server connection that NTLM or Kerberos authenticated; WinRM then sends sealed requests on it without credentials. A proxy that shares those server connections between its clients (RFC 4559 section 6 forbids it) lets its other users send requests that run as you, whenever the server accepts unencrypted messages. Keep `AllowUnencrypted = false` on the server, and prefer HTTPS or a SOCKS proxy. See [Choosing a transport](#choosing-a-transport). With `WinrmClientBuilder::proxy_session_auth(ProxySessionAuth::RequireWhenUnsealed)` or `Require`, the client needs `Proxy-Support: Session-Based-Authentication` on the server's 401 through such a proxy before it authenticates: `RequireWhenUnsealed` refuses `EncryptionMode::Never` without it and logs a WARN in sealed modes, `Require` refuses both. The default, `ProxySessionAuth::Allow`, does not check, so that deployments through proxies that do not send the header keep working.
 - Credentials in a proxy URL reach `http://` and `socks5://` proxies in cleartext (`socks4://` ignores them); an `https://` proxy receives them inside TLS.
@@ -441,7 +441,7 @@ cargo test --test integration_real -- --ignored
 |---|---|---|
 | *(default)* | stable | NTLMv2, Basic, Certificate auth; no optional deps |
 | `kerberos` | stable | Pulls `cross-krb5`; requires a working `kinit` |
-| `credssp` | **experimental** | Double-hop delegation. CredSSP refuses `accept_invalid_certs = true`: set it to false and either pin the listener certificate with `pin_server_certificate_sha256` or trust its CA with `add_root_certificates_pem`. Validated end-to-end against Windows Server 2025 (live `credssp_run_command_whoami`); not yet exercised on other host generations. Up to 1.4.1 it ignored `proxy`, `max_retries`, `connect_timeout_secs`, `operation_timeout_secs` and `user_agent`; since 1.4.2 it applies both timeouts and `user_agent`, and still ignores `proxy` and `max_retries` (see `AuthMethod::CredSsp`). Since 1.5.0 each request waits for, and holds for its whole exchange, one of the connection slots shared with the other connection-bound methods (32 per host, 128 per client). Delegates your cleartext password to the target: use it only toward hosts you trust as much as the account. Links the host OpenSSL; see below. |
+| `credssp` | **experimental** | Double-hop delegation. CredSSP refuses `accept_invalid_certs = true`: set it to false and either pin the listener certificate with `pin_server_certificate_sha256` or trust its CA with `add_root_certificates_pem`. Validated end-to-end against Windows Server 2025 (live `credssp_run_command_whoami`); not yet exercised on other host generations. Up to 1.4.1 it ignored `proxy`, `max_retries`, `connect_timeout_secs`, `operation_timeout_secs` and `user_agent`; since 1.4.2 it applies both timeouts and `user_agent`, and still ignores `max_retries` (see `AuthMethod::CredSsp`); since 1.5.0 it is tunnelled through an `http://` or `socks5://` `proxy`. Since 1.5.0 each request waits for, and holds for its whole exchange, one of the connection slots shared with the other connection-bound methods (32 per host, 128 per client). Delegates your cleartext password to the target: use it only toward hosts you trust as much as the account. Links the host OpenSSL; see below. |
 
 ### `credssp` and the host OpenSSL
 

@@ -126,6 +126,8 @@ mod soap;
 mod test_ntlm_server;
 #[cfg(test)]
 mod test_pki;
+#[cfg(all(test, feature = "credssp"))]
+mod test_proxy;
 mod tls;
 mod transfer;
 mod transport;

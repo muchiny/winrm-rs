@@ -142,6 +142,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   longer calls the hook. Migration: where a hook refusal is expected under
   load, handle `WinrmError::Timeout` as well as `Cancelled`; to stop a
   request still waiting for a slot, drop the call's future.
+- CredSSP connects through `WinrmConfig::proxy` (HTTP `CONNECT` or SOCKS5
+  tunnel) instead of connecting directly. An `https://` or `socks4://` proxy
+  is refused for CredSSP when the client is built. The outer TLS still runs
+  end-to-end with the host under the client's verifier, and
+  `connect_timeout_secs` now covers the proxy handshake too. CredSSP still
+  reads no proxy environment variable. Migration: for CredSSP, use an
+  `http://` or `socks5://` proxy, or unset `WinrmConfig::proxy` to keep
+  connecting directly.
 
 ### Added
 

@@ -79,6 +79,8 @@ use crate::error::WinrmError;
 use crate::ntlm;
 #[cfg(feature = "credssp")]
 use crate::ntlm::NtlmSession;
+#[cfg(feature = "credssp")]
+use crate::transport::proxy::CredSspDial;
 
 #[cfg(test)]
 pub(crate) mod test_server;
@@ -345,7 +347,7 @@ struct CredSspConnection<S = tokio_rustls::client::TlsStream<tokio::net::TcpStre
 pub(crate) struct CredSspConnOptions {
     /// Largest response body accepted (see `transport::max_response_bytes`).
     pub(crate) max_response_bytes: usize,
-    /// TCP connect and outer TLS handshake, together.
+    /// TCP connect, proxy handshake and outer TLS handshake, together.
     pub(crate) connect_timeout: std::time::Duration,
     /// Each HTTP exchange (request written, response read).
     pub(crate) exchange_timeout: std::time::Duration,
@@ -379,38 +381,42 @@ impl CredSspConnection {
     /// transport's own TLS configuration (its verifier, provider and trust
     /// settings). The returned object owns the socket; drop to close.
     ///
-    /// The TCP connect and the outer TLS handshake share one deadline,
+    /// The TCP connect (through the proxy of `dial`, see [`dial_tunnel`]),
+    /// the proxy handshake and the outer TLS handshake share one deadline,
     /// `opts.connect_timeout`; its expiry is [`WinrmError::Timeout`].
     ///
     /// The outer TLS leg uses `tls.outer`, which carries the verifier of the
     /// client. Nothing inside CredSSP replaces it: the inner TLS is not
     /// verified (MS-CSSP 1.3) and `pubKeyAuth` binds only the inner TLS key.
     /// The outer TLS verifier is the transport's; CredSSP is refused under
-    /// `accept_invalid_certs`.
+    /// `accept_invalid_certs`. Through a proxy, the handshake still runs
+    /// end-to-end with the host: the tunnel only relays its bytes.
     async fn connect(
         endpoint: &CredSspEndpoint,
         tls: &CredSspTls,
+        dial: &CredSspDial,
         opts: CredSspConnOptions,
     ) -> Result<Self, WinrmError> {
         let connect_timeout = opts.connect_timeout;
-        tokio::time::timeout(connect_timeout, Self::connect_inner(endpoint, tls, opts))
-            .await
-            .map_err(|_| WinrmError::Timeout(connect_timeout.as_secs()))?
+        tokio::time::timeout(
+            connect_timeout,
+            Self::connect_inner(endpoint, tls, dial, opts),
+        )
+        .await
+        .map_err(|_| WinrmError::Timeout(connect_timeout.as_secs()))?
     }
 
     async fn connect_inner(
         endpoint: &CredSspEndpoint,
         tls: &CredSspTls,
+        dial: &CredSspDial,
         opts: CredSspConnOptions,
     ) -> Result<Self, WinrmError> {
-        use tokio::net::TcpStream;
         use tokio_rustls::TlsConnector;
 
         let connector = TlsConnector::from(Arc::clone(&tls.outer));
 
-        let tcp = TcpStream::connect((endpoint.host.as_str(), endpoint.port))
-            .await
-            .map_err(|e| WinrmError::AuthFailed(format!("CredSSP TCP connect: {e}")))?;
+        let tcp = dial_tunnel(dial, &endpoint.host, endpoint.port).await?;
         tcp.set_nodelay(true).ok();
 
         let stream = connector
@@ -978,11 +984,7 @@ impl CredSspEndpoint {
             Some(query) => format!("{}?{query}", parsed.path()),
             None => parsed.path().to_string(),
         };
-        let host_header = if host.contains(':') {
-            format!("[{host}]:{port}")
-        } else {
-            format!("{host}:{port}")
-        };
+        let host_header = authority(&host, port);
         Ok(Self {
             host,
             port,
@@ -996,6 +998,290 @@ impl CredSspEndpoint {
     pub(crate) fn spn(&self) -> String {
         format!("HTTP/{}", self.host.to_ascii_lowercase())
     }
+}
+
+/// `host:port`, an IPv6 `host` in brackets: the `Host` header value and the
+/// `CONNECT` target.
+#[cfg(feature = "credssp")]
+fn authority(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+/// Largest answer head accepted from an HTTP proxy to `CONNECT`.
+#[cfg(feature = "credssp")]
+const MAX_PROXY_HEAD_BYTES: usize = 64 * 1024;
+
+/// The TCP stream that carries a CredSSP connection to `host:port`: a
+/// direct connection, or a tunnel through the proxy `dial` names (HTTP
+/// `CONNECT`, RFC 7231 section 4.3.6, or SOCKS5, RFC 1928).
+///
+/// A tunnel only relays bytes. The outer TLS handshake that follows runs
+/// end-to-end with the host, under the transport's verifier, and the
+/// CredSSP context stays bound to that one TLS connection. The proxy's
+/// credentials go to the proxy alone, before that handshake; the server's
+/// travel only inside it. The caller bounds the whole call with
+/// `connect_timeout` ([`CredSspConnection::connect`]).
+#[cfg(feature = "credssp")]
+async fn dial_tunnel(
+    dial: &CredSspDial,
+    host: &str,
+    port: u16,
+) -> Result<tokio::net::TcpStream, WinrmError> {
+    use tokio::net::TcpStream;
+    let to_proxy = |proxy: &str| {
+        let proxy = proxy.to_string();
+        async move {
+            TcpStream::connect(proxy.as_str()).await.map_err(|e| {
+                WinrmError::AuthFailed(format!("CredSSP: TCP connect to the proxy {proxy}: {e}"))
+            })
+        }
+    };
+    match dial {
+        CredSspDial::Direct => TcpStream::connect((host, port))
+            .await
+            .map_err(|e| WinrmError::AuthFailed(format!("CredSSP TCP connect: {e}"))),
+        CredSspDial::HttpConnect {
+            proxy,
+            authorization,
+        } => {
+            let mut tcp = to_proxy(proxy).await?;
+            http_connect(
+                &mut tcp,
+                &authority(host, port),
+                authorization.as_ref().map(|a| a.as_str()),
+            )
+            .await?;
+            Ok(tcp)
+        }
+        CredSspDial::Socks5 {
+            proxy,
+            user_pass,
+            remote_dns,
+        } => {
+            let mut tcp = to_proxy(proxy).await?;
+            let user_pass = user_pass
+                .as_ref()
+                .map(|(user, pass)| (user.as_str(), pass.as_str()));
+            socks5_connect(&mut tcp, host, port, user_pass, *remote_dns).await?;
+            Ok(tcp)
+        }
+    }
+}
+
+/// An I/O error of the proxy handshake.
+#[cfg(feature = "credssp")]
+fn proxy_io(e: &std::io::Error) -> WinrmError {
+    if e.kind() == std::io::ErrorKind::UnexpectedEof {
+        WinrmError::AuthFailed("CredSSP: the proxy closed the connection".into())
+    } else {
+        WinrmError::AuthFailed(format!("CredSSP: proxy handshake: {e}"))
+    }
+}
+
+/// Ask the HTTP proxy on `tcp` to open a tunnel to `authority`. Only a 2xx
+/// answer with nothing after its head opens it.
+#[cfg(feature = "credssp")]
+async fn http_connect(
+    tcp: &mut tokio::net::TcpStream,
+    authority: &str,
+    authorization: Option<&str>,
+) -> Result<(), WinrmError> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut request = Zeroizing::new(String::with_capacity(256));
+    for part in [
+        "CONNECT ",
+        authority,
+        " HTTP/1.1\r\nHost: ",
+        authority,
+        "\r\n",
+    ] {
+        request.push_str(part);
+    }
+    if let Some(value) = authorization {
+        for part in ["Proxy-Authorization: ", value, "\r\n"] {
+            request.push_str(part);
+        }
+    }
+    request.push_str("\r\n");
+    tcp.write_all(request.as_bytes())
+        .await
+        .map_err(|e| proxy_io(&e))?;
+    drop(request);
+
+    let mut buf = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 4096];
+    let mut scanned: usize = 0;
+    let head_end = loop {
+        if let Some(end) = find_head_end(&buf, scanned.saturating_sub(3)) {
+            break end;
+        }
+        if buf.len() >= MAX_PROXY_HEAD_BYTES {
+            return Err(WinrmError::AuthFailed(
+                "CredSSP: proxy response head too large".into(),
+            ));
+        }
+        scanned = buf.len();
+        let n = tcp.read(&mut chunk).await.map_err(|e| proxy_io(&e))?;
+        if n == 0 {
+            return Err(WinrmError::AuthFailed(
+                "CredSSP: the proxy closed the connection".into(),
+            ));
+        }
+        buf.extend_from_slice(chunk.get(..n).unwrap_or_default());
+    };
+    if head_end > MAX_PROXY_HEAD_BYTES {
+        return Err(WinrmError::AuthFailed(
+            "CredSSP: proxy response head too large".into(),
+        ));
+    }
+    let head = parse_response_head(buf.get(..head_end).unwrap_or_default())?;
+    match head.status {
+        200..=299 if buf.len() > head_end => Err(WinrmError::AuthFailed(
+            "CredSSP: the proxy sent data before the tunnel opened".into(),
+        )),
+        200..=299 => Ok(()),
+        407 => Err(WinrmError::AuthFailed(
+            "CredSSP: the proxy refused the credentials (407)".into(),
+        )),
+        status => Err(WinrmError::AuthFailed(format!(
+            "CredSSP: proxy CONNECT failed with status {status}"
+        ))),
+    }
+}
+
+/// Ask the SOCKS5 proxy on `tcp` to connect to `host:port` (RFC 1928), with
+/// the user name and password of RFC 1929 when `user_pass` is set. With
+/// `remote_dns`, a host name goes to the proxy as is; otherwise it is
+/// resolved here and the first address is sent.
+#[cfg(feature = "credssp")]
+async fn socks5_connect(
+    tcp: &mut tokio::net::TcpStream,
+    host: &str,
+    port: u16,
+    user_pass: Option<(&str, &str)>,
+    remote_dns: bool,
+) -> Result<(), WinrmError> {
+    use std::net::IpAddr;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let invalid =
+        || WinrmError::AuthFailed("CredSSP: the SOCKS5 proxy sent an invalid reply".into());
+
+    let greeting: &[u8] = if user_pass.is_some() {
+        &[5, 2, 0, 2]
+    } else {
+        &[5, 1, 0]
+    };
+    tcp.write_all(greeting).await.map_err(|e| proxy_io(&e))?;
+    let mut choice = [0u8; 2];
+    tcp.read_exact(&mut choice)
+        .await
+        .map_err(|e| proxy_io(&e))?;
+    match (choice, user_pass) {
+        ([5, 0], _) => {}
+        ([5, 2], Some((user, pass))) => {
+            let too_long = || {
+                WinrmError::AuthFailed(crate::transport::proxy::SOCKS5_CREDENTIALS_TOO_LONG.into())
+            };
+            let ulen = u8::try_from(user.len()).map_err(|_| too_long())?;
+            let plen = u8::try_from(pass.len()).map_err(|_| too_long())?;
+            let mut auth = Zeroizing::new(Vec::with_capacity(515));
+            auth.extend_from_slice(&[1, ulen]);
+            auth.extend_from_slice(user.as_bytes());
+            auth.push(plen);
+            auth.extend_from_slice(pass.as_bytes());
+            tcp.write_all(&auth).await.map_err(|e| proxy_io(&e))?;
+            drop(auth);
+            let mut status = [0u8; 2];
+            tcp.read_exact(&mut status)
+                .await
+                .map_err(|e| proxy_io(&e))?;
+            if status != [1, 0] {
+                return Err(WinrmError::AuthFailed(
+                    "CredSSP: the SOCKS5 proxy refused the credentials".into(),
+                ));
+            }
+        }
+        _ => {
+            return Err(WinrmError::AuthFailed(
+                "CredSSP: the SOCKS5 proxy accepted no offered authentication method".into(),
+            ));
+        }
+    }
+
+    let mut request = vec![5, 1, 0];
+    let address = match host.parse::<IpAddr>() {
+        Ok(ip) => Some(ip),
+        Err(_) if remote_dns => None,
+        Err(_) => Some(
+            tokio::net::lookup_host((host, port))
+                .await
+                .ok()
+                .and_then(|mut addrs| addrs.next())
+                .map(|addr| addr.ip())
+                .ok_or_else(|| {
+                    WinrmError::AuthFailed(format!(
+                        "CredSSP: cannot resolve {host} for the SOCKS5 proxy"
+                    ))
+                })?,
+        ),
+    };
+    match address {
+        Some(IpAddr::V4(ip)) => {
+            request.push(1);
+            request.extend_from_slice(&ip.octets());
+        }
+        Some(IpAddr::V6(ip)) => {
+            request.push(4);
+            request.extend_from_slice(&ip.octets());
+        }
+        None => {
+            let len = u8::try_from(host.len()).map_err(|_| {
+                WinrmError::AuthFailed("CredSSP: host name too long for SOCKS5".into())
+            })?;
+            request.extend_from_slice(&[3, len]);
+            request.extend_from_slice(host.as_bytes());
+        }
+    }
+    request.extend_from_slice(&port.to_be_bytes());
+    tcp.write_all(&request).await.map_err(|e| proxy_io(&e))?;
+
+    // `05 REP 00 ATYP BND.ADDR BND.PORT`, read to its last byte so that
+    // nothing of it is left for the TLS handshake.
+    let mut reply = [0u8; 4];
+    tcp.read_exact(&mut reply).await.map_err(|e| proxy_io(&e))?;
+    let [version, rep, _, atyp] = reply;
+    if version != 5 {
+        return Err(invalid());
+    }
+    if rep != 0 {
+        return Err(WinrmError::AuthFailed(format!(
+            "CredSSP: SOCKS5 connect failed (reply {rep})"
+        )));
+    }
+    let addr_len = match atyp {
+        1 => 4,
+        4 => 16,
+        3 => {
+            let mut len = [0u8; 1];
+            tcp.read_exact(&mut len).await.map_err(|e| proxy_io(&e))?;
+            let [len] = len;
+            usize::from(len)
+        }
+        _ => return Err(invalid()),
+    };
+    // At most 255 address bytes, then the two port bytes.
+    let mut bound = [0u8; 257];
+    let rest = bound
+        .get_mut(..addr_len.saturating_add(2))
+        .ok_or_else(invalid)?;
+    tcp.read_exact(rest).await.map_err(|e| proxy_io(&e))?;
+    Ok(())
 }
 
 /// CredSSP authentication transport.
@@ -1012,6 +1298,9 @@ pub(crate) struct CredSspAuth {
     pub(crate) tls: Arc<CredSspTls>,
     /// Response size and timeout limits of the connection.
     pub(crate) opts: CredSspConnOptions,
+    /// How the connection reaches the host: directly or through the proxy
+    /// of `WinrmConfig::proxy`.
+    pub(crate) dial: Arc<CredSspDial>,
 }
 
 #[cfg(feature = "credssp")]
@@ -1027,7 +1316,8 @@ impl AuthTransport for CredSspAuth {
         // reqwest entirely and drive raw HTTP/1.1 over a single tokio_rustls
         // TlsStream. See CredSspConnection above.
         let endpoint = CredSspEndpoint::parse(url)?;
-        let mut conn = CredSspConnection::connect(&endpoint, &self.tls, self.opts.clone()).await?;
+        let mut conn =
+            CredSspConnection::connect(&endpoint, &self.tls, &self.dial, self.opts.clone()).await?;
 
         // Pywinrm sends the SOAP body in every CredSSP round (which is what
         // Microsoft HTTPAPI on the WSMAN listener expects). The same body is
@@ -2050,7 +2340,14 @@ mod tests {
                 crate::test_pki::spawn_tls_sink(crate::test_pki::impostor_server_config(versions));
             let endpoint =
                 CredSspEndpoint::parse(&format!("https://127.0.0.1:{port}/wsman")).unwrap();
-            match CredSspConnection::connect(&endpoint, &no_verify(), test_opts()).await {
+            match CredSspConnection::connect(
+                &endpoint,
+                &no_verify(),
+                &CredSspDial::Direct,
+                test_opts(),
+            )
+            .await
+            {
                 Err(WinrmError::AuthFailed(m)) => {
                     assert!(m.starts_with("CredSSP outer TLS:"), "{label}: {m}");
                 }
@@ -2256,15 +2553,17 @@ mod tests {
             let tls = no_verify();
             let endpoint =
                 CredSspEndpoint::parse(&format!("https://127.0.0.1:{port}/wsman")).unwrap();
-            let mut first = CredSspConnection::connect(&endpoint, &tls, test_opts())
-                .await
-                .unwrap();
+            let mut first =
+                CredSspConnection::connect(&endpoint, &tls, &CredSspDial::Direct, test_opts())
+                    .await
+                    .unwrap();
             // Reading a response makes the client process any NewSessionTicket.
             assert_eq!(first.post(None, "<a/>").await.unwrap().status, 401);
             drop(first);
-            let second = CredSspConnection::connect(&endpoint, &tls, test_opts())
-                .await
-                .unwrap();
+            let second =
+                CredSspConnection::connect(&endpoint, &tls, &CredSspDial::Direct, test_opts())
+                    .await
+                    .unwrap();
             assert_eq!(
                 second.stream.get_ref().1.handshake_kind(),
                 Some(rustls::HandshakeKind::Full),
@@ -2308,6 +2607,7 @@ mod tests {
                 exchange_timeout: Duration::from_secs(20),
                 user_agent: "winrm-rs/test".into(),
             },
+            dial: Arc::new(CredSspDial::Direct),
         }
     }
 
@@ -2438,7 +2738,7 @@ mod tests {
         let start = std::time::Instant::now();
         let res = tokio::time::timeout(
             Duration::from_secs(10),
-            CredSspConnection::connect(&endpoint, &no_verify(), opts),
+            CredSspConnection::connect(&endpoint, &no_verify(), &CredSspDial::Direct, opts),
         )
         .await
         .expect("connect is not bounded");
@@ -2446,6 +2746,277 @@ mod tests {
         assert!(matches!(err, WinrmError::Timeout(1)), "{err:?}");
         assert!(start.elapsed() < Duration::from_secs(5));
         drop(listener);
+    }
+
+    // --- The tunnel through WinrmConfig::proxy ---
+
+    use crate::test_proxy;
+
+    /// A target that accepts connections and writes `hi` on each.
+    async fn spawn_hi_target() -> u16 {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                let _ = s.write_all(b"hi").await;
+                // Keep the socket open until the peer is done.
+                tokio::spawn(async move {
+                    let mut sink = [0u8; 64];
+                    use tokio::io::AsyncReadExt;
+                    while matches!(s.read(&mut sink).await, Ok(n) if n > 0) {}
+                });
+            }
+        });
+        port
+    }
+
+    async fn read_two(stream: &mut tokio::net::TcpStream) -> [u8; 2] {
+        use tokio::io::AsyncReadExt;
+        let mut got = [0u8; 2];
+        stream.read_exact(&mut got).await.unwrap();
+        got
+    }
+
+    fn http_dial(pport: u16, authorization: Option<&str>) -> CredSspDial {
+        CredSspDial::HttpConnect {
+            proxy: format!("127.0.0.1:{pport}"),
+            authorization: authorization.map(|a| Zeroizing::new(a.to_string())),
+        }
+    }
+
+    fn auth_failed(res: Result<tokio::net::TcpStream, WinrmError>) -> String {
+        match res {
+            Err(WinrmError::AuthFailed(m)) => m,
+            Err(e) => panic!("{e:?}"),
+            Ok(_) => panic!("the tunnel opened"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dial_tunnel_runs_http_connect() {
+        let port = spawn_hi_target().await;
+        for authorization in [Some("Basic dXNlcjpwdw=="), None] {
+            let (pport, heads) = test_proxy::spawn_connect_proxy_answering(
+                "HTTP/1.1 200 Connection established\r\n\r\n",
+            )
+            .await;
+            let mut stream = dial_tunnel(&http_dial(pport, authorization), "127.0.0.1", port)
+                .await
+                .unwrap();
+            assert_eq!(&read_two(&mut stream).await, b"hi");
+            let heads = heads.lock().unwrap().clone();
+            assert_eq!(heads.len(), 1);
+            let expected =
+                format!("CONNECT 127.0.0.1:{port} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n");
+            assert!(heads[0].starts_with(&expected), "{:?}", heads[0]);
+            assert_eq!(
+                heads[0].contains("Proxy-Authorization: Basic dXNlcjpwdw==\r\n"),
+                authorization.is_some(),
+                "{:?}",
+                heads[0]
+            );
+        }
+    }
+
+    /// The `CONNECT` target of an IPv6 host is its bracketed authority.
+    #[tokio::test]
+    async fn dial_tunnel_brackets_an_ipv6_target() {
+        let (pport, heads) =
+            test_proxy::spawn_connect_proxy_answering("HTTP/1.1 403 Forbidden\r\n\r\n").await;
+        let err = auth_failed(dial_tunnel(&http_dial(pport, None), "::1", 5986).await);
+        assert_eq!(err, "CredSSP: proxy CONNECT failed with status 403");
+        assert!(
+            heads.lock().unwrap()[0]
+                .starts_with("CONNECT [::1]:5986 HTTP/1.1\r\nHost: [::1]:5986\r\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn dial_tunnel_reports_407_and_other_statuses() {
+        for (answer, expected) in [
+            (
+                "HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n",
+                "CredSSP: the proxy refused the credentials (407)",
+            ),
+            (
+                "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n",
+                "CredSSP: proxy CONNECT failed with status 502",
+            ),
+            (
+                "HTTP/1.1 200 OK\r\n\r\nEARLY",
+                "CredSSP: the proxy sent data before the tunnel opened",
+            ),
+        ] {
+            let (pport, _) = test_proxy::spawn_connect_proxy_answering(answer).await;
+            // The target port is never reached: nothing listens on port 9.
+            let err = auth_failed(dial_tunnel(&http_dial(pport, None), "127.0.0.1", 9).await);
+            assert_eq!(err, expected, "{answer:?}");
+        }
+    }
+
+    /// A proxy that closes, or whose answer head never ends within 64 KiB,
+    /// is refused.
+    #[tokio::test]
+    async fn dial_tunnel_bounds_the_proxy_answer() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        async fn scripted(answer: Vec<u8>) -> u16 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let mut head = [0u8; 1024];
+                let _ = s.read(&mut head).await;
+                let _ = s.write_all(&answer).await;
+                // Hold the connection open: only the cap ends the read.
+                let _ = s.read(&mut head).await;
+            });
+            port
+        }
+        let mut endless = b"HTTP/1.1 200 OK\r\n".to_vec();
+        while endless.len() <= MAX_PROXY_HEAD_BYTES {
+            endless
+                .extend_from_slice(b"X-Pad: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n");
+        }
+        let port = scripted(endless).await;
+        let err = auth_failed(dial_tunnel(&http_dial(port, None), "127.0.0.1", 9).await);
+        assert_eq!(err, "CredSSP: proxy response head too large");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut head = [0u8; 1024];
+            let _ = s.read(&mut head).await;
+        });
+        let err = auth_failed(dial_tunnel(&http_dial(port, None), "127.0.0.1", 9).await);
+        assert_eq!(err, "CredSSP: the proxy closed the connection");
+    }
+
+    /// The connect timeout covers the proxy handshake: a proxy that never
+    /// answers the `CONNECT` ends at `connect_timeout`.
+    #[tokio::test]
+    async fn connect_timeout_covers_the_proxy_handshake() {
+        crate::test_pki::install_test_provider();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); // never accepted
+        let pport = listener.local_addr().unwrap().port();
+        let endpoint = CredSspEndpoint::parse("https://127.0.0.1:5986/wsman").unwrap();
+        let opts = CredSspConnOptions {
+            connect_timeout: Duration::from_secs(1),
+            ..test_opts()
+        };
+        let res = tokio::time::timeout(
+            Duration::from_secs(10),
+            CredSspConnection::connect(&endpoint, &no_verify(), &http_dial(pport, None), opts),
+        )
+        .await
+        .expect("connect is not bounded");
+        assert!(
+            matches!(res, Err(WinrmError::Timeout(1))),
+            "{:?}",
+            res.err()
+        );
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn dial_tunnel_runs_socks5() {
+        let port = spawn_hi_target().await;
+        let [hi, lo] = port.to_be_bytes();
+
+        let (pport, records) = test_proxy::spawn_socks5_proxy(true).await;
+        let dial = CredSspDial::Socks5 {
+            proxy: format!("127.0.0.1:{pport}"),
+            user_pass: Some((Zeroizing::new("u".into()), Zeroizing::new("p".into()))),
+            remote_dns: false,
+        };
+        let mut stream = dial_tunnel(&dial, "127.0.0.1", port).await.unwrap();
+        assert_eq!(&read_two(&mut stream).await, b"hi");
+        assert_eq!(
+            *records.lock().unwrap(),
+            vec![
+                vec![5, 2, 0, 2],
+                vec![1, 1, b'u', 1, b'p'],
+                vec![5, 1, 0, 1, 127, 0, 0, 1, hi, lo],
+            ]
+        );
+
+        let (pport, records) = test_proxy::spawn_socks5_proxy(false).await;
+        let dial = CredSspDial::Socks5 {
+            proxy: format!("127.0.0.1:{pport}"),
+            user_pass: None,
+            remote_dns: true,
+        };
+        let mut stream = dial_tunnel(&dial, "localhost", port).await.unwrap();
+        assert_eq!(&read_two(&mut stream).await, b"hi");
+        let mut connect = vec![5, 1, 0, 3, 9];
+        connect.extend_from_slice(b"localhost");
+        connect.extend_from_slice(&[hi, lo]);
+        assert_eq!(*records.lock().unwrap(), vec![vec![5, 1, 0], connect]);
+    }
+
+    #[tokio::test]
+    async fn dial_tunnel_refuses_a_socks5_without_a_common_method() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pport = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut greeting = [0u8; 3];
+            let _ = s.read_exact(&mut greeting).await;
+            let _ = s.write_all(&[5, 0xFF]).await;
+        });
+        let dial = CredSspDial::Socks5 {
+            proxy: format!("127.0.0.1:{pport}"),
+            user_pass: None,
+            remote_dns: false,
+        };
+        let err = auth_failed(dial_tunnel(&dial, "127.0.0.1", 9).await);
+        assert_eq!(
+            err,
+            "CredSSP: the SOCKS5 proxy accepted no offered authentication method"
+        );
+    }
+
+    /// A SOCKS5 proxy that refuses the credentials, or the connection, is
+    /// reported as such.
+    #[tokio::test]
+    async fn dial_tunnel_reports_socks5_refusals() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        async fn scripted(replies: &'static [&'static [u8]]) -> u16 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                let (mut s, _) = listener.accept().await.unwrap();
+                for reply in replies {
+                    let mut msg = [0u8; 512];
+                    let _ = s.read(&mut msg).await;
+                    let _ = s.write_all(reply).await;
+                }
+            });
+            port
+        }
+        let dial = |pport: u16, user_pass: bool| CredSspDial::Socks5 {
+            proxy: format!("127.0.0.1:{pport}"),
+            user_pass: user_pass.then(|| (Zeroizing::new("u".into()), Zeroizing::new("p".into()))),
+            remote_dns: false,
+        };
+        let port = scripted(&[&[5, 2], &[1, 1]]).await;
+        assert_eq!(
+            auth_failed(dial_tunnel(&dial(port, true), "127.0.0.1", 9).await),
+            "CredSSP: the SOCKS5 proxy refused the credentials"
+        );
+        // Offered no credentials, so user name and password is no choice.
+        let port = scripted(&[&[5, 2]]).await;
+        assert_eq!(
+            auth_failed(dial_tunnel(&dial(port, false), "127.0.0.1", 9).await),
+            "CredSSP: the SOCKS5 proxy accepted no offered authentication method"
+        );
+        let port = scripted(&[&[5, 0], &[5, 5, 0, 1, 0, 0, 0, 0, 0, 0]]).await;
+        assert_eq!(
+            auth_failed(dial_tunnel(&dial(port, false), "127.0.0.1", 9).await),
+            "CredSSP: SOCKS5 connect failed (reply 5)"
+        );
     }
 
     /// One CredSSP exchange posting `body` to the acceptor on `port`.

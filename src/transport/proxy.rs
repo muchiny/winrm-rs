@@ -11,7 +11,7 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use hyper_util::client::proxy::matcher::Matcher;
+use hyper_util::client::proxy::matcher::{Intercept, Matcher};
 use zeroize::Zeroizing;
 
 use crate::config::WinrmConfig;
@@ -177,6 +177,14 @@ impl ProxyRoute {
     /// `hyper-util` matcher `reqwest` builds from [`Self::reqwest_proxies`],
     /// on the URL as `reqwest` parses it (IDN to punycode).
     pub(crate) fn proxy_for(&self, endpoint_url: &str) -> Option<reqwest::Url> {
+        let intercept = self.intercept(endpoint_url)?;
+        reqwest::Url::parse(&intercept.uri().to_string()).ok()
+    }
+
+    /// The `hyper-util` interception of a request to `endpoint_url`: the
+    /// proxy (its URI without user info) and the credentials it gets, or
+    /// `None` when the request goes direct.
+    fn intercept(&self, endpoint_url: &str) -> Option<Intercept> {
         let url = reqwest::Url::parse(endpoint_url).ok()?;
         let uri: http::Uri = url.as_str().parse().ok()?;
         let builder = match &self.explicit {
@@ -186,8 +194,74 @@ impl ProxyRoute {
                 .https(self.https.as_deref().map_or("", String::as_str))
                 .no(self.no.as_str()),
         };
-        let intercept = builder.build().intercept(&uri)?;
-        reqwest::Url::parse(&intercept.uri().to_string()).ok()
+        builder.build().intercept(&uri)
+    }
+
+    /// With `use_env == false`, only `WinrmConfig::proxy` counts; with `true`,
+    /// the same proxy reqwest would pick for `endpoint_url` (explicit first,
+    /// then `HTTPS_PROXY` subject to `NO_PROXY`).
+    ///
+    /// The credentials are those `reqwest` would send: the URL's user info,
+    /// percent-decoded. An `https://` or `socks4://` / `socks4a://` proxy is
+    /// refused ([`WinrmError::AuthFailed`]), and so is a SOCKS5 user name or
+    /// password longer than RFC 1929 allows (255 bytes).
+    #[cfg(feature = "credssp")]
+    pub(crate) fn credssp_dial(
+        &self,
+        endpoint_url: &str,
+        use_env: bool,
+    ) -> Result<CredSspDial, WinrmError> {
+        if self.explicit.is_none() && !use_env {
+            return Ok(CredSspDial::Direct);
+        }
+        let Some(intercept) = self.intercept(endpoint_url) else {
+            return Ok(CredSspDial::Direct);
+        };
+        let uri = intercept.uri();
+        let scheme = uri.scheme_str().unwrap_or_default();
+        let refused = |what: &str| {
+            WinrmError::AuthFailed(format!(
+                "CredSSP: {what} is not supported; use an http:// or socks5:// proxy, or \
+                 connect directly"
+            ))
+        };
+        let default_port = match scheme {
+            "http" => 80,
+            "https" => return Err(refused("an https:// proxy")),
+            "socks4" | "socks4a" => return Err(refused("a socks4 proxy")),
+            _ => DEFAULT_SOCKS_PORT,
+        };
+        // `host()` keeps the brackets of an IPv6 address.
+        let proxy = format!(
+            "{}:{}",
+            uri.host().unwrap_or_default(),
+            uri.port_u16().unwrap_or(default_port)
+        );
+        if scheme == "http" {
+            let authorization = intercept
+                .basic_auth()
+                .and_then(|value| value.to_str().ok())
+                .map(|value| Zeroizing::new(value.to_string()));
+            return Ok(CredSspDial::HttpConnect {
+                proxy,
+                authorization,
+            });
+        }
+        let user_pass = match intercept.raw_auth() {
+            Some((user, pass)) if user.len() > 255 || pass.len() > 255 => {
+                return Err(WinrmError::AuthFailed(SOCKS5_CREDENTIALS_TOO_LONG.into()));
+            }
+            Some((user, pass)) => Some((
+                Zeroizing::new(user.to_string()),
+                Zeroizing::new(pass.to_string()),
+            )),
+            None => None,
+        };
+        Ok(CredSspDial::Socks5 {
+            proxy,
+            user_pass,
+            remote_dns: scheme == "socks5h",
+        })
     }
 
     /// The TLS server names of the `https://` proxy a client on this route
@@ -217,6 +291,65 @@ impl ProxyRoute {
         self.http.as_deref().map(String::as_str)
     }
 }
+
+/// How CredSSP reaches the host. `Debug` redacts every credential.
+///
+/// A tunnel only relays bytes: the outer TLS handshake runs end-to-end with
+/// the host, under the transport's verifier, and the proxy's credentials go
+/// to the proxy alone, before that handshake. `proxy` is `host:port` (an
+/// IPv6 address in brackets), with no user info.
+#[cfg(feature = "credssp")]
+#[derive(Clone)]
+pub(crate) enum CredSspDial {
+    /// A TCP connection to the host itself.
+    Direct,
+    /// `CONNECT host:port` (RFC 7231 section 4.3.6) through an `http://`
+    /// proxy; `authorization` is the full `Basic <b64>` value.
+    HttpConnect {
+        proxy: String,
+        authorization: Option<Zeroizing<String>>,
+    },
+    /// A SOCKS5 `CONNECT` (RFC 1928), with the user name and password of
+    /// RFC 1929 when set. `remote_dns` is true for `socks5h://`.
+    Socks5 {
+        proxy: String,
+        user_pass: Option<(Zeroizing<String>, Zeroizing<String>)>,
+        remote_dns: bool,
+    },
+}
+
+#[cfg(feature = "credssp")]
+impl std::fmt::Debug for CredSspDial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        const REDACTED: &str = "<redacted>";
+        match self {
+            Self::Direct => f.write_str("Direct"),
+            Self::HttpConnect {
+                proxy,
+                authorization,
+            } => f
+                .debug_struct("HttpConnect")
+                .field("proxy", proxy)
+                .field("authorization", &authorization.as_ref().map(|_| REDACTED))
+                .finish(),
+            Self::Socks5 {
+                proxy,
+                user_pass,
+                remote_dns,
+            } => f
+                .debug_struct("Socks5")
+                .field("proxy", proxy)
+                .field("user_pass", &user_pass.as_ref().map(|_| REDACTED))
+                .field("remote_dns", remote_dns)
+                .finish(),
+        }
+    }
+}
+
+/// The refusal of a SOCKS5 user name or password RFC 1929 cannot carry.
+#[cfg(feature = "credssp")]
+pub(crate) const SOCKS5_CREDENTIALS_TOO_LONG: &str =
+    "CredSSP: SOCKS5 user name and password must be at most 255 bytes each";
 
 /// Whether a response carries `Proxy-Support: Session-Based-Authentication`
 /// (RFC 4559 section 6): any `Proxy-Support` value holding that token in its
@@ -775,6 +908,157 @@ mod tests {
             "Session-Based-Authentication-X"
         ])));
         assert!(!proxy_supports_session_auth(&h(&["Foo"])));
+    }
+
+    #[cfg(feature = "credssp")]
+    fn explicit_route(proxy: &str) -> ProxyRoute {
+        let config = WinrmConfig {
+            proxy: Some(proxy.into()),
+            ..Default::default()
+        };
+        ProxyRoute::resolve(&config, false, |_: &str| None).unwrap()
+    }
+
+    #[cfg(feature = "credssp")]
+    const EP: &str = "https://h:5986/wsman";
+
+    #[cfg(feature = "credssp")]
+    #[test]
+    fn credssp_dial_follows_the_explicit_proxy() {
+        match explicit_route("http://user:pw@127.0.0.1:3128")
+            .credssp_dial(EP, false)
+            .unwrap()
+        {
+            CredSspDial::HttpConnect {
+                proxy,
+                authorization,
+            } => {
+                assert_eq!(proxy, "127.0.0.1:3128");
+                assert_eq!(authorization.as_deref().unwrap(), "Basic dXNlcjpwdw==");
+            }
+            other => panic!("{other:?}"),
+        }
+        // No credentials, and the port an http:// proxy URL leaves out.
+        match explicit_route("http://proxy.corp")
+            .credssp_dial(EP, false)
+            .unwrap()
+        {
+            CredSspDial::HttpConnect {
+                proxy,
+                authorization: None,
+            } => assert_eq!(proxy, "proxy.corp:80"),
+            other => panic!("{other:?}"),
+        }
+        match explicit_route("socks5h://127.0.0.1:1080")
+            .credssp_dial(EP, false)
+            .unwrap()
+        {
+            CredSspDial::Socks5 {
+                proxy,
+                user_pass: None,
+                remote_dns: true,
+            } => assert_eq!(proxy, "127.0.0.1:1080"),
+            other => panic!("{other:?}"),
+        }
+        // SOCKS5 credentials are percent-decoded, as reqwest sends them;
+        // an IPv6 proxy keeps its brackets, and the default port is 1080.
+        match explicit_route("socks5://u%40corp:p%3Aw@[::1]")
+            .credssp_dial(EP, false)
+            .unwrap()
+        {
+            CredSspDial::Socks5 {
+                proxy,
+                user_pass: Some((user, pass)),
+                remote_dns: false,
+            } => {
+                assert_eq!(proxy, "[::1]:1080");
+                assert_eq!((user.as_str(), pass.as_str()), ("u@corp", "p:w"));
+            }
+            other => panic!("{other:?}"),
+        }
+        let none = ProxyRoute::resolve(&WinrmConfig::default(), false, |_: &str| None).unwrap();
+        assert!(matches!(
+            none.credssp_dial(EP, false).unwrap(),
+            CredSspDial::Direct
+        ));
+    }
+
+    #[cfg(feature = "credssp")]
+    #[test]
+    fn credssp_dial_refuses_https_and_socks4_proxies() {
+        let refused = |proxy: &str| match explicit_route(proxy).credssp_dial(EP, false) {
+            Err(WinrmError::AuthFailed(m)) => m,
+            other => panic!("{proxy}: {other:?}"),
+        };
+        assert_eq!(
+            refused("https://127.0.0.1:3128"),
+            "CredSSP: an https:// proxy is not supported; use an http:// or socks5:// proxy, \
+             or connect directly"
+        );
+        for socks4 in ["socks4://127.0.0.1:1080", "socks4a://127.0.0.1:1080"] {
+            assert_eq!(
+                refused(socks4),
+                "CredSSP: a socks4 proxy is not supported; use an http:// or socks5:// proxy, \
+                 or connect directly"
+            );
+        }
+        let long = "a".repeat(256);
+        for proxy in [
+            format!("socks5://{long}:p@127.0.0.1:1080"),
+            format!("socks5://u:{long}@127.0.0.1:1080"),
+        ] {
+            assert_eq!(refused(&proxy), SOCKS5_CREDENTIALS_TOO_LONG);
+        }
+        let max = "a".repeat(255);
+        assert!(
+            explicit_route(&format!("socks5://{max}:{max}@127.0.0.1:1080"))
+                .credssp_dial(EP, false)
+                .is_ok()
+        );
+    }
+
+    #[cfg(feature = "credssp")]
+    #[test]
+    fn credssp_dial_ignores_env_proxies_without_opt_in() {
+        let route = ProxyRoute::resolve(&WinrmConfig::default(), true, |n: &str| {
+            (n == "HTTPS_PROXY").then(|| "http://10.0.0.1:3128".to_string())
+        })
+        .unwrap();
+        assert!(matches!(
+            route.credssp_dial(EP, false).unwrap(),
+            CredSspDial::Direct
+        ));
+        match route.credssp_dial(EP, true).unwrap() {
+            CredSspDial::HttpConnect { proxy, .. } => assert_eq!(proxy, "10.0.0.1:3128"),
+            other => panic!("{other:?}"),
+        }
+        let excluded = ProxyRoute::resolve(&WinrmConfig::default(), true, |n: &str| match n {
+            "HTTPS_PROXY" => Some("http://10.0.0.1:3128".to_string()),
+            "NO_PROXY" => Some("h".to_string()),
+            _ => None,
+        })
+        .unwrap();
+        assert!(matches!(
+            excluded.credssp_dial(EP, true).unwrap(),
+            CredSspDial::Direct
+        ));
+    }
+
+    #[cfg(feature = "credssp")]
+    #[test]
+    fn credssp_dial_debug_redacts_credentials() {
+        for proxy in [
+            "http://user:pw@127.0.0.1:3128",
+            "socks5://user:pw@127.0.0.1:1080",
+        ] {
+            let dial = explicit_route(proxy).credssp_dial(EP, false).unwrap();
+            let shown = format!("{dial:?}");
+            assert!(
+                !shown.contains("pw") && !shown.contains("dXNlcjpwdw=="),
+                "{shown}"
+            );
+            assert!(shown.contains("<redacted>"), "{shown}");
+        }
     }
 
     #[test]

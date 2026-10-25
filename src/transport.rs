@@ -469,6 +469,12 @@ pub(crate) struct HttpTransport {
     /// for [`AuthMethod::CredSsp`].
     #[cfg(feature = "credssp")]
     credssp_tls: Option<Arc<CredSspTls>>,
+    /// How [`AuthMethod::CredSsp`] reaches the host: through the proxy of
+    /// [`WinrmConfig::proxy`], else directly. Resolved at construction
+    /// ([`proxy::ProxyRoute::credssp_dial`]), so a proxy CredSSP cannot use
+    /// fails there. [`proxy::CredSspDial::Direct`] for the other methods.
+    #[cfg(feature = "credssp")]
+    credssp_dial: Arc<proxy::CredSspDial>,
     /// Idle dedicated connections. The lock is only held to check one
     /// out or back in, never across an HTTP exchange.
     #[expect(
@@ -838,7 +844,8 @@ impl HttpTransport {
     /// certificate and key, a crypto
     /// provider, TLS verifier or client certificate that rustls rejects, an
     /// invalid [`WinrmConfig::proxy`], or, with the `credssp` feature, the
-    /// CredSSP TLS contexts.
+    /// CredSSP TLS contexts, and a [`WinrmConfig::proxy`] CredSSP cannot
+    /// tunnel through ([`proxy::ProxyRoute::credssp_dial`]).
     #[tracing::instrument(level = "debug", skip_all)]
     fn with_provider(
         config: WinrmConfig,
@@ -992,6 +999,15 @@ impl HttpTransport {
         } else {
             None
         };
+        // CredSSP tunnels through `WinrmConfig::proxy` only, and never reads
+        // the environment. That proxy serves every host, so the host of the
+        // URL named here does not change the result.
+        #[cfg(feature = "credssp")]
+        let credssp_dial = Arc::new(if matches!(config.auth_method, AuthMethod::CredSsp) {
+            route.credssp_dial(&endpoint_url(true, "localhost", config.port), false)?
+        } else {
+            proxy::CredSspDial::Direct
+        });
 
         let http = build_http_client(&config, &route, client_tls.clone(), 10, None)?;
 
@@ -1003,6 +1019,8 @@ impl HttpTransport {
             server_verifier,
             #[cfg(feature = "credssp")]
             credssp_tls,
+            #[cfg(feature = "credssp")]
+            credssp_dial,
             conn_pool: Mutex::new(Vec::new()),
             conn_slots: Mutex::new(std::collections::HashMap::new()),
             all_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONNS_IN_FLIGHT_TOTAL)),
@@ -1180,6 +1198,7 @@ impl HttpTransport {
                         WinrmError::AuthFailed("CredSSP requires HTTPS (set use_tls = true)".into())
                     })?),
                     opts: CredSspConnOptions::from_config(&self.config),
+                    dial: Arc::clone(&self.credssp_dial),
                 };
                 auth.send_authenticated(&self.http, &url, body).await?
             }
@@ -4640,6 +4659,125 @@ mod tests {
         assert_eq!(test_server::delegations(&log.lock().unwrap()), 1);
     }
 
+    /// [`credssp_test_transport`] with `proxy` as [`WinrmConfig::proxy`].
+    #[cfg(feature = "credssp")]
+    fn credssp_proxied_transport(port: u16, proxy: String) -> Result<HttpTransport, WinrmError> {
+        HttpTransport::new_with(
+            WinrmConfig {
+                proxy: Some(proxy),
+                ..credssp_test_config(port)
+            },
+            WinrmCredentials::new(USER, PASS, ""),
+            TransportOptions {
+                tls: TlsOptions {
+                    pins: vec![sha256_hex(crate::test_pki::EC_CERT_PEM)],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+    }
+
+    #[cfg(feature = "credssp")]
+    #[tokio::test]
+    async fn credssp_runs_through_an_http_connect_proxy() {
+        use crate::auth::credssp::test_server::{self, Fault};
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
+        let (port, log) = test_server::spawn(Fault::Honest, EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let (pport, heads) = crate::test_proxy::spawn_connect_proxy_answering(
+            "HTTP/1.1 200 Connection established\r\n\r\n",
+        )
+        .await;
+        let t =
+            credssp_proxied_transport(port, format!("http://user:pw@127.0.0.1:{pport}")).unwrap();
+        let reply = send_bounded(&t).await.unwrap();
+        assert_eq!(reply, test_server::MOCK_REPLY);
+        assert_eq!(test_server::delegations(&log.lock().unwrap()), 1);
+        let heads = heads.lock().unwrap().clone();
+        assert_eq!(heads.len(), 1, "{heads:?}");
+        assert!(
+            heads[0].starts_with(&format!("CONNECT 127.0.0.1:{port} HTTP/1.1")),
+            "{heads:?}"
+        );
+        assert!(heads[0].contains("Proxy-Authorization: Basic dXNlcjpwdw==\r\n"));
+    }
+
+    #[cfg(feature = "credssp")]
+    #[tokio::test]
+    async fn credssp_runs_through_a_socks5_proxy() {
+        use crate::auth::credssp::test_server::{self, Fault};
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
+        let (port, log) = test_server::spawn(Fault::Honest, EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let (pport, records) = crate::test_proxy::spawn_socks5_proxy(false).await;
+        let t = credssp_proxied_transport(port, format!("socks5://127.0.0.1:{pport}")).unwrap();
+        let reply = send_bounded(&t).await.unwrap();
+        assert_eq!(reply, test_server::MOCK_REPLY);
+        assert_eq!(test_server::delegations(&log.lock().unwrap()), 1);
+        let [hi, lo] = port.to_be_bytes();
+        let connects: Vec<_> = records
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.get(..2) == Some(&[5, 1][..]) && r.len() == 10)
+            .cloned()
+            .collect();
+        assert_eq!(connects, vec![vec![5, 1, 0, 1, 127, 0, 0, 1, hi, lo]]);
+    }
+
+    /// Through a proxy, the outer TLS still runs end-to-end with the host
+    /// under the pin: a listener with another certificate behind the proxy
+    /// is refused before any request reaches the real server.
+    #[cfg(feature = "credssp")]
+    #[tokio::test]
+    async fn credssp_through_a_proxy_keeps_the_pin() {
+        use crate::auth::credssp::test_server::{self, Fault};
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM, RSA_CERT_PEM, RSA_KEY_PKCS1_PEM};
+        let (port, log) = test_server::spawn(Fault::Honest, EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let relay = test_server::spawn_tls_relay(port, RSA_CERT_PEM, RSA_KEY_PKCS1_PEM);
+        let (pport, heads) = crate::test_proxy::spawn_connect_proxy_answering(
+            "HTTP/1.1 200 Connection established\r\n\r\n",
+        )
+        .await;
+        let t = credssp_proxied_transport(relay, format!("http://127.0.0.1:{pport}")).unwrap();
+        let err = send_bounded(&t).await.unwrap_err();
+        assert!(
+            matches!(&err, WinrmError::AuthFailed(m) if m.starts_with("CredSSP outer TLS")),
+            "{err}"
+        );
+        assert_eq!(heads.lock().unwrap().len(), 1, "the proxy was not used");
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "the real server saw a request"
+        );
+    }
+
+    #[cfg(feature = "credssp")]
+    #[test]
+    fn credssp_refuses_an_https_proxy_at_construction() {
+        let err = credssp_proxied_transport(5986, "https://127.0.0.1:1".into())
+            .err()
+            .expect("must refuse");
+        assert!(
+            matches!(
+                &err,
+                WinrmError::AuthFailed(m) if m == "CredSSP: an https:// proxy is not supported; \
+                    use an http:// or socks5:// proxy, or connect directly"
+            ),
+            "{err}"
+        );
+        // The other methods keep their https:// proxy.
+        let ntlm = HttpTransport::new(
+            WinrmConfig {
+                auth_method: AuthMethod::Ntlm,
+                use_tls: true,
+                proxy: Some("https://127.0.0.1:1".into()),
+                ..Default::default()
+            },
+            creds(),
+        );
+        assert!(ntlm.is_ok(), "{:?}", ntlm.err());
+    }
+
     /// Without a pin or an extra root, the default verifier (the built-in
     /// Mozilla roots) refuses the self-signed test listener.
     #[cfg(feature = "credssp")]
@@ -7678,17 +7816,30 @@ mod tests {
     /// A host with the server name of the `https://` proxy would be verified
     /// as the proxy is (trusted roots, no pin): while a pin is set it is
     /// refused before anything is sent, whatever the auth method, even when
-    /// its certificate chains to a trusted root.
+    /// its certificate chains to a trusted root. CredSSP takes no `https://`
+    /// proxy at all: it is refused when the client is built.
     #[tokio::test]
     async fn pin_refuses_a_host_named_like_the_https_proxy() {
         use crate::test_pki::{CA_LEAF_KEY_PEM, CA_LEAF_PEM, EC_CERT_PEM, TEST_CA_PEM};
         let ca = root_file("ca-pin-shared-name", TEST_CA_PEM);
         let p = spawn_https_connect_proxy(CA_LEAF_PEM, CA_LEAF_KEY_PEM);
         #[cfg(feature = "credssp")]
-        let methods = [AuthMethod::Basic, AuthMethod::Ntlm, AuthMethod::CredSsp];
-        #[cfg(not(feature = "credssp"))]
-        let methods = [AuthMethod::Basic, AuthMethod::Ntlm];
-        for method in methods {
+        {
+            let config = WinrmConfig {
+                proxy: Some(format!("https://LOCALHOST:{p}")),
+                ..tls_config(AuthMethod::CredSsp, 5986)
+            };
+            let opts = TlsOptions {
+                pins: vec![sha256_hex(EC_CERT_PEM)],
+                ..roots(&[&ca])
+            };
+            let err = transport_with(config, &opts).err().expect("must refuse");
+            assert!(
+                matches!(&err, WinrmError::AuthFailed(m) if m.starts_with("CredSSP: an https:// proxy is not supported")),
+                "{err}"
+            );
+        }
+        for method in [AuthMethod::Basic, AuthMethod::Ntlm] {
             let label = format!("{method:?}");
             let (port, read) = crate::test_pki::spawn_tls_sink(crate::test_pki::server_config(
                 CA_LEAF_PEM,

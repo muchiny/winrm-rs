@@ -167,9 +167,10 @@ pub struct WinrmConfig {
     pub client_key_pem: Option<String>,
     /// Proxy URL (e.g. `"http://proxy:8080"`).
     ///
-    /// When set, WinRM requests go through this proxy, with one exception:
-    /// [`AuthMethod::CredSsp`] opens its own TCP connection to the host and
-    /// uses no proxy at all, neither this one nor one from the environment.
+    /// When set, WinRM requests go through this proxy.
+    /// [`AuthMethod::CredSsp`] uses this proxy through an HTTP `CONNECT` or
+    /// SOCKS5 tunnel. It refuses an `https://` or `socks4://` proxy, and it
+    /// does not read the proxy environment variables.
     ///
     /// Limitation with [`AuthMethod::Certificate`]: with an `https://` proxy,
     /// `reqwest` uses a copy of the same TLS client configuration for the
@@ -719,11 +720,11 @@ pub enum AuthMethod {
     /// # Limitations in this release
     ///
     /// CredSSP runs on a TLS connection of its own, outside the HTTP client
-    /// of the other methods. It applies `connect_timeout_secs`,
-    /// `operation_timeout_secs` and `user_agent`, and does not apply these
+    /// of the other methods. It applies `connect_timeout_secs` (TCP, proxy
+    /// handshake and TLS together), `operation_timeout_secs`, `user_agent`
+    /// and an `http://` or `socks5://` [`WinrmConfig::proxy`] (the proxy
+    /// environment variables are not read), and does not apply these
     /// [`WinrmConfig`] fields:
-    /// - `proxy`, and the `HTTPS_PROXY` / `ALL_PROXY` environment variables:
-    ///   CredSSP connects directly to the endpoint.
     /// - `max_retries`: a CredSSP connection error is
     ///   [`WinrmError::AuthFailed`](crate::WinrmError::AuthFailed) or
     ///   [`WinrmError::Timeout`](crate::WinrmError::Timeout), never

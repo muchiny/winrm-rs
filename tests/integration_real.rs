@@ -2999,6 +2999,84 @@ async fn credssp_run_command_whoami() {
     assert!(!stdout.trim().is_empty());
 }
 
+/// `whoami` over CredSSP with `proxy_url` as `WinrmConfig::proxy`, on the
+/// bench HTTPS listener with its certificate pinned. `None` when the host is
+/// Server 2012 R2 (see `credssp_run_command_whoami`).
+#[cfg(feature = "credssp")]
+async fn credssp_whoami_through(test: &str, proxy_url: String) -> Option<()> {
+    if is_server_2012_r2().await {
+        eprintln!("SKIP {test}: no TLS cipher suite shared with Server 2012 R2");
+        return None;
+    }
+    let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    let pass = std::env::var("WINRM_TEST_PASS").expect("WINRM_TEST_PASS");
+    let config = WinrmConfig {
+        auth_method: AuthMethod::CredSsp,
+        use_tls: true,
+        accept_invalid_certs: false,
+        port: https_test_port(),
+        proxy: Some(proxy_url),
+        ..Default::default()
+    };
+    let client = WinrmClient::builder(config)
+        .pin_server_certificate_sha256(&bench_https_pin().expect("WINRM_TEST_HTTPS_CERT_SHA256"))
+        .credentials(WinrmCredentials::new(user, pass, ""))
+        .build()
+        .unwrap();
+    let output = client
+        .run_command(&host, "whoami", &[])
+        .await
+        .expect("credssp whoami through the proxy");
+    assert_eq!(output.exit_code, 0);
+    assert!(!String::from_utf8_lossy(&output.stdout).trim().is_empty());
+    Some(())
+}
+
+/// CredSSP through an HTTP `CONNECT` proxy: each CredSSP connection is one
+/// tunnel.
+#[cfg(feature = "credssp")]
+#[tokio::test]
+#[ignore]
+async fn credssp_through_http_proxy() {
+    let proxy = TestProxy::http().await;
+    let url = format!("http://{}", proxy.addr);
+    if credssp_whoami_through("credssp_through_http_proxy", url)
+        .await
+        .is_none()
+    {
+        return;
+    }
+    assert!(
+        proxy.connections() > 0,
+        "the request did not go through the proxy"
+    );
+    assert_eq!(
+        proxy.connect_requests(),
+        proxy.connections(),
+        "every CredSSP connection is one CONNECT tunnel"
+    );
+}
+
+/// CredSSP through a SOCKS5 proxy.
+#[cfg(feature = "credssp")]
+#[tokio::test]
+#[ignore]
+async fn credssp_through_socks5_proxy() {
+    let proxy = TestProxy::socks5().await;
+    let url = format!("socks5://{}", proxy.addr);
+    if credssp_whoami_through("credssp_through_socks5_proxy", url)
+        .await
+        .is_none()
+    {
+        return;
+    }
+    assert!(
+        proxy.connections() > 0,
+        "the request did not go through the proxy"
+    );
+}
+
 /// A response body of several hundred kilobytes, read over CredSSP strictly
 /// by its `Content-Length` (identity coding, no chunked framing).
 #[cfg(feature = "credssp")]

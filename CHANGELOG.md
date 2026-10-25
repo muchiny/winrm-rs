@@ -129,7 +129,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - A client that talks to several hosts no longer lets one host's slow requests
   hold up another's. Dedicated connections (sealed NTLM/Kerberos, NTLM and
   Kerberos over HTTPS) allow 32 exchanges in flight per host and 128 per
-  client, instead of 32 per client. Signal and Delete requests get 2 more per
+  client, instead of 32 per client. Signal and Delete requests get 8 more per
   host of their own, so clean-up never waits behind data requests. For fleets,
   one client per host is still the recommendation.
 - Opening an authenticated connection (the NTLM or Kerberos handshake before a
@@ -142,7 +142,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   which would then have to authenticate again.
 - Kerberos: the ticket request to the KDC runs on tokio's blocking pool, at
   most 32 at a time per client, and fails with `WinrmError::Timeout` after
-  `operation_timeout_secs`. It no longer blocks an async worker thread.
+  `operation_timeout_secs + 10` seconds. It no longer blocks an async worker
+  thread.
 - Kerberos: the service principal now names the host the connection goes to
   (IDN, short or octal IPv4 and IPv6-literal endpoints). ASCII host names are
   unchanged.
@@ -165,8 +166,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - A shell opened with `open_psrp_shell` is handled as a PowerShell shell
   whatever the case of its resource URI; `reconnect_shell` recognises the
   `/powershell` path segment case-insensitively.
-- Kerberos: a zero `operation_timeout_secs` no longer makes every ticket
-  request time out; the KDC timeout is at least one second.
 - `NtlmError::InvalidMessage` is also returned for NTLM messages with
   oversized or out-of-range fields: a Type 3 field longer than a 16-bit
   length can hold is refused instead of being truncated.

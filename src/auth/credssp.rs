@@ -2,10 +2,8 @@
 //
 // **STATUS: EXPERIMENTAL — validated end-to-end against Windows Server 2025**
 //
-// A few helpers below (reqwest-header variants of the token extraction) are
-// kept for the day the flow moves back onto reqwest and are not on the
-// active path. Silence dead_code at module level rather than scattering
-// attributes.
+// A few helpers below are not on the active path. Silence dead_code at
+// module level rather than scattering attributes.
 #![allow(dead_code)]
 //
 // This implements the CredSSP protocol with TLS-in-TLS architecture:
@@ -105,36 +103,6 @@ pub(crate) fn apply_debug_key_log(cfg: &mut rustls::ClientConfig) {
 /// debug builds that enable the internal `__internal` feature.
 #[cfg(not(all(debug_assertions, feature = "__internal")))]
 pub(crate) fn apply_debug_key_log(_cfg: &mut rustls::ClientConfig) {}
-
-/// Extract a CredSSP token from a response's WWW-Authenticate headers.
-#[cfg(feature = "credssp")]
-fn extract_credssp_token(headers: &http::HeaderMap) -> Option<String> {
-    let all: String = headers
-        .get_all("WWW-Authenticate")
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    let upper = all.to_uppercase();
-    let pos = upper.find("CREDSSP ")?;
-    let after = &all[pos + "CREDSSP ".len()..];
-    let token: String = after
-        .chars()
-        .take_while(|c| !c.is_whitespace() && *c != ',')
-        .collect();
-    if token.is_empty() { None } else { Some(token) }
-}
-
-/// Check if the server advertises CredSSP in any WWW-Authenticate header.
-#[cfg(feature = "credssp")]
-fn advertises_credssp(headers: &http::HeaderMap) -> bool {
-    headers
-        .get_all("WWW-Authenticate")
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .any(|v| v.to_uppercase().contains("CREDSSP"))
-}
 
 // === Inner TLS helpers ===
 //
@@ -384,13 +352,14 @@ pub(crate) struct CredSspConnOptions {
 }
 
 impl CredSspConnOptions {
-    /// `connect_timeout_secs`; `operation_timeout_secs.saturating_add(10)`;
+    /// `connect_timeout_secs` (at least 1 s: a zero timeout would end every
+    /// connect at once); `operation_timeout_secs.saturating_add(10)`;
     /// `transport::max_response_bytes(config)`; `user_agent`, by default
     /// `winrm-rs/<version>` like the other methods.
     pub(crate) fn from_config(config: &crate::config::WinrmConfig) -> Self {
         Self {
             max_response_bytes: crate::transport::max_response_bytes(config),
-            connect_timeout: std::time::Duration::from_secs(config.connect_timeout_secs),
+            connect_timeout: std::time::Duration::from_secs(config.connect_timeout_secs.max(1)),
             exchange_timeout: std::time::Duration::from_secs(
                 config.operation_timeout_secs.saturating_add(10),
             ),
@@ -1426,84 +1395,6 @@ impl AuthTransport for CredSspAuth {
 mod tests {
     use super::*;
     use crate::config::WinrmConfig;
-    use reqwest::header::{HeaderMap, HeaderValue};
-
-    fn make_headers(values: &[&str]) -> HeaderMap {
-        let mut h = HeaderMap::new();
-        for v in values {
-            h.append("WWW-Authenticate", HeaderValue::from_str(v).unwrap());
-        }
-        h
-    }
-
-    #[test]
-    fn extract_credssp_token_simple() {
-        let h = make_headers(&["CredSSP YWJjZGVm"]);
-        assert_eq!(extract_credssp_token(&h), Some("YWJjZGVm".to_string()));
-    }
-
-    #[test]
-    fn extract_credssp_token_case_insensitive() {
-        let h = make_headers(&["credssp YWJjZGVm"]);
-        assert_eq!(extract_credssp_token(&h), Some("YWJjZGVm".to_string()));
-        let h = make_headers(&["CREDSSP YWJjZGVm"]);
-        assert_eq!(extract_credssp_token(&h), Some("YWJjZGVm".to_string()));
-    }
-
-    #[test]
-    fn extract_credssp_token_multiple_schemes_one_header() {
-        let h = make_headers(&["Negotiate, CredSSP TOKEN, Basic"]);
-        assert_eq!(extract_credssp_token(&h), Some("TOKEN".to_string()));
-    }
-
-    #[test]
-    fn extract_credssp_token_multiple_headers() {
-        let h = make_headers(&["Negotiate", "Basic realm=\"WSMAN\"", "CredSSP MYTOKEN"]);
-        assert_eq!(extract_credssp_token(&h), Some("MYTOKEN".to_string()));
-    }
-
-    #[test]
-    fn extract_credssp_token_no_credssp() {
-        let h = make_headers(&["Negotiate", "Basic realm=\"WSMAN\""]);
-        assert_eq!(extract_credssp_token(&h), None);
-    }
-
-    #[test]
-    fn extract_credssp_token_advertised_no_token() {
-        // CredSSP advertised but without a token (e.g., initial 401)
-        let h = make_headers(&["CredSSP"]);
-        assert_eq!(extract_credssp_token(&h), None);
-    }
-
-    #[test]
-    fn extract_credssp_token_empty_headers() {
-        let h = HeaderMap::new();
-        assert_eq!(extract_credssp_token(&h), None);
-    }
-
-    #[test]
-    fn advertises_credssp_detects_scheme() {
-        let h = make_headers(&["Negotiate", "Basic", "CredSSP"]);
-        assert!(advertises_credssp(&h));
-    }
-
-    #[test]
-    fn advertises_credssp_case_insensitive() {
-        let h = make_headers(&["credssp"]);
-        assert!(advertises_credssp(&h));
-    }
-
-    #[test]
-    fn advertises_credssp_returns_false_when_absent() {
-        let h = make_headers(&["Negotiate", "Basic"]);
-        assert!(!advertises_credssp(&h));
-    }
-
-    #[test]
-    fn advertises_credssp_works_with_token() {
-        let h = make_headers(&["CredSSP YWJjZGVm"]);
-        assert!(advertises_credssp(&h));
-    }
 
     use rustls::pki_types::ServerName;
 
@@ -2484,6 +2375,8 @@ mod tests {
         let opts = CredSspConnOptions::from_config(&config(u64::MAX, u64::MAX));
         assert_eq!(opts.connect_timeout, Duration::from_secs(u64::MAX));
         assert_eq!(opts.exchange_timeout, Duration::from_secs(u64::MAX));
+        let opts = CredSspConnOptions::from_config(&config(0, 60));
+        assert_eq!(opts.connect_timeout, Duration::from_secs(1));
     }
 
     #[tokio::test(start_paused = true)]

@@ -482,7 +482,8 @@ fn describe_pem_error(e: &pem::Error) -> &'static str {
 }
 
 /// Placeholder shown in place of a `client_cert_pem` / `client_key_pem` value
-/// that looks like key material, in errors that would otherwise name the path.
+/// that looks like key material, in errors that would otherwise name the path
+/// and in `WinrmConfig`'s `Debug` output.
 pub(crate) const KEY_MATERIAL_NOT_SHOWN: &str =
     "<not shown: looks like key material, and this field takes a file path>";
 

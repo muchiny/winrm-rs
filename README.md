@@ -161,10 +161,10 @@ server certificate with no binding hash (Ed25519, unknown algorithm) is
 refused. `EncryptionMode::Never` over plain HTTP has none of this.
 
 The KDC exchange runs on a bounded blocking pool (at most 32 concurrent per
-client); a ticket request longer than `operation_timeout_secs` fails with
-`WinrmError::Timeout`. The OS thread inside libkrb5 cannot be cancelled, so
-set `[libdefaults] request_timeout` in `krb5.conf` to cap libkrb5's own
-retries. On a Windows client the KDC call runs on a pool thread, which drops
+client); a ticket request longer than `operation_timeout_secs + 10` seconds
+fails with `WinrmError::Timeout`. The OS thread inside libkrb5 cannot be
+cancelled, so set `[libdefaults] request_timeout` in `krb5.conf` to cap
+libkrb5's own retries. On a Windows client the KDC call runs on a pool thread, which drops
 any per-thread SSPI impersonation a caller set on the tokio worker.
 
 Requirements: use a system MIT krb5 1.21.3 or later, or a vendor build with

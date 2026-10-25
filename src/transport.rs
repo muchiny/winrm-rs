@@ -200,8 +200,8 @@ const CONN_MAX_IDLE: Duration = Duration::from_secs(60);
 
 /// Dedicated-connection exchanges (sealed, NTLM over TLS, Kerberos over TLS)
 /// in flight: 32 per host and 128 per client. Signal and Delete use their own
-/// lane of 2 slots per host, outside both limits, so clean-up never queues
-/// behind data requests. At most 128 + 2 × hosts sockets are in use at once;
+/// lane of 8 slots per host, outside both limits, so clean-up never queues
+/// behind data requests. At most 128 + 8 × hosts sockets are in use at once;
 /// the idle pooled connections ([`MAX_IDLE_PER_HOST`]: 8 per host,
 /// [`MAX_IDLE_TOTAL`]: 32 in total) come on top. Hosts are keyed by
 /// their string, ASCII case aside: `win01` and its address get separate
@@ -209,8 +209,14 @@ const CONN_MAX_IDLE: Duration = Duration::from_secs(60);
 const MAX_CONNS_PER_HOST: usize = 32;
 
 /// Clean-up (Signal, Delete) exchanges in flight per host, on top of
-/// [`MAX_CONNS_PER_HOST`] (see there).
-const CLEANUP_SLOTS_PER_HOST: usize = 2;
+/// [`MAX_CONNS_PER_HOST`] (see there). As many as [`MAX_IDLE_PER_HOST`], so a
+/// burst of Signal and Delete requests after many concurrent calls drains
+/// quickly.
+const CLEANUP_SLOTS_PER_HOST: usize = 8;
+
+/// Kerberos ticket requests in flight per client, each on a thread of
+/// tokio's blocking pool.
+const MAX_KDC_IN_FLIGHT: usize = 32;
 
 /// Data exchanges in flight per client, all hosts together (see
 /// [`MAX_CONNS_PER_HOST`]).
@@ -790,7 +796,7 @@ impl HttpTransport {
             conn_pool: Mutex::new(Vec::new()),
             conn_slots: Mutex::new(std::collections::HashMap::new()),
             all_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONNS_IN_FLIGHT_TOTAL)),
-            kdc_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONNS_PER_HOST)),
+            kdc_slots: Arc::new(tokio::sync::Semaphore::new(MAX_KDC_IN_FLIGHT)),
             session_id: format!("uuid:{}", uuid::Uuid::new_v4().to_string().to_uppercase()),
             before_send: None,
         })
@@ -993,7 +999,7 @@ impl HttpTransport {
         Ok(KerberosAuth {
             service_principal: format!("HTTP/{host}"),
             max_response_bytes: self.max_response_bytes(),
-            kdc_timeout: Duration::from_secs(self.config.operation_timeout_secs.max(1)),
+            kdc_timeout: self.request_budget(),
             kdc_slots: Arc::clone(&self.kdc_slots),
         })
     }
@@ -1194,8 +1200,8 @@ impl HttpTransport {
     ///
     /// The whole handshake, retry included, is bounded by `budget`: a slower
     /// one fails with [`WinrmError::Timeout`], and nothing has been sent at
-    /// that point. A Kerberos context creation already in progress is not
-    /// interrupted: it is a synchronous library call.
+    /// that point. A Kerberos ticket request already in progress keeps running
+    /// on its blocking-pool thread (and its KDC slot) after the budget fires.
     async fn open_authenticated_conn(
         &self,
         host: &str,
@@ -4210,8 +4216,8 @@ mod tests {
     }
 
     #[test]
-    fn kerberos_kdc_timeout_is_at_least_one_second() {
-        for (secs, expected) in [(0, 1), (1, 1), (5, 5)] {
+    fn kerberos_kdc_timeout_is_the_request_budget() {
+        for secs in [0, 5] {
             let config = WinrmConfig {
                 auth_method: AuthMethod::Basic,
                 use_tls: false,
@@ -4223,7 +4229,8 @@ mod tests {
             let auth = transport
                 .kerberos_auth("http://dc.winrm.test:5985/wsman")
                 .unwrap();
-            assert_eq!(auth.kdc_timeout, Duration::from_secs(expected), "{secs}");
+            assert_eq!(auth.kdc_timeout, transport.request_budget(), "{secs}");
+            assert_eq!(auth.kdc_timeout, Duration::from_secs(secs + 10), "{secs}");
         }
     }
 
@@ -4362,20 +4369,20 @@ mod tests {
     // --- Bounded in-flight NTLM connections ---
 
     #[tokio::test]
-    async fn slot_limits_are_32_per_host_2_cleanup_and_128_per_client() {
+    async fn slot_limits_are_32_per_host_8_cleanup_and_128_per_client() {
         assert_eq!(
             (
                 MAX_CONNS_PER_HOST,
                 CLEANUP_SLOTS_PER_HOST,
                 MAX_CONNS_IN_FLIGHT_TOTAL
             ),
-            (32, 2, 128)
+            (32, 8, 128)
         );
         let (_server, _fake, transport, host) = sealed_setup().await;
         let (data, cleanup) = transport.host_slots(&host);
         assert_eq!(
             (data.available_permits(), cleanup.available_permits()),
-            (32, 2)
+            (32, 8)
         );
         assert_eq!(transport.all_slots.available_permits(), 128);
     }
@@ -4414,6 +4421,43 @@ mod tests {
         )
         .await
         .expect("clean-up waited behind data")
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn eight_cleanup_requests_to_one_host_proceed_at_once() {
+        let (_server, _fake, transport, _host) = sealed_setup().await;
+        let mut held = Vec::new();
+        for _ in 0..CLEANUP_SLOTS_PER_HOST {
+            held.push(
+                tokio::time::timeout(
+                    Duration::from_millis(100),
+                    transport.conn_slot("a", Lane::Cleanup),
+                )
+                .await
+                .expect("a clean-up request waited with all data slots free")
+                .unwrap(),
+            );
+        }
+        assert_eq!(held.len(), 8);
+        // The 9th waits for one of the 8.
+        let ninth = tokio::time::timeout(
+            Duration::from_millis(100),
+            transport.conn_slot("a", Lane::Cleanup),
+        )
+        .await;
+        assert!(ninth.is_err(), "a 9th clean-up request did not wait");
+        // The data slots of the host and the client are untouched.
+        assert_eq!(transport.host_slots("a").0.available_permits(), 32);
+        assert_eq!(transport.all_slots.available_permits(), 128);
+        // A freed slot lets the next one in.
+        held.pop();
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            transport.conn_slot("a", Lane::Cleanup),
+        )
+        .await
+        .expect("a freed clean-up slot was not reusable")
         .unwrap();
     }
 

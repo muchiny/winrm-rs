@@ -24,7 +24,8 @@ pub(crate) struct KerberosAuth {
     /// Largest response body read (see `transport::max_response_bytes`).
     #[cfg_attr(not(feature = "kerberos"), allow(dead_code))]
     pub(crate) max_response_bytes: usize,
-    /// Budget of one ticket request (`operation_timeout_secs`).
+    /// Budget of one ticket request: the request budget of the client
+    /// (`operation_timeout_secs + 10` seconds).
     #[cfg_attr(not(feature = "kerberos"), allow(dead_code))]
     pub(crate) kdc_timeout: std::time::Duration,
     /// Ticket requests in flight for the client (see [`run_blocking_bounded`]).

@@ -374,7 +374,7 @@ struct PemPath<'a>(&'a str);
 impl std::fmt::Debug for PemPath<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if crate::tls::looks_like_key_material(self.0) {
-            f.write_str("<redacted: looks like key material, not a file path>")
+            f.write_str(crate::tls::KEY_MATERIAL_NOT_SHOWN)
         } else {
             std::fmt::Debug::fmt(self.0, f)
         }
@@ -836,12 +836,7 @@ mod tests {
         let debug = format!("{config:?}");
         assert!(!debug.contains("BEGIN"), "{debug}");
         assert!(!debug.contains("IvSE2eFVFQPSvWUFhXFxIaP6"), "{debug}");
-        assert_eq!(
-            debug
-                .matches("<redacted: looks like key material, not a file path>")
-                .count(),
-            2
-        );
+        assert_eq!(debug.matches(crate::tls::KEY_MATERIAL_NOT_SHOWN).count(), 2);
         let paths = WinrmConfig {
             client_cert_pem: Some("/etc/winrm/client.pem".into()),
             client_key_pem: Some(r"C:\certs\client.key".into()),
@@ -874,7 +869,7 @@ mod tests {
             };
             let debug = format!("{config:?}");
             assert!(!debug.contains(&value[..24]), "{debug}");
-            assert!(debug.contains("<redacted: looks like key material, not a file path>"));
+            assert!(debug.contains(crate::tls::KEY_MATERIAL_NOT_SHOWN));
         }
     }
 }

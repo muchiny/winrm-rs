@@ -5200,7 +5200,9 @@ fn kerberos_client_through_relay(
 /// connection: through a TLS-terminating relay they name the relay's
 /// certificate, and the DC (`CbtHardeningLevel = Relaxed`, which checks
 /// bindings that are present) refuses the authentication. No SOAP body
-/// reaches the relay: the AP-REQ request has none.
+/// reaches the relay: the AP-REQ request has none. `Never` covers the
+/// unsealed route, `Auto` (the certificate is not verified) and `Always`
+/// the sealed one.
 #[cfg(feature = "kerberos")]
 #[tokio::test]
 #[ignore]
@@ -5210,7 +5212,11 @@ async fn kerberos_channel_binding_through_a_tls_relay_is_refused() {
         .parse()
         .expect("port");
     let relay = TlsRecordingRelay::start(https_port);
-    for mode in [EncryptionMode::Auto, EncryptionMode::Always] {
+    for mode in [
+        EncryptionMode::Never,
+        EncryptionMode::Auto,
+        EncryptionMode::Always,
+    ] {
         let (client, host) = kerberos_client_through_relay(&relay, mode.clone());
         let err = client
             .run_command(&host, "whoami", &[])
@@ -5235,14 +5241,19 @@ async fn kerberos_channel_binding_through_a_tls_relay_is_refused() {
 /// connection, which would carry the AP-REQ, is terminated by the relay with
 /// its own certificate. The dedicated client's verifier is pinned to the
 /// probe's certificate, so that handshake fails and nothing is sent on it:
-/// the relay records no request at all.
+/// the relay records no request at all. Checked unsealed (`Never`) and
+/// sealed (`Auto` without certificate verification, `Always`).
 #[cfg(feature = "kerberos")]
 async fn assert_split_relay_fails_at_the_handshake() {
     let https_port: u16 = std::env::var("WINRM_TEST_KRB_HTTPS_PORT")
         .expect("WINRM_TEST_KRB_HTTPS_PORT")
         .parse()
         .expect("port");
-    for mode in [EncryptionMode::Auto, EncryptionMode::Always] {
+    for mode in [
+        EncryptionMode::Never,
+        EncryptionMode::Auto,
+        EncryptionMode::Always,
+    ] {
         let relay = TlsRecordingRelay::start_with(https_port, true);
         let (client, host) = kerberos_client_through_relay(&relay, mode.clone());
         let err = client
@@ -5643,24 +5654,48 @@ async fn before_send_refusal_leaves_a_sealed_ntlm_session_usable() {
     );
 }
 
-#[tokio::test]
-#[ignore]
-async fn before_send_refusal_leaves_an_ntlm_https_session_usable() {
+/// NTLM over HTTPS under a hook refusal, with `encryption` set to `mode`.
+/// The certificate is not verified, so `Auto` seals inside TLS and `Never`
+/// does not.
+async fn assert_ntlm_https_refusal_leaves_session_usable(test: &str, mode: EncryptionMode) {
     if is_server_2012_r2().await {
         eprintln!(
-            "SKIP before_send_refusal_leaves_an_ntlm_https_session_usable: HTTPS against a default Server 2012 R2 listener has no shared cipher suite with rustls"
+            "SKIP {test}: HTTPS against a default Server 2012 R2 listener has no shared cipher suite with rustls"
         );
         return;
     }
     let gate = Gate::open();
     let (client, host) = gated_client(&gate, |c| {
         c.auth_method = AuthMethod::Ntlm;
-        c.encryption = EncryptionMode::Auto; // the base config is Basic (Never)
+        c.encryption = mode; // the base config is Basic (Never)
         c.use_tls = true;
         c.accept_invalid_certs = true;
         c.port = Some(https_test_port());
     });
     assert_refusal_leaves_session_usable(&client, &host, &gate).await;
+}
+
+/// Sealed NTLM over HTTPS (`Auto` without certificate verification).
+#[tokio::test]
+#[ignore]
+async fn before_send_refusal_leaves_an_ntlm_https_session_usable() {
+    assert_ntlm_https_refusal_leaves_session_usable(
+        "before_send_refusal_leaves_an_ntlm_https_session_usable",
+        EncryptionMode::Auto,
+    )
+    .await;
+}
+
+/// Unsealed NTLM over HTTPS (`Never`): TLS alone, each message carried by
+/// its own Negotiate and Authenticate.
+#[tokio::test]
+#[ignore]
+async fn before_send_refusal_leaves_an_unsealed_ntlm_https_session_usable() {
+    assert_ntlm_https_refusal_leaves_session_usable(
+        "before_send_refusal_leaves_an_unsealed_ntlm_https_session_usable",
+        EncryptionMode::Never,
+    )
+    .await;
 }
 
 #[cfg(feature = "credssp")]

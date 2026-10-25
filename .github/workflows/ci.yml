@@ -407,6 +407,45 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
+  release-profile:
+    # The release profile compiles out the debug-only environment hooks; this
+    # job builds it and runs the tests that assert the hooks have no effect.
+    name: Release profile
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-24
+        with:
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Install krb5 and OpenSSL headers
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libssl-dev pkg-config
+      - run: cargo build --locked --release --all-features
+      - run: cargo test --locked --release --lib --features credssp,kerberos
+
+  windows-system-proxy:
+    # The test writes the per-user Windows proxy settings (HKCU) with an empty
+    # exception list, then checks that the client still connects directly.
+    name: OS proxy ignored (windows)
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-24
+        with:
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo test --locked --test proxy_env os_proxy_is_never_used -- --exact
+        env:
+          WINRM_RS_OS_PROXY_TEST: "1"
+
   # Gate job — add this to branch protection rules
   ci-pass:
     name: CI passed
@@ -426,6 +465,8 @@ jobs:
       - semver
       - workflow-lint
       - vet
+      - release-profile
+      - windows-system-proxy
     runs-on: ubuntu-latest
     permissions: {}
     steps:

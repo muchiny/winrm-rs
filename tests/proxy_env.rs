@@ -133,6 +133,122 @@ async fn child_sends(host: &str, ignore_env: bool) {
     println!("{RAN}");
 }
 
+/// The per-user Internet Settings key that holds the Windows system proxy.
+#[cfg(windows)]
+const INTERNET_SETTINGS: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+
+/// The system proxy values as they were before [`InternetSettings::set_proxy`];
+/// `None` is a value that was absent. Dropping restores them.
+#[cfg(windows)]
+struct InternetSettings {
+    previous: Vec<(&'static str, Option<String>)>,
+}
+
+#[cfg(windows)]
+impl InternetSettings {
+    /// Point the system proxy at `server`. `ProxyOverride` is set to an empty
+    /// string: a runner exception list (`<local>`, `127.0.0.1`) would
+    /// otherwise make the test pass without testing anything.
+    fn set_proxy(server: &str) -> Self {
+        let previous = ["ProxyEnable", "ProxyServer", "ProxyOverride"]
+            .into_iter()
+            .map(|name| (name, Self::query(name)))
+            .collect();
+        let settings = Self { previous };
+        Self::write("ProxyEnable", "REG_DWORD", "1");
+        Self::write("ProxyServer", "REG_SZ", server);
+        Self::write("ProxyOverride", "REG_SZ", "");
+        settings
+    }
+
+    /// The data of the value `name`, or `None` when it is absent.
+    fn query(name: &str) -> Option<String> {
+        #[expect(clippy::disallowed_methods, reason = "test-only subprocess")]
+        let output = std::process::Command::new("reg")
+            .args(["query", INTERNET_SETTINGS, "/v", name])
+            .output()
+            .unwrap();
+        if !output.status.success() {
+            return None;
+        }
+        // `    <name>    <type>    <data>`; the data may be empty or hold spaces.
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let line = stdout.lines().find(|l| l.trim_start().starts_with(name))?;
+        let mut parts = line.trim_start().splitn(3, "    ");
+        parts.next()?;
+        parts.next()?;
+        Some(parts.next().unwrap_or("").trim().to_string())
+    }
+
+    fn write(name: &str, kind: &str, data: &str) {
+        #[expect(clippy::disallowed_methods, reason = "test-only subprocess")]
+        let status = std::process::Command::new("reg")
+            .args([
+                "add",
+                INTERNET_SETTINGS,
+                "/v",
+                name,
+                "/t",
+                kind,
+                "/d",
+                data,
+                "/f",
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success(), "reg add {name} failed");
+    }
+}
+
+#[cfg(windows)]
+impl Drop for InternetSettings {
+    fn drop(&mut self) {
+        for (name, value) in &self.previous {
+            match value {
+                Some(data) if *name == "ProxyEnable" => {
+                    // `reg query` prints a REG_DWORD as `0x1`.
+                    let number = data
+                        .strip_prefix("0x")
+                        .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+                        .unwrap_or(0);
+                    Self::write(name, "REG_DWORD", &number.to_string());
+                }
+                Some(data) => Self::write(name, "REG_SZ", data),
+                None => {
+                    #[expect(clippy::disallowed_methods, reason = "test-only subprocess")]
+                    let _ = std::process::Command::new("reg")
+                        .args(["delete", INTERNET_SETTINGS, "/v", name, "/f"])
+                        .status();
+                }
+            }
+        }
+    }
+}
+
+// Writes HKCU, so it runs only in the dedicated CI job (WINRM_RS_OS_PROXY_TEST).
+#[cfg(windows)]
+#[tokio::test]
+async fn os_proxy_is_never_used() {
+    if is_child() {
+        return child_sends("127.0.0.1", false).await;
+    }
+    if std::env::var_os("WINRM_RS_OS_PROXY_TEST").is_none() {
+        return;
+    }
+    let (proxy, proxy_seen) = spawn_recorder();
+    let (target, target_seen) = spawn_recorder();
+    let _restore = InternetSettings::set_proxy(&format!("127.0.0.1:{proxy}"));
+    run_child("os_proxy_is_never_used", target, &[]);
+    assert!(
+        proxy_seen.lock().unwrap().is_empty(),
+        "the OS proxy was used"
+    );
+    assert_eq!(
+        target_seen.lock().unwrap().first().map(String::as_str),
+        Some("POST /wsman HTTP/1.1")
+    );
+}
+
 #[tokio::test]
 async fn env_http_proxy_routes_plain_http() {
     if is_child() {

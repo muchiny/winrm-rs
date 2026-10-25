@@ -96,3 +96,8 @@ serde_json = "1"
 tracing-test = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 proptest = "1"
+
+# The OS proxy check (tests/proxy_env.rs, `os_proxy_is_never_used`) enables the
+# system proxy lookup the library must never use; the feature is test-only.
+[target.'cfg(windows)'.dev-dependencies]
+hyper-util = { version = "0.1.21", features = ["client-proxy-system"] }

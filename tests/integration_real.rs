@@ -5837,10 +5837,14 @@ async fn poll_pacing_bench_stderr_trickle() {
         eprintln!("SKIP poll_pacing_bench_stderr_trickle: set WINRM_TEST_HOST and WINRM_TEST_PASS");
         return;
     };
+    // `[Threading.Thread]::Sleep`, not `Start-Sleep`: the first `Start-Sleep`
+    // loads its module, and Windows PowerShell 5.1 then writes a "Preparing
+    // modules for first use." progress record to stderr, which this probe of
+    // poll pacing is not about.
     let out = client
         .run_powershell(
             &host,
-            "1..5 | % { [Console]::Error.WriteLine('e'); Start-Sleep 1 }",
+            "1..5 | % { [Console]::Error.WriteLine('e'); [Threading.Thread]::Sleep(1000) }",
         )
         .await
         .expect("run stderr trickle");

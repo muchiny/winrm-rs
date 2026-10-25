@@ -28,7 +28,7 @@ use crate::auth::kerberos::KerberosAuth;
 #[cfg(feature = "kerberos")]
 use crate::auth::kerberos::KerberosSession;
 use crate::auth::ntlm::{self as ntlm_auth, NtlmAuth};
-use crate::config::{AuthMethod, EncryptionMode, WinrmConfig, WinrmCredentials};
+use crate::config::{AuthMethod, EncryptionMode, ProxySessionAuth, WinrmConfig, WinrmCredentials};
 use crate::error::{SoapError, WinrmError};
 use crate::ntlm::NtlmSession;
 use crate::soap;
@@ -418,6 +418,14 @@ pub(crate) struct HttpTransport {
     route: proxy::ProxyRoute,
     /// The options this transport was built with.
     options: TransportOptions,
+    /// The endpoint URLs whose proxy has been logged for not announcing
+    /// session-based authentication (see [`proxy::ProxyGate`]).
+    proxy_warned: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Kerberos: whether the proxy of each endpoint URL announced
+    /// session-based authentication, probed once for the client's life (see
+    /// [`Self::kerberos_proxy_probe`]).
+    #[cfg(feature = "kerberos")]
+    proxy_probes: Mutex<std::collections::HashMap<String, bool>>,
 }
 
 /// Transport settings chosen through [`crate::WinrmClientBuilder`], beside
@@ -430,6 +438,9 @@ pub(crate) struct TransportOptions {
     pub(crate) use_env_proxy: bool,
     /// TLS settings.
     pub(crate) tls: TlsOptions,
+    /// What NTLM and Kerberos do through a forwarding proxy that does not
+    /// announce session-based authentication (see [`ProxySessionAuth`]).
+    pub(crate) proxy_session_auth: ProxySessionAuth,
 }
 
 impl Default for TransportOptions {
@@ -437,6 +448,7 @@ impl Default for TransportOptions {
         Self {
             use_env_proxy: true,
             tls: TlsOptions::default(),
+            proxy_session_auth: ProxySessionAuth::default(),
         }
     }
 }
@@ -913,6 +925,9 @@ impl HttpTransport {
             shared_proxy_names,
             route,
             options: opts,
+            proxy_warned: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            #[cfg(feature = "kerberos")]
+            proxy_probes: Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -1030,7 +1045,7 @@ impl HttpTransport {
                 } else if self.config.use_tls {
                     self.send_ntlm_over_tls(host, &url, &body, lane).await?
                 } else {
-                    self.ntlm_auth()
+                    self.ntlm_auth_for(&url)
                         .send_authenticated(&self.http, &url, body)
                         .await?
                 }
@@ -1070,7 +1085,8 @@ impl HttpTransport {
 
     /// Kerberos dispatch: sealed ([`Self::seals`]); unsealed over HTTPS on an
     /// authenticated dedicated connection; unsealed over HTTP
-    /// (`EncryptionMode::Never`) with a context per request.
+    /// (`EncryptionMode::Never`) with a context per request. Over plain HTTP
+    /// through a forwarding proxy, [`Self::kerberos_proxy_probe`] runs first.
     #[cfg(feature = "kerberos")]
     async fn send_kerberos(
         &self,
@@ -1079,6 +1095,7 @@ impl HttpTransport {
         body: String,
         lane: Lane,
     ) -> Result<String, WinrmError> {
+        self.kerberos_proxy_probe(url).await?;
         if self.seals() {
             self.send_sealed(host, url, &body, lane).await
         } else if self.config.use_tls {
@@ -1152,14 +1169,100 @@ impl HttpTransport {
         })
     }
 
-    /// NTLM authenticator for this transport's credentials.
+    /// NTLM authenticator for this transport's credentials, without a proxy
+    /// check.
     fn ntlm_auth(&self) -> NtlmAuth {
         NtlmAuth {
             username: self.credentials.username.clone(),
             password: Zeroizing::new(self.credentials.password.expose_secret().to_string()),
             domain: self.credentials.domain.clone(),
             max_response_bytes: self.max_response_bytes(),
+            proxy_gate: None,
         }
+    }
+
+    /// [`Self::ntlm_auth`] for the endpoint `url`, with the proxy check of
+    /// [`Self::proxy_gate`].
+    fn ntlm_auth_for(&self, url: &str) -> NtlmAuth {
+        NtlmAuth {
+            proxy_gate: self.proxy_gate(url),
+            ..self.ntlm_auth()
+        }
+    }
+
+    /// The proxy a request to `url` is forwarded by: `Some` only for an
+    /// `http://` endpoint whose route goes through an `http://` or
+    /// `https://` proxy, which sends the request in absolute form and owns
+    /// the server connection. A SOCKS proxy relays bytes, and an `https://`
+    /// endpoint goes through a `CONNECT` tunnel: both keep the server
+    /// connection this client's own.
+    fn forwarding_proxy(&self, url: &str) -> Option<reqwest::Url> {
+        if reqwest::Url::parse(url).ok()?.scheme() != "http" {
+            return None;
+        }
+        self.route
+            .proxy_for(url)
+            .filter(|proxy| matches!(proxy.scheme(), "http" | "https"))
+    }
+
+    /// The check of [`ProxySessionAuth`] for NTLM or Kerberos to `url`:
+    /// `None` without a forwarding proxy ([`Self::forwarding_proxy`]) or
+    /// under [`ProxySessionAuth::Allow`]. It refuses under
+    /// [`ProxySessionAuth::Require`], and under
+    /// [`ProxySessionAuth::RequireWhenUnsealed`] when requests are not sealed.
+    fn proxy_gate(&self, url: &str) -> Option<proxy::ProxyGate> {
+        let refuse = match self.options.proxy_session_auth {
+            ProxySessionAuth::Allow => return None,
+            ProxySessionAuth::Require => true,
+            ProxySessionAuth::RequireWhenUnsealed => !self.seals(),
+        };
+        let forwarder = self.forwarding_proxy(url)?;
+        Some(proxy::ProxyGate {
+            refuse,
+            proxy: log_host(forwarder.as_str()),
+            key: url.to_string(),
+            warned: Arc::clone(&self.proxy_warned),
+        })
+    }
+
+    /// Kerberos, before any AP-REQ to `url`: when [`Self::proxy_gate`]
+    /// applies, whether the proxy announces session-based authentication is
+    /// read from one unauthenticated empty POST on the shared client, the
+    /// first time for `url`, and kept for the client's life; then the gate
+    /// is checked. Kerberos has no 401 of its own to read it from: its
+    /// AP-REQ goes on the first request.
+    #[cfg(feature = "kerberos")]
+    async fn kerberos_proxy_probe(&self, url: &str) -> Result<(), WinrmError> {
+        let Some(gate) = self.proxy_gate(url) else {
+            return Ok(());
+        };
+        let known = self
+            .proxy_probes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(url)
+            .copied();
+        let supports = match known {
+            Some(supports) => supports,
+            None => {
+                let resp = self
+                    .http
+                    .post(url)
+                    .header(CONTENT_TYPE, "application/soap+xml;charset=UTF-8")
+                    .header("Content-Length", "0")
+                    .send()
+                    .await
+                    .map_err(crate::auth::send_error)?;
+                let supports = proxy::proxy_supports_session_auth(resp.headers());
+                let _ = crate::auth::read_body_capped(resp, self.max_response_bytes()).await;
+                self.proxy_probes
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(url.to_string(), supports);
+                supports
+            }
+        };
+        gate.check(supports)
     }
 
     #[expect(
@@ -1394,7 +1497,10 @@ impl HttpTransport {
     ) -> Result<(Sealer, bool), WinrmError> {
         match self.config.auth_method {
             AuthMethod::Ntlm => {
-                let (session_key, closing) = self.ntlm_auth().authenticate(http, cert, url).await?;
+                let (session_key, closing) = self
+                    .ntlm_auth_for(url)
+                    .authenticate(http, cert, url)
+                    .await?;
                 Ok((
                     Sealer::Ntlm(NtlmSession::boxed_from_auth(&session_key)),
                     closing,
@@ -5707,6 +5813,368 @@ mod tests {
         .unwrap();
         assert_eq!(t.proxy_route().proxy_for("http://win01:5985/wsman"), None);
         assert!(!t.options().use_env_proxy);
+    }
+
+    // --- `Proxy-Support: Session-Based-Authentication` (RFC 4559 section 6) ---
+
+    /// Read the rest of an HTTP message body: `have` (bytes already read
+    /// past the head) completed from `rd` up to `len` bytes.
+    fn read_body_by_length(
+        rd: &mut impl std::io::Read,
+        mut have: Vec<u8>,
+        len: usize,
+    ) -> Result<Vec<u8>, String> {
+        let mut chunk = [0u8; 4096];
+        while have.len() < len {
+            let n = rd.read(&mut chunk).map_err(|e| e.to_string())?;
+            if n == 0 {
+                return Err("connection closed inside an HTTP body".into());
+            }
+            have.extend_from_slice(&chunk[..n]);
+        }
+        have.truncate(len);
+        Ok(have)
+    }
+
+    /// The `Content-Length` of an HTTP head, 0 when absent.
+    fn head_content_length(head: &str) -> usize {
+        head.lines()
+            .find_map(|l| {
+                let (name, value) = l.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse().ok())?
+            })
+            .unwrap_or(0)
+    }
+
+    /// A forwarding `http://` proxy on loopback, as a plain-HTTP endpoint
+    /// sees one: each request arrives in absolute form, is recorded (request
+    /// line), rewritten to origin form and sent on one upstream connection
+    /// per client connection (a 1:1 relay, so the NTLM handshake stays on
+    /// one server connection). Bodies are read by `Content-Length`. With
+    /// `session_support`, every 401 gets `Proxy-Support:
+    /// Session-Based-Authentication` and `Connection: Proxy-support` after
+    /// its status line, as Squid adds them.
+    fn spawn_forwarding_proxy(session_support: bool) -> (u16, Arc<Mutex<Vec<String>>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            while let Ok(client) = accept_with_deadline(&listener) {
+                let recorded = Arc::clone(&recorded);
+                std::thread::spawn(move || relay_forwarded(client, session_support, &recorded));
+            }
+        });
+        (port, seen)
+    }
+
+    /// One client connection of [`spawn_forwarding_proxy`].
+    fn relay_forwarded(
+        mut client: std::net::TcpStream,
+        session_support: bool,
+        seen: &Mutex<Vec<String>>,
+    ) -> Result<(), String> {
+        use std::io::Write;
+        let mut upstream: Option<std::net::TcpStream> = None;
+        loop {
+            let Ok((head, rest)) = read_http_head(&mut client) else {
+                return Ok(());
+            };
+            let body = read_body_by_length(&mut client, rest, head_content_length(&head))?;
+            let (line, headers) = head.split_once("\r\n").ok_or("no request line")?;
+            seen.lock().unwrap().push(line.to_string());
+            let mut parts = line.splitn(3, ' ');
+            let (verb, target, version) = (
+                parts.next().ok_or("no method")?,
+                parts.next().ok_or("no target")?,
+                parts.next().ok_or("no version")?,
+            );
+            let rest_of_target = target
+                .strip_prefix("http://")
+                .ok_or("not an absolute-form target")?;
+            let (authority, path) = rest_of_target
+                .split_once('/')
+                .map_or((rest_of_target, String::from("/")), |(a, p)| {
+                    (a, format!("/{p}"))
+                });
+            if upstream.is_none() {
+                let tcp = std::net::TcpStream::connect(authority).map_err(|e| e.to_string())?;
+                tcp.set_read_timeout(Some(MTLS_SERVER_DEADLINE))
+                    .map_err(|e| e.to_string())?;
+                upstream = Some(tcp);
+            }
+            let up = upstream.as_mut().ok_or("no upstream")?;
+            up.write_all(format!("{verb} {path} {version}\r\n{headers}").as_bytes())
+                .map_err(|e| e.to_string())?;
+            up.write_all(&body).map_err(|e| e.to_string())?;
+
+            let (resp_head, resp_rest) = read_http_head(up)?;
+            let resp_body = read_body_by_length(up, resp_rest, head_content_length(&resp_head))?;
+            let (status_line, resp_headers) =
+                resp_head.split_once("\r\n").ok_or("no status line")?;
+            let extra = if session_support && status_line.split(' ').nth(1) == Some("401") {
+                "Proxy-Support: Session-Based-Authentication\r\nConnection: Proxy-support\r\n"
+            } else {
+                ""
+            };
+            client
+                .write_all(format!("{status_line}\r\n{extra}{resp_headers}").as_bytes())
+                .map_err(|e| e.to_string())?;
+            client.write_all(&resp_body).map_err(|e| e.to_string())?;
+            let closes = resp_headers.lines().any(|l| {
+                l.split_once(':').is_some_and(|(n, v)| {
+                    n.trim().eq_ignore_ascii_case("connection")
+                        && v.to_ascii_lowercase().contains("close")
+                })
+            });
+            if closes {
+                return Ok(());
+            }
+        }
+    }
+
+    /// An NTLM transport for the fake endpoint `server`, through the
+    /// forwarding proxy on `proxy_port`, with `encryption` and `policy`.
+    fn ntlm_via_proxy(
+        proxy_port: u16,
+        server: &MockServer,
+        encryption: EncryptionMode,
+        policy: ProxySessionAuth,
+    ) -> HttpTransport {
+        let config = WinrmConfig {
+            auth_method: AuthMethod::Ntlm,
+            port: server.address().port(),
+            use_tls: false,
+            encryption,
+            proxy: Some(format!("http://127.0.0.1:{proxy_port}")),
+            operation_timeout_secs: 10,
+            ..Default::default()
+        };
+        HttpTransport::new_with_env(
+            config,
+            WinrmCredentials::new(USER, PASS, ""),
+            TransportOptions {
+                proxy_session_auth: policy,
+                ..Default::default()
+            },
+            |_| None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn proxy_session_auth_defaults_to_allow() {
+        assert_eq!(ProxySessionAuth::default(), ProxySessionAuth::Allow);
+        assert_eq!(
+            TransportOptions::default().proxy_session_auth,
+            ProxySessionAuth::Allow
+        );
+    }
+
+    #[tokio::test]
+    async fn never_through_a_proxy_without_session_auth_is_refused_before_type3() {
+        let server = MockServer::start().await;
+        let fake = FakeNtlmServer::mount(&server).await;
+        let (proxy, _seen) = spawn_forwarding_proxy(false);
+        let t = ntlm_via_proxy(
+            proxy,
+            &server,
+            EncryptionMode::Never,
+            ProxySessionAuth::RequireWhenUnsealed,
+        );
+        let err = t
+            .send_soap_raw(&server.address().ip().to_string(), "<a/>".into())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, WinrmError::AuthFailed(m) if m.contains("Session-Based-Authentication") && m.contains("proxy_session_auth")),
+            "{err:?}"
+        );
+        assert_eq!(fake.log(), vec![Event::Negotiate], "no Type 3 may follow");
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn sealed_through_a_proxy_without_session_auth_warns_once_per_host() {
+        let server = MockServer::start().await;
+        let fake = FakeNtlmServer::mount(&server).await;
+        fake.close_after_auth(1); // two handshakes
+        let (proxy, _seen) = spawn_forwarding_proxy(false);
+        let t = ntlm_via_proxy(
+            proxy,
+            &server,
+            EncryptionMode::Auto,
+            ProxySessionAuth::RequireWhenUnsealed,
+        );
+        t.send_soap_raw(&server.address().ip().to_string(), "<a/>".into())
+            .await
+            .unwrap();
+        assert_eq!(fake.handshakes(), 2);
+        logs_assert(|lines| {
+            match lines
+                .iter()
+                .filter(|l| l.contains("did not announce"))
+                .count()
+            {
+                1 => Ok(()),
+                n => Err(format!("{n} warnings")),
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn proxy_announcing_session_auth_is_accepted_even_under_require() {
+        let server = MockServer::start().await;
+        let _fake = FakeNtlmServer::mount(&server).await;
+        let (proxy, seen) = spawn_forwarding_proxy(true);
+        let t = ntlm_via_proxy(
+            proxy,
+            &server,
+            EncryptionMode::Never,
+            ProxySessionAuth::Require,
+        );
+        let reply = t
+            .send_soap_raw(&server.address().ip().to_string(), "<a/>".into())
+            .await
+            .unwrap();
+        assert_eq!(reply, "<ok/>");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "Type 1 and Type 3 through the proxy");
+        assert!(
+            seen.iter().all(|l| l.starts_with("POST http://")),
+            "absolute form through the proxy"
+        );
+    }
+
+    #[tokio::test]
+    async fn allow_skips_the_check() {
+        let server = MockServer::start().await;
+        let fake = FakeNtlmServer::mount(&server).await;
+        let (proxy, _seen) = spawn_forwarding_proxy(false);
+        let t = ntlm_via_proxy(
+            proxy,
+            &server,
+            EncryptionMode::Never,
+            ProxySessionAuth::Allow,
+        );
+        let reply = t
+            .send_soap_raw(&server.address().ip().to_string(), "<a/>".into())
+            .await
+            .unwrap();
+        assert_eq!(reply, "<ok/>");
+        assert_eq!(fake.handshakes(), 1);
+    }
+
+    #[test]
+    fn only_http_endpoints_through_http_proxies_are_gated() {
+        let creds = || WinrmCredentials::new("u", "p", "");
+        let build = |proxy: Option<&str>,
+                     use_tls: bool,
+                     env: &'static [(&'static str, &'static str)],
+                     policy| {
+            let config = WinrmConfig {
+                auth_method: AuthMethod::Ntlm,
+                use_tls,
+                encryption: EncryptionMode::Never,
+                proxy: proxy.map(str::to_string),
+                ..Default::default()
+            };
+            let var = move |k: &str| {
+                env.iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| (*v).to_string())
+            };
+            HttpTransport::new_with_env(
+                config,
+                creds(),
+                TransportOptions {
+                    proxy_session_auth: policy,
+                    ..Default::default()
+                },
+                var,
+            )
+            .unwrap()
+        };
+        let d = ProxySessionAuth::RequireWhenUnsealed;
+        assert!(
+            build(Some("http://p:3128"), false, &[], d)
+                .proxy_gate("http://win01:5985/wsman")
+                .is_some()
+        );
+        assert!(
+            build(Some("socks5h://s:1080"), false, &[], d)
+                .proxy_gate("http://win01:5985/wsman")
+                .is_none()
+        );
+        assert!(
+            build(Some("http://p:3128"), true, &[], d)
+                .proxy_gate("https://win01:5986/wsman")
+                .is_none()
+        );
+        assert!(
+            build(Some("http://p:3128"), false, &[], ProxySessionAuth::Allow)
+                .proxy_gate("http://win01:5985/wsman")
+                .is_none()
+        );
+        let env = build(
+            None,
+            false,
+            &[("HTTP_PROXY", "http://p:3128"), ("NO_PROXY", "win01")],
+            d,
+        );
+        assert!(env.proxy_gate("http://win01:5985/wsman").is_none());
+        assert!(env.proxy_gate("http://win02:5985/wsman").is_some());
+    }
+
+    #[cfg(feature = "kerberos")]
+    #[tokio::test]
+    async fn kerberos_probe_runs_once_per_host_and_refuses_before_the_ap_req() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401).insert_header("WWW-Authenticate", "Negotiate"))
+            .mount(&server)
+            .await;
+        let (proxy, seen) = spawn_forwarding_proxy(false);
+        let config = WinrmConfig {
+            auth_method: AuthMethod::Kerberos,
+            port: server.address().port(),
+            encryption: EncryptionMode::Never,
+            proxy: Some(format!("http://127.0.0.1:{proxy}")),
+            operation_timeout_secs: 5,
+            ..Default::default()
+        };
+        let t = HttpTransport::new_with_env(
+            config,
+            WinrmCredentials::new("u", "p", ""),
+            TransportOptions {
+                proxy_session_auth: ProxySessionAuth::RequireWhenUnsealed,
+                ..Default::default()
+            },
+            |_| None,
+        )
+        .unwrap();
+        let host = server.address().ip().to_string();
+        for _ in 0..2 {
+            let err = t.send_soap_raw(&host, "<a/>".into()).await.unwrap_err();
+            assert!(
+                err.to_string().contains("Session-Based-Authentication"),
+                "{err}"
+            );
+        }
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "one probe for the client's life"
+        );
+        let received = server.received_requests().await.unwrap();
+        assert!(
+            received
+                .iter()
+                .all(|r| !r.headers.contains_key("authorization")),
+            "no AP-REQ was sent"
+        );
     }
 
     /// Basic over plain HTTP through an `https://` proxy on loopback whose

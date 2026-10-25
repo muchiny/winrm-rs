@@ -463,6 +463,111 @@ async fn ntlm_shell_reuse() {
     shell.close().await.expect("close shell");
 }
 
+/// Log sink of [`ntlm_through_a_forward_proxy`].
+#[derive(Clone, Default)]
+struct LogLines(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl LogLines {
+    fn text(&self) -> String {
+        let bytes = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+impl std::io::Write for LogLines {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogLines {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// NTLM with `EncryptionMode::Auto` (sealed) through the forward proxy
+/// `WINRM_TEST_PROXY` (for example a Squid 6 with its default configuration,
+/// `http://squid:3128`), which must reach `WINRM_TEST_HOST`: `whoami` runs
+/// with the default `ProxySessionAuth`, with `RequireWhenUnsealed` (which
+/// would log a WARN for these sealed requests) and with `Require` (which
+/// would refuse them), and the client never logs that the proxy did not
+/// announce `Proxy-Support: Session-Based-Authentication`. Skipped without
+/// `WINRM_TEST_PROXY`.
+#[tokio::test]
+#[ignore]
+async fn ntlm_through_a_forward_proxy() {
+    use tracing_subscriber::util::SubscriberInitExt;
+    use winrm_rs::ProxySessionAuth;
+
+    let Ok(proxy) = std::env::var("WINRM_TEST_PROXY") else {
+        eprintln!("SKIP ntlm_through_a_forward_proxy: set WINRM_TEST_PROXY");
+        return;
+    };
+    let host = std::env::var("WINRM_TEST_HOST").expect("set WINRM_TEST_HOST");
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    let pass = std::env::var("WINRM_TEST_PASS").expect("set WINRM_TEST_PASS");
+    let port: u16 = std::env::var("WINRM_TEST_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(5985);
+
+    // A `#[tokio::test]` runs on one thread, so this default sees every log.
+    let logs = LogLines::default();
+    let _guard = tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
+        .with_ansi(false)
+        .finish()
+        .set_default();
+
+    for policy in [
+        ProxySessionAuth::default(),
+        ProxySessionAuth::RequireWhenUnsealed,
+        ProxySessionAuth::Require,
+    ] {
+        let config = WinrmConfig {
+            auth_method: AuthMethod::Ntlm,
+            encryption: EncryptionMode::Auto,
+            port,
+            proxy: Some(proxy.clone()),
+            ..Default::default()
+        };
+        let client = WinrmClient::builder(config)
+            .credentials(WinrmCredentials::new(user.clone(), pass.clone(), ""))
+            .proxy_session_auth(policy)
+            .build()
+            .expect("build the client");
+        let output = client
+            .run_command(&host, "whoami", &[])
+            .await
+            .unwrap_or_else(|e| panic!("whoami through {proxy} with {policy:?}: {e}"));
+        assert_eq!(output.exit_code, 0, "{policy:?}");
+        assert!(
+            !String::from_utf8_lossy(&output.stdout).trim().is_empty(),
+            "{policy:?}: whoami should return a username"
+        );
+    }
+    let text = logs.text();
+    assert!(
+        !text.contains("did not announce"),
+        "the proxy did not announce session-based authentication:\n{text}"
+    );
+}
+
 // === File transfer ===
 
 #[tokio::test]

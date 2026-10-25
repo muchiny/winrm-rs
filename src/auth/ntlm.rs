@@ -26,6 +26,10 @@ pub(crate) struct NtlmAuth {
     pub(crate) domain: String,
     /// Largest response body read (see `transport::max_response_bytes`).
     pub(crate) max_response_bytes: usize,
+    /// The proxy check of `crate::ProxySessionAuth`, run on the 401 that
+    /// carries the challenge, before the Type 3. `None` when it does not
+    /// apply (no forwarding proxy, HTTPS, or `Allow`).
+    pub(crate) proxy_gate: Option<crate::transport::proxy::ProxyGate>,
 }
 
 /// Length of an NTLM message signature (MS-NLMP 2.2.2.9.1).
@@ -149,6 +153,14 @@ impl NtlmAuth {
                 "expected 401 for NTLM negotiate, got {}",
                 resp.status()
             )));
+        }
+        // A forwarding proxy announces here whether it keeps the server
+        // connection to this client (RFC 4559 section 6). On a refusal no
+        // Type 3 is sent, so that connection is never authenticated.
+        if let Some(gate) = &self.proxy_gate {
+            gate.check(crate::transport::proxy::proxy_supports_session_auth(
+                resp.headers(),
+            ))?;
         }
 
         let www_auth = resp

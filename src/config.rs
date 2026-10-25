@@ -460,7 +460,9 @@ impl std::fmt::Debug for EnvVarNames<'_> {
 /// requests that run as this client. A SOCKS proxy (a 1:1 relay) or an
 /// `https://` endpoint (a `CONNECT` tunnel) keeps the connection this
 /// client's own. The client cannot see an intercepting (transparent) proxy.
-/// Keep `AllowUnencrypted = false` on the server, and prefer HTTPS.
+/// Keep `AllowUnencrypted = false` on the server, and prefer HTTPS. The
+/// client can check for that header before authenticating through such a
+/// proxy: see [`ProxySessionAuth`].
 ///
 /// Sealing protects the messages of this client. Server side, integrity on
 /// plain HTTP, against a party that can write on the network path, also
@@ -509,6 +511,45 @@ pub enum EncryptionMode {
     /// (a WARN is still logged). With NTLM or Kerberos, use it only for
     /// debugging or for an RC4-only Kerberos realm.
     Never,
+}
+
+/// What a client does when NTLM or Kerberos would authenticate through a
+/// forwarding proxy that does not announce `Proxy-Support:
+/// Session-Based-Authentication`, chosen with
+/// [`WinrmClientBuilder::proxy_session_auth`](crate::WinrmClientBuilder::proxy_session_auth).
+///
+/// RFC 4559 section 6: a client must not use this authentication through a
+/// proxy unless the proxy sends that header with the server's 401, its
+/// promise never to share the authenticated server connection with its other
+/// clients (see [`EncryptionMode`]). The check applies to an `http://`
+/// endpoint reached through an `http://` or `https://` proxy, which forwards
+/// each request and owns the server connection. NTLM reads the header on the
+/// 401 that carries the challenge, before it sends its last message. Kerberos
+/// first sends one unauthenticated request per endpoint, once for the
+/// client's life, and reads the header on its answer. Under the default,
+/// [`Self::Allow`], nothing is checked and no such request is sent.
+///
+/// SOCKS proxies, `https://` endpoints and direct connections are never
+/// checked. An intercepting proxy cannot be seen.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ProxySessionAuth {
+    /// Refuse to authenticate with [`EncryptionMode::Never`] through a proxy
+    /// that does not announce the header: the authentication fails with
+    /// [`WinrmError::AuthFailed`](crate::WinrmError::AuthFailed) and nothing
+    /// more is sent. Sealed requests only log a WARN, once per endpoint:
+    /// they stay protected, but the server must keep `AllowUnencrypted =
+    /// false`. `Never` is refused because it needs `AllowUnencrypted = true`
+    /// on the server, so the proxy's other users could send requests that
+    /// run as this client.
+    RequireWhenUnsealed,
+    /// Refuse to authenticate through a proxy that does not announce the
+    /// header, sealed or not.
+    Require,
+    /// Do not check (default): authenticate through any proxy, as earlier
+    /// releases do.
+    #[default]
+    Allow,
 }
 
 /// The rustls crypto provider of a client's TLS connections, chosen with

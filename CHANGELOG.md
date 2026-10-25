@@ -146,6 +146,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `WinrmClientBuilder::danger_accept_invalid_proxy_certs`.
 - `WinrmClientBuilder::ignore_env_proxy`: build a client that does not read
   proxies from the environment.
+- `ProxySessionAuth` and `WinrmClientBuilder::proxy_session_auth`.
+- `ProxySessionAuth::RequireWhenUnsealed` and `ProxySessionAuth::Require`
+  refuse NTLM or Kerberos through a forwarding proxy that does not announce
+  `Proxy-Support: Session-Based-Authentication` (RFC 4559 section 6). The
+  default, `Allow`, keeps today's behaviour.
 
 ### Fixed
 

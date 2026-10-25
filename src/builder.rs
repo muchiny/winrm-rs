@@ -6,7 +6,7 @@
 use std::panic::AssertUnwindSafe;
 
 use crate::client::WinrmClient;
-use crate::config::{TlsProvider, WinrmConfig, WinrmCredentials};
+use crate::config::{ProxySessionAuth, TlsProvider, WinrmConfig, WinrmCredentials};
 use crate::error::WinrmError;
 use crate::transport::TransportOptions;
 
@@ -307,6 +307,23 @@ impl WinrmClientBuilder<Ready> {
         self
     }
 
+    /// Choose what NTLM and Kerberos do through a forwarding `http://` or
+    /// `https://` proxy (plain-HTTP endpoints only) that does not announce
+    /// `Proxy-Support: Session-Based-Authentication` with the server's 401
+    /// (RFC 4559 section 6). Default: [`ProxySessionAuth::Allow`], no check.
+    ///
+    /// [`ProxySessionAuth::RequireWhenUnsealed`] refuses
+    /// [`EncryptionMode::Never`](crate::EncryptionMode::Never) through such a
+    /// proxy and logs a WARN for sealed requests;
+    /// [`ProxySessionAuth::Require`] refuses both. A refusal is
+    /// [`WinrmError::AuthFailed`], returned before the client completes the
+    /// authentication. SOCKS proxies, `https://` endpoints and direct
+    /// connections are never checked.
+    pub fn proxy_session_auth(mut self, policy: ProxySessionAuth) -> Self {
+        self.options.proxy_session_auth = policy;
+        self
+    }
+
     /// Build the [`WinrmClient`].
     ///
     /// Returns [`WinrmError::Http`] if the underlying HTTP client cannot be
@@ -436,6 +453,28 @@ mod tests {
             .build()
             .unwrap();
         assert!(default.transport.options().use_env_proxy);
+    }
+
+    /// `proxy_session_auth` reaches the transport, and the default is `Allow`.
+    #[test]
+    fn proxy_session_auth_reaches_the_transport() {
+        let client = WinrmClientBuilder::new(WinrmConfig::default())
+            .credentials(WinrmCredentials::new("u", "p", ""))
+            .proxy_session_auth(ProxySessionAuth::Require)
+            .build()
+            .unwrap();
+        assert_eq!(
+            client.transport.options().proxy_session_auth,
+            ProxySessionAuth::Require
+        );
+        let default = WinrmClientBuilder::new(WinrmConfig::default())
+            .credentials(WinrmCredentials::new("u", "p", ""))
+            .build()
+            .unwrap();
+        assert_eq!(
+            default.transport.options().proxy_session_auth,
+            ProxySessionAuth::Allow
+        );
     }
 
     /// `TlsProvider::Ring` reaches the transport: its TLS configuration

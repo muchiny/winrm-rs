@@ -8,6 +8,9 @@
 // The operating system's proxy settings are never read: the `reqwest` client
 // is built with `no_proxy()` and then given the proxies of this route only.
 
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, PoisonError};
+
 use hyper_util::client::proxy::matcher::Matcher;
 use zeroize::Zeroizing;
 
@@ -173,10 +176,6 @@ impl ProxyRoute {
     /// or `None` when it goes direct. It is computed by the same
     /// `hyper-util` matcher `reqwest` builds from [`Self::reqwest_proxies`],
     /// on the URL as `reqwest` parses it (IDN to punycode).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the tests until a caller needs the route")
-    )]
     pub(crate) fn proxy_for(&self, endpoint_url: &str) -> Option<reqwest::Url> {
         let url = reqwest::Url::parse(endpoint_url).ok()?;
         let uri: http::Uri = url.as_str().parse().ok()?;
@@ -216,6 +215,73 @@ impl ProxyRoute {
             return None;
         }
         self.http.as_deref().map(String::as_str)
+    }
+}
+
+/// Whether a response carries `Proxy-Support: Session-Based-Authentication`
+/// (RFC 4559 section 6): any `Proxy-Support` value holding that token in its
+/// comma-separated list, ASCII case aside and trimmed.
+pub(crate) fn proxy_supports_session_auth(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get_all("proxy-support")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|token| {
+            token
+                .trim()
+                .eq_ignore_ascii_case("Session-Based-Authentication")
+        })
+}
+
+/// The check of [`crate::ProxySessionAuth`] for one endpoint reached through
+/// a forwarding proxy: built by the transport for each authentication, and
+/// given whether the proxy announced session-based authentication.
+pub(crate) struct ProxyGate {
+    /// Whether a proxy that does not announce it is refused, rather than
+    /// logged.
+    pub(super) refuse: bool,
+    /// The proxy URL, user info redacted, as a log field.
+    pub(super) proxy: String,
+    /// The endpoint URL: the WARN is logged once per endpoint.
+    pub(super) key: String,
+    /// The endpoints already warned about, shared by every gate of a client.
+    pub(super) warned: Arc<Mutex<HashSet<String>>>,
+}
+
+impl ProxyGate {
+    /// `Ok` when the proxy announced session-based authentication
+    /// (`supports`). Otherwise [`WinrmError::AuthFailed`] when refusing, else
+    /// `Ok` with a WARN the first time for this endpoint.
+    pub(crate) fn check(&self, supports: bool) -> Result<(), WinrmError> {
+        if supports {
+            return Ok(());
+        }
+        let proxy = &self.proxy;
+        if self.refuse {
+            return Err(WinrmError::AuthFailed(format!(
+                "the proxy {proxy} did not announce `Proxy-Support: Session-Based-Authentication` \
+                 with the server's 401 (RFC 4559 section 6), so it may share this client's \
+                 authenticated server connection with its other users; nothing more was sent. \
+                 Use HTTPS or a SOCKS proxy, or choose with \
+                 WinrmClientBuilder::proxy_session_auth"
+            )));
+        }
+        let first = self
+            .warned
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(self.key.clone());
+        if first {
+            tracing::warn!(
+                proxy = %proxy,
+                "the proxy did not announce `Proxy-Support: Session-Based-Authentication` (RFC \
+                 4559 section 6): it may share this client's authenticated server connection \
+                 with its other users; sealed requests stay protected, but keep \
+                 AllowUnencrypted = false on the server"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -653,6 +719,36 @@ mod tests {
                 "{plain}"
             );
         }
+    }
+
+    #[test]
+    fn proxy_support_header_is_parsed_as_a_token_list() {
+        use reqwest::header::HeaderMap;
+        let h = |vals: &[&str]| {
+            let mut m = HeaderMap::new();
+            for v in vals {
+                m.append("proxy-support", v.parse().unwrap());
+            }
+            m
+        };
+        assert!(proxy_supports_session_auth(&h(&[
+            "Session-Based-Authentication"
+        ])));
+        assert!(proxy_supports_session_auth(&h(&[
+            "session-based-authentication"
+        ])));
+        assert!(proxy_supports_session_auth(&h(&[
+            "Foo, Session-Based-Authentication"
+        ])));
+        assert!(proxy_supports_session_auth(&h(&[
+            "Foo",
+            " Session-Based-Authentication "
+        ])));
+        assert!(!proxy_supports_session_auth(&h(&[])));
+        assert!(!proxy_supports_session_auth(&h(&[
+            "Session-Based-Authentication-X"
+        ])));
+        assert!(!proxy_supports_session_auth(&h(&["Foo"])));
     }
 
     #[test]

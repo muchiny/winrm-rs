@@ -89,6 +89,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   certificate with `pin_server_certificate_sha256` or trust its CA with
   `add_root_certificates_pem`. The CredSSP connection now uses the client's
   TLS verifier, custom CA and pin included, instead of its own.
+- **A host must be bare.** A host with a scheme, user info, a path or a port
+  (`win01:5985`, `http://win01/wsman`, `user@win01`) used to be cut down to the
+  bare name with a WARN. It is now refused with `WinrmError::AuthFailed` before
+  anything is sent. Migration: pass the host alone, and set the port in
+  `WinrmConfig::port`.
 
 ### Added
 

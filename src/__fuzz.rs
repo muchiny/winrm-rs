@@ -526,10 +526,11 @@ pub struct EndpointParts {
     pub has_userinfo: bool,
 }
 
-/// `None` when `validate_host` refuses `input`. Otherwise the host
-/// `sanitize_host` kept, the endpoint URL the transport builds from it, and
-/// that URL as the parser reads it back (`Err` with the parser's message
-/// when it refuses the URL: the request then fails before anything is sent).
+/// `None` when `validate_host` refuses `input`. Otherwise the host (an
+/// accepted input equals its `sanitize_host` form), the endpoint URL the
+/// transport builds from it, and that URL as the parser reads it back (`Err`
+/// with the parser's message when it refuses the URL: the request then fails
+/// before anything is sent).
 pub fn accepted_host_endpoint(
     input: &str,
     use_tls: bool,
@@ -678,6 +679,7 @@ mod tests {
             let Some((accepted, url, parsed)) = accepted_host_endpoint(host, use_tls, 5985) else {
                 continue;
             };
+            assert_eq!(accepted, host, "an accepted host is its sanitized form");
             assert!(!accepted.is_empty(), "{host:?}");
             assert!(
                 !accepted

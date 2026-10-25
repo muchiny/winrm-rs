@@ -64,9 +64,9 @@ async fn http_redirects_are_not_followed() {
     );
 }
 
-/// `endpoint()` (transport-internal) sanitizes garbage host strings. Full
+/// A host that is not a bare host name is refused before anything is sent. Full
 /// integration coverage requires a live SOAP responder; the behaviour is
-/// pinned by `transport::tests::sanitize_host_*` unit tests. This sentinel
+/// pinned by `transport::tests::sanitize_host_*` and `validate_host_*` unit tests. This sentinel
 /// keeps the docstring discoverable so the unit tests are not removed
 /// without updating this file.
 #[tokio::test]

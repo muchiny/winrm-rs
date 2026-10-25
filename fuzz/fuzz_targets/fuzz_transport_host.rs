@@ -3,8 +3,9 @@
 //! can get through, a caller-supplied host string can retarget the request or
 //! smuggle credentials into the authority component.
 //!
-//! `validate_host` then refuses what is still not a host name. For an
-//! accepted host: no `?`, `#`, `\`, whitespace or control character (each
+//! `validate_host` refuses a host that `sanitize_host` would change, and what
+//! is still not a host name. For an accepted host: it equals its sanitized
+//! form; no `?`, `#`, `\`, whitespace or control character (each
 //! would end the authority early or be rewritten by the URL parser), and the
 //! endpoint URL, when the URL parser accepts it, reads back with that host,
 //! the configured port, the `/wsman` path, and no userinfo, query or
@@ -47,6 +48,10 @@ fuzz_target!(|data: &[u8]| {
             continue;
         };
         assert_eq!(accepted, sanitized);
+        assert_eq!(
+            sanitized, host,
+            "validate_host accepted a host that sanitize_host changes"
+        );
         assert!(!accepted.is_empty(), "empty host accepted from {host:?}");
         assert!(
             !accepted

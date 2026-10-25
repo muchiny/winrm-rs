@@ -87,6 +87,8 @@ much as the client's:
 
 ## Usage
 
+Hosts are bare names or addresses (`win01`, `10.0.0.5`, `[fe80::1]`); the port is `WinrmConfig::port`. A host with a scheme, user info, path or port is refused.
+
 ### Basic authentication
 
 ```rust

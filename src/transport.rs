@@ -507,9 +507,10 @@ fn proxy_server_names(
 
 /// Strip scheme, userinfo, port, and path from a host string.
 ///
-/// Defensive: callers are supposed to pass `"hostname"` or `"10.0.0.1"`,
-/// but if they accidentally pass `"http://evil.com/path"` we keep just
-/// `"evil.com"` and log the deviation. IPv6 literals (`[::1]`) are
+/// Callers must pass `"hostname"` or `"10.0.0.1"`: [`validate_host`] refuses
+/// any host this function would change (`"http://evil.com/path"` would be cut
+/// to `"evil.com"`), so the stripped form is never the one a request goes
+/// to. IPv6 literals (`[::1]`) are
 /// preserved as-is because `:` inside brackets is part of the address; a
 /// port after the closing bracket (`[::1]:5985`) is dropped like any other.
 ///
@@ -575,8 +576,12 @@ pub(crate) fn log_host(host: &str) -> String {
     crate::error::quote_server_text(&redact_userinfo(host), 256)
 }
 
-/// Refuse a host that, once [`sanitize_host`] has stripped the scheme,
-/// userinfo, path and port, is still not a host name or address.
+/// Refuse a host that is not a bare host name or address.
+///
+/// A host that [`sanitize_host`] would change (it has a scheme, user info, a
+/// path or a port) is refused first: the caller's string is what an
+/// allowlist or a log line saw, so it must be what the request goes to. The
+/// port is [`WinrmConfig::port`].
 ///
 /// The endpoint URL is built by formatting the host into
 /// `scheme://HOST:PORT/wsman`, so a host such as `win01?x` or `win01\x`
@@ -587,7 +592,14 @@ pub(crate) fn log_host(host: &str) -> String {
 /// character that is not whitespace or a control character (internationalised
 /// names, converted to punycode by the URL parser).
 pub(crate) fn validate_host(host: &str) -> Result<(), WinrmError> {
-    let sanitized = sanitize_host(host);
+    if sanitize_host(host) != host {
+        return Err(WinrmError::AuthFailed(format!(
+            "invalid host {:?}: pass a bare host name or address, without scheme, user info, \
+             path or port (the port is WinrmConfig::port)",
+            crate::error::excerpt_chars(&redact_userinfo(host), 64)
+        )));
+    }
+    let sanitized = host;
     let valid = if let Some(inner) = sanitized
         .strip_prefix('[')
         .and_then(|rest| rest.strip_suffix(']'))
@@ -610,11 +622,10 @@ pub(crate) fn validate_host(host: &str) -> Result<(), WinrmError> {
         Ok(())
     } else {
         Err(WinrmError::AuthFailed(format!(
-            // Debug form: shows whitespace and control characters. Userinfo
-            // is already stripped.
+            // Debug form: shows whitespace and control characters.
             "invalid host {:?}: expected a host name, an IPv4 address or a bracketed IPv6 \
              literal (letters, digits, '-', '_' and '.')",
-            crate::error::excerpt_chars(&sanitized, 64)
+            crate::error::excerpt_chars(sanitized, 64)
         )))
     }
 }
@@ -880,25 +891,16 @@ impl HttpTransport {
 
     /// Build the WinRM endpoint URL for a given host.
     ///
-    /// `host` is expected to be a bare hostname or IP literal — no scheme,
-    /// no port, no userinfo. If suspect characters (`/`, `@`, `://`) are
-    /// detected they are stripped and a WARN is logged so the call still
-    /// produces a syntactically valid URL but the operator notices the
-    /// misuse instead of silently sending credentials to a forged host.
+    /// `host` must be a bare host name or address (see [`validate_host`]):
+    /// no scheme, no user info, no path, no port. This formats the
+    /// [`sanitize_host`] form of `host`, which for a valid host is `host`
+    /// itself.
     ///
-    /// Infallible, so that envelopes can embed it; every request goes
-    /// through [`Self::checked_endpoint`], which refuses a host that is not
-    /// a host name (see [`validate_host`]) before anything is sent.
+    /// Infallible, so that envelopes can embed it. For a host
+    /// [`validate_host`] refuses, the result is never sent: every request
+    /// goes through [`Self::checked_endpoint`], which refuses it first.
     pub(crate) fn endpoint(&self, host: &str) -> String {
-        let sanitized = sanitize_host(host);
-        if sanitized != host {
-            tracing::warn!(
-                original = %log_host(host),
-                sanitized = %crate::error::quote_server_text(&sanitized, 256),
-                "host string contained scheme/path/userinfo; using sanitized form"
-            );
-        }
-        endpoint_url(self.config.use_tls, &sanitized, self.config.port)
+        endpoint_url(self.config.use_tls, &sanitize_host(host), self.config.port)
     }
 
     /// [`Self::endpoint`] for a host that [`validate_host`] accepts, else
@@ -1878,17 +1880,32 @@ mod tests {
         "[fe80::1]",
         "[::ffff:10.0.0.1]",
         "bücher.example",
-        // Stripped by sanitize_host, so what is left is a valid name.
-        "win01:5985",
-        "http://win01/wsman",
-        "https://user:pw@win01:5986/wsman",
-        "[fe80::1]:5985",
     ];
 
     #[test]
-    fn validate_host_accepts_names_addresses_and_the_forms_sanitize_strips() {
+    fn validate_host_accepts_names_and_addresses() {
         for host in VALID_HOSTS {
             assert!(validate_host(host).is_ok(), "{host:?} should be accepted");
+        }
+    }
+
+    #[test]
+    fn validate_host_refuses_anything_sanitize_would_strip() {
+        for host in [
+            "http://win01/wsman",
+            "https://user:s3cret@win01:5986/wsman",
+            "user:s3cret@win01",
+            "win01:5985",
+            "[fe80::1]:5985",
+            "evil.example/.corp.local",
+            "win01.corp.local@evil.example",
+        ] {
+            let err = validate_host(host).unwrap_err().to_string();
+            assert!(
+                err.contains("invalid host") && err.contains("WinrmConfig::port"),
+                "{host:?}: {err}"
+            );
+            assert!(!err.contains("s3cret"), "{host:?}: {err}");
         }
     }
 
@@ -1926,8 +1943,8 @@ mod tests {
     }
 
     #[test]
-    fn invalid_host_error_quotes_the_stripped_host_only() {
-        // Userinfo is stripped before the host is quoted: no password leaks.
+    fn invalid_host_error_never_quotes_the_userinfo() {
+        // Userinfo is redacted before the host is quoted: no password leaks.
         let err = validate_host("user:s3cret@win01?x")
             .unwrap_err()
             .to_string();
@@ -1955,15 +1972,19 @@ mod tests {
         }
         let requests = server.received_requests().await.unwrap_or_default();
         assert!(requests.is_empty(), "{} request(s) sent", requests.len());
-        // A well-formed host with the port glued on still reaches the server.
+        // A host with the port glued on is refused too: the port is
+        // `WinrmConfig::port`.
         let host = format!("127.0.0.1:{}", server.address().port());
-        assert_eq!(
-            transport
-                .send_soap_raw(&host, "<env/>".into())
-                .await
-                .unwrap(),
-            "<ok/>"
+        let err = transport
+            .send_soap_raw(&host, "<env/>".into())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, WinrmError::AuthFailed(m) if m.contains("WinrmConfig::port")),
+            "{err:?}"
         );
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert!(requests.is_empty(), "{} request(s) sent", requests.len());
     }
 
     #[test]
@@ -3050,7 +3071,7 @@ mod tests {
         );
     }
 
-    /// The WARN about a polluted host string, and the span of the request,
+    /// The refusal of a host with userinfo, and the span of the request,
     /// never carry the userinfo.
     #[tracing_test::traced_test]
     #[tokio::test]
@@ -3072,26 +3093,28 @@ mod tests {
         )
         .unwrap();
         let host = "admin:hunter2@127.0.0.1";
-        assert_eq!(
-            transport.endpoint(host),
-            format!("http://127.0.0.1:{port}/wsman")
-        );
         let sent = transport
             .send_soap(host, "<s:Envelope/>".into(), Lane::Data)
             .await;
-        assert!(sent.is_err(), "nothing listens on port {port}");
+        assert!(
+            matches!(&sent, Err(WinrmError::AuthFailed(m)) if m.contains("invalid host")),
+            "{sent:?}"
+        );
         assert!(logs_contain("<redacted>@127.0.0.1"));
-        assert!(logs_contain("sending WinRM SOAP request"));
+        assert!(logs_contain("request not sent: host refused"));
+        assert!(!logs_contain("sending WinRM SOAP request"));
         assert!(!logs_contain("hunter2"));
     }
 
+    #[tracing_test::traced_test]
     #[test]
     fn endpoint_strips_scheme_and_path_silently() {
         let transport = basic_transport(5985);
-        // Caller passed a polluted host string; sanitize_host pulls just
-        // the hostname and the URL is rebuilt with the configured scheme.
+        // `endpoint` is infallible (envelopes embed it) and never sent for a
+        // host `validate_host` refuses; it formats the stripped host, silently.
         let url = transport.endpoint("http://evil.com/path");
         assert_eq!(url, "http://evil.com:5985/wsman");
+        assert!(!logs_contain("using sanitized form"));
     }
 
     /// Every request of a session carries the same `wsmv:SessionId`; without
@@ -3241,8 +3264,6 @@ mod tests {
         let server = MockServer::start().await;
         mount_ok_expecting(&server, 0).await;
         let transport = basic_transport(server.address().port());
-        // The endpoint() WARN logs the original host (1.5.0 removes it).
-        let _ = transport.endpoint("x/\nFORGED-LINE one");
         // A control character makes validate_host refuse the host; the refusal is logged.
         let err = transport
             .send_soap_raw("x\u{1b}[31m\r\nFORGED-LINE two", "<a/>".into())
@@ -3253,7 +3274,6 @@ mod tests {
             "{err:?}"
         );
         let text = logs.text();
-        assert!(text.contains("x/ FORGED-LINE one"), "{text}");
         assert!(text.contains("x\\u{1b}[31m FORGED-LINE two"), "{text}");
         assert!(
             !text.contains("\nFORGED-LINE") && !text.contains("\rFORGED-LINE"),

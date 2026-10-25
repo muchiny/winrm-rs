@@ -34,6 +34,15 @@ use crate::transport::HttpTransport;
 /// What the client logs at each level, and what `trace` exposes, is described
 /// in the crate-level *Logging* section.
 ///
+/// # Host strings
+///
+/// Every method that takes a `host` expects a bare host name, IPv4 address
+/// or bracketed IPv6 literal: `win01`, `win01.corp.local`, `10.0.0.5`,
+/// `[fe80::1]`. The scheme comes from [`WinrmConfig::use_tls`] and the port
+/// from [`WinrmConfig::port`]. A host with a scheme, user info, a path, a
+/// port, or a character that would end the URL authority is refused with
+/// [`WinrmError::AuthFailed`] before anything is sent.
+///
 /// # Session identifier
 ///
 /// Every request this client sends carries the same `wsmv:SessionId`

@@ -1000,8 +1000,11 @@ impl HttpTransport {
             None
         };
         // CredSSP tunnels through `WinrmConfig::proxy` only, and never reads
-        // the environment. That proxy serves every host, so the host of the
-        // URL named here does not change the result.
+        // the environment. That proxy serves every host, so the placeholder
+        // host of the URL named here does not change the result, but only
+        // while `use_env` is false: reading the environment (`use_env` true)
+        // requires computing the dial per request, because `NO_PROXY`
+        // depends on the host.
         #[cfg(feature = "credssp")]
         let credssp_dial = Arc::new(if matches!(config.auth_method, AuthMethod::CredSsp) {
             route.credssp_dial(&endpoint_url(true, "localhost", config.port), false)?
@@ -4741,7 +4744,8 @@ mod tests {
         let t = credssp_proxied_transport(relay, format!("http://127.0.0.1:{pport}")).unwrap();
         let err = send_bounded(&t).await.unwrap_err();
         assert!(
-            matches!(&err, WinrmError::AuthFailed(m) if m.starts_with("CredSSP outer TLS")),
+            matches!(&err, WinrmError::AuthFailed(m) if m.starts_with("CredSSP outer TLS")
+                && m.contains("matches no pin_server_certificate_sha256 fingerprint")),
             "{err}"
         );
         assert_eq!(heads.lock().unwrap().len(), 1, "the proxy was not used");
@@ -7837,6 +7841,39 @@ mod tests {
             assert!(
                 matches!(&err, WinrmError::AuthFailed(m) if m.starts_with("CredSSP: an https:// proxy is not supported")),
                 "{err}"
+            );
+
+            // The same https:// proxy from the environment: CredSSP does not
+            // use it (it reads no environment variable), so the client is
+            // built, but the proxy's name still gets the proxy's
+            // verification and a host with that name is refused.
+            let (port, read) = crate::test_pki::spawn_tls_sink(crate::test_pki::server_config(
+                CA_LEAF_PEM,
+                CA_LEAF_KEY_PEM,
+            ));
+            let env_proxy = format!("https://LOCALHOST:{p}");
+            let t = HttpTransport::new_with_env(
+                tls_config(AuthMethod::CredSsp, port),
+                WinrmCredentials::new(USER, PASS, ""),
+                TransportOptions {
+                    tls: opts,
+                    ..Default::default()
+                },
+                move |n: &str| (n == "HTTPS_PROXY").then(|| env_proxy.clone()),
+            )
+            .unwrap();
+            match send_basic(&t, "localhost").await {
+                Err(WinrmError::AuthFailed(m)) => assert_eq!(
+                    m,
+                    "pin_server_certificate_sha256: host localhost has the name of an https:// \
+                     proxy; the pin cannot be applied to it, refusing"
+                ),
+                other => panic!("CredSsp (environment proxy): expected AuthFailed, got {other:?}"),
+            }
+            assert_eq!(
+                read.load(Ordering::SeqCst),
+                0,
+                "CredSsp (environment proxy)"
             );
         }
         for method in [AuthMethod::Basic, AuthMethod::Ntlm] {

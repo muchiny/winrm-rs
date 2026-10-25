@@ -313,7 +313,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   transport*.
 - Proxies: which environment variables and OS settings apply, what a
   forwarding proxy means for NTLM and Kerberos over plain HTTP, how proxy
-  credentials travel, and that CredSSP uses no proxy. `WinrmClient`: one
+  credentials travel, and which proxy CredSSP uses. `WinrmClient`: one
   `wsmv:SessionId` per client, sent to every host.
 - `AuthMethod::Kerberos`, the README and SECURITY.md say that over plain HTTP
   the authentication is not bound to the connection and can be relayed, and

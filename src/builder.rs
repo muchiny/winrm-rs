@@ -164,7 +164,8 @@ impl<S> WinrmClientBuilder<S> {
     /// `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY` and their
     /// lower-case forms are ignored. Only [`WinrmConfig::proxy`] applies; with
     /// it `None`, every request goes direct. The operating system's proxy
-    /// settings are never read, and CredSSP never uses a proxy.
+    /// settings are never read. CredSSP uses only [`WinrmConfig::proxy`] and
+    /// never reads these variables.
     pub fn ignore_env_proxy(mut self) -> Self {
         self.options.use_env_proxy = false;
         self

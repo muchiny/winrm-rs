@@ -215,6 +215,16 @@ impl ProxyRoute {
             return Ok(CredSspDial::Direct);
         }
         let Some(intercept) = self.intercept(endpoint_url) else {
+            // An explicit proxy serves every endpoint: no interception means
+            // the endpoint or the proxy could not be read, and connecting
+            // directly would silently leave the proxy out.
+            if let Some(explicit) = &self.explicit {
+                return Err(WinrmError::AuthFailed(format!(
+                    "CredSSP: the proxy {} gives no route to this endpoint; not connecting \
+                     directly",
+                    redact_userinfo(explicit)
+                )));
+            }
             return Ok(CredSspDial::Direct);
         };
         let uri = intercept.uri();
@@ -227,9 +237,15 @@ impl ProxyRoute {
         };
         let default_port = match scheme {
             "http" => 80,
+            "socks5" | "socks5h" => DEFAULT_SOCKS_PORT,
             "https" => return Err(refused("an https:// proxy")),
             "socks4" | "socks4a" => return Err(refused("a socks4 proxy")),
-            _ => DEFAULT_SOCKS_PORT,
+            other => {
+                return Err(refused(&format!(
+                    "a proxy with the scheme {}",
+                    excerpt_chars(other, 16)
+                )));
+            }
         };
         // `host()` keeps the brackets of an IPv6 address.
         let proxy = format!(
@@ -1015,6 +1031,28 @@ mod tests {
                 .credssp_dial(EP, false)
                 .is_ok()
         );
+    }
+
+    /// An explicit proxy that yields no route fails closed rather than
+    /// falling back to a direct connection. The transport always passes a
+    /// well-formed endpoint URL, so the reachable input is one this method
+    /// cannot parse.
+    #[cfg(feature = "credssp")]
+    #[test]
+    fn credssp_dial_refuses_an_explicit_proxy_without_a_route() {
+        match explicit_route("http://user:s3cret@127.0.0.1:3128").credssp_dial("not a url", false) {
+            Err(WinrmError::AuthFailed(m)) => {
+                assert!(m.contains("gives no route"), "{m}");
+                assert!(m.contains("127.0.0.1:3128") && !m.contains("s3cret"), "{m}");
+            }
+            other => panic!("{other:?}"),
+        }
+        // Without an explicit proxy the same input stays direct.
+        let none = ProxyRoute::resolve(&WinrmConfig::default(), false, |_: &str| None).unwrap();
+        assert!(matches!(
+            none.credssp_dial("not a url", true).unwrap(),
+            CredSspDial::Direct
+        ));
     }
 
     #[cfg(feature = "credssp")]

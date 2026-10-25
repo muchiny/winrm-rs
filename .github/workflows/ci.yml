@@ -494,10 +494,32 @@ jobs:
       # `credssp` (OpenSSL) and `kerberos` (krb5).
       - name: Install krb5 and OpenSSL headers
         run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libssl-dev pkg-config
+      # The 2.0 breaking changes land before the release commit that sets
+      # Cargo.toml to 2.0.0, so against the last 1.x release the check asks for
+      # a major version. While the crate version is 1.x a failure is reported
+      # (step log and warning below) without failing the job; from 2.0.0 on it
+      # fails the job again, with no edit here.
+      - name: Crate major version
+        id: crate
+        run: |
+          set -o pipefail
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "winrm-rs") | .version')
+          [[ -n "$version" ]] \
+            || { echo "::error::could not read the crate version with cargo metadata and jq"; exit 1; }
+          echo "major=${version%%.*}" >> "$GITHUB_OUTPUT"
       - uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2.9
+        id: semver
+        continue-on-error: ${{ steps.crate.outputs.major == '1' }}
         with:
           # Use the 1.98.0 toolchain installed above, not a floating stable.
           rust-toolchain: manual
+      - name: Breaking changes under a 1.x version
+        if: steps.semver.outcome == 'failure'
+        run: >-
+          echo "::warning::cargo-semver-checks reports changes that need a major
+          version while Cargo.toml is 1.x: expected until the 2.0.0 version
+          commit; see the log of the step above"
 
   workflow-lint:
     name: Workflow lint

@@ -5,11 +5,9 @@
 // follows redirects; deeper crypto / parser regressions live in unit tests
 // next to the affected module.
 //
-// The clients here are built through the public API, which (outside the
-// crate's own unit tests) reads `HTTP_PROXY` / `ALL_PROXY` from the
-// environment (see `WinrmConfig::proxy`). These tests talk to a loopback mock
-// server: if your shell exports a proxy, make sure `NO_PROXY` covers
-// `127.0.0.1` (`*` does not: it matches names only).
+// The clients here are built through the public API without
+// `use_env_proxy`, so they read no proxy from the environment (see
+// `WinrmConfig::proxy`) and reach the loopback mock server directly.
 
 use winrm_rs::{
     AuthMethod, EncryptionMode, WinrmClient, WinrmConfig, WinrmCredentials, WinrmError,

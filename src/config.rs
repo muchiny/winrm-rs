@@ -177,8 +177,9 @@ pub struct WinrmConfig {
     ///
     /// When set, WinRM requests go through this proxy.
     /// [`AuthMethod::CredSsp`] uses this proxy through an HTTP `CONNECT` or
-    /// SOCKS5 tunnel. It refuses an `https://` or `socks4://` proxy, and it
-    /// does not read the proxy environment variables.
+    /// SOCKS5 tunnel. It refuses an `https://` or `socks4://` proxy, here
+    /// when the client is built, and from the environment (once opted in,
+    /// see below) for the requests that proxy applies to.
     ///
     /// Limitation with [`AuthMethod::Certificate`]: with an `https://` proxy,
     /// `reqwest` uses a copy of the same TLS client configuration for the
@@ -193,7 +194,7 @@ pub struct WinrmConfig {
     /// (CONNECT) and SOCKS5 proxies only
     /// relay bytes: TLS, and the certificate, stay end-to-end with the WinRM
     /// host. The same applies to a proxy taken from the environment when this
-    /// field is `None` (see below).
+    /// field is `None` and the client reads it (see below).
     ///
     /// Credentials in the URL (`http://user:password@proxy:8080`) are the
     /// proxy account's, never the WinRM credentials. They reach `http://`
@@ -212,7 +213,12 @@ pub struct WinrmConfig {
     /// `socks5` or `socks5h` (`ftp://`, for one) is refused when the client
     /// is built.
     ///
-    /// With this field `None`, the environment applies: `HTTP_PROXY` for
+    /// With this field `None`, every request goes direct, unless the client
+    /// was built with
+    /// [`WinrmClientBuilder::use_env_proxy(true)`](crate::WinrmClientBuilder::use_env_proxy)
+    /// (off by default since 2.0; [`WinrmClient::new`](crate::WinrmClient::new)
+    /// never reads the environment). Then the environment applies, CredSSP
+    /// included: `HTTP_PROXY` for
     /// `http://` endpoints, `HTTPS_PROXY` for `https://` endpoints,
     /// `ALL_PROXY` for both when the specific one is unset or unusable, and
     /// `NO_PROXY` for exclusions (names, domain suffixes, IP addresses, CIDR
@@ -222,10 +228,9 @@ pub struct WinrmConfig {
     /// lower-case form, and a set but empty value counts as set. None applies
     /// when `REQUEST_METHOD` is set (CGI). A non-empty value that is not a
     /// usable proxy URL is ignored with a WARN. The operating system's proxy
-    /// settings are never read.
-    /// [`WinrmClientBuilder::ignore_env_proxy(true)`](crate::WinrmClientBuilder::ignore_env_proxy)
-    /// turns environment proxies off for one client. `NO_PROXY=*` does it for
-    /// the whole process (for host names, not IP addresses).
+    /// settings are never read. For a client that reads the environment,
+    /// `NO_PROXY=*` leaves every host name out of the proxy (not IP
+    /// addresses).
     ///
     /// Kerberos over HTTPS pins the server certificate in the connection's
     /// verifier and refuses a TLS handshake for any other server name than
@@ -799,8 +804,10 @@ pub enum AuthMethod {
     /// CredSSP runs on a TLS connection of its own, outside the HTTP client
     /// of the other methods. It applies `connect_timeout_secs` (TCP, proxy
     /// handshake and TLS together), `operation_timeout_secs`, `user_agent`
-    /// and an `http://` or `socks5://` [`WinrmConfig::proxy`] (the proxy
-    /// environment variables are not read), and does not apply these
+    /// and an `http://` or `socks5://` proxy, from [`WinrmConfig::proxy`] or,
+    /// once opted in with `WinrmClientBuilder::use_env_proxy(true)`, from the
+    /// environment (chosen per request; `https://` refused), and does not
+    /// apply these
     /// [`WinrmConfig`] fields:
     /// - `max_retries`: a CredSSP connection error is
     ///   [`WinrmError::AuthFailed`](crate::WinrmError::AuthFailed) or

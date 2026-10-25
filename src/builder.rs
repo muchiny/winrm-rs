@@ -169,13 +169,29 @@ impl<S> WinrmClientBuilder<S> {
         self
     }
 
-    /// With `true`, do not read proxies from the environment for this
-    /// client: `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY` and their
-    /// lower-case forms are ignored. Only [`WinrmConfig::proxy`] applies; with
-    /// it `None`, every request goes direct. With `false` (the default), the
-    /// environment applies while [`WinrmConfig::proxy`] is `None`. The
-    /// operating system's proxy settings are never read. CredSSP uses only
-    /// [`WinrmConfig::proxy`] and never reads these variables.
+    /// With `true`, read proxies from the environment for this client while
+    /// [`WinrmConfig::proxy`] is `None`: `HTTP_PROXY`, `HTTPS_PROXY`,
+    /// `ALL_PROXY`, `NO_PROXY` and their lower-case forms (see
+    /// [`WinrmConfig::proxy`] for how they apply). CredSSP then follows them
+    /// too, per request (`NO_PROXY` is matched against each host); it
+    /// refuses an `https://` or `socks4://` proxy from the environment for
+    /// the requests that proxy applies to.
+    ///
+    /// With `false` (the default since 2.0), no variable is read: only
+    /// [`WinrmConfig::proxy`] applies, and with it `None` every request goes
+    /// direct. The operating system's proxy settings are never read.
+    pub fn use_env_proxy(mut self, on: bool) -> Self {
+        self.options.use_env_proxy = on;
+        self
+    }
+
+    /// With `true`, do not read proxies from the environment; with `false`,
+    /// read them: the opposite of [`use_env_proxy`](Self::use_env_proxy),
+    /// which replaces it.
+    #[deprecated(
+        since = "2.0.0",
+        note = "environment proxies are off by default since 2.0; call use_env_proxy(true) to read them"
+    )]
     pub fn ignore_env_proxy(mut self, ignore: bool) -> Self {
         self.options.use_env_proxy = !ignore;
         self
@@ -794,28 +810,63 @@ mod tests {
         );
     }
 
-    /// `ignore_env_proxy` reaches the transport, `false` undoes `true`, and
-    /// the default keeps the environment.
+    /// A client built with `use_env_proxy(true)` reads the environment; one
+    /// built without it does not.
     #[test]
-    fn ignore_env_proxy_reaches_the_transport() {
+    fn use_env_proxy_reads_the_environment() {
         let client = WinrmClientBuilder::new(WinrmConfig::default())
             .credentials(WinrmCredentials::new("u", "p", ""))
-            .ignore_env_proxy(true)
+            .use_env_proxy(true)
             .build()
             .unwrap();
-        assert!(!client.transport.options().use_env_proxy);
-        let undone = WinrmClientBuilder::new(WinrmConfig::default())
-            .ignore_env_proxy(true)
-            .credentials(WinrmCredentials::new("u", "p", ""))
-            .ignore_env_proxy(false)
-            .build()
-            .unwrap();
-        assert!(undone.transport.options().use_env_proxy);
+        assert!(client.transport.options().use_env_proxy);
         let default = WinrmClientBuilder::new(WinrmConfig::default())
             .credentials(WinrmCredentials::new("u", "p", ""))
             .build()
             .unwrap();
-        assert!(default.transport.options().use_env_proxy);
+        assert!(!default.transport.options().use_env_proxy);
+    }
+
+    /// `use_env_proxy` is carried over by the credentials, and `false` undoes
+    /// `true`.
+    #[test]
+    fn use_env_proxy_reaches_the_transport() {
+        let carried = WinrmClientBuilder::new(WinrmConfig::default())
+            .use_env_proxy(true)
+            .credentials(WinrmCredentials::new("u", "p", ""))
+            .build()
+            .unwrap();
+        assert!(carried.transport.options().use_env_proxy);
+        let undone = WinrmClientBuilder::new(WinrmConfig::default())
+            .use_env_proxy(true)
+            .credentials(WinrmCredentials::new("u", "p", ""))
+            .use_env_proxy(false)
+            .build()
+            .unwrap();
+        assert!(!undone.transport.options().use_env_proxy);
+    }
+
+    /// The deprecated `ignore_env_proxy` still works: `false` turns the
+    /// environment on, `true` turns it off again.
+    #[test]
+    #[expect(
+        deprecated,
+        reason = "checks the deprecated method still sets the option"
+    )]
+    fn deprecated_ignore_env_proxy_still_sets_the_option() {
+        let on = WinrmClientBuilder::new(WinrmConfig::default())
+            .credentials(WinrmCredentials::new("u", "p", ""))
+            .ignore_env_proxy(false)
+            .build()
+            .unwrap();
+        assert!(on.transport.options().use_env_proxy);
+        let off = WinrmClientBuilder::new(WinrmConfig::default())
+            .ignore_env_proxy(false)
+            .credentials(WinrmCredentials::new("u", "p", ""))
+            .ignore_env_proxy(true)
+            .build()
+            .unwrap();
+        assert!(!off.transport.options().use_env_proxy);
     }
 
     /// `proxy_session_auth` reaches the transport, and the default is `Allow`.

@@ -110,10 +110,10 @@ fn run_child(test: &str, target_port: u16, env: &[(&str, String)]) {
 }
 
 /// In the child: one Basic request over plain HTTP to `host` on the port in
-/// [`TARGET_PORT`], built with `ignore_env_proxy(ignore_env)` (so `false`
-/// also checks that the explicit `false` keeps the environment). Its result
+/// [`TARGET_PORT`], built with `use_env_proxy(on)` when `use_env` is
+/// `Some(on)`, and with the builder's default when it is `None`. Its result
 /// is ignored: the recorders answer 500.
-async fn child_sends(host: &str, ignore_env: bool) {
+async fn child_sends(host: &str, use_env: Option<bool>) {
     let port = std::env::var(TARGET_PORT).unwrap().parse().unwrap();
     let config = WinrmConfig {
         auth_method: AuthMethod::Basic,
@@ -124,11 +124,11 @@ async fn child_sends(host: &str, ignore_env: bool) {
         max_retries: 0,
         ..Default::default()
     };
-    let client = WinrmClient::builder(config)
-        .credentials(WinrmCredentials::new("u", "p", ""))
-        .ignore_env_proxy(ignore_env)
-        .build()
-        .unwrap();
+    let mut builder = WinrmClient::builder(config).credentials(WinrmCredentials::new("u", "p", ""));
+    if let Some(on) = use_env {
+        builder = builder.use_env_proxy(on);
+    }
+    let client = builder.build().unwrap();
     let _ = client.open_shell(host).await;
     println!("{RAN}");
 }
@@ -230,7 +230,8 @@ impl Drop for InternetSettings {
 #[tokio::test]
 async fn os_proxy_is_never_used() {
     if is_child() {
-        return child_sends("127.0.0.1", false).await;
+        // Reading the environment, so the OS proxy has every chance to be used.
+        return child_sends("127.0.0.1", Some(true)).await;
     }
     if std::env::var_os("WINRM_RS_OS_PROXY_TEST").is_none() {
         return;
@@ -252,7 +253,7 @@ async fn os_proxy_is_never_used() {
 #[tokio::test]
 async fn env_http_proxy_routes_plain_http() {
     if is_child() {
-        return child_sends("127.0.0.1", false).await;
+        return child_sends("127.0.0.1", Some(true)).await;
     }
     let (proxy, proxy_seen) = spawn_recorder();
     let (target, target_seen) = spawn_recorder();
@@ -269,7 +270,7 @@ async fn env_http_proxy_routes_plain_http() {
 #[tokio::test]
 async fn lower_case_http_proxy_is_read() {
     if is_child() {
-        return child_sends("127.0.0.1", false).await;
+        return child_sends("127.0.0.1", Some(true)).await;
     }
     let (proxy, proxy_seen) = spawn_recorder();
     let (target, target_seen) = spawn_recorder();
@@ -289,7 +290,7 @@ async fn no_proxy_star_goes_direct() {
     // checks an address against the address and CIDR entries only), so the
     // child sends to `localhost`.
     if is_child() {
-        return child_sends("localhost", false).await;
+        return child_sends("localhost", Some(true)).await;
     }
     let (proxy, proxy_seen) = spawn_recorder();
     let (target, target_seen) = spawn_recorder();
@@ -308,15 +309,36 @@ async fn no_proxy_star_goes_direct() {
     );
 }
 
+/// Without `use_env_proxy`, the builder's default reads no environment.
 #[tokio::test]
-async fn ignore_env_proxy_connects_directly() {
+async fn env_proxy_is_off_by_default() {
     if is_child() {
-        return child_sends("127.0.0.1", true).await;
+        return child_sends("127.0.0.1", None).await;
     }
     let (proxy, proxy_seen) = spawn_recorder();
     let (target, target_seen) = spawn_recorder();
     run_child(
-        "ignore_env_proxy_connects_directly",
+        "env_proxy_is_off_by_default",
+        target,
+        &[("HTTP_PROXY", format!("http://127.0.0.1:{proxy}"))],
+    );
+    assert!(proxy_seen.lock().unwrap().is_empty());
+    assert_eq!(
+        target_seen.lock().unwrap().first().map(String::as_str),
+        Some("POST /wsman HTTP/1.1")
+    );
+}
+
+/// An explicit `use_env_proxy(false)` reads no environment.
+#[tokio::test]
+async fn use_env_proxy_false_connects_directly() {
+    if is_child() {
+        return child_sends("127.0.0.1", Some(false)).await;
+    }
+    let (proxy, proxy_seen) = spawn_recorder();
+    let (target, target_seen) = spawn_recorder();
+    run_child(
+        "use_env_proxy_false_connects_directly",
         target,
         &[("HTTP_PROXY", format!("http://127.0.0.1:{proxy}"))],
     );

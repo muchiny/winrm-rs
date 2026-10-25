@@ -471,10 +471,13 @@ pub(crate) struct HttpTransport {
     /// for [`AuthMethod::CredSsp`].
     #[cfg(feature = "credssp")]
     credssp_tls: Option<Arc<CredSspTls>>,
-    /// How [`AuthMethod::CredSsp`] reaches the host: through the proxy of
-    /// [`WinrmConfig::proxy`], else directly. Resolved at construction
-    /// ([`proxy::ProxyRoute::credssp_dial`]), so a proxy CredSSP cannot use
-    /// fails there. [`proxy::CredSspDial::Direct`] for the other methods.
+    /// How [`AuthMethod::CredSsp`] reaches the host when the environment is
+    /// not read: through the proxy of [`WinrmConfig::proxy`], else directly.
+    /// Resolved at construction ([`proxy::ProxyRoute::credssp_dial`]), so an
+    /// explicit proxy CredSSP cannot use fails there. With
+    /// [`TransportOptions::use_env_proxy`], each request computes its own
+    /// dial instead ([`Self::credssp_dial_for`]).
+    /// [`proxy::CredSspDial::Direct`] for the other methods.
     #[cfg(feature = "credssp")]
     credssp_dial: Arc<proxy::CredSspDial>,
     /// Idle dedicated connections. The lock is only held to check one
@@ -533,6 +536,7 @@ pub(crate) struct HttpTransport {
 pub(crate) struct TransportOptions {
     /// Whether the proxy environment variables are read when
     /// [`WinrmConfig::proxy`] is `None` (see [`proxy::ProxyRoute::resolve`]).
+    /// Off by default since 2.0.
     pub(crate) use_env_proxy: bool,
     /// TLS settings.
     pub(crate) tls: TlsOptions,
@@ -550,7 +554,7 @@ pub(crate) struct TransportOptions {
 impl Default for TransportOptions {
     fn default() -> Self {
         Self {
-            use_env_proxy: true,
+            use_env_proxy: false,
             tls: TlsOptions::default(),
             proxy_session_auth: ProxySessionAuth::default(),
             workstation: None,
@@ -1014,6 +1018,8 @@ impl HttpTransport {
         let route = proxy::ProxyRoute::resolve(&config, opts.use_env_proxy, var)?;
         debug!(route = ?route, "proxy route");
         // The host is not known here, hence "may": it depends on `NO_PROXY`.
+        // Only a client that opted in reads the environment, so only such a
+        // client gets this WARN.
         if !config.use_tls
             && let Some(proxy) = route.env_http_proxy()
         {
@@ -1021,8 +1027,7 @@ impl HttpTransport {
                 proxy = %log_host(proxy),
                 "plain-HTTP WinRM traffic may follow a proxy from the environment \
                  (HTTP_PROXY / ALL_PROXY) for every host not in NO_PROXY; set \
-                 WinrmConfig::proxy or call WinrmClientBuilder::ignore_env_proxy(true) to \
-                 choose"
+                 WinrmConfig::proxy or leave use_env_proxy off to choose"
             );
         }
         let proxy_names = route.https_proxy_server_names();
@@ -1073,12 +1078,13 @@ impl HttpTransport {
         } else {
             None
         };
-        // CredSSP tunnels through `WinrmConfig::proxy` only, and never reads
-        // the environment. That proxy serves every host, so the placeholder
-        // host of the URL named here does not change the result, but only
-        // while `use_env` is false: reading the environment (`use_env` true)
-        // requires computing the dial per request, because `NO_PROXY`
-        // depends on the host.
+        // Checks `WinrmConfig::proxy` for CredSSP when the client is built, so
+        // an explicit proxy CredSSP cannot use (`https://`, `socks4://`) is
+        // refused here. That proxy serves every host, so the placeholder
+        // host of the URL named here does not change the result. The
+        // environment is not read here (`use_env` false): its proxy depends
+        // on the host through `NO_PROXY`, so with `use_env_proxy` each
+        // request computes its own dial (`credssp_dial_for`).
         #[cfg(feature = "credssp")]
         let credssp_dial = Arc::new(if matches!(config.auth_method, AuthMethod::CredSsp) {
             route.credssp_dial(&endpoint_url(true, "localhost", config.port), false)?
@@ -1287,7 +1293,7 @@ impl HttpTransport {
                         WinrmError::AuthFailed("CredSSP requires HTTPS (set use_tls = true)".into())
                     })?),
                     opts: CredSspConnOptions::from_config(&self.config),
-                    dial: Arc::clone(&self.credssp_dial),
+                    dial: Arc::new(self.credssp_dial_for(&url)?),
                 };
                 auth.send_authenticated(&self.http, &url, body).await?
             }
@@ -1311,6 +1317,21 @@ impl HttpTransport {
     /// The [`Route`] of every request of this transport.
     fn route(&self) -> Route {
         Route::for_config(&self.config)
+    }
+
+    /// How CredSSP reaches the endpoint `url`: the dial resolved at
+    /// construction when the environment is not read, else the route's dial
+    /// for this URL ([`proxy::ProxyRoute::credssp_dial`] with `use_env`):
+    /// [`WinrmConfig::proxy`] when set, otherwise the environment's proxy for
+    /// `https://` endpoints, subject to `NO_PROXY` for the URL's host. An
+    /// `https://` or `socks4://` proxy from the environment is refused here
+    /// ([`WinrmError::AuthFailed`]), before anything is sent.
+    #[cfg(feature = "credssp")]
+    pub(crate) fn credssp_dial_for(&self, url: &str) -> Result<proxy::CredSspDial, WinrmError> {
+        if !self.options.use_env_proxy {
+            return Ok((*self.credssp_dial).clone());
+        }
+        self.route.credssp_dial(url, true)
     }
 
     /// The CredSSP TLS contexts and dial of this transport, for the tests of
@@ -4801,7 +4822,7 @@ mod tests {
         "Basic sends the password to a server whose certificate is not verified";
     const UNVERIFIED_PROXY_WARN: &str = "https:// proxy certificate verification disabled";
 
-    /// Build a transport reading the proxy environment `env`.
+    /// Build a transport reading the proxy environment `env` (opted in).
     fn transport_in_env(
         config: WinrmConfig,
         tls: TlsOptions,
@@ -4812,6 +4833,7 @@ mod tests {
             WinrmCredentials::new(USER, PASS, ""),
             TransportOptions {
                 tls,
+                use_env_proxy: true,
                 ..Default::default()
             },
             move |k: &str| {
@@ -6628,7 +6650,10 @@ mod tests {
         let transport = HttpTransport::new_with_env(
             config,
             WinrmCredentials::new(USER, PASS, ""),
-            TransportOptions::default(),
+            TransportOptions {
+                use_env_proxy: true,
+                ..Default::default()
+            },
             env,
         )
         .unwrap();
@@ -6654,7 +6679,8 @@ mod tests {
     }
 
     /// Plain HTTP that may follow a proxy from the environment is logged when
-    /// the client is built, with the proxy's userinfo redacted.
+    /// a client that reads the environment is built, with the proxy's
+    /// userinfo redacted.
     #[tracing_test::traced_test]
     #[test]
     fn env_proxy_for_plain_http_is_logged_redacted() {
@@ -6667,7 +6693,10 @@ mod tests {
         HttpTransport::new_with_env(
             config,
             WinrmCredentials::new("u", "p", ""),
-            TransportOptions::default(),
+            TransportOptions {
+                use_env_proxy: true,
+                ..Default::default()
+            },
             env,
         )
         .unwrap();
@@ -6677,11 +6706,16 @@ mod tests {
     }
 
     /// No such WARN over HTTPS (the bodies are protected there and the proxy
-    /// only tunnels), nor when `WinrmConfig::proxy` is set.
+    /// only tunnels), nor when `WinrmConfig::proxy` is set, nor for a client
+    /// that does not read the environment (the default).
     #[tracing_test::traced_test]
     #[test]
     fn no_env_proxy_warning_over_https_or_with_an_explicit_proxy() {
         let env = |n: &str| (n == "HTTP_PROXY").then(|| "http://p.corp:3128".to_string());
+        let opted_in = TransportOptions {
+            use_env_proxy: true,
+            ..Default::default()
+        };
         let https = WinrmConfig {
             auth_method: AuthMethod::Ntlm,
             use_tls: true,
@@ -6693,34 +6727,114 @@ mod tests {
             proxy: Some("http://explicit.corp:1".into()),
             ..Default::default()
         };
-        for config in [https, explicit] {
-            HttpTransport::new_with_env(
-                config,
-                WinrmCredentials::new("u", "p", ""),
-                TransportOptions::default(),
-                env,
-            )
-            .unwrap();
+        let plain = WinrmConfig {
+            auth_method: AuthMethod::Ntlm,
+            ..Default::default()
+        };
+        for (config, opts) in [
+            (https, opted_in.clone()),
+            (explicit, opted_in),
+            (plain, TransportOptions::default()),
+        ] {
+            HttpTransport::new_with_env(config, WinrmCredentials::new("u", "p", ""), opts, env)
+                .unwrap();
         }
         assert!(!logs_contain("may follow a proxy"));
     }
 
-    /// With the environment ignored, no variable is read and no proxy applies.
+    /// Without `use_env_proxy` (the default), no variable is read and no
+    /// proxy applies.
     #[test]
-    fn ignore_env_proxy_reads_no_environment() {
-        let opts = TransportOptions {
-            use_env_proxy: false,
-            ..TransportOptions::default()
-        };
+    fn without_use_env_proxy_no_variable_is_read() {
         let t = HttpTransport::new_with_env(
             WinrmConfig::default(),
             WinrmCredentials::new("u", "p", ""),
-            opts,
+            TransportOptions::default(),
             |n: &str| -> Option<String> { panic!("{n} was read") },
         )
         .unwrap();
         assert_eq!(t.proxy_route().proxy_for("http://win01:5985/wsman"), None);
         assert!(!t.options().use_env_proxy);
+    }
+
+    /// Environment proxies are off by default: a transport built with the
+    /// default options takes no proxy from an environment that sets one.
+    #[test]
+    fn env_proxies_are_off_by_default() {
+        let env = |n: &str| {
+            (n == "HTTP_PROXY" || n == "HTTPS_PROXY").then(|| "http://10.0.0.1:3128".to_string())
+        };
+        let t = HttpTransport::new_with_env(
+            WinrmConfig::default(),
+            WinrmCredentials::new("u", "p", ""),
+            TransportOptions::default(),
+            env,
+        )
+        .unwrap();
+        assert_eq!(t.proxy_route().proxy_for("http://h:5985/wsman"), None);
+    }
+
+    /// CredSSP follows the environment's proxies once they are opted in, per
+    /// request: `HTTPS_PROXY` for one host, a direct connection for a host in
+    /// `NO_PROXY`, and an `https://` proxy refused for the request it applies
+    /// to. Without the opt-in both hosts are reached directly.
+    #[cfg(feature = "credssp")]
+    #[test]
+    fn credssp_follows_env_proxies_when_opted_in() {
+        fn build(use_env_proxy: bool, proxy: &'static str) -> HttpTransport {
+            HttpTransport::new_with_env(
+                tls_config(AuthMethod::CredSsp, 5986),
+                WinrmCredentials::new(USER, PASS, ""),
+                TransportOptions {
+                    use_env_proxy,
+                    ..Default::default()
+                },
+                move |n: &str| match n {
+                    "HTTPS_PROXY" => Some(proxy.to_string()),
+                    "NO_PROXY" => Some("excluded.test".to_string()),
+                    _ => None,
+                },
+            )
+            .unwrap()
+        }
+        let h = "https://h:5986/wsman";
+        let excluded = "https://excluded.test:5986/wsman";
+
+        let t = build(true, "http://10.0.0.1:3128");
+        assert!(t.options().use_env_proxy);
+        match t.credssp_dial_for(h).unwrap() {
+            proxy::CredSspDial::HttpConnect { proxy, .. } => assert_eq!(proxy, "10.0.0.1:3128"),
+            other => panic!("expected HttpConnect, got {other:?}"),
+        }
+        assert!(matches!(
+            t.credssp_dial_for(excluded).unwrap(),
+            proxy::CredSspDial::Direct
+        ));
+
+        let t = build(false, "http://10.0.0.1:3128");
+        for url in [h, excluded] {
+            assert!(
+                matches!(t.credssp_dial_for(url).unwrap(), proxy::CredSspDial::Direct),
+                "{url}"
+            );
+        }
+
+        // An https:// proxy from the environment is refused for the request
+        // it applies to, not when the client is built.
+        let t = build(true, "https://10.0.0.1:3128");
+        match t.credssp_dial_for(h) {
+            Err(WinrmError::AuthFailed(m)) => {
+                assert!(
+                    m.starts_with("CredSSP: an https:// proxy is not supported"),
+                    "{m}"
+                );
+            }
+            other => panic!("expected AuthFailed, got {other:?}"),
+        }
+        assert!(matches!(
+            t.credssp_dial_for(excluded).unwrap(),
+            proxy::CredSspDial::Direct
+        ));
     }
 
     // --- `Proxy-Support: Session-Based-Authentication` (RFC 4559 section 6) ---
@@ -7003,6 +7117,7 @@ mod tests {
                 creds(),
                 TransportOptions {
                     proxy_session_auth: policy,
+                    use_env_proxy: true,
                     ..Default::default()
                 },
                 var,
@@ -8289,10 +8404,10 @@ mod tests {
                 "{err}"
             );
 
-            // The same https:// proxy from the environment: CredSSP does not
-            // use it (it reads no environment variable), so the client is
-            // built, but the proxy's name still gets the proxy's
-            // verification and a host with that name is refused.
+            // The same https:// proxy from the environment, opted in: it is
+            // checked per request, so the client is built, but the proxy's
+            // name still gets the proxy's verification and a host with that
+            // name is refused before any dial.
             let (port, read) = crate::test_pki::spawn_tls_sink(crate::test_pki::server_config(
                 CA_LEAF_PEM,
                 CA_LEAF_KEY_PEM,
@@ -8303,6 +8418,7 @@ mod tests {
                 WinrmCredentials::new(USER, PASS, ""),
                 TransportOptions {
                     tls: opts,
+                    use_env_proxy: true,
                     ..Default::default()
                 },
                 move |n: &str| (n == "HTTPS_PROXY").then(|| env_proxy.clone()),

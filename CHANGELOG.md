@@ -244,6 +244,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   callers that reach shares on purpose, typically a CredSSP double-hop, build
   the client with `.remote_path_policy(RemotePathPolicy::Any)`; the builder
   is the only way to choose, since `WinrmClient::new` has no knob.
+- Environment proxies are opt-in. `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`
+  and `NO_PROXY` are read only by a client built with
+  `WinrmClientBuilder::use_env_proxy(true)`, and CredSSP then follows them
+  too (`http://` and `socks5://` only). `ignore_env_proxy` is deprecated;
+  `ignore_env_proxy(false)` still turns them on. Migration: call
+  `use_env_proxy(true)` to keep the 1.x behaviour.
 
 ### Added
 
@@ -307,6 +313,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `WinrmConfig::https()` (HTTPS on 5986, NTLM, certificate validated) and
   `WinrmConfig::http()` (plain HTTP on 5985, today's default). The default
   becomes HTTPS on 5986 in 2.0; `WinrmConfig::http()` keeps plain HTTP.
+- `WinrmClientBuilder::use_env_proxy(bool)`.
 
 ### Fixed
 

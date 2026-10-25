@@ -552,15 +552,14 @@ fn open_existing(local_path: &Path) -> std::io::Result<Option<(std::fs::File, st
 }
 
 /// Rewrite `file` in place with `data`: not atomic, a failed write leaves it
-/// truncated. On Unix the set-user-ID and set-group-ID bits are cleared, so
-/// the new content never runs with them.
+/// truncated. On Unix the set-user-ID and set-group-ID bits are cleared
+/// first, so no byte of the new content is ever written under them, even
+/// when the write fails.
 fn write_in_place(
     file: &mut std::fs::File,
     data: &[u8],
     write: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    file.set_len(0)?;
-    write(file, data)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -570,6 +569,8 @@ fn write_in_place(
             file.set_permissions(std::fs::Permissions::from_mode(mode & !SET_ID_BITS))?;
         }
     }
+    file.set_len(0)?;
+    write(file, data)?;
     file.sync_all()
 }
 
@@ -632,7 +633,26 @@ fn check_sticky_rule(
     use std::os::unix::fs::MetadataExt;
 
     let dir_meta = std::fs::metadata(dir)?;
-    if sticky_rule_allows(dir_meta.mode(), dir_meta.uid(), file.uid(), our_uid) {
+    sticky_rule_verdict(
+        local_path,
+        dir_meta.mode(),
+        dir_meta.uid(),
+        file.uid(),
+        our_uid,
+    )
+}
+
+/// [`sticky_rule_allows`] as a result: `Ok` when it allows, else the
+/// `PermissionDenied` error that names `local_path` and the reason.
+#[cfg(unix)]
+fn sticky_rule_verdict(
+    local_path: &Path,
+    dir_mode: u32,
+    dir_uid: u32,
+    file_uid: u32,
+    our_uid: Option<u32>,
+) -> std::io::Result<()> {
+    if sticky_rule_allows(dir_mode, dir_uid, file_uid, our_uid) {
         return Ok(());
     }
     let why = if our_uid.is_some() {
@@ -684,26 +704,69 @@ fn replace_local_file_with(
     data: &[u8],
     write: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
+    replace_local_file_checked(local_path, data, write, owner_rule)
+}
+
+/// The ownership rule an existing file must pass before it is written: the
+/// sticky-directory rule ([`check_sticky_rule`]) on Unix, none elsewhere.
+fn owner_rule(
+    local_path: &Path,
+    dir: &Path,
+    file: &std::fs::Metadata,
+    our_uid: Option<u32>,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        check_sticky_rule(local_path, dir, file, our_uid)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (local_path, dir, file, our_uid);
+        Ok(())
+    }
+}
+
+/// The uid that owns the temporary file, which is this user's; `None` when
+/// it was not created or on non-Unix targets.
+fn temp_owner(created: &std::io::Result<std::fs::File>) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        created
+            .as_ref()
+            .ok()
+            .and_then(|tmp| tmp.metadata().ok())
+            .map(|m| std::os::unix::fs::MetadataExt::uid(&m))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = created;
+        None
+    }
+}
+
+/// [`replace_local_file_with`], with the ownership rule given as `rule`
+/// (`local_path`, its directory, the existing file's metadata, this user's
+/// uid), so that tests can supply the uids.
+fn replace_local_file_checked(
+    local_path: &Path,
+    data: &[u8],
+    write: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
+    rule: impl FnOnce(&Path, &Path, &std::fs::Metadata, Option<u32>) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let dir = temp_dir_of(local_path)?;
     let mut existing = open_existing(local_path)?;
     let tmp_path = dir.join(format!(".winrm-rs-{}.tmp", uuid::Uuid::new_v4().simple()));
     let created = create_temp(&tmp_path);
 
     // Before any write to the existing file, in place or by rename.
-    #[cfg(unix)]
-    if let Some((_, meta)) = existing.as_ref() {
-        let our_uid = created
-            .as_ref()
-            .ok()
-            .and_then(|tmp| tmp.metadata().ok())
-            .map(|m| std::os::unix::fs::MetadataExt::uid(&m));
-        if let Err(e) = check_sticky_rule(local_path, dir, meta, our_uid) {
-            if let Ok(tmp) = created {
-                drop(tmp);
-                remove_temp(&tmp_path);
-            }
-            return Err(e);
+    if let Some((_, meta)) = existing.as_ref()
+        && let Err(e) = rule(local_path, dir, meta, temp_owner(&created))
+    {
+        if let Ok(tmp) = created {
+            drop(tmp);
+            remove_temp(&tmp_path);
         }
+        return Err(e);
     }
 
     // A rename would split a hard link from its other names.
@@ -1369,6 +1432,131 @@ mod tests {
             assert_eq!(std::fs::metadata(&dest).unwrap().uid(), ours);
         }
         std::fs::remove_file(&dest).ok();
+    }
+
+    /// A directory and a file owner that are neither this user nor each
+    /// other, for the ownership facts these tests supply.
+    #[cfg(unix)]
+    const OTHER_DIR_UID: u32 = u32::MAX - 1;
+    #[cfg(unix)]
+    const OTHER_FILE_UID: u32 = u32::MAX - 2;
+
+    /// Replace `dest` as if it were a third user's file in a 1777 directory
+    /// owned by a fourth one; this user's uid is the real one.
+    #[cfg(unix)]
+    fn replace_as_third_users_file(dest: &Path) -> std::io::Result<()> {
+        replace_local_file_checked(
+            dest,
+            b"new",
+            <std::fs::File as std::io::Write>::write_all,
+            |path, _dir, _file, our_uid| {
+                sticky_rule_verdict(path, 0o1777, OTHER_DIR_UID, OTHER_FILE_UID, our_uid)
+            },
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replace_local_file_refuses_a_third_users_file_in_a_sticky_directory() {
+        let dir = test_dir("replace-sticky-refused");
+        let dest = dir.join("f.bin");
+        std::fs::write(&dest, b"old").unwrap();
+        let err = replace_as_third_users_file(&dest).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            err.to_string().contains("owned by neither this user"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), b"old");
+        assert_eq!(leftover_temp_files(&dir), 0);
+
+        // The same facts with the file owned by this user pass: the rule is
+        // given the uid read from the temporary file.
+        replace_local_file_checked(
+            &dest,
+            b"new",
+            <std::fs::File as std::io::Write>::write_all,
+            |path, _dir, _file, our_uid| {
+                let ours = our_uid.expect("this user's uid from the temporary file");
+                sticky_rule_verdict(path, 0o1777, OTHER_DIR_UID, ours, our_uid)
+            },
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+        assert_eq!(leftover_temp_files(&dir), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replace_local_file_refuses_a_third_users_hard_linked_file_in_a_sticky_directory() {
+        let dir = test_dir("replace-sticky-refused-link");
+        let dest = dir.join("f.bin");
+        let other = dir.join("g.bin");
+        std::fs::write(&dest, b"old").unwrap();
+        std::fs::hard_link(&dest, &other).unwrap();
+        let err = replace_as_third_users_file(&dest).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"old");
+        assert_eq!(std::fs::read(&other).unwrap(), b"old");
+        assert_eq!(leftover_temp_files(&dir), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replace_local_file_refuses_a_third_users_file_when_no_temp_file_can_be_made() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = test_dir("replace-sticky-refused-ro");
+        let dest = dir.join("f.bin");
+        std::fs::write(&dest, b"old").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::write(dir.join("probe"), b"").is_ok() {
+            eprintln!("a read-only directory is writable here (root): test skipped");
+        } else {
+            let result = replace_as_third_users_file(&dest);
+            let err = result.unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(err.to_string().contains("could not be determined"), "{err}");
+            assert_eq!(std::fs::read(&dest).unwrap(), b"old");
+            assert_eq!(leftover_temp_files(&dir), 0);
+        }
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// In place, the set-id bits are gone before the first byte is written,
+    /// and stay gone when the write fails. Mode 0o2644 (set-group-ID without
+    /// group execute) is one the kernel keeps through a non-root write, so
+    /// the check means something without root.
+    #[cfg(unix)]
+    #[test]
+    fn replace_local_file_clears_set_id_bits_before_writing_in_place() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = test_dir("replace-set-id-first");
+        for (i, start) in [0o2644_u32, 0o6755].into_iter().enumerate() {
+            let dest = dir.join(format!("f{i}.bin"));
+            std::fs::write(&dest, b"old").unwrap();
+            std::fs::hard_link(&dest, dir.join(format!("f{i}.link"))).unwrap();
+            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(start)).unwrap();
+            let before = std::fs::metadata(&dest).unwrap().permissions().mode();
+            if before & 0o6000 == 0 {
+                eprintln!("set-id bits not kept here ({before:o}): {start:o} skipped");
+                continue;
+            }
+            let err = replace_local_file_with(&dest, b"new", |f, _| {
+                let mode = f.metadata()?.permissions().mode();
+                assert_eq!(mode & 0o6000, 0, "mode {mode:o} while writing");
+                Err(std::io::Error::from(std::io::ErrorKind::StorageFull))
+            })
+            .unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::StorageFull);
+            let mode = std::fs::metadata(&dest).unwrap().permissions().mode();
+            assert_eq!(mode & 0o7777, start & 0o777, "{start:o}: mode {mode:o}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[cfg(unix)]

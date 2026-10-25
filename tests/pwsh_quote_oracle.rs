@@ -6,8 +6,9 @@
 // builds a syntax tree and runs nothing. The test requires zero errors, one
 // statement, and a literal whose characters equal the input.
 //
-// Host state: `pwsh` (`pwsh.exe` on Windows) must be on `PATH`. Without it the test is skipped with a
-// message; the CI job that runs it checks that `pwsh` is present.
+// Host state: `pwsh` (`pwsh.exe` on Windows) must be on `PATH`. Without it
+// the test is skipped with a message; the CI job that runs it checks that
+// `pwsh` is present.
 
 use std::path::PathBuf;
 

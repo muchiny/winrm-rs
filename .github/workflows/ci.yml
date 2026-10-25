@@ -520,8 +520,10 @@ jobs:
   release-profile:
     # The release profile compiles out the debug-only environment hooks, even
     # with the internal `__internal` feature that enables them in debug builds.
-    # This job builds it and runs the tests with `__internal` on, so the test
-    # that asserts the hooks have no effect runs against the release code.
+    # This job builds it and runs the lib tests with `__internal` on. Among
+    # them, fixed_rng_hooks_need_the_internal_feature checks the two NTLM RNG
+    # hooks (CREDSSP_FIXED_CC, CREDSSP_FIXED_RSK): in the release code they
+    # cannot fix the client challenge or the random session key.
     name: Release profile
     runs-on: ubuntu-latest
     permissions:

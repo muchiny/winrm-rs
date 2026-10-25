@@ -1603,7 +1603,7 @@ impl HttpTransport {
 
     /// Send a request with Kerberos over HTTPS, unsealed (TLS protects it),
     /// on a dedicated connection authenticated once with channel binding and
-    /// the server's AP-REP (see [`KerberosAuth::establish`]); later requests
+    /// the server's AP-REP (see `KerberosAuth::establish`); later requests
     /// on that connection carry no `Authorization` header.
     async fn send_kerberos_over_tls(
         &self,
@@ -5494,12 +5494,25 @@ mod tests {
     #[tokio::test]
     async fn a_panicking_hook_releases_its_conn_slot() {
         let (_server, fake, mut transport, host) = sealed_setup().await;
-        transport.set_before_send(Arc::new(|| -> bool { panic!("hook") }));
+        // The hook records the free data slots of the host when it runs: one
+        // fewer than the maximum shows the attempt already holds its slot.
+        let data = transport.host_slots(&host).0;
+        let seen = Arc::new(AtomicUsize::new(usize::MAX));
+        let s = Arc::clone(&seen);
+        transport.set_before_send(Arc::new(move || -> bool {
+            s.store(data.available_permits(), Ordering::SeqCst);
+            panic!("hook")
+        }));
         let transport = Arc::new(transport);
         let (t, h) = (Arc::clone(&transport), host.clone());
         let joined =
             tokio::spawn(async move { t.send_soap_with_retry(&h, "<a/>".into()).await }).await;
         assert!(joined.unwrap_err().is_panic());
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            MAX_CONNS_PER_HOST - 1,
+            "the hook ran while the attempt held its slot"
+        );
         assert_eq!(
             transport.host_slots(&host).0.available_permits(),
             MAX_CONNS_PER_HOST
@@ -5521,7 +5534,10 @@ mod tests {
             .send_soap_with_retry("bad host", "<a/>".into())
             .await
             .unwrap_err();
-        assert!(matches!(err, WinrmError::AuthFailed(_)), "{err:?}");
+        assert!(
+            matches!(&err, WinrmError::AuthFailed(m) if m.contains("invalid host")),
+            "{err:?}"
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 

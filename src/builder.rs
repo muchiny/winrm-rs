@@ -254,11 +254,15 @@ impl WinrmClientBuilder<Ready> {
     /// and only then consults the hook. An approved request goes out at
     /// once on a pooled authenticated connection; on a new connection, that
     /// connection's handshake (see above; for Kerberos, possibly a ticket
-    /// request to the KDC) runs first. Under saturation a refusal is therefore
-    /// reported only once a slot frees, and a request that gets no slot fails
-    /// with [`WinrmError::Timeout`] without calling the hook: a kill switch
-    /// then surfaces as `Timeout`, not `Cancelled`. Other methods consult the
-    /// hook at once. A request whose host is invalid fails before the hook.
+    /// request to the KDC) runs first. Sealed Kerberos over plain HTTP through
+    /// a forwarding proxy, under `ProxySessionAuth::Require` or
+    /// `RequireWhenUnsealed`, also sends one unauthenticated probe request
+    /// after the approval, until a 401 answer to it is cached. Under
+    /// saturation a refusal is therefore reported only once a slot frees, and
+    /// a request that gets no slot fails with [`WinrmError::Timeout`] without
+    /// calling the hook: a kill switch then surfaces as `Timeout`, not
+    /// `Cancelled`. Other requests consult the hook at once. A request whose
+    /// host is invalid fails before the hook.
     ///
     /// A request already on the wire cannot be recalled: to stop waiting for
     /// it, drop the call's future.

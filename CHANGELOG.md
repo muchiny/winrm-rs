@@ -115,8 +115,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   to go direct. Migration: use an `http://`, `https://`, `socks4://`,
   `socks4a://`, `socks5://` or `socks5h://` proxy URL, or leave
   `WinrmConfig::proxy` unset to connect directly.
-- A proxy environment variable whose value is not a usable proxy URL is
-  ignored with a WARN. Migration: none; fix or unset the variable to silence
+- A proxy environment variable whose non-empty value is not a usable proxy
+  URL is ignored with a WARN. Migration: none; fix or unset the variable to silence
   the WARN.
 
 ### Added

@@ -12,7 +12,7 @@ use hyper_util::client::proxy::matcher::Matcher;
 use zeroize::Zeroizing;
 
 use crate::config::WinrmConfig;
-use crate::error::{WinrmError, excerpt_chars};
+use crate::error::{WinrmError, excerpt_chars, quote_server_text};
 
 use super::{redact_userinfo, url_server_name};
 
@@ -99,7 +99,8 @@ impl ProxyRoute {
     /// 4. A proxy value is used only when `hyper-util` would use it and
     ///    [`parse_proxy_url`] accepts it, so the route never proxies where
     ///    `hyper-util`'s own environment path would not. A non-empty value
-    ///    that is not used is logged at WARN, its user info replaced.
+    ///    that is not used is logged at WARN, its user info replaced and its
+    ///    control characters made inert.
     /// 5. `http://` endpoints take `HTTP_PROXY`, else `ALL_PROXY`; `https://`
     ///    endpoints take `HTTPS_PROXY`, else `ALL_PROXY`; `NO_PROXY` excludes
     ///    hosts from both.
@@ -239,7 +240,7 @@ fn usable(name: &str, raw: &str) -> Option<Zeroizing<String>> {
         _ => {
             if !raw.is_empty() {
                 tracing::warn!(
-                    value = %excerpt_chars(&redact_userinfo(raw), 64),
+                    value = %quote_server_text(&redact_userinfo(raw), 64),
                     "ignoring {name}: not a usable proxy URL"
                 );
             }
@@ -395,12 +396,22 @@ mod tests {
                 ("HTTP_PROXY", "http://p.corp:3128"),
                 ("no_proxy", "10.0.0.0/8"),
             ],
+            &[
+                ("HTTPS_PROXY", "http://h.corp:3128"),
+                ("ALL_PROXY", "https://all.corp"),
+            ],
+            &[
+                ("ALL_PROXY", "http://a.corp:1"),
+                ("NO_PROXY", "0.0.0.0/0,::/0"),
+            ],
         ];
         let endpoints = [
             "http://win01:5985/wsman",
             "https://win01:5986/wsman",
             "http://win02:5985/wsman",
+            "https://win02:5986/wsman",
             "http://10.0.0.5:5985/wsman",
+            "http://[fe80::1]:5985/wsman",
         ];
         for env in rows {
             let var = |name: &str| {
@@ -430,6 +441,43 @@ mod tests {
                 assert_eq!(got, expected, "{env:?} {ep}");
             }
         }
+    }
+
+    /// `*` in `NO_PROXY` matches host names only; `0.0.0.0/0,::/0` leaves
+    /// every IPv4 and IPv6 address out of the proxy, and names still use it.
+    #[test]
+    fn no_proxy_can_leave_every_address_out() {
+        let route_with = |no: &'static str| {
+            let var = move |n: &str| match n {
+                "ALL_PROXY" => Some("http://a.corp:1".to_string()),
+                "NO_PROXY" => Some(no.to_string()),
+                _ => None,
+            };
+            ProxyRoute::resolve(&WinrmConfig::default(), true, var).unwrap()
+        };
+        let host = |route: &ProxyRoute, ep: &str| {
+            route
+                .proxy_for(ep)
+                .map(|u| u.host_str().unwrap().to_string())
+        };
+        let star = route_with("*");
+        assert_eq!(host(&star, "http://win01:5985/wsman"), None);
+        assert_eq!(
+            host(&star, "http://10.0.0.5:5985/wsman").as_deref(),
+            Some("a.corp")
+        );
+        let addresses = route_with("0.0.0.0/0,::/0");
+        for ep in [
+            "http://10.0.0.5:5985/wsman",
+            "https://192.168.1.1:5986/wsman",
+            "http://[fe80::1]:5985/wsman",
+        ] {
+            assert_eq!(host(&addresses, ep), None, "{ep}");
+        }
+        assert_eq!(
+            host(&addresses, "http://win01:5985/wsman").as_deref(),
+            Some("a.corp")
+        );
     }
 
     #[test]
@@ -463,6 +511,21 @@ mod tests {
         assert_eq!(route.env_http_proxy(), Some("http://a.corp:1/"));
         assert!(logs_contain("ignoring HTTP_PROXY"));
         assert!(!logs_contain("s3cret"));
+    }
+
+    /// The value in the WARN is made inert: a line break cannot start a new
+    /// log line, and an escape sequence is written out.
+    #[tracing_test::traced_test]
+    #[test]
+    fn the_warning_escapes_the_value() {
+        let var =
+            |n: &str| (n == "HTTPS_PROXY").then(|| "bad value\nsecond line \u{1b}[31m".to_string());
+        let route = ProxyRoute::resolve(&WinrmConfig::default(), true, var).unwrap();
+        assert_eq!(route.proxy_for("https://win01:5986/wsman"), None);
+        assert!(logs_contain("ignoring HTTPS_PROXY"));
+        assert!(logs_contain("bad value second line \\u{1b}[31m"));
+        assert!(!logs_contain("value\nsecond"));
+        assert!(!logs_contain("\u{1b}"));
     }
 
     #[test]
@@ -555,6 +618,28 @@ mod tests {
             .is_empty()
         );
         assert!(names(&none, &[]).is_empty());
+        // The lower-case name, read when the upper-case one is unset; the
+        // scheme is matched in any case.
+        assert_eq!(
+            names(&none, &[("https_proxy", "HTTPS://Lower.Corp")]),
+            vec![name("lower.corp")]
+        );
+        // hyper-util does not trim: a padded value is not a usable proxy.
+        assert!(names(&none, &[("https_proxy", " HTTPS://Lower.Corp ")]).is_empty());
+        // Exactly the route, not every https:// proxy in the environment: an
+        // https:// endpoint takes HTTPS_PROXY, here a plain http:// proxy
+        // (CONNECT, no TLS with the proxy), so ALL_PROXY is never used and its
+        // name gets no exception.
+        assert!(
+            names(
+                &none,
+                &[
+                    ("HTTPS_PROXY", "http://h.corp:3128"),
+                    ("ALL_PROXY", "https://all.corp")
+                ]
+            )
+            .is_empty()
+        );
         let explicit = |proxy: &str| WinrmConfig {
             proxy: Some(proxy.into()),
             ..Default::default()

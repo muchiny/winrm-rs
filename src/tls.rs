@@ -168,10 +168,9 @@ impl ServerCertVerifier for CertCapturingVerifier {
             // refused.
             if pinned.is_some() && !self.proxies.contains(server_name) {
                 return Err(PinMismatch::refuse(
-                    "TLS server name differs from the pinned endpoint's (an HTTPS proxy that \
-                     is neither `WinrmConfig::proxy` nor taken from HTTPS_PROXY / ALL_PROXY, \
-                     such as a system proxy setting, is not supported here); refusing the \
-                     handshake",
+                    "TLS server name differs from the pinned endpoint's and is not the \
+                     client's https:// proxy (`WinrmConfig::proxy`, else the environment's \
+                     proxy for https:// endpoints); refusing the handshake",
                 ));
             }
             return Ok(verified);

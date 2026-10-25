@@ -204,11 +204,12 @@ pub struct WinrmConfig {
     /// `ALL_PROXY` for both when the specific one is unset or unusable, and
     /// `NO_PROXY` for exclusions (names, domain suffixes, IP addresses, CIDR
     /// ranges, and `*`, which matches every name but no IP address; `<local>`
-    /// has no meaning). Each upper-case name is read before its lower-case
-    /// form, and a set but empty value counts as set. None applies when
-    /// `REQUEST_METHOD` is set (CGI). A value that is not a usable proxy URL
-    /// is ignored with a WARN. The operating system's proxy settings are
-    /// never read.
+    /// has no meaning). To leave every address out of the proxy, list
+    /// `0.0.0.0/0,::/0` in `NO_PROXY`. Each upper-case name is read before its
+    /// lower-case form, and a set but empty value counts as set. None applies
+    /// when `REQUEST_METHOD` is set (CGI). A non-empty value that is not a
+    /// usable proxy URL is ignored with a WARN. The operating system's proxy
+    /// settings are never read.
     ///
     /// Kerberos over HTTPS pins the server certificate in the connection's
     /// verifier and refuses a TLS handshake for any other server name than

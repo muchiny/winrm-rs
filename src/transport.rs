@@ -2948,6 +2948,98 @@ mod tests {
         );
     }
 
+    /// A loopback HTTP server that records the request line of each request
+    /// and answers `500` with an empty body. Returns its port and the lines.
+    fn spawn_request_line_recorder() -> (u16, Arc<Mutex<Vec<String>>>) {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            while let Ok(mut tcp) = accept_with_deadline(&listener) {
+                if let Ok((head, _)) = read_http_head(&mut tcp) {
+                    let line = head.lines().next().unwrap_or_default().to_string();
+                    recorded.lock().unwrap().push(line);
+                    let _ = tcp.write_all(
+                        b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n",
+                    );
+                }
+            }
+        });
+        (port, seen)
+    }
+
+    /// A transport whose route is empty sends direct even when `HTTP_PROXY`
+    /// is set: `reqwest`'s own proxy lookup is off. Run by
+    /// [`an_empty_route_ignores_reqwest_s_own_proxy_lookup`] in a child
+    /// process whose environment sets `HTTP_PROXY` (here `proxy::env_var`
+    /// reads nothing, so the route is empty).
+    #[tokio::test]
+    #[ignore = "run in a child process by an_empty_route_ignores_reqwest_s_own_proxy_lookup"]
+    async fn an_empty_route_ignores_reqwest_s_own_proxy_lookup_inner() {
+        assert!(
+            std::env::var_os("HTTP_PROXY").is_some(),
+            "run by the parent"
+        );
+        let (port, seen) = spawn_request_line_recorder();
+        let transport = basic_transport(port);
+        assert_eq!(transport.proxy_route().proxy_for("http://127.0.0.1/"), None);
+        let _ = transport
+            .send_soap_with_retry("127.0.0.1", "<soap/>".into())
+            .await;
+        assert_eq!(
+            seen.lock().unwrap().first().map(String::as_str),
+            Some("POST /wsman HTTP/1.1"),
+            "the request did not go direct"
+        );
+    }
+
+    /// Runs [`an_empty_route_ignores_reqwest_s_own_proxy_lookup_inner`] in a
+    /// child copy of this test binary with `HTTP_PROXY` pointing at a
+    /// recorder, which must see nothing.
+    #[test]
+    fn an_empty_route_ignores_reqwest_s_own_proxy_lookup() {
+        let (proxy_port, proxy_seen) = spawn_request_line_recorder();
+        let exe = std::env::current_exe().unwrap();
+        #[expect(clippy::disallowed_methods, reason = "test-only subprocess")]
+        let mut command = std::process::Command::new(exe);
+        command.args([
+            "--exact",
+            "transport::tests::an_empty_route_ignores_reqwest_s_own_proxy_lookup_inner",
+            "--ignored",
+            "--nocapture",
+        ]);
+        for name in [
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "NO_PROXY",
+            "no_proxy",
+            "REQUEST_METHOD",
+        ] {
+            command.env_remove(name);
+        }
+        let output = command
+            .env("HTTP_PROXY", format!("http://127.0.0.1:{proxy_port}"))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "child failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "the inner test did not run:\n{stdout}"
+        );
+        assert!(proxy_seen.lock().unwrap().is_empty());
+    }
+
     /// Every TLS configuration of a transport (shared client, dedicated
     /// clients' base, CredSSP outer TLS) uses the provider it was given.
     #[test]

@@ -54,9 +54,9 @@ pub struct WinrmConfig {
     /// # Security
     ///
     /// Setting this to `true` stops checking the server certificate's chain,
-    /// validity dates and host name: on the HTTPS transport, on the CredSSP
-    /// outer TLS leg, and on the leg to an `https://` proxy (see below). Use
-    /// it **only** in test environments. The constructor logs a
+    /// validity dates and host name: on the HTTPS transport and on the
+    /// CredSSP outer TLS leg, not on the leg to an `https://` proxy (see
+    /// below). Use it **only** in test environments. The constructor logs a
     /// `tracing::warn` when this flag is enabled.
     ///
     /// For an internal CA or a self-signed listener, use
@@ -83,17 +83,16 @@ pub struct WinrmConfig {
     /// signature algorithms differ, and P-521 keys. Re-issue such a listener
     /// certificate.
     ///
-    /// This flag also turns off verification of an `https://` proxy's
-    /// certificate: [`proxy`](Self::proxy), one named in `HTTPS_PROXY`,
-    /// `https_proxy`, `HTTP_PROXY`, `http_proxy`, `ALL_PROXY` or `all_proxy`,
-    /// or one `reqwest` takes from system settings. With `use_tls = true`
-    /// that proxy must still prove it holds its key; with `use_tls = false`
-    /// not even that is checked. Whoever answers on that leg receives the
-    /// proxy credentials of the proxy URL (`Proxy-Authorization`). With
-    /// `use_tls = false` it also receives every request: Basic credentials,
-    /// the NTLM handshake, and the SOAP bodies that are not sealed (Basic,
-    /// [`EncryptionMode::Never`]). NTLM and Kerberos bodies sealed under
-    /// [`EncryptionMode::Auto`] stay sealed.
+    /// The leg to an `https://` proxy is verified even with this flag, with
+    /// the trusted roots
+    /// ([`WinrmClientBuilder::add_root_certificates_pem`](crate::WinrmClientBuilder::add_root_certificates_pem),
+    /// [`WinrmClientBuilder::platform_roots`](crate::WinrmClientBuilder::platform_roots);
+    /// the built-in Mozilla roots for `use_tls = true`, the operating
+    /// system's store for `use_tls = false`).
+    /// [`WinrmClientBuilder::danger_accept_invalid_proxy_certs`](crate::WinrmClientBuilder::danger_accept_invalid_proxy_certs)
+    /// turns that off. With `use_tls = true`, one proxy is still verified as
+    /// the WinRM server is, that is not at all under this flag: a proxy that
+    /// `reqwest` takes from system settings, which the client cannot name.
     ///
     /// **CredSSP is the exception.** Its HTTPS connection carries no channel
     /// binding, and nothing inside CredSSP identifies the server. With this
@@ -179,10 +178,11 @@ pub struct WinrmConfig {
     /// receives the client's certificate chain. Only that public chain is
     /// disclosed. The private key never leaves the client, and the handshake
     /// signature made with it covers only that proxy handshake, so it cannot
-    /// be replayed to the WinRM host. With
-    /// [`accept_invalid_certs`](Self::accept_invalid_certs) the proxy's own
-    /// certificate is not verified, so any party in the middle of the proxy
-    /// leg can request the chain. `http://` (CONNECT) and SOCKS5 proxies only
+    /// be replayed to the WinRM host. The proxy's own certificate is
+    /// verified, even with
+    /// [`accept_invalid_certs`](Self::accept_invalid_certs) (see there), so
+    /// only a proxy the client trusts can request the chain. `http://`
+    /// (CONNECT) and SOCKS5 proxies only
     /// relay bytes: TLS, and the certificate, stay end-to-end with the WinRM
     /// host. The same applies to a proxy taken from the `HTTPS_PROXY` /
     /// `ALL_PROXY` environment variables, which `reqwest` uses when this field
@@ -194,11 +194,8 @@ pub struct WinrmConfig {
     /// plain-HTTP request, or on the `CONNECT`), and `socks5://` /
     /// `socks5h://` proxies in cleartext too (RFC 1929). `socks4://` and
     /// `socks4a://` ignore them. An `https://` proxy receives them inside TLS.
-    /// Its certificate is checked against the `webpki-roots` CA set for an
-    /// `https://` WinRM endpoint and against the operating system's store for
-    /// an `http://` endpoint, and not verified with
-    /// [`accept_invalid_certs`](Self::accept_invalid_certs) (see there for
-    /// what is still checked).
+    /// See [`accept_invalid_certs`](Self::accept_invalid_certs) for how the
+    /// proxy's certificate is verified.
     ///
     /// With this field `None`, `reqwest` reads `HTTP_PROXY`, `HTTPS_PROXY`,
     /// `ALL_PROXY` and `NO_PROXY` (and their lower-case forms) from the

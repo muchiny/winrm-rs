@@ -142,6 +142,22 @@ impl<S> WinrmClientBuilder<S> {
         self.tls.pins.push(fingerprint.to_string());
         self
     }
+
+    /// Do not verify an `https://` proxy's certificate: the 1.4 behaviour
+    /// under [`accept_invalid_certs`](crate::WinrmConfig::accept_invalid_certs).
+    /// Whoever answers on the proxy leg then receives the proxy credentials
+    /// and, with `use_tls = false`, every request. Test environments only.
+    /// Prefer [`add_root_certificates_pem`](Self::add_root_certificates_pem)
+    /// with the proxy's CA.
+    ///
+    /// This concerns the proxy leg only: the WinRM server's certificate is
+    /// verified as before. While it is set with `use_tls = true`, a WinRM
+    /// host that has the name of the `https://` proxy is refused, since its
+    /// handshake could not be told from the proxy's. Default: `false`.
+    pub fn danger_accept_invalid_proxy_certs(mut self, accept: bool) -> Self {
+        self.tls.accept_invalid_proxy_certs = accept;
+        self
+    }
 }
 
 impl WinrmClientBuilder<NeedsCredentials> {
@@ -367,6 +383,24 @@ mod tests {
             Err(WinrmError::AuthFailed(m)) => assert!(m.contains("got 2"), "{m}"),
             other => panic!("expected AuthFailed, got {:?}", other.map(|_| ())),
         }
+    }
+
+    /// `danger_accept_invalid_proxy_certs` is plain data kept across the
+    /// credentials, and off by default.
+    #[test]
+    fn danger_accept_invalid_proxy_certs_is_carried_over_by_credentials() {
+        let builder = WinrmClientBuilder::new(WinrmConfig::default());
+        assert!(!builder.tls.accept_invalid_proxy_certs);
+        let builder = builder
+            .danger_accept_invalid_proxy_certs(true)
+            .credentials(WinrmCredentials::new("u", "p", ""));
+        assert!(builder.tls.accept_invalid_proxy_certs);
+        assert!(
+            !builder
+                .danger_accept_invalid_proxy_certs(false)
+                .tls
+                .accept_invalid_proxy_certs
+        );
     }
 
     /// `TlsProvider::Ring` reaches the transport: its TLS configuration

@@ -399,12 +399,15 @@ pub(crate) struct HttpTransport {
     /// Called before each attempt of [`Self::send_soap_with_retry`]; `false`
     /// refuses the request.
     before_send: Option<BeforeSend>,
-    /// With `pin_server_certificate_sha256`, the server names of the
-    /// `https://` proxies ([`proxy_server_names`]): their handshakes are not
-    /// pinned (see [`crate::tls::ProxyRoutingVerifier`]), so a host with one
-    /// of these names is refused (see [`Self::checked_endpoint`]). Empty
-    /// without a pin.
-    pinned_proxy_names: Vec<rustls::pki_types::ServerName<'static>>,
+    /// With `pin_server_certificate_sha256` or
+    /// `danger_accept_invalid_proxy_certs` over HTTPS, the server names of
+    /// the `https://` proxies ([`proxy_server_names`]): their handshakes get
+    /// the proxy's verification, not the endpoint's (see
+    /// [`crate::tls::ProxyRoutingVerifier`]), so a host with one of these
+    /// names is refused (see [`Self::checked_endpoint`]). Empty otherwise.
+    shared_proxy_names: Vec<rustls::pki_types::ServerName<'static>>,
+    /// Whether a pin is set, which picks the wording of that refusal.
+    shared_proxy_names_pinned: bool,
 }
 
 /// Largest response body read from the server: four times the envelope size
@@ -789,18 +792,21 @@ impl HttpTransport {
         // that carried the challenge: from the response (`tls_info`), or from
         // the verifier of a dedicated single-connection client (see `AuthConn`).
         let proxy_names = proxy_server_names(&config, proxy_env);
-        let origin = crate::tls::server_verifiers(
+        let crate::tls::ServerVerifiers { origin, proxy } = crate::tls::server_verifiers(
             opts,
             config.use_tls,
             config.accept_invalid_certs,
             &proxy_names,
             &provider,
-        )?
-        .origin;
-        let pinned_proxy_names = if opts.pins.is_empty() {
-            Vec::new()
-        } else {
+        )?;
+        // The names whose handshakes do not get the endpoint's own
+        // verification (see `ProxyRoutingVerifier`): a host with one of them
+        // is refused where that would weaken the endpoint's verification.
+        let pinned = !opts.pins.is_empty();
+        let shared_proxy_names = if config.use_tls && (pinned || opts.accept_invalid_proxy_certs) {
             proxy_names
+        } else {
+            Vec::new()
         };
         let (client_tls, server_verifier) = if config.use_tls {
             let tls_builder = crate::tls::client_config_builder(&provider)?
@@ -817,7 +823,7 @@ impl HttpTransport {
             (client_tls, Some(origin))
         } else {
             // Plain HTTP: TLS only on the leg to an `https://` proxy.
-            (crate::tls::plain_http_config(origin, &provider)?, None)
+            (crate::tls::plain_http_config(proxy, &provider)?, None)
         };
 
         #[cfg(feature = "credssp")]
@@ -850,7 +856,8 @@ impl HttpTransport {
             kdc_slots: Arc::new(tokio::sync::Semaphore::new(MAX_KDC_IN_FLIGHT)),
             session_id: format!("uuid:{}", uuid::Uuid::new_v4().to_string().to_uppercase()),
             before_send: None,
-            pinned_proxy_names,
+            shared_proxy_names,
+            shared_proxy_names_pinned: pinned,
         })
     }
 
@@ -893,20 +900,28 @@ impl HttpTransport {
     ///
     /// Every request takes its URL here, whatever the auth method (the
     /// shared client, the dedicated connections and CredSSP, which takes its
-    /// TLS server name from this URL). While a pin is set, a host whose TLS
-    /// server name is that of an `https://` proxy is refused: its handshake
-    /// would be verified as the proxy's, without the pin.
+    /// TLS server name from this URL). While a pin is set, or the proxy's
+    /// certificate is not verified, a host whose TLS server name is that of
+    /// an `https://` proxy is refused: its handshake would be verified as the
+    /// proxy's, without the pin or without any check.
     fn checked_endpoint(&self, host: &str) -> Result<String, WinrmError> {
         validate_host(host)?;
         let url = self.endpoint(host);
-        if !self.pinned_proxy_names.is_empty()
-            && url_server_name(&url).is_some_and(|name| self.pinned_proxy_names.contains(&name))
+        if !self.shared_proxy_names.is_empty()
+            && url_server_name(&url).is_some_and(|name| self.shared_proxy_names.contains(&name))
         {
-            return Err(WinrmError::AuthFailed(format!(
-                "pin_server_certificate_sha256: host {} has the name of an https:// proxy; the \
-                 pin cannot be applied to it, refusing",
-                log_host(host)
-            )));
+            let host = log_host(host);
+            return Err(WinrmError::AuthFailed(if self.shared_proxy_names_pinned {
+                format!(
+                    "pin_server_certificate_sha256: host {host} has the name of an https:// \
+                     proxy; the pin cannot be applied to it, refusing"
+                )
+            } else {
+                format!(
+                    "danger_accept_invalid_proxy_certs: host {host} has the name of an https:// \
+                     proxy; it would not be verified, refusing"
+                )
+            }));
         }
         Ok(url)
     }
@@ -5180,6 +5195,9 @@ mod tests {
     /// with a copy of the client's TLS configuration, so the capturing
     /// verifier also sees the proxy's certificate. Only certificates of the
     /// target count: the handshake succeeds and binds the target's.
+    ///
+    /// The proxy's RSA self-signed certificate is not trusted, so this test
+    /// builds with `accept_invalid_proxy_certs`.
     #[tokio::test]
     async fn ntlm_cbt_through_an_https_proxy_binds_the_target_certificate() {
         use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM, RSA_CERT_PEM, RSA_KEY_PKCS1_PEM};
@@ -5196,7 +5214,14 @@ mod tests {
             operation_timeout_secs: 5,
             ..Default::default()
         };
-        let transport = HttpTransport::new(config, WinrmCredentials::new(USER, PASS, "")).unwrap();
+        let transport = transport_with(
+            config,
+            &TlsOptions {
+                accept_invalid_proxy_certs: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let url = format!("https://127.0.0.1:{port}/wsman");
         let reply = tokio::time::timeout(
             Duration::from_secs(20),
@@ -5208,6 +5233,161 @@ mod tests {
         assert_eq!(reply, "<ok/>");
         let seen = seen.lock().unwrap().clone();
         assert_eq!(type3_channel_bindings(&seen[0]), Some(cbt_of(EC_CERT_PEM)));
+    }
+
+    /// Basic over plain HTTP through an `https://` proxy on loopback whose
+    /// certificate is the self-signed CA:TRUE `EC_CERT_PEM`, with the proxy
+    /// credentials in its URL. Returns the result and the application bytes
+    /// the proxy read.
+    async fn basic_through_a_self_signed_https_proxy(
+        accept_invalid_certs: bool,
+        opts: &TlsOptions,
+    ) -> (Result<String, WinrmError>, usize) {
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
+        let (p, read) = crate::test_pki::spawn_tls_sink(crate::test_pki::server_config(
+            EC_CERT_PEM,
+            EC_KEY_PKCS8_PEM,
+        ));
+        let config = WinrmConfig {
+            use_tls: false,
+            accept_invalid_certs,
+            proxy: Some(format!("https://proxyuser:proxysecret@localhost:{p}")),
+            ..tls_config(AuthMethod::Basic, 5985)
+        };
+        let t = transport_with(config, opts).unwrap();
+        let result = send_basic(&t, "127.0.0.1").await;
+        (result, read.load(Ordering::SeqCst))
+    }
+
+    /// `accept_invalid_certs` does not reach the proxy leg: the untrusted
+    /// proxy is refused before the proxy credentials are sent.
+    #[tokio::test]
+    async fn https_proxy_is_verified_under_accept_invalid_certs_plain_http() {
+        let (result, read) =
+            basic_through_a_self_signed_https_proxy(true, &TlsOptions::default()).await;
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(read, 0, "Proxy-Authorization must not have been sent");
+    }
+
+    /// The same over HTTPS: the origin is accepted under the flag, the
+    /// untrusted proxy is not, and no Type 3 is sent.
+    #[tokio::test]
+    async fn https_proxy_is_verified_under_accept_invalid_certs_over_tls() {
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM, RSA_CERT_PEM, RSA_KEY_PKCS1_PEM};
+        let (port, seen) = spawn_ntlm_tls_server(EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let p = spawn_https_connect_proxy(RSA_CERT_PEM, RSA_KEY_PKCS1_PEM);
+        let config = WinrmConfig {
+            accept_invalid_certs: true,
+            proxy: Some(format!("https://localhost:{p}")),
+            ..tls_config(AuthMethod::Ntlm, port)
+        };
+        let url = format!("https://127.0.0.1:{port}/wsman");
+        let t = transport_with(config, &TlsOptions::default()).unwrap();
+        let refused = ntlm_over_tls(&t, &url).await;
+        assert!(refused.is_err(), "{refused:?}");
+        assert!(seen.lock().unwrap().is_empty(), "no Type 3 was sent");
+    }
+
+    /// A proxy that chains to an added root is accepted under the flag, and
+    /// the origin is still accepted (and bound) under it.
+    #[tokio::test]
+    async fn https_proxy_trusted_by_extra_root_is_accepted() {
+        use crate::test_pki::{
+            CA_LEAF_KEY_PEM, CA_LEAF_PEM, EC_CERT_PEM, EC_KEY_PKCS8_PEM, TEST_CA_PEM,
+        };
+        let ca = root_file("ca-proxy-under-flag", TEST_CA_PEM);
+        let (port, seen) = spawn_ntlm_tls_server(EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let p = spawn_https_connect_proxy(CA_LEAF_PEM, CA_LEAF_KEY_PEM);
+        let config = WinrmConfig {
+            accept_invalid_certs: true,
+            proxy: Some(format!("https://localhost:{p}")),
+            ..tls_config(AuthMethod::Ntlm, port)
+        };
+        let url = format!("https://127.0.0.1:{port}/wsman");
+        let t = transport_with(config, &roots(&[&ca])).unwrap();
+        assert_eq!(ntlm_over_tls(&t, &url).await.unwrap(), "<ok/>");
+        let recorded = seen.lock().unwrap().clone();
+        assert_eq!(
+            type3_channel_bindings(&recorded[0]),
+            Some(cbt_of(EC_CERT_PEM))
+        );
+    }
+
+    /// The opt-out restores the 1.4 behaviour on the proxy leg.
+    #[tokio::test]
+    async fn danger_accept_invalid_proxy_certs_restores_the_old_behaviour() {
+        let opts = TlsOptions {
+            accept_invalid_proxy_certs: true,
+            ..Default::default()
+        };
+        let (_, read) = basic_through_a_self_signed_https_proxy(true, &opts).await;
+        assert!(read > 0, "the proxy must have been accepted");
+    }
+
+    /// The opt-out concerns the proxy leg only: an untrusted origin is still
+    /// refused.
+    #[tokio::test]
+    async fn accepting_invalid_proxy_certs_still_verifies_the_origin() {
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM, RSA_CERT_PEM, RSA_KEY_PKCS1_PEM};
+        let (port, seen) = spawn_ntlm_tls_server(EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let p = spawn_https_connect_proxy(RSA_CERT_PEM, RSA_KEY_PKCS1_PEM);
+        let config = WinrmConfig {
+            accept_invalid_certs: false,
+            proxy: Some(format!("https://localhost:{p}")),
+            ..tls_config(AuthMethod::Ntlm, port)
+        };
+        let opts = TlsOptions {
+            accept_invalid_proxy_certs: true,
+            ..Default::default()
+        };
+        let url = format!("https://127.0.0.1:{port}/wsman");
+        let t = transport_with(config, &opts).unwrap();
+        let refused = ntlm_over_tls(&t, &url).await;
+        assert!(refused.is_err(), "{refused:?}");
+        assert!(seen.lock().unwrap().is_empty(), "no Type 3 was sent");
+
+        // The refusal came from the origin: with the origin pinned, the same
+        // proxy is accepted and the exchange completes.
+        let config = WinrmConfig {
+            proxy: Some(format!("https://localhost:{p}")),
+            ..tls_config(AuthMethod::Ntlm, port)
+        };
+        let opts = TlsOptions {
+            accept_invalid_proxy_certs: true,
+            pins: vec![sha256_hex(EC_CERT_PEM)],
+            ..Default::default()
+        };
+        let t = transport_with(config, &opts).unwrap();
+        assert_eq!(ntlm_over_tls(&t, &url).await.unwrap(), "<ok/>");
+    }
+
+    /// A host with the server name of the `https://` proxy would be accepted
+    /// unverified under the opt-out: it is refused before anything is sent.
+    #[tokio::test]
+    async fn accepting_invalid_proxy_certs_refuses_a_host_named_like_the_proxy() {
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
+        let (port, read) = crate::test_pki::spawn_tls_sink(crate::test_pki::server_config(
+            EC_CERT_PEM,
+            EC_KEY_PKCS8_PEM,
+        ));
+        let config = WinrmConfig {
+            proxy: Some(format!("https://localhost:{port}")),
+            ..tls_config(AuthMethod::Basic, port)
+        };
+        let opts = TlsOptions {
+            accept_invalid_proxy_certs: true,
+            ..Default::default()
+        };
+        let t = transport_with(config, &opts).unwrap();
+        match send_basic(&t, "localhost").await {
+            Err(WinrmError::AuthFailed(m)) => assert_eq!(
+                m,
+                "danger_accept_invalid_proxy_certs: host localhost has the name of an https:// \
+                 proxy; it would not be verified, refusing"
+            ),
+            other => panic!("expected AuthFailed, got {other:?}"),
+        }
+        assert_eq!(read.load(Ordering::SeqCst), 0);
     }
 
     /// A server that accepts the connection and never answers leaves the

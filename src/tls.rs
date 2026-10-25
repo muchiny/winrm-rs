@@ -360,6 +360,9 @@ pub(crate) struct TlsOptions {
     /// SHA-256 fingerprints of the accepted server certificates, as the
     /// caller gave them (parsed by [`server_verifiers`]).
     pub(crate) pins: Vec<String>,
+    /// Whether the certificate of an `https://` proxy is accepted without
+    /// verification, whatever `accept_invalid_certs` says.
+    pub(crate) accept_invalid_proxy_certs: bool,
 }
 
 /// Parse a SHA-256 certificate fingerprint: outer whitespace is trimmed,
@@ -485,8 +488,10 @@ impl ServerCertVerifier for PinnedVerifier {
 /// receive no server name and go to `origin`; both verifiers must check
 /// signatures with the same provider algorithms, which [`server_verifiers`]
 /// guarantees. A handshake whose server name is a proxy's always goes to
-/// `proxy`, so the pin would not apply to a WinRM host with that name: the
-/// transport refuses such a host before connecting while a pin is set
+/// `proxy`, so the origin's verification (the pin, or the trusted roots when
+/// `proxy` accepts any certificate) would not apply to a WinRM host with
+/// that name: the transport refuses such a host before connecting
+/// while a pin is set or the proxy's certificate is not verified
 /// (`HttpTransport::checked_endpoint`).
 #[derive(Debug)]
 pub(crate) struct ProxyRoutingVerifier {
@@ -690,16 +695,14 @@ fn load_root_certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>, W
 /// The server verifiers of a client, built once so that the shared client,
 /// the per-connection clients and CredSSP all verify alike.
 pub(crate) struct ServerVerifiers {
-    /// Verifies the WinRM server (HTTPS transport, CredSSP outer TLS); when
-    /// pinned, it hands an `https://` proxy's handshake to the strict
-    /// verifier.
+    /// Verifies the WinRM server (HTTPS transport, CredSSP outer TLS). When
+    /// the origin and the proxy are verified differently, it hands the
+    /// handshakes with an `https://` proxy to `proxy` (see
+    /// [`ProxyRoutingVerifier`]).
     pub(crate) origin: Arc<dyn ServerCertVerifier>,
-    /// Verifies the certificate of an `https://` proxy.
-    #[expect(
-        dead_code,
-        reason = "read by the proxy-leg verification change; until then the leg to an https \
-                  proxy verifies with `origin`, and the pin router gets `strict` directly"
-    )]
+    /// Verifies the certificate of an `https://` proxy: the strict verifier,
+    /// or one that accepts any certificate with
+    /// `accept_invalid_proxy_certs`.
     pub(crate) proxy: Arc<dyn ServerCertVerifier>,
 }
 
@@ -713,12 +716,16 @@ pub(crate) struct ServerVerifiers {
 ///   store plus the root files, or, when the store is unusable, the built-in
 ///   Mozilla roots plus the root files.
 ///
-/// `origin` is a verifier that accepts any certificate under
-/// `accept_invalid_certs`, a [`PinnedVerifier`] when `opts.pins` is not
-/// empty, else the strict one; `proxy` is always the strict one. A pinned
-/// `origin` is wrapped in a [`ProxyRoutingVerifier`] sending the handshakes
-/// with `proxies` (the server names of the `https://` proxies the client may
-/// use) to the strict verifier.
+/// `proxy` is a verifier that accepts any certificate under
+/// `opts.accept_invalid_proxy_certs`, else the strict one. The origin base is
+/// a [`PinnedVerifier`] when `opts.pins` is not empty, else a verifier that
+/// accepts any certificate under `accept_invalid_certs`, else the strict one.
+/// With `use_tls`, `proxies` (the server names of the `https://` proxies the
+/// client may use) not empty, and a pin, `accept_invalid_certs` or
+/// `accept_invalid_proxy_certs` set, `origin` is the origin base wrapped in a
+/// [`ProxyRoutingVerifier`] sending the handshakes with `proxies` to `proxy`;
+/// else it is the origin base. Without `use_tls` the client only verifies
+/// proxies: the caller uses `proxy`.
 ///
 /// Pins are refused with `accept_invalid_certs` (the pin replaces it) and
 /// without `use_tls` (no server certificate to pin), and each must parse
@@ -772,26 +779,29 @@ pub(crate) fn server_verifiers(
             provider,
         )?
     };
-    let origin: Arc<dyn ServerCertVerifier> = if accept_invalid_certs {
+    let proxy: Arc<dyn ServerCertVerifier> = if opts.accept_invalid_proxy_certs {
         Arc::new(NoVerifier::new(provider))
-    } else if pins.is_empty() {
-        Arc::clone(&strict)
     } else {
-        let pinned: Arc<dyn ServerCertVerifier> = Arc::new(PinnedVerifier::new(pins, provider));
-        if proxies.is_empty() {
-            pinned
-        } else {
-            Arc::new(ProxyRoutingVerifier::new(
-                pinned,
-                Arc::clone(&strict),
-                proxies.to_vec(),
-            ))
-        }
+        Arc::clone(&strict)
     };
-    Ok(ServerVerifiers {
-        origin,
-        proxy: strict,
-    })
+    let routed = !pins.is_empty() || accept_invalid_certs || opts.accept_invalid_proxy_certs;
+    let origin_base: Arc<dyn ServerCertVerifier> = if !pins.is_empty() {
+        Arc::new(PinnedVerifier::new(pins, provider))
+    } else if accept_invalid_certs {
+        Arc::new(NoVerifier::new(provider))
+    } else {
+        strict
+    };
+    let origin: Arc<dyn ServerCertVerifier> = if use_tls && routed && !proxies.is_empty() {
+        Arc::new(ProxyRoutingVerifier::new(
+            origin_base,
+            Arc::clone(&proxy),
+            proxies.to_vec(),
+        ))
+    } else {
+        origin_base
+    };
+    Ok(ServerVerifiers { origin, proxy })
 }
 
 /// The TLS configuration of a plain-HTTP client, used only on the leg to an
@@ -1342,6 +1352,50 @@ mod tests {
         assert!(format!("{:?}", v.origin).contains("PinnedVerifier"));
         let v = server_verifiers(&opts, true, false, &[target("proxy.corp")], &p).unwrap();
         assert!(format!("{:?}", v.origin).contains("ProxyRoutingVerifier"));
+    }
+
+    /// Which verifiers `server_verifiers` returns for each combination of
+    /// the flags that make the origin and the proxy differ.
+    #[test]
+    fn server_verifiers_route_only_when_origin_and_proxy_differ() {
+        let p = Arc::new(rustls::crypto::ring::default_provider());
+        let proxies = [target("proxy.corp")];
+        let kinds = |opts: &TlsOptions, use_tls, accept_invalid, proxies: &[_]| {
+            let v = server_verifiers(opts, use_tls, accept_invalid, proxies, &p).unwrap();
+            (format!("{:?}", v.origin), format!("{:?}", v.proxy))
+        };
+        let strict = TlsOptions::default();
+        let (origin, proxy) = kinds(&strict, true, false, &proxies);
+        assert!(origin.contains("WebPkiServerVerifier"), "{origin}");
+        assert!(proxy.contains("WebPkiServerVerifier"), "{proxy}");
+
+        // accept_invalid_certs leaves the proxy strict, behind the router.
+        let (origin, proxy) = kinds(&strict, true, true, &proxies);
+        assert!(origin.contains("ProxyRoutingVerifier"), "{origin}");
+        assert!(proxy.contains("WebPkiServerVerifier"), "{proxy}");
+        // Without a listed proxy there is nothing to route.
+        let (origin, _) = kinds(&strict, true, true, &[]);
+        assert!(origin.contains("NoVerifier"), "{origin}");
+        assert!(!origin.contains("ProxyRoutingVerifier"), "{origin}");
+
+        // The opt-out accepts the proxy and leaves the origin strict.
+        let lax = TlsOptions {
+            accept_invalid_proxy_certs: true,
+            ..Default::default()
+        };
+        let (origin, proxy) = kinds(&lax, true, false, &proxies);
+        assert!(origin.contains("ProxyRoutingVerifier"), "{origin}");
+        assert!(origin.contains("WebPkiServerVerifier"), "{origin}");
+        assert!(proxy.contains("NoVerifier"), "{proxy}");
+        assert!(!proxy.contains("WebPkiServerVerifier"), "{proxy}");
+
+        // Without TLS only the proxy leg exists: no router, the proxy
+        // verifier is the one to use.
+        let (origin, proxy) = kinds(&lax, false, false, &proxies);
+        assert!(!origin.contains("ProxyRoutingVerifier"), "{origin}");
+        assert!(proxy.contains("NoVerifier"), "{proxy}");
+        let (_, proxy) = kinds(&strict, false, true, &proxies);
+        assert!(!proxy.contains("NoVerifier"), "{proxy}");
     }
 
     /// Asking for the OS store and not getting it is an error, not a

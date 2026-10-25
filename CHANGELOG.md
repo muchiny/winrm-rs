@@ -74,6 +74,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   now prove it holds its certificate's key, as the WinRM server must since
   1.4.1. The plain-HTTP TLS configuration is now built by the crate rather
   than by reqwest.
+- **`accept_invalid_certs` no longer turns off verification of an `https://`
+  proxy's certificate.** The proxy leg is verified with the trusted roots,
+  including those added with `add_root_certificates_pem` and `platform_roots`.
+  For the old behaviour use
+  `WinrmClientBuilder::danger_accept_invalid_proxy_certs(true)`. With
+  `use_tls = true`, a proxy that reqwest takes from system settings is still
+  verified like the WinRM server.
 
 ### Added
 
@@ -95,6 +102,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   connections by IP), on the HTTPS transport and the CredSSP outer TLS,
   without `accept_invalid_certs`. While a pin is set, a host that has the name
   of an `https://` proxy is refused.
+- `WinrmClientBuilder::danger_accept_invalid_proxy_certs`.
 
 ### Fixed
 

@@ -2187,6 +2187,16 @@ const CONNECT_HINT: &str = "could not connect to the default HTTPS port 5986: a 
 /// default was HTTP on 5985, the stock listener of a Windows host. `None`
 /// for any other error or configuration.
 ///
+/// With a proxy set there is no hint either: a failed connection is then the
+/// proxy's (unreachable, or a name it could not resolve), and
+/// `WinrmConfig::http()` would not fix it.
+///
+/// The hint is also silent when `connect_timeout_secs >=
+/// operation_timeout_secs + 10`: the client's total timeout, which is
+/// `operation_timeout_secs + 10`, then expires no later than the connect
+/// timeout, so a connection that hangs ends as a timeout and not as a
+/// connect error. A refused connection still gets the hint.
+///
 /// A failure that rustls reports (an untrusted or mismatched certificate, a
 /// pin, no shared cipher suite) gets no hint: a TLS listener answered on
 /// 5986, and plain HTTP is not the fix for it.
@@ -2196,7 +2206,8 @@ const CONNECT_HINT: &str = "could not connect to the default HTTPS port 5986: a 
 /// [`WinrmError::Http`].
 fn connect_hint(config: &WinrmConfig, err: &WinrmError) -> Option<&'static str> {
     let connect_failed = matches!(err, WinrmError::Http(e) if e.is_connect() && !is_tls_failure(e));
-    (config.port.is_none() && config.use_tls && connect_failed).then_some(CONNECT_HINT)
+    (config.port.is_none() && config.use_tls && config.proxy.is_none() && connect_failed)
+        .then_some(CONNECT_HINT)
 }
 
 /// Whether a [`rustls::Error`] is in the cause chain of `err`. An
@@ -4003,6 +4014,27 @@ mod tests {
         };
         assert!(connect_hint(&plain_default_port, &err).is_none());
         assert!(connect_hint(&WinrmConfig::default(), &WinrmError::Timeout(1)).is_none());
+    }
+
+    /// With a proxy set, a connect failure is the proxy's (unreachable, or
+    /// a DNS failure through it): `WinrmConfig::http()` would not fix it.
+    #[tokio::test]
+    async fn no_connect_hint_when_a_proxy_is_set() {
+        let (_socket, closed) = refused_port();
+        let err = basic_transport(closed)
+            .send_soap_with_retry("127.0.0.1", "<s:Envelope/>".into())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, WinrmError::Http(e) if e.is_connect()),
+            "{err:?}"
+        );
+        assert!(connect_hint(&WinrmConfig::default(), &err).is_some());
+        let proxied = WinrmConfig {
+            proxy: Some(SecretString::from("http://127.0.0.1:1")),
+            ..Default::default()
+        };
+        assert!(connect_hint(&proxied, &err).is_none());
     }
 
     /// A default client whose connection to port 5986 fails logs the hint

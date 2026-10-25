@@ -3039,10 +3039,9 @@ async fn credssp_run_command_whoami() {
     // Full MS-CSSP handshake against a live host. 2012 R2 is skipped below:
     // it has no cipher suite rustls will take, so the HTTPS leg never gets
     // this far. Passes against Server 2025 since the SPNEGO mechListMIC RC4
-    // reset fix (`NtlmSession::sign_mech_list_mic`); before it the server
-    // answered the pubKeyAuth TSRequest with a bare 401. `CREDSSP_DUMP=1`
-    // dumps every intermediate value if it regresses; it needs a debug build
-    // with `--features credssp,__internal`.
+    // reset fix; before it the server answered the pubKeyAuth TSRequest with
+    // a bare 401. `CREDSSP_DUMP=1` dumps every intermediate value if it
+    // regresses; it needs a debug build with `--features credssp,__internal`.
     if is_server_2012_r2().await {
         eprintln!(
             "SKIP credssp_run_command_whoami: Server 2012 R2 SCHANNEL pairs GCM only with static-RSA \

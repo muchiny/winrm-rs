@@ -229,6 +229,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   winrm-rs installing it must now call `CryptoProvider::install_default`
   itself, or its own rustls configs built from the process default panic or
   fail.
+- `NtlmSession` is removed from the public API (deprecated since 1.5.0). It
+  was the crate's internal NTLM sealing primitive; the client seals messages
+  itself and no public API takes or returns it. Migration: none for
+  `WinrmClient` users; code that drove it directly has no replacement.
 
 ### Added
 

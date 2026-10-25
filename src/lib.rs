@@ -18,9 +18,7 @@
 //!
 //! - **`ntlm`** (internal) -- implements the `NTLMv2` challenge/response handshake
 //!   per MS-NLMP and the NTLM message sealing of HTTP traffic. Only `NTLMv2` is
-//!   supported; `NTLMv1` is intentionally excluded. Its sealing primitive is
-//!   still exported as the deprecated [`NtlmSession`], which leaves the public
-//!   API in 2.0.
+//!   supported; `NTLMv1` is intentionally excluded.
 //!
 //! HTTP transport is provided by `reqwest` over `rustls`; the crypto provider
 //! is chosen with [`WinrmClientBuilder::tls_provider`].
@@ -147,8 +145,6 @@ pub use config::{
     AuthMethod, EncryptionMode, ProxySessionAuth, TlsProvider, WinrmConfig, WinrmCredentials,
 };
 pub use error::{CredSspError, NtlmError, SoapError, WinrmError};
-#[expect(deprecated, reason = "kept exported until 2.0")]
-pub use ntlm::NtlmSession;
 pub use request::{OutgoingRequest, RequestKind};
 pub use secrecy::{ExposeSecret, SecretString};
 pub use shell::Shell;

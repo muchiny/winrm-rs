@@ -26,7 +26,7 @@ pub use messages::{create_authenticate_message_credssp, create_negotiate_message
 // The sealing session uses crypto internals
 use crate::error::NtlmError;
 use crypto::{Rc4State, hmac_md5_parts};
-use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Length of an NTLM message signature (MS-NLMP 2.2.2.9.1).
 const SIGNATURE_LEN: usize = 16;
@@ -129,8 +129,9 @@ impl SealingSession {
         session
     }
 
-    /// The same session as [`Self::boxed_from_auth`], by value: the
-    /// constructor of the deprecated public [`NtlmSession`].
+    /// The same session as [`Self::boxed_from_auth`], by value. Tests use it
+    /// to check that both constructors agree.
+    #[cfg(test)]
     fn from_auth(exported_session_key: &[u8; 16]) -> Self {
         let mut session = Self::INERT;
         session.rekey_in_place(exported_session_key);
@@ -220,24 +221,6 @@ impl SealingSession {
         result.as_mut_slice().zeroize();
     }
 
-    /// Wipe the keys and leave the session dead. The RC4 handles are
-    /// re-keyed from fresh random bytes rather than zeroed, so even a caller
-    /// that ignores the dead state never gets an identity keystream.
-    fn wipe(&mut self) {
-        self.client_sign_key.zeroize();
-        self.server_sign_key.zeroize();
-        self.client_seal_key.zeroize();
-        self.server_seal_key.zeroize();
-        self.client_seq_num = None;
-        self.server_seq_num = None;
-        self.poisoned = true;
-        let mut seed = Zeroizing::new([0u8; 16]);
-        rand::fill(&mut *seed);
-        self.client_seal_handle.reinit(&*seed);
-        rand::fill(&mut *seed);
-        self.server_seal_handle.reinit(&*seed);
-    }
-
     /// Run `op` on a live session, and poison the session if it fails.
     fn guarded<T>(
         &mut self,
@@ -296,11 +279,16 @@ impl SealingSession {
     /// # Errors
     ///
     /// As [`Self::seal`].
+    ///
+    /// Compiled for tests and the `__internal` fuzz surface only: the client
+    /// signs through [`Self::seal`] and [`Self::sign_mech_list_mic`].
+    #[cfg(any(test, feature = "__internal"))]
     pub(crate) fn sign(&mut self, data: &[u8]) -> Result<[u8; 16], NtlmError> {
         self.guarded(|s| s.sign_live(data))
     }
 
     /// [`Self::sign`] on a session already checked live.
+    #[cfg(any(test, feature = "credssp", feature = "__internal"))]
     fn sign_live(&mut self, data: &[u8]) -> Result<[u8; 16], NtlmError> {
         let seq = self.client_seq_num.ok_or_else(|| invalid(SEQ_EXHAUSTED))?;
         let mac = hmac_md5_parts(&self.client_sign_key, &[&seq.to_le_bytes(), data]);
@@ -334,6 +322,7 @@ impl SealingSession {
     /// # Errors
     ///
     /// As [`Self::seal`].
+    #[cfg(any(test, feature = "credssp", feature = "__internal"))]
     pub(crate) fn sign_mech_list_mic(
         &mut self,
         mech_type_list: &[u8],
@@ -365,6 +354,7 @@ impl SealingSession {
     /// a version other than 1, carries an unexpected sequence number, or its
     /// checksum does not match, and on a poisoned session. Any error poisons
     /// the session.
+    #[cfg(any(test, feature = "credssp", feature = "__internal"))]
     pub(crate) fn verify_mech_list_mic(
         &mut self,
         mech_type_list: &[u8],
@@ -459,168 +449,6 @@ impl SealingSession {
     }
 }
 
-/// NTLM session state for message encryption/decryption after authentication.
-///
-/// Derived from the NTLMv2 authentication exchange per MS-NLMP section 3.4.4.
-/// Provides seal (encrypt+sign) and unseal (decrypt+verify) for `WinRM`
-/// message-level encryption over HTTP.
-///
-/// This is the crate's internal NTLM sealing primitive, still exported for
-/// compatibility. The client seals HTTP traffic itself (see
-/// [`EncryptionMode`](crate::EncryptionMode)) and does not need it.
-///
-/// # Usage
-///
-/// Build it from the exported session key of an NTLMv2 handshake, then:
-///
-/// 1. call [`Self::sign_mech_list_mic`] first and once, when the protocol
-///    carries a SPNEGO `mechListMIC` (`CredSSP` does; HTTP sealing does not);
-/// 2. seal each message to the server with [`Self::seal`] (or sign it with
-///    [`Self::sign`]), and unseal each answer with [`Self::unseal`], in order.
-///
-/// ```
-/// # #![allow(deprecated, reason = "the example shows the deprecated type")]
-/// use winrm_rs::NtlmSession;
-///
-/// let exported_session_key = [0x42u8; 16];
-/// let mut session = NtlmSession::from_auth(&exported_session_key);
-/// let sealed = session.seal(b"<s:Envelope/>");
-/// assert_eq!(sealed.len(), 16 + 13);
-/// ```
-///
-/// # Errors and the dead session
-///
-/// The session is unusable after an error. Once [`Self::unseal`] or
-/// [`Self::verify_mech_list_mic`] has failed, or after
-/// [`Zeroize::zeroize`], every later call fails: `unseal` and
-/// `verify_mech_list_mic` return `Err`, [`Self::seal`] returns an empty `Vec`
-/// and [`Self::sign`] and [`Self::sign_mech_list_mic`] return `[0; 16]`. An
-/// empty `Vec` is never a sealed message: do not send it as a body.
-///
-/// Sequence numbers never wrap: once a message carried `u32::MAX`, the next
-/// call in that direction fails and poisons the session.
-///
-/// # Memory hygiene
-///
-/// All four derived session keys plus the two RC4 S-boxes are wiped from
-/// memory when the session drops. [`Zeroize::zeroize`] wipes the keys, marks
-/// the session dead, and re-keys both RC4 handles from random bytes, so a
-/// zeroized session never emits plaintext.
-#[deprecated(
-    since = "1.5.0",
-    note = "internal NTLM sealing primitive; leaves the public API in 2.0"
-)]
-pub struct NtlmSession {
-    inner: SealingSession,
-}
-
-#[expect(deprecated, reason = "the deprecated public wrapper itself")]
-impl NtlmSession {
-    /// Derive a session from the exported session key produced during
-    /// the NTLMv2 authentication exchange.
-    ///
-    /// Computes the four session keys (client/server seal/sign) per
-    /// MS-NLMP section 3.4.4 and initializes the RC4 cipher handles.
-    pub fn from_auth(exported_session_key: &[u8; 16]) -> Self {
-        Self {
-            inner: SealingSession::from_auth(exported_session_key),
-        }
-    }
-
-    /// Seal (encrypt + sign) a message for sending to the server.
-    ///
-    /// Returns `signature (16 bytes) || ciphertext`. The signature contains:
-    /// - Version (4 bytes, always 1)
-    /// - Encrypted HMAC-MD5 checksum (8 bytes)
-    /// - Sequence number (4 bytes, little-endian)
-    ///
-    /// Returns an empty `Vec` once the session is unusable (see the type
-    /// docs). An empty `Vec` must not be sent as a body.
-    pub fn seal(&mut self, plaintext: &[u8]) -> Vec<u8> {
-        self.inner.seal(plaintext).unwrap_or_default()
-    }
-
-    /// Compute an NTLM signature over `data` (no encryption of payload).
-    /// Returns the 16-byte NTLMSSP_MESSAGE_SIGNATURE per MS-NLMP 3.4.4.1
-    /// (with extended session security + key exchange). Consumes 8 bytes of
-    /// the client RC4 keystream and increments the client sequence number.
-    ///
-    /// Returns `[0; 16]` once the session is unusable (see the type docs).
-    pub fn sign(&mut self, data: &[u8]) -> [u8; 16] {
-        self.inner.sign(data).unwrap_or([0; 16])
-    }
-
-    /// Sign the SPNEGO mech_type_list for the `mechListMIC` of the final
-    /// NegTokenResp, then re-initialise the client RC4 sealing handle.
-    ///
-    /// Windows SPNEGO resets the NTLM RC4 sealing state right after the
-    /// mechListMIC, keeping the sequence number, so the next [`Self::seal`]
-    /// runs at keystream offset 0 with seq 1. Call it first and once: called
-    /// after another client operation, it signs without the reset.
-    ///
-    /// Returns `[0; 16]` once the session is unusable (see the type docs).
-    pub fn sign_mech_list_mic(&mut self, mech_type_list: &[u8]) -> [u8; 16] {
-        self.inner
-            .sign_mech_list_mic(mech_type_list)
-            .unwrap_or([0; 16])
-    }
-
-    /// Verify the server's SPNEGO `mechListMIC` over `mech_type_list`, then
-    /// re-initialise the server RC4 sealing handle.
-    ///
-    /// Accept-direction twin of [`Self::sign_mech_list_mic`]: the server
-    /// signs with its seq 0 and resets its sealing state, so its next sealed
-    /// message (the `CredSSP` pubKeyAuth echo) is at seq 1, keystream offset 0.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`NtlmError::InvalidMessage`] if the MIC is not 16 bytes, has
-    /// a version other than 1, carries an unexpected sequence number, or its
-    /// checksum does not match, and once the session is unusable. The
-    /// session is unusable after an error.
-    pub fn verify_mech_list_mic(
-        &mut self,
-        mech_type_list: &[u8],
-        mic: &[u8],
-    ) -> Result<(), NtlmError> {
-        self.inner.verify_mech_list_mic(mech_type_list, mic)
-    }
-
-    /// Unseal (decrypt + verify) a message received from the server.
-    ///
-    /// Expects `sealed` to be `signature (16 bytes) || ciphertext`.
-    /// Verifies the signature version and sequence number. Returns the
-    /// decrypted plaintext.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`NtlmError::InvalidMessage`] if:
-    /// - The message is shorter than 16 bytes
-    /// - The signature version is not 1
-    /// - The sequence number does not match the expected value
-    /// - The HMAC-MD5 checksum does not match the expected value
-    /// - The session is unusable (see the type docs)
-    ///
-    /// The session is unusable after an error.
-    pub fn unseal(&mut self, sealed: &[u8]) -> Result<Vec<u8>, NtlmError> {
-        self.inner.unseal(sealed)
-    }
-}
-
-/// Wipes the keys, marks the session dead and re-keys both RC4 handles from
-/// random bytes: a zeroized session seals to an empty `Vec` and refuses
-/// every message.
-#[expect(deprecated, reason = "the deprecated public wrapper itself")]
-impl Zeroize for NtlmSession {
-    fn zeroize(&mut self) {
-        self.inner.wipe();
-    }
-}
-
-/// The inner session wipes its keys and S-boxes on drop.
-#[expect(deprecated, reason = "the deprecated public wrapper itself")]
-impl ZeroizeOnDrop for NtlmSession {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -660,34 +488,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(deprecated)]
-    fn zeroized_session_never_emits_plaintext() {
-        let mut s = NtlmSession::from_auth(&[0x42; 16]);
-        s.zeroize();
-        let body = b"<s:Envelope>secret</s:Envelope>";
-        let sealed = s.seal(body);
-        assert!(!sealed.windows(body.len()).any(|w| w == body));
-        assert!(sealed.is_empty(), "a dead session seals to an empty Vec");
-    }
-
-    #[test]
-    #[expect(deprecated)]
-    fn zeroized_session_rejects_zero_key_forgeries() {
-        let mut s = NtlmSession::from_auth(&[0x42; 16]);
-        s.zeroize();
-        // A forgery built for an all-zero key and an all-zero RC4 state.
-        let body = b"forged";
-        let mut mac_input = 0u32.to_le_bytes().to_vec();
-        mac_input.extend_from_slice(body);
-        let mac = crate::ntlm::crypto::hmac_md5(&[0u8; 16], &mac_input);
-        let mut forged = 1u32.to_le_bytes().to_vec();
-        forged.extend_from_slice(&mac[..8]);
-        forged.extend_from_slice(&0u32.to_le_bytes());
-        forged.extend_from_slice(body);
-        assert!(s.unseal(&forged).is_err());
-    }
-
-    #[test]
     fn unseal_after_a_failed_unseal_is_refused() {
         let key = [0x42; 16];
         let mut client = SealingSession::boxed_from_auth(&key);
@@ -717,20 +517,6 @@ mod tests {
             s.sign(b"after").is_err(),
             "an exhausted session stays poisoned"
         );
-    }
-
-    #[test]
-    #[expect(deprecated)]
-    fn deprecated_wrapper_matches_internal_session() {
-        let key = [0x42; 16];
-        let mut public = NtlmSession::from_auth(&key);
-        let mut internal = SealingSession::boxed_from_auth(&key);
-        assert_eq!(
-            public.sign_mech_list_mic(b"mechs"),
-            internal.sign_mech_list_mic(b"mechs").unwrap()
-        );
-        assert_eq!(public.seal(b"body"), internal.seal(b"body").unwrap());
-        assert_eq!(public.sign(b"data"), internal.sign(b"data").unwrap());
     }
 
     #[test]
@@ -783,43 +569,6 @@ mod tests {
             client.sign(b"to server").is_err(),
             "server-side exhaustion poisons the whole session"
         );
-    }
-
-    /// The first `n` keystream bytes of `handle`, without advancing it.
-    fn keystream(handle: &crypto::Rc4State, n: usize) -> Vec<u8> {
-        let mut bytes = vec![0u8; n];
-        handle.clone().process(&mut bytes);
-        bytes
-    }
-
-    #[test]
-    #[expect(deprecated)]
-    fn zeroize_wipes_the_keys_and_rekeys_both_rc4_handles() {
-        let key = [0x42; 16];
-        let fresh = SealingSession::boxed_from_auth(&key);
-        let mut s = NtlmSession::from_auth(&key);
-        s.zeroize();
-        let wiped = &s.inner;
-        for k in [
-            wiped.client_sign_key,
-            wiped.server_sign_key,
-            wiped.client_seal_key,
-            wiped.server_seal_key,
-        ] {
-            assert_eq!(k, [0; 16], "a key survived zeroize");
-        }
-        for (dead, live) in [
-            (&wiped.client_seal_handle, &fresh.client_seal_handle),
-            (&wiped.server_seal_handle, &fresh.server_seal_handle),
-        ] {
-            let stream = keystream(dead, 32);
-            assert_ne!(
-                stream,
-                keystream(live, 32),
-                "RC4 still keyed from the old key"
-            );
-            assert_ne!(stream, vec![0u8; 32], "identity keystream");
-        }
     }
 
     #[test]
@@ -1062,20 +811,6 @@ mod tests {
         assert_eq!(seq_num, 0);
 
         assert_ne!(&sealed[16..], &plaintext[..]);
-    }
-
-    #[test]
-    #[expect(deprecated)]
-    fn seq_num_exhaustion_seals_to_an_empty_vec() {
-        let mut s = NtlmSession::from_auth(&[0x42; 16]);
-        s.inner.set_client_seq_num(u32::MAX);
-        let a = s.seal(b"x"); // SeqNum field 0xFFFFFFFF
-        let b = s.seal(b"y"); // no wrap to 0, no panic: the session is spent
-        assert_eq!(
-            u32::from_le_bytes(a[12..16].try_into().unwrap()),
-            0xFFFF_FFFF
-        );
-        assert!(b.is_empty(), "an exhausted session seals to an empty Vec");
     }
 
     #[test]

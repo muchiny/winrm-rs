@@ -3,14 +3,15 @@
 ## Supported versions
 
 Security fixes ship as a new patch release of the latest minor version only;
-older minor versions get no backports. Every 1.x release is
-semver-compatible with the latest one, so moving up within 1.x needs no code
-change.
+older minor versions get no backports. Within a major version every release
+is semver-compatible with the latest one, so moving up within 2.x needs no
+code change. Moving from 1.x to 2.0 does: see *Upgrading from 1.x* in the
+[CHANGELOG](CHANGELOG.md).
 
 | Version              | Supported |
 |----------------------|-----------|
-| 1.4.x (latest patch) | Yes       |
-| < 1.4                | No        |
+| 2.0.x (latest patch) | Yes       |
+| < 2.0                | No        |
 
 ## Reporting a vulnerability
 
@@ -62,6 +63,12 @@ We will credit reporters in the release notes and CHANGELOG (unless you prefer t
 - Message sealing flaws: a request body sent unsealed when sealing applies,
   or a forged, replayed or reordered answer accepted beyond the limits the
   `EncryptionMode` documentation states.
+- Requests that follow a proxy the client was not set to use: one from the
+  environment on a client built without
+  `WinrmClientBuilder::use_env_proxy(true)`, or one from the operating
+  system's proxy settings.
+- Under the default `RemotePathPolicy::LocalDrive`, a remote path that its
+  documentation says is refused and that reaches the host.
 - Arguments the crate places in a SOAP envelope that change its structure.
 - Values the crate places in PowerShell scripts that change what the script
   runs.
@@ -80,12 +87,16 @@ We will credit reporters in the release notes and CHANGELOG (unless you prefer t
     everything in plaintext.
 - Relay of NTLM or Kerberos authentication over plain HTTP by a party on the
   network path or controlling DNS. It is inherent to Windows authentication
-  without a TLS channel. Client-side remedy: HTTPS. Server side:
-  `AllowUnencrypted = false` (the default), an HTTPS listener with
-  `CbtHardeningLevel = Strict`, and SMB and LDAP signing plus Extended
+  without a TLS channel. Client-side remedy: HTTPS, the default since 2.0.
+  Server side: `AllowUnencrypted = false` (the default), an HTTPS listener
+  with `CbtHardeningLevel = Strict`, and SMB and LDAP signing plus Extended
   Protection on the account's other services.
 - What `accept_invalid_certs = true` gives up, as its documentation states:
-  the server is not authenticated. CredSSP refuses the flag.
+  the server is not authenticated. CredSSP, and Basic over HTTPS, refuse the
+  flag.
+- What `RemotePathPolicy::Any` lets through, and a link, junction, `subst`
+  drive or mapped drive on the host that leads a drive-absolute path to a
+  share: the `LocalDrive` check is lexical.
 - What `danger_accept_invalid_proxy_certs(true)` gives up: the `https://`
   proxy is not authenticated. The WinRM server stays verified.
 - Windows server settings: `AllowUnencrypted = true`,

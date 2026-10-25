@@ -57,6 +57,12 @@ cargo add winrm-rs
 cargo add winrm-rs --features kerberos
 ```
 
+Upgrading from 1.x: 2.0 changes defaults (HTTPS on 5986, proxy environment
+variables read only on request, drive-absolute transfer paths only,
+non-interactive PowerShell) and the types of `WinrmConfig::port` and
+`WinrmConfig::proxy`, among other changes. See *Upgrading from 1.x* in the
+[CHANGELOG](CHANGELOG.md) for each one and its migration.
+
 ## Choosing a transport
 
 | Setting | Server authenticated | Authentication bound to the connection | SOAP bodies | Use |
@@ -399,10 +405,9 @@ winrm-rs logs through `tracing`. Below `trace` it logs no command text, argument
 | **v0.4** | Kerberos + Certificate auth | Done |
 | **v0.5** | File transfer, streaming output, proxy | Done |
 | **v1.0** | Stable public API, TLS channel binding, CI/CD | Done |
-| **v1.4** | `before_send` request hook | **Current** |
-| **v1.5** | `WinrmConfig::https()` / `http()` presets, opt-in SOAP body logging | Planned |
-| **v1.x** | CredSSP stabilization (`--features credssp`) | Planned |
-| **v2.0** | HTTPS on 5986 by default | Planned |
+| **v1.4** | `before_send` request hook | Done |
+| **v2.0** | HTTPS on 5986 by default, `WinrmConfig::https()` / `http()` presets, opt-in environment proxies and SOAP body logging | **Current** |
+| **v2.x** | CredSSP stabilization (`--features credssp`) | Planned |
 
 ## Comparison
 
@@ -462,7 +467,8 @@ environment variables and use `--ignored`:
 | `WINRM_TEST_HOST` | yes | — | Hostname or IP of the target Windows box |
 | `WINRM_TEST_PASS` | yes | — | Password for the test account |
 | `WINRM_TEST_USER` | no | `vagrant` | Username |
-| `WINRM_TEST_PORT` | no | `5985` | WinRM port (`5985` = HTTP, `5986` = HTTPS) |
+| `WINRM_TEST_PORT` | no | `5985` | Port of the plain-HTTP listener: the tests build their HTTP clients on `WinrmConfig::http()` with this port |
+| `WINRM_TEST_HTTPS_PORT` | for the HTTPS legs | `55986` | Port of the HTTPS listener the HTTPS legs connect to |
 | `WINRM_TEST_HTTPS_CERT_SHA256` | for the HTTPS legs | — | SHA-256 fingerprint of the HTTPS listener certificate, pinned by the tests that verify it; required for the HTTPS legs (`basic_over_https_works`, `http_proxy_connect_carries_https`, the CredSSP tests) |
 
 ```sh

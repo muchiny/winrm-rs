@@ -201,6 +201,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the output when the deadline passes during it. Migration: a command that must outlive the
   deadline belongs in `Shell::start_command` and `Shell::receive_next`, which
   are not bounded.
+- `run_powershell` and `Shell::run_powershell` (and their `_with_timeout` /
+  `_with_cancel` forms) start
+  `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe` instead of
+  whatever `powershell.exe` the working directory or `PATH` resolves to.
+  Migration: a caller who needs another PowerShell, such as the 32-bit one,
+  runs its full path (for example
+  `%SystemRoot%\SysWOW64\WindowsPowerShell\v1.0\powershell.exe`) through
+  `run_command` with `-EncodedCommand`.
 
 ### Added
 

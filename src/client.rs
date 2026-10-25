@@ -645,6 +645,14 @@ impl WinrmClient {
     /// `powershell.exe -EncodedCommand`, which avoids quoting and escaping
     /// issues. Internally delegates to [`run_command`](Self::run_command).
     ///
+    /// PowerShell starts by its full path,
+    /// `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`, so a
+    /// `powershell.exe` in the working directory or on the `PATH` does not
+    /// decide which interpreter runs. That path is the 64-bit Windows
+    /// PowerShell on a 64-bit host; the 32-bit one is not used. A caller who
+    /// needs it runs `%SystemRoot%\SysWOW64\WindowsPowerShell\v1.0\powershell.exe`
+    /// through [`run_command`](Self::run_command).
+    ///
     /// Like [`run_command`](Self::run_command), it has no overall time limit:
     /// a script that hangs silently blocks the call until it ends. Bound it
     /// with [`run_powershell_with_timeout`](Self::run_powershell_with_timeout)
@@ -671,14 +679,20 @@ impl WinrmClient {
         script: &str,
     ) -> Result<CommandOutput, WinrmError> {
         let encoded = encode_powershell_command(script);
-        self.run_command(host, "powershell.exe", &["-EncodedCommand", &encoded])
-            .await
+        self.run_command(
+            host,
+            crate::command::POWERSHELL_EXE,
+            &["-EncodedCommand", &encoded],
+        )
+        .await
     }
 
     /// Run a PowerShell script with a total time limit.
     ///
     /// Like [`run_powershell`](Self::run_powershell), but the whole call must
-    /// finish within `timeout`; see
+    /// finish within `timeout`. It starts PowerShell by the same full path
+    /// (`%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`, never
+    /// the 32-bit one); see
     /// [`run_command_with_timeout`](Self::run_command_with_timeout) for what
     /// happens on expiry (terminate signal, shell deleted,
     /// [`WinrmError::Timeout`] with `timeout` rounded up to whole seconds).
@@ -711,7 +725,7 @@ impl WinrmClient {
         let encoded = encode_powershell_command(script);
         self.run_command_with_timeout(
             host,
-            "powershell.exe",
+            crate::command::POWERSHELL_EXE,
             &["-EncodedCommand", &encoded],
             timeout,
         )
@@ -760,6 +774,10 @@ impl WinrmClient {
     /// [`WinrmError::Cancelled`]; see
     /// [`run_command_with_cancel`](Self::run_command_with_cancel) for the
     /// details.
+    ///
+    /// It starts PowerShell by the same full path as `run_powershell`
+    /// (`%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`, never
+    /// the 32-bit one).
     pub async fn run_powershell_with_cancel(
         &self,
         host: &str,
@@ -769,7 +787,7 @@ impl WinrmClient {
         let encoded = encode_powershell_command(script);
         self.run_command_with_cancel(
             host,
-            "powershell.exe",
+            crate::command::POWERSHELL_EXE,
             &["-EncodedCommand", &encoded],
             cancel,
         )
@@ -1222,6 +1240,10 @@ mod tests {
         assert!(!text.contains("\nFORGED-LINE"), "{text}");
     }
 
+    /// The `<rsp:Command>` element every PowerShell helper sends.
+    const FULL_PATH_COMMAND: &str =
+        r"<rsp:Command>%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe</rsp:Command>";
+
     fn basic_config(port: u16) -> WinrmConfig {
         WinrmConfig {
             port,
@@ -1434,6 +1456,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(output.exit_code, 0);
+        let bodies = received_bodies(&server).await;
+        assert_eq!(
+            count_containing(&bodies, FULL_PATH_COMMAND),
+            1,
+            "{bodies:?}"
+        );
+        assert_eq!(
+            count_containing(&bodies, "<rsp:Command>powershell.exe</rsp:Command>"),
+            0
+        );
+        assert_eq!(count_containing(&bodies, "-EncodedCommand"), 1);
     }
 
     #[tokio::test]
@@ -2173,6 +2206,57 @@ mod tests {
         let shell = client.open_shell("127.0.0.1").await.unwrap();
         let output = shell.run_powershell("Get-Process").await.unwrap();
         assert_eq!(output.exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn shell_run_powershell_uses_the_full_path() {
+        let server = MockServer::start().await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        mount_ok(&server, SHELL_S1, 1).await;
+        mount_ok(&server, COMMAND_C1, 1).await;
+        mount_ok(&server, DONE_HELLO, 1).await;
+        mount_ok(&server, EMPTY_BODY, u64::MAX).await;
+
+        let shell = client.open_shell("127.0.0.1").await.unwrap();
+        shell.run_powershell("Get-Process").await.unwrap();
+
+        let bodies = received_bodies(&server).await;
+        assert_eq!(
+            count_containing(&bodies, FULL_PATH_COMMAND),
+            1,
+            "{bodies:?}"
+        );
+        assert_eq!(
+            count_containing(&bodies, "<rsp:Command>powershell.exe</rsp:Command>"),
+            0
+        );
+        assert_eq!(count_containing(&bodies, "-EncodedCommand"), 1);
+    }
+
+    #[tokio::test]
+    async fn shell_run_powershell_with_cancel_uses_the_full_path() {
+        use std::time::Duration;
+        let server = MockServer::start().await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        mount_hanging_command(&server, silent_poll()).await;
+
+        let shell = client.open_shell("127.0.0.1").await.unwrap();
+        let token = tokio_util::sync::CancellationToken::new();
+        let canceller = cancel_after(&token, Duration::from_millis(600));
+        let err = shell
+            .run_powershell_with_cancel("Read-Host", token)
+            .await
+            .unwrap_err();
+        canceller.await.unwrap();
+
+        assert!(matches!(err, WinrmError::Cancelled), "got {err:?}");
+        let bodies = received_bodies(&server).await;
+        assert_eq!(
+            count_containing(&bodies, FULL_PATH_COMMAND),
+            1,
+            "{bodies:?}"
+        );
+        assert_eq!(count_containing(&bodies, "-EncodedCommand"), 1);
     }
 
     // --- Phase 3: Retry tests ---
@@ -5255,6 +5339,11 @@ mod tests {
         assert!(matches!(err, WinrmError::Timeout(2)), "got {err:?}");
         let bodies = received_bodies(&server).await;
         assert_eq!(count_containing(&bodies, "-EncodedCommand"), 1);
+        assert_eq!(
+            count_containing(&bodies, FULL_PATH_COMMAND),
+            1,
+            "{bodies:?}"
+        );
         assert_eq!(count_containing(&bodies, "signal/terminate"), 1);
         assert_eq!(count_containing(&bodies, "transfer/Delete"), 1);
     }
@@ -5522,6 +5611,11 @@ mod tests {
 
         assert!(matches!(err, WinrmError::Cancelled), "got {err:?}");
         let bodies = received_bodies(&server).await;
+        assert_eq!(
+            count_containing(&bodies, FULL_PATH_COMMAND),
+            1,
+            "{bodies:?}"
+        );
         assert_eq!(
             count_containing(&bodies, "signal/terminate"),
             1,

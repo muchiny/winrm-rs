@@ -280,6 +280,14 @@ impl<'a> Shell<'a> {
     /// The script is encoded as UTF-16LE base64 and executed via
     /// `powershell.exe -EncodedCommand`.
     ///
+    /// PowerShell starts by its full path,
+    /// `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`, so a
+    /// `powershell.exe` in the working directory or on the `PATH` does not
+    /// decide which interpreter runs. The 32-bit Windows PowerShell is not
+    /// used; a caller who needs it runs
+    /// `%SystemRoot%\SysWOW64\WindowsPowerShell\v1.0\powershell.exe`
+    /// through [`run_command`](Self::run_command).
+    ///
     /// The script is the `-EncodedCommand` argument of `powershell.exe`: hosts
     /// that audit process command lines (event 4688, Sysmon event 1) or log
     /// script blocks (event 4104) record its text. Do not embed secrets in it.
@@ -291,22 +299,31 @@ impl<'a> Shell<'a> {
     /// with `-NoProfile -NonInteractive`.
     pub async fn run_powershell(&self, script: &str) -> Result<CommandOutput, WinrmError> {
         let encoded = crate::command::encode_powershell_command(script);
-        self.run_command("powershell.exe", &["-EncodedCommand", &encoded])
-            .await
+        self.run_command(
+            crate::command::POWERSHELL_EXE,
+            &["-EncodedCommand", &encoded],
+        )
+        .await
     }
 
     /// Execute a PowerShell script with cancellation support.
     ///
     /// Like [`run_powershell`](Self::run_powershell), but can be cancelled via a
-    /// [`CancellationToken`](crate::CancellationToken).
+    /// [`CancellationToken`](crate::CancellationToken). It starts PowerShell by
+    /// the same full path as [`run_powershell`](Self::run_powershell) (never
+    /// the 32-bit one).
     pub async fn run_powershell_with_cancel(
         &self,
         script: &str,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<CommandOutput, WinrmError> {
         let encoded = crate::command::encode_powershell_command(script);
-        self.run_command_with_cancel("powershell.exe", &["-EncodedCommand", &encoded], cancel)
-            .await
+        self.run_command_with_cancel(
+            crate::command::POWERSHELL_EXE,
+            &["-EncodedCommand", &encoded],
+            cancel,
+        )
+        .await
     }
 
     /// Send input data (stdin) to a running command.

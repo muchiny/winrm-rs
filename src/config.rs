@@ -103,6 +103,11 @@ pub struct WinrmConfig {
     /// [`add_root_certificates_pem`](crate::WinrmClientBuilder::add_root_certificates_pem).
     /// CredSSP has no channel binding, so it needs an authenticated HTTPS
     /// connection.
+    ///
+    /// With [`AuthMethod::Basic`] over HTTPS, the client is built with a
+    /// second WARN: Basic sends the password to a server whose certificate is
+    /// not verified. Pin the certificate or add a root instead. 1.x warns;
+    /// 2.0 will refuse this combination as it refuses CredSSP.
     pub accept_invalid_certs: bool,
     /// TCP connect timeout in seconds (default: 30).
     ///
@@ -214,7 +219,7 @@ pub struct WinrmConfig {
     /// when `REQUEST_METHOD` is set (CGI). A non-empty value that is not a
     /// usable proxy URL is ignored with a WARN. The operating system's proxy
     /// settings are never read.
-    /// [`WinrmClientBuilder::ignore_env_proxy`](crate::WinrmClientBuilder::ignore_env_proxy)
+    /// [`WinrmClientBuilder::ignore_env_proxy(true)`](crate::WinrmClientBuilder::ignore_env_proxy)
     /// turns environment proxies off for one client. `NO_PROXY=*` does it for
     /// the whole process (for host names, not IP addresses).
     ///
@@ -636,6 +641,14 @@ pub enum AuthMethod {
     /// plain HTTP, building the client fails unless [`EncryptionMode::Never`]
     /// says plaintext is accepted. That includes a loopback endpoint reached
     /// through an SSH or port-forward tunnel, which the client cannot see.
+    ///
+    /// Over HTTPS with [`WinrmConfig::accept_invalid_certs`], building the
+    /// client logs a WARN: the password goes to a server whose certificate
+    /// is not verified. Pin the certificate
+    /// ([`pin_server_certificate_sha256`](crate::WinrmClientBuilder::pin_server_certificate_sha256))
+    /// or add a root
+    /// ([`add_root_certificates_pem`](crate::WinrmClientBuilder::add_root_certificates_pem)).
+    /// 1.x warns; 2.0 will refuse this combination.
     Basic,
     /// NTLMv2 challenge/response authentication (default). When requests are
     /// sealed (see [`EncryptionMode`]), the three-step handshake (negotiate,

@@ -298,6 +298,21 @@ impl ProxyRoute {
             .collect()
     }
 
+    /// The `https://` proxy a client on this route may do a handshake with
+    /// (its normalised URL, user info included: log it through `log_host`):
+    /// the explicit proxy, else the environment's proxy for the endpoints'
+    /// scheme (`https://` with `use_tls`, `http://` without), when its scheme
+    /// is `https`. `None` when no proxy of the route does TLS of its own.
+    /// `NO_PROXY` may still leave a given host out.
+    pub(crate) fn tls_proxy(&self, use_tls: bool) -> Option<&str> {
+        let env = if use_tls { &self.https } else { &self.http };
+        let proxy = self.explicit.as_ref().or(env.as_ref())?;
+        reqwest::Url::parse(proxy)
+            .ok()
+            .filter(|url| url.scheme() == "https")
+            .map(|_| proxy.as_str())
+    }
+
     /// The environment's proxy for `http://` endpoints, `None` when
     /// [`WinrmConfig::proxy`] is set or the environment gives none.
     pub(crate) fn env_http_proxy(&self) -> Option<&str> {
@@ -892,6 +907,61 @@ mod tests {
             assert!(
                 names(&explicit(plain), &[("HTTPS_PROXY", "https://proxy.corp")]).is_empty(),
                 "{plain}"
+            );
+        }
+    }
+
+    /// The `https://` proxy of the endpoints' scheme: `HTTPS_PROXY` for
+    /// `use_tls`, `HTTP_PROXY` without, `ALL_PROXY` for either, the explicit
+    /// proxy for both; never a proxy that does no TLS of its own.
+    #[test]
+    fn tls_proxy_is_the_https_proxy_of_the_endpoints_scheme() {
+        let tls_proxy = |config: &WinrmConfig,
+                         use_env: bool,
+                         env: &'static [(&'static str, &'static str)],
+                         use_tls: bool| {
+            let var = move |k: &str| {
+                env.iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| (*v).to_string())
+            };
+            ProxyRoute::resolve(config, use_env, var)
+                .unwrap()
+                .tls_proxy(use_tls)
+                .map(str::to_string)
+        };
+        let none = WinrmConfig::default();
+        let split = &[
+            ("HTTP_PROXY", "https://h.corp:3128"),
+            ("HTTPS_PROXY", "http://s.corp:3128"),
+        ];
+        assert_eq!(
+            tls_proxy(&none, true, split, false).as_deref(),
+            Some("https://h.corp:3128/")
+        );
+        assert_eq!(tls_proxy(&none, true, split, true), None);
+        assert_eq!(tls_proxy(&none, false, split, false), None, "env not read");
+        let all = &[("ALL_PROXY", "https://u:pw@all.corp")];
+        for use_tls in [false, true] {
+            assert_eq!(
+                tls_proxy(&none, true, all, use_tls).as_deref(),
+                Some("https://u:pw@all.corp/")
+            );
+        }
+        assert_eq!(tls_proxy(&none, true, &[], true), None);
+        let explicit = |proxy: &str| WinrmConfig {
+            proxy: Some(proxy.into()),
+            ..Default::default()
+        };
+        for use_tls in [false, true] {
+            assert_eq!(
+                tls_proxy(&explicit("https://p.corp:8443"), false, &[], use_tls).as_deref(),
+                Some("https://p.corp:8443/")
+            );
+            assert_eq!(
+                tls_proxy(&explicit("socks5://p.corp"), true, all, use_tls),
+                None,
+                "an explicit proxy replaces the environment"
             );
         }
     }

@@ -675,11 +675,14 @@ pub(crate) fn log_host(host: &str) -> String {
 /// character that is not whitespace or a control character (internationalised
 /// names, converted to punycode by the URL parser).
 ///
-/// A host that is not a bracketed IPv6 literal must also be the form the URL
-/// parser keeps (lowercase aside), so the host on the wire is the string the
-/// caller checked: `10.1`, `010.0.0.1`, `167772161`, fullwidth characters, an
-/// ideographic full stop and decomposed accents are refused, and the error
-/// names the form the parser reads.
+/// The host must also be the form the URL parser keeps (lowercase aside), so
+/// the host on the wire is the string the caller checked: `10.1`,
+/// `010.0.0.1`, `167772161`, fullwidth characters, an ideographic full stop,
+/// decomposed accents and an IPv6 literal not in its RFC 5952 form
+/// (`[0:0::1]`, `[2001:0db8::1]`) are refused, and the error names the form
+/// the parser reads. An IPv4-mapped (`[::ffff:10.0.0.1]`) or IPv4-compatible
+/// (`[::10.0.0.1]`) literal, in any spelling, is refused too: it reaches an
+/// IPv4 host, and the error names the dotted-quad form to pass instead.
 pub(crate) fn validate_host(host: &str) -> Result<(), WinrmError> {
     if sanitize_host(host) != host {
         return Err(WinrmError::AuthFailed(format!(
@@ -714,20 +717,35 @@ pub(crate) fn validate_host(host: &str) -> Result<(), WinrmError> {
             crate::error::excerpt_chars(host, 64)
         )));
     }
-    if !host.starts_with('[') {
-        check_parser_keeps_host(host)?;
+    check_parser_keeps_host(host)
+}
+
+/// The IPv4 address an IPv6 address stands for: an IPv4-mapped address
+/// (`::ffff:a.b.c.d`), or an IPv4-compatible one (`::a.b.c.d`, other than
+/// `::` and `::1`). `None` for any other address.
+fn embedded_ipv4(addr: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    if let Some(v4) = addr.to_ipv4_mapped() {
+        return Some(v4);
     }
-    Ok(())
+    let compatible = matches!(addr.segments(), [0, 0, 0, 0, 0, 0, _, _])
+        && !addr.is_unspecified()
+        && !addr.is_loopback();
+    if compatible { addr.to_ipv4() } else { None }
 }
 
 /// Refuse a host the URL parser would rewrite, so the host on the wire is
-/// the string the caller checked.
+/// the string the caller checked, and an IPv6 literal that stands for an
+/// IPv4 address ([`embedded_ipv4`]).
 ///
 /// The parser reads `10.1`, `0x0a.0.0.1`, `167772161` and fullwidth digits as
-/// `10.0.0.1`, and maps fullwidth letters, `U+3002` and decomposed accents to
-/// other characters. An ASCII host must come back as its lowercase self. A
-/// non-ASCII host must not become an IPv4 address, and must equal the Unicode
-/// form of what the parser produced (lowercase, composed).
+/// `10.0.0.1`, maps fullwidth letters, `U+3002` and decomposed accents to
+/// other characters, and writes an IPv6 literal in its RFC 5952 form
+/// (`[0:0::1]` as `[::1]`, `[::ffff:10.0.0.1]` as `[::ffff:a00:1]`). An ASCII
+/// host (a bracketed literal included) must come back as its lowercase self.
+/// A non-ASCII host must not become an IPv4 address, and must equal the
+/// Unicode form of what the parser produced (lowercase, composed). The IPv6
+/// check reads the address the parser produced, so no spelling of the input
+/// can avoid it.
 fn check_parser_keeps_host(host: &str) -> Result<(), WinrmError> {
     let refuse = |read_as: &str| {
         WinrmError::AuthFailed(format!(
@@ -739,6 +757,23 @@ fn check_parser_keeps_host(host: &str) -> Result<(), WinrmError> {
     let parsed = reqwest::Url::parse(&endpoint_url(false, host, 1))
         .map_err(|e| refuse(&format!("an unparsable URL ({e})")))?;
     let read_as = parsed.host_str().unwrap_or_default();
+    if let Some(literal) = read_as
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    {
+        // Fails closed: the parser's own output must read back as an address.
+        let addr = literal
+            .parse::<std::net::Ipv6Addr>()
+            .map_err(|_| refuse(read_as))?;
+        if let Some(v4) = embedded_ipv4(addr) {
+            return Err(WinrmError::AuthFailed(format!(
+                "invalid host {:?}: an IPv6 literal that stands for the IPv4 address {v4}; \
+                 pass {:?}",
+                crate::error::excerpt_chars(host, 64),
+                v4.to_string()
+            )));
+        }
+    }
     let kept = if host.is_ascii() {
         read_as == host.to_ascii_lowercase()
     } else {
@@ -804,6 +839,38 @@ fn build_http_client(
         builder = builder.connector_layer(ConnGateLayer(gate));
     }
     builder.build().map_err(WinrmError::Http)
+}
+
+/// The construction WARNs for a certificate that is not verified: the
+/// server's (`accept_invalid_certs`, once more for Basic, which then sends
+/// the password to that server), and an `https://` proxy's
+/// (`danger_accept_invalid_proxy_certs`) when the route has such a proxy for
+/// the endpoints' scheme.
+fn warn_unverified_tls(config: &WinrmConfig, opts: &TransportOptions, route: &proxy::ProxyRoute) {
+    if config.accept_invalid_certs {
+        tracing::warn!(
+            "TLS certificate verification disabled (accept_invalid_certs=true) — \
+             TEST USE ONLY, do not use in production"
+        );
+        if config.use_tls && matches!(config.auth_method, AuthMethod::Basic) {
+            tracing::warn!(
+                "Basic sends the password to a server whose certificate is not verified \
+                 (accept_invalid_certs=true); pin the certificate \
+                 (pin_server_certificate_sha256) or add a root (add_root_certificates_pem)"
+            );
+        }
+    }
+    if opts.tls.accept_invalid_proxy_certs
+        && let Some(proxy) = route.tls_proxy(config.use_tls)
+    {
+        tracing::warn!(
+            proxy = %log_host(proxy),
+            "https:// proxy certificate verification disabled \
+             (danger_accept_invalid_proxy_certs=true): whoever answers on the proxy leg \
+             receives the proxy credentials, and with use_tls = false every request — TEST \
+             USE ONLY; add the proxy's CA with add_root_certificates_pem"
+        );
+    }
 }
 
 impl HttpTransport {
@@ -892,13 +959,6 @@ impl HttpTransport {
             )));
         }
 
-        if config.accept_invalid_certs {
-            tracing::warn!(
-                "TLS certificate verification disabled (accept_invalid_certs=true) — \
-                 TEST USE ONLY, do not use in production"
-            );
-        }
-
         // Load the client certificate for Certificate auth here, so a bad path
         // or PEM fails at construction. It is presented through the rustls
         // config built below (`reqwest::Identity` would be discarded by
@@ -959,7 +1019,8 @@ impl HttpTransport {
                 proxy = %log_host(proxy),
                 "plain-HTTP WinRM traffic may follow a proxy from the environment \
                  (HTTP_PROXY / ALL_PROXY) for every host not in NO_PROXY; set \
-                 WinrmConfig::proxy or call WinrmClientBuilder::ignore_env_proxy to choose"
+                 WinrmConfig::proxy or call WinrmClientBuilder::ignore_env_proxy(true) to \
+                 choose"
             );
         }
         let proxy_names = route.https_proxy_server_names();
@@ -1024,6 +1085,9 @@ impl HttpTransport {
         });
 
         let http = build_http_client(&config, &route, client_tls.clone(), 10, None)?;
+        // Logged once every refusal above has passed: a refused build logs
+        // none of them.
+        warn_unverified_tls(&config, &opts, &route);
 
         Ok(Self {
             http,
@@ -2217,7 +2281,7 @@ mod tests {
         "10.0.0.5",
         "[::1]",
         "[fe80::1]",
-        "[::ffff:10.0.0.1]",
+        "[2001:db8::1]",
         "bücher.example",
     ];
 
@@ -2289,9 +2353,78 @@ mod tests {
             "BÜCHER.example",
             "xn--bcher-kva.example",
             "win01.",
-            "[::ffff:10.0.0.1]",
+            "[::1]",
+            "[fe80::1]",
+            "[2001:db8::1]",
+            "[2001:DB8::1]",
+            "[::]",
+            "[64:ff9b::a00:1]",
         ] {
             assert!(validate_host(host).is_ok(), "{host:?}");
+        }
+    }
+
+    #[test]
+    fn validate_host_refuses_ipv6_literals_that_stand_for_an_ipv4_address() {
+        for (host, v4) in [
+            ("[::ffff:169.254.169.254]", "169.254.169.254"),
+            ("[::ffff:a9fe:a9fe]", "169.254.169.254"),
+            ("[::FFFF:A9FE:A9FE]", "169.254.169.254"),
+            ("[0:0:0:0:0:ffff:a9fe:a9fe]", "169.254.169.254"),
+            ("[::ffff:10.0.0.1]", "10.0.0.1"),
+            ("[::169.254.169.254]", "169.254.169.254"),
+            ("[::a9fe:a9fe]", "169.254.169.254"),
+            ("[0::0.0.0.2]", "0.0.0.2"),
+        ] {
+            let err = validate_host(host).unwrap_err();
+            assert!(
+                matches!(&err, WinrmError::AuthFailed(m)
+                    if m.contains("invalid host") && m.contains(&format!("pass \"{v4}\""))),
+                "{host:?}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_host_refuses_ipv6_literals_the_url_parser_would_rewrite() {
+        for (host, read_as) in [
+            ("[0:0::1]", "[::1]"),
+            ("[2001:0db8::1]", "[2001:db8::1]"),
+            ("[2001:db8:0:0:0:0:0:1]", "[2001:db8::1]"),
+            ("[FE80:0::1]", "[fe80::1]"),
+        ] {
+            let err = validate_host(host).unwrap_err().to_string();
+            assert!(
+                err.contains("invalid host") && err.contains(&format!("reads it as {read_as:?}")),
+                "{host:?}: {err}"
+            );
+        }
+        // Not an address: refused, never accepted as written.
+        for host in ["[1::2::3]", "[:::]", "[1:2:3:4:5:6:7:8:9]", "[::1.2.3]"] {
+            assert!(validate_host(host).is_err(), "{host:?}");
+        }
+    }
+
+    #[test]
+    fn embedded_ipv4_covers_the_mapped_and_compatible_ranges_only() {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+        let v6 = |s: &str| s.parse::<Ipv6Addr>().unwrap();
+        assert_eq!(embedded_ipv4(Ipv6Addr::UNSPECIFIED), None);
+        assert_eq!(embedded_ipv4(Ipv6Addr::LOCALHOST), None);
+        assert_eq!(embedded_ipv4(v6("::2")), Some(Ipv4Addr::new(0, 0, 0, 2)));
+        assert_eq!(
+            embedded_ipv4(v6("::ffff:0.0.0.1")),
+            Some(Ipv4Addr::new(0, 0, 0, 1))
+        );
+        assert_eq!(embedded_ipv4(v6("::ffff:0:0")), Some(Ipv4Addr::UNSPECIFIED));
+        for other in [
+            "::1:0:0",
+            "1::a00:1",
+            "64:ff9b::a00:1",
+            "::fffe:a00:1",
+            "fe80::1",
+        ] {
+            assert_eq!(embedded_ipv4(v6(other)), None, "{other}");
         }
     }
 
@@ -4616,6 +4749,141 @@ mod tests {
             matches!(&err, WinrmError::AuthFailed(m) if m == CREDSSP_UNAUTHENTICATED_TLS),
             "{err}"
         );
+    }
+
+    const UNVERIFIED_SERVER_WARN: &str = "TLS certificate verification disabled";
+    const UNVERIFIED_BASIC_WARN: &str =
+        "Basic sends the password to a server whose certificate is not verified";
+    const UNVERIFIED_PROXY_WARN: &str = "https:// proxy certificate verification disabled";
+
+    /// Build a transport reading the proxy environment `env`.
+    fn transport_in_env(
+        config: WinrmConfig,
+        tls: TlsOptions,
+        env: &'static [(&'static str, &'static str)],
+    ) -> Result<HttpTransport, WinrmError> {
+        HttpTransport::new_with_env(
+            config,
+            WinrmCredentials::new(USER, PASS, ""),
+            TransportOptions {
+                tls,
+                ..Default::default()
+            },
+            move |k: &str| {
+                env.iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| (*v).to_string())
+            },
+        )
+    }
+
+    /// Basic over HTTPS to a server whose certificate is not verified is
+    /// built with its own WARN on top of the general one.
+    #[test]
+    #[tracing_test::traced_test]
+    fn basic_with_accept_invalid_certs_warns_about_the_password() {
+        let config = WinrmConfig {
+            accept_invalid_certs: true,
+            ..tls_config(AuthMethod::Basic, 5986)
+        };
+        transport_in_env(config, TlsOptions::default(), &[]).unwrap();
+        assert!(logs_contain(UNVERIFIED_SERVER_WARN));
+        assert!(logs_contain(UNVERIFIED_BASIC_WARN));
+        assert!(logs_contain("pin_server_certificate_sha256"));
+    }
+
+    /// The Basic WARN needs both Basic and an unverified server.
+    #[test]
+    #[tracing_test::traced_test]
+    fn no_basic_warn_without_basic_or_with_a_verified_server() {
+        let verified = tls_config(AuthMethod::Basic, 5986);
+        transport_in_env(verified, TlsOptions::default(), &[]).unwrap();
+        let ntlm = WinrmConfig {
+            accept_invalid_certs: true,
+            ..tls_config(AuthMethod::Ntlm, 5986)
+        };
+        transport_in_env(ntlm, TlsOptions::default(), &[]).unwrap();
+        assert!(
+            logs_contain(UNVERIFIED_SERVER_WARN),
+            "NTLM gets the general one"
+        );
+        assert!(!logs_contain(UNVERIFIED_BASIC_WARN));
+    }
+
+    /// A build refused for CredSSP with `accept_invalid_certs` logs no
+    /// "verification disabled" WARN: nothing was built.
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_refused_credssp_build_logs_no_verification_warn() {
+        let config = WinrmConfig {
+            accept_invalid_certs: true,
+            ..tls_config(AuthMethod::CredSsp, 5986)
+        };
+        let err = transport_in_env(config, TlsOptions::default(), &[])
+            .err()
+            .expect("must refuse");
+        assert!(
+            matches!(&err, WinrmError::AuthFailed(m) if m == CREDSSP_UNAUTHENTICATED_TLS),
+            "{err}"
+        );
+        assert!(!logs_contain(UNVERIFIED_SERVER_WARN));
+    }
+
+    /// `danger_accept_invalid_proxy_certs` WARNs when an `https://` proxy can
+    /// apply: explicit, or from the environment for the endpoints' scheme. The
+    /// proxy is logged without its user info.
+    #[test]
+    #[tracing_test::traced_test]
+    fn accepting_invalid_proxy_certs_warns_when_an_https_proxy_applies() {
+        let danger = TlsOptions {
+            accept_invalid_proxy_certs: true,
+            ..Default::default()
+        };
+        let explicit = WinrmConfig {
+            proxy: Some("https://user:s3cret@explicit.corp:8443".into()),
+            ..tls_config(AuthMethod::Ntlm, 5986)
+        };
+        transport_in_env(explicit, danger.clone(), &[]).unwrap();
+        assert!(logs_contain(UNVERIFIED_PROXY_WARN));
+        assert!(logs_contain("explicit.corp"));
+        assert!(!logs_contain("s3cret"));
+
+        let plain = WinrmConfig {
+            use_tls: false,
+            ..tls_config(AuthMethod::Ntlm, 5985)
+        };
+        transport_in_env(plain, danger, &[("HTTP_PROXY", "https://env.corp:3128")]).unwrap();
+        assert!(logs_contain("env.corp"));
+    }
+
+    /// No proxy WARN without the flag, or without an `https://` proxy for the
+    /// endpoints' scheme.
+    #[test]
+    #[tracing_test::traced_test]
+    fn no_proxy_warn_when_no_https_proxy_applies() {
+        let danger = TlsOptions {
+            accept_invalid_proxy_certs: true,
+            ..Default::default()
+        };
+        let config = tls_config(AuthMethod::Ntlm, 5986);
+        transport_in_env(config.clone(), danger.clone(), &[]).unwrap();
+        transport_in_env(
+            config.clone(),
+            danger.clone(),
+            &[("HTTP_PROXY", "https://http-only.corp:3128")],
+        )
+        .unwrap();
+        let socks = WinrmConfig {
+            proxy: Some("socks5://socks.corp:1080".into()),
+            ..config.clone()
+        };
+        transport_in_env(socks, danger, &[]).unwrap();
+        let https_proxy = WinrmConfig {
+            proxy: Some("https://explicit.corp:8443".into()),
+            ..config
+        };
+        transport_in_env(https_proxy, TlsOptions::default(), &[]).unwrap();
+        assert!(!logs_contain(UNVERIFIED_PROXY_WARN));
     }
 
     /// The pinned listener completes the exchange and receives the password.

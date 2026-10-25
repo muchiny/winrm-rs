@@ -159,20 +159,24 @@ impl<S> WinrmClientBuilder<S> {
     /// This concerns the proxy leg only: the WinRM server's certificate is
     /// verified as before. While it is set with `use_tls = true`, a WinRM
     /// host that has the name of the `https://` proxy is refused, since its
-    /// handshake could not be told from the proxy's. Default: `false`.
+    /// handshake could not be told from the proxy's. Building a client with
+    /// it set logs a WARN when an `https://` proxy applies to its endpoints
+    /// ([`WinrmConfig::proxy`], else the environment's proxy for the
+    /// endpoints' scheme). Default: `false`.
     pub fn danger_accept_invalid_proxy_certs(mut self, accept: bool) -> Self {
         self.options.tls.accept_invalid_proxy_certs = accept;
         self
     }
 
-    /// Do not read proxies from the environment for this client.
-    /// `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY` and their
+    /// With `true`, do not read proxies from the environment for this
+    /// client: `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY` and their
     /// lower-case forms are ignored. Only [`WinrmConfig::proxy`] applies; with
-    /// it `None`, every request goes direct. The operating system's proxy
-    /// settings are never read. CredSSP uses only [`WinrmConfig::proxy`] and
-    /// never reads these variables.
-    pub fn ignore_env_proxy(mut self) -> Self {
-        self.options.use_env_proxy = false;
+    /// it `None`, every request goes direct. With `false` (the default), the
+    /// environment applies while [`WinrmConfig::proxy`] is `None`. The
+    /// operating system's proxy settings are never read. CredSSP uses only
+    /// [`WinrmConfig::proxy`] and never reads these variables.
+    pub fn ignore_env_proxy(mut self, ignore: bool) -> Self {
+        self.options.use_env_proxy = !ignore;
         self
     }
 }
@@ -742,16 +746,23 @@ mod tests {
         );
     }
 
-    /// `ignore_env_proxy` reaches the transport, and the default keeps the
-    /// environment.
+    /// `ignore_env_proxy` reaches the transport, `false` undoes `true`, and
+    /// the default keeps the environment.
     #[test]
     fn ignore_env_proxy_reaches_the_transport() {
         let client = WinrmClientBuilder::new(WinrmConfig::default())
             .credentials(WinrmCredentials::new("u", "p", ""))
-            .ignore_env_proxy()
+            .ignore_env_proxy(true)
             .build()
             .unwrap();
         assert!(!client.transport.options().use_env_proxy);
+        let undone = WinrmClientBuilder::new(WinrmConfig::default())
+            .ignore_env_proxy(true)
+            .credentials(WinrmCredentials::new("u", "p", ""))
+            .ignore_env_proxy(false)
+            .build()
+            .unwrap();
+        assert!(undone.transport.options().use_env_proxy);
         let default = WinrmClientBuilder::new(WinrmConfig::default())
             .credentials(WinrmCredentials::new("u", "p", ""))
             .build()

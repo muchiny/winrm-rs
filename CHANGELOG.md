@@ -118,8 +118,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **A host must be in the form the URL parser keeps.** A host the URL parser
   would rewrite is refused with `WinrmError::AuthFailed`, with the form it
   would use: short or octal IPv4 forms (`10.1`, `010.0.0.1`), fullwidth
-  characters, an ideographic full stop, decomposed accents. Migration: pass
-  the form in the error.
+  characters, an ideographic full stop, decomposed accents, and a bracketed
+  IPv6 literal not in its RFC 5952 form (`[0:0::1]`); an IPv4-mapped or
+  IPv4-compatible literal (`[::ffff:10.0.0.1]`, `[::10.0.0.1]`) is refused
+  with its dotted-quad form. Migration: pass the form in the error.
 - **Basic over plain HTTP needs `encryption: EncryptionMode::Never`**, the
   explicit consent that the password and every SOAP body travel in cleartext.
   Without it, building the client fails with `WinrmError::AuthFailed`.
@@ -143,8 +145,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the WARN.
 - A client for plain HTTP that will follow a proxy from the environment logs a
   WARN when it is built, with the proxy's credentials redacted. Migration:
-  none; call `WinrmClientBuilder::ignore_env_proxy` or set
+  none; call `WinrmClientBuilder::ignore_env_proxy(true)` or set
   `WinrmConfig::proxy` to silence it.
+- Basic over HTTPS with `accept_invalid_certs = true` logs a second WARN when
+  the client is built: the password goes to a server whose certificate is
+  not verified. 1.x warns; 2.0 will refuse it. Migration: none; pin the
+  certificate (`pin_server_certificate_sha256`) or add a root
+  (`add_root_certificates_pem`) and set `accept_invalid_certs = false` to
+  silence it.
 - `before_send` is consulted once a request holds its connection slot (NTLM
   and Kerberos, except over plain HTTP with `EncryptionMode::Never`), so the
   slot wait no longer ages an approval (it could add up to
@@ -236,9 +244,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   connections by IP), on the HTTPS transport and the CredSSP outer TLS,
   without `accept_invalid_certs`. While a pin is set, a host that has the name
   of an `https://` proxy is refused.
-- `WinrmClientBuilder::danger_accept_invalid_proxy_certs`.
-- `WinrmClientBuilder::ignore_env_proxy`: build a client that does not read
-  proxies from the environment.
+- `WinrmClientBuilder::danger_accept_invalid_proxy_certs`. Building a client
+  with it set logs a WARN when an `https://` proxy applies to its endpoints.
+- `WinrmClientBuilder::ignore_env_proxy(bool)`: with `true`, build a client
+  that does not read proxies from the environment.
 - `ProxySessionAuth` and `WinrmClientBuilder::proxy_session_auth`.
 - `ProxySessionAuth::Require` refuses NTLM or Kerberos to an `http://`
   endpoint through a forwarding `http://` or `https://` proxy that does not

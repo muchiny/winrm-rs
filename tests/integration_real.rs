@@ -2910,8 +2910,8 @@ async fn enable_credssp_server() {
 async fn enable_cbt_hardening_strict() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let script = r"
-        Set-Item -Path WSMan:\localhost\Service\CbtHardeningLevel -Value Strict
-        (Get-Item WSMan:\localhost\Service\CbtHardeningLevel).Value
+        Set-Item -Path WSMan:\localhost\Service\Auth\CbtHardeningLevel -Value Strict
+        (Get-Item WSMan:\localhost\Service\Auth\CbtHardeningLevel).Value
     ";
     let output = client
         .run_powershell(&host, script)
@@ -2983,7 +2983,7 @@ async fn dump_winrm_service_config() {
         $auth = Get-ChildItem WSMan:\localhost\Service\Auth | ForEach-Object { @{Name=$_.Name; Value=$_.Value} }
         @{
             AllowUnencrypted = (Get-Item WSMan:\localhost\Service\AllowUnencrypted).Value
-            CbtHardeningLevel = (Get-Item WSMan:\localhost\Service\CbtHardeningLevel -ErrorAction SilentlyContinue).Value
+            CbtHardeningLevel = (Get-Item WSMan:\localhost\Service\Auth\CbtHardeningLevel -ErrorAction SilentlyContinue).Value
             Auth = $auth
         } | ConvertTo-Json -Compress -Depth 3
     ";

@@ -2,10 +2,6 @@
 //
 // **STATUS: EXPERIMENTAL — validated end-to-end against Windows Server 2025**
 //
-// A few helpers below are not on the active path. Silence dead_code at
-// module level rather than scattering attributes.
-#![allow(dead_code)]
-//
 // This implements the CredSSP protocol with TLS-in-TLS architecture:
 //
 // - **Outer channel**: HTTPS on one raw `tokio-rustls` stream (not reqwest:
@@ -79,7 +75,6 @@ use crate::error::WinrmError;
 use crate::ntlm;
 #[cfg(feature = "credssp")]
 use crate::ntlm::SealingSession;
-#[cfg(feature = "credssp")]
 use crate::transport::proxy::CredSspDial;
 
 #[cfg(test)]
@@ -1002,7 +997,6 @@ impl CredSspEndpoint {
 
 /// `host:port`, an IPv6 `host` in brackets: the `Host` header value and the
 /// `CONNECT` target.
-#[cfg(feature = "credssp")]
 fn authority(host: &str, port: u16) -> String {
     if host.contains(':') {
         format!("[{host}]:{port}")
@@ -1012,7 +1006,6 @@ fn authority(host: &str, port: u16) -> String {
 }
 
 /// Largest answer head accepted from an HTTP proxy to `CONNECT`.
-#[cfg(feature = "credssp")]
 const MAX_PROXY_HEAD_BYTES: usize = 64 * 1024;
 
 /// The TCP stream that carries a CredSSP connection to `host:port`: a
@@ -1025,7 +1018,6 @@ const MAX_PROXY_HEAD_BYTES: usize = 64 * 1024;
 /// credentials go to the proxy alone, before that handshake; the server's
 /// travel only inside it. The caller bounds the whole call with
 /// `connect_timeout` ([`CredSspConnection::connect`]).
-#[cfg(feature = "credssp")]
 async fn dial_tunnel(
     dial: &CredSspDial,
     host: &str,
@@ -1073,7 +1065,6 @@ async fn dial_tunnel(
 }
 
 /// An I/O error of the proxy handshake.
-#[cfg(feature = "credssp")]
 fn proxy_io(e: &std::io::Error) -> WinrmError {
     if e.kind() == std::io::ErrorKind::UnexpectedEof {
         WinrmError::AuthFailed("CredSSP: the proxy closed the connection".into())
@@ -1084,7 +1075,6 @@ fn proxy_io(e: &std::io::Error) -> WinrmError {
 
 /// Ask the HTTP proxy on `tcp` to open a tunnel to `authority`. Only a 2xx
 /// answer with nothing after its head opens it.
-#[cfg(feature = "credssp")]
 async fn http_connect(
     tcp: &mut tokio::net::TcpStream,
     authority: &str,
@@ -1158,7 +1148,6 @@ async fn http_connect(
 /// the user name and password of RFC 1929 when `user_pass` is set. With
 /// `remote_dns`, a host name goes to the proxy as is; otherwise it is
 /// resolved here and the first address is sent.
-#[cfg(feature = "credssp")]
 async fn socks5_connect(
     tcp: &mut tokio::net::TcpStream,
     host: &str,
@@ -1354,7 +1343,6 @@ impl AuthTransport for CredSspAuth {
 /// round posts `body_for_auth`. Returns the `Authorization` value of the
 /// delegation round (the TSRequest with the sealed TSCredentials in
 /// `authInfo`), which the caller posts with the request body.
-#[cfg(feature = "credssp")]
 async fn authenticate(
     conn: &mut CredSspConnection,
     auth: &CredSspAuth,
@@ -3194,7 +3182,27 @@ mod tests {
 
         let delete =
             crate::soap::delete_shell_request_for(&url, &shell_id, RESOURCE_URI_CMD, 60, 153_600);
-        let resp = match conn.post(None, &delete).await {
+        let outcome = conn.post(None, &delete).await;
+        let deleted = matches!(&outcome, Ok(resp)
+            if resp.status == 200 && !String::from_utf8_lossy(&resp.body).contains("s:Fault"));
+        if !deleted {
+            // Best effort, before the assertions fail: delete the shell
+            // through a fresh session, so a failed run does not leave it on
+            // the host until its idle timeout.
+            let cleanup = async {
+                let mut fresh =
+                    CredSspConnection::connect(&endpoint, tls, dial, auth.opts.clone()).await?;
+                let token = authenticate(&mut fresh, &auth, &endpoint, &delete).await?;
+                fresh.post(Some(&token), &delete).await
+            };
+            match cleanup.await {
+                Ok(resp) => eprintln!("clean-up through a fresh session: status {}", resp.status),
+                Err(e) => eprintln!(
+                    "clean-up through a fresh session failed ({e}): delete shell {shell_id} by hand"
+                ),
+            }
+        }
+        let resp = match outcome {
             Ok(resp) => resp,
             Err(e) => panic!("delete without Authorization on the same connection: {e}"),
         };

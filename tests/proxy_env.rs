@@ -103,8 +103,9 @@ fn run_child(test: &str, target_port: u16, env: &[(&str, String)]) {
 }
 
 /// In the child: one Basic request over plain HTTP to `host` on the port in
-/// [`TARGET_PORT`], with the environment's proxies ignored when `ignore_env`
-/// is set. Its result is ignored: the recorders answer 500.
+/// [`TARGET_PORT`], built with `ignore_env_proxy(ignore_env)` (so `false`
+/// also checks that the explicit `false` keeps the environment). Its result
+/// is ignored: the recorders answer 500.
 async fn child_sends(host: &str, ignore_env: bool) {
     let port = std::env::var(TARGET_PORT).unwrap().parse().unwrap();
     let config = WinrmConfig {
@@ -116,13 +117,11 @@ async fn child_sends(host: &str, ignore_env: bool) {
         max_retries: 0,
         ..Default::default()
     };
-    let builder = WinrmClient::builder(config).credentials(WinrmCredentials::new("u", "p", ""));
-    let builder = if ignore_env {
-        builder.ignore_env_proxy()
-    } else {
-        builder
-    };
-    let client = builder.build().unwrap();
+    let client = WinrmClient::builder(config)
+        .credentials(WinrmCredentials::new("u", "p", ""))
+        .ignore_env_proxy(ignore_env)
+        .build()
+        .unwrap();
     let _ = client.open_shell(host).await;
 }
 

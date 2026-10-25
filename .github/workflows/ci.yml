@@ -47,11 +47,12 @@ jobs:
           toolchain: 1.98.0
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Install krb5 and OpenSSL headers
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libssl-dev pkg-config
+      # Default features: catches leftovers behind `cfg(not(feature = ...))`.
       - run: cargo clippy --locked --all-targets -- -D warnings
-      - name: Clippy (kerberos)
-        run: |
-          sudo apt-get update && sudo apt-get install -y libkrb5-dev
-          cargo clippy --locked --all-targets --features kerberos -- -D warnings
+      - name: Clippy (all features)
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
   test:
     name: Test (${{ matrix.os }})
@@ -95,6 +96,33 @@ jobs:
       - run: cargo nextest run --locked --features kerberos
       - run: cargo test --doc --locked --features kerberos
 
+  test-credssp:
+    # The `credssp` feature needs OpenSSL headers. `__internal` also builds
+    # tests/proptest_wire_format.rs and replays its committed seeds. The release
+    # check compiles the `cfg(not(debug_assertions))` branches that no test
+    # build reaches.
+    name: Test (credssp)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-24
+        with:
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: cargo-nextest@0.9.135
+      - name: Install OpenSSL headers
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+      - run: cargo nextest run --locked --features credssp,__internal
+      - run: cargo test --doc --locked --features credssp
+      - name: Release build check (release-only branches)
+        run: cargo check --locked --release --lib --features credssp
+
   kerberos-windows:
     # The SSPI branch of cross-krb5 (and the `cfg(windows)` wrap code of
     # src/auth/kerberos.rs) only compiles on Windows; no Kerberos test runs
@@ -128,11 +156,16 @@ jobs:
       - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-llvm-cov@0.8.7
+      - name: Install OpenSSL headers
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+      # Runs with the `credssp` feature, so the CredSSP code is measured and
+      # gated too.
       - name: Generate coverage
-        run: cargo llvm-cov --locked --summary-only --fail-under-lines 95
-      # Reuses the profile data of the run above: no rebuild.
+        run: cargo llvm-cov --locked --features credssp --summary-only --fail-under-lines 95
+      # Reuses the profile data of the run above: no rebuild. The feature list
+      # must match that run, or the report would come from a different build.
       - name: Cobertura report for SonarQube Cloud
-        run: cargo llvm-cov report --cobertura --output-path cobertura.xml
+        run: cargo llvm-cov report --features credssp --cobertura --output-path cobertura.xml
       - name: Keep cobertura.xml for the sonar job
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -202,9 +235,10 @@ jobs:
           toolchain: 1.98.0
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # The `kerberos` feature pulls `cross-krb5` which needs krb5 dev
-      # headers (gssapi.h) to build its `libgssapi-sys` bindings.
-      - name: Install krb5 dev headers
-        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev
+      # headers (gssapi.h) to build its `libgssapi-sys` bindings; `credssp`
+      # needs the OpenSSL headers.
+      - name: Install krb5 and OpenSSL dev headers
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libssl-dev pkg-config
       - run: cargo doc --locked --no-deps --all-features
 
   hardening:
@@ -250,7 +284,10 @@ jobs:
         with:
           toolchain: 1.98.0
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Install OpenSSL headers
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
       - run: cargo check --locked --all-targets
+      - run: cargo check --locked --all-targets --features credssp
 
   deny:
     name: Dependency check
@@ -357,6 +394,7 @@ jobs:
       - clippy
       - test
       - test-kerberos
+      - test-credssp
       - kerberos-windows
       - coverage
       - doc

@@ -6,6 +6,7 @@ Thank you for your interest in contributing to winrm-rs! This document provides 
 
 - **Rust 1.98.0** or later
 - **libkrb5-dev** (Linux) or equivalent — only needed for the `kerberos` feature
+- **libssl-dev** and **pkg-config** (Linux) — needed for the `credssp` feature
 
 ## Getting started
 
@@ -23,6 +24,10 @@ Thank you for your interest in contributing to winrm-rs! This document provides 
 cargo nextest run
 cargo test --doc
 
+# Run tests with the CredSSP feature (needs libssl-dev and pkg-config)
+cargo nextest run --features credssp,__internal
+cargo test --features __internal --test proptest_wire_format
+
 # Run tests with Kerberos feature
 sudo apt-get install libkrb5-dev  # Linux
 cargo nextest run --features kerberos
@@ -30,6 +35,7 @@ cargo nextest run --features kerberos
 # Lint
 cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --features kerberos -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
 
 # Format (requires nightly)
 cargo +nightly fmt --check

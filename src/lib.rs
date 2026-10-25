@@ -50,11 +50,11 @@
 //! The crate logs through `tracing`. What each level records:
 //!
 //! - `warn`: settings that weaken security, at each client construction
-//!   (`accept_invalid_certs`, Basic with `EncryptionMode::Never` or NTLM over
-//!   plain HTTP), and runtime anomalies (a host string that had to be sanitised, a shell dropped
-//!   without `close`, a retry). The NTLM one has its own target,
-//!   `winrm_rs::ntlm_over_http`, so a deliberate plain-HTTP deployment can
-//!   silence it alone.
+//!   (`accept_invalid_certs`, Basic over plain HTTP (`EncryptionMode::Never`)
+//!   or NTLM over plain HTTP), and runtime anomalies (a host string that had
+//!   to be sanitised, a shell dropped without `close`, a retry). The NTLM one
+//!   has its own target, `winrm_rs::ntlm_over_http`, so a deliberate
+//!   plain-HTTP deployment can silence it alone.
 //! - `info`: no request content.
 //! - `debug`: spans with the host (userinfo replaced by `<redacted>`), shell
 //!   and command ids, `args_len`, `script_len`, `query_len`, the WQL

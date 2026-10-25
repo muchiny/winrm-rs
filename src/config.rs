@@ -406,9 +406,12 @@ impl std::fmt::Debug for EnvVarNames<'_> {
     }
 }
 
-/// Controls whether message encryption (sealing) is applied to SOAP bodies
-/// ([`AuthMethod::Ntlm`] and [`AuthMethod::Kerberos`]; the other methods
-/// ignore it).
+/// Controls whether message encryption (sealing) is applied to SOAP bodies.
+///
+/// The mode controls message sealing for [`AuthMethod::Ntlm`] and
+/// [`AuthMethod::Kerberos`], the only methods winrm-rs can seal with. Basic
+/// over plain HTTP requires [`Self::Never`], and [`Self::Always`] is refused
+/// for the methods that cannot seal (Basic, Certificate and CredSSP).
 ///
 /// When using HTTP (not HTTPS), sealing encrypts and signs each SOAP message
 /// to prevent eavesdropping and tampering (MS-WSMV 2.2.9.1): with the NTLM
@@ -479,8 +482,9 @@ impl std::fmt::Debug for EnvVarNames<'_> {
 /// way back if that fails.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub enum EncryptionMode {
-    /// Seal every SOAP body over HTTP; over HTTPS rely on TLS and send them
-    /// unsealed (default).
+    /// Seal every SOAP body over HTTP (NTLM and Kerberos); over HTTPS rely on
+    /// TLS and send them unsealed (default). Basic, Certificate and CredSSP
+    /// never seal: they rely on TLS.
     #[default]
     Auto,
     /// Seal every SOAP body, over HTTPS too (inside TLS).

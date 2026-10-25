@@ -2172,7 +2172,12 @@ mod tests {
                 let config = WinrmConfig {
                     auth_method: auth_method.clone(),
                     use_tls,
-                    encryption: EncryptionMode::Never,
+                    // Basic over plain HTTP needs `Never`; the others keep `Auto`.
+                    encryption: if matches!(auth_method, AuthMethod::Basic) {
+                        EncryptionMode::Never
+                    } else {
+                        EncryptionMode::Auto
+                    },
                     user_agent: Some(user_agent.into()),
                     ..Default::default()
                 };

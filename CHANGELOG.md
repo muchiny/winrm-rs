@@ -170,6 +170,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `NtlmError::InvalidMessage` is also returned for NTLM messages with
   oversized or out-of-range fields: a Type 3 field longer than a 16-bit
   length can hold is refused instead of being truncated.
+- `WinrmConfig::proxy` is checked when the client is built. A value that lost
+  a slash (`socks5h:/proxy:1080`, `socks5h//proxy:1080`) used to become an
+  `http://` proxy on a host named after the scheme. It is now refused, with an
+  error that does not repeat the credentials. A scheme that no proxy supports
+  (`ftp://`) still goes direct, now with a WARN. 1.5.0 will refuse it.
 
 ### Documentation
 

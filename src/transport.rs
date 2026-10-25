@@ -3,6 +3,8 @@
 // Manages the reqwest HTTP client, authentication dispatch, and retry logic.
 // Extracted from client.rs.
 
+pub(crate) mod proxy;
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -441,7 +443,11 @@ fn proxy_server_names(
     var: impl Fn(&str) -> Option<String>,
 ) -> Vec<rustls::pki_types::ServerName<'static>> {
     if let Some(proxy) = config.proxy.as_deref() {
-        return url_server_name(proxy).into_iter().collect();
+        return proxy::parse_proxy_url(proxy)
+            .ok()
+            .and_then(|url| url_server_name(url.as_str()))
+            .into_iter()
+            .collect();
     }
     ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]
         .into_iter()
@@ -610,7 +616,15 @@ fn build_http_client(
                 .unwrap_or(concat!("winrm-rs/", env!("CARGO_PKG_VERSION"))),
         );
     if let Some(ref proxy_url) = config.proxy {
-        let proxy = reqwest::Proxy::all(proxy_url).map_err(WinrmError::Http)?;
+        let url = proxy::parse_proxy_url(proxy_url)?;
+        if !proxy::PROXY_SCHEMES.contains(&url.scheme()) {
+            tracing::warn!(
+                scheme = url.scheme(),
+                "WinrmConfig::proxy has a scheme no proxy supports: requests go direct, as \
+                 before; winrm-rs 1.5.0 refuses it"
+            );
+        }
+        let proxy = reqwest::Proxy::all(url).map_err(|e| WinrmError::Http(e.without_url()))?;
         builder = builder.proxy(proxy);
     } else if cfg!(test) {
         // Unit tests talk to loopback servers: keep `HTTP(S)_PROXY` from the
@@ -2680,6 +2694,32 @@ mod tests {
     fn no_tls_has_no_tls_config() {
         let transport = basic_transport(5985);
         assert!(transport.tls_config.is_none());
+    }
+
+    #[test]
+    fn proxy_named_after_its_scheme_is_refused_at_construction() {
+        let config = WinrmConfig {
+            proxy: Some("socks5h:/proxy.corp:1080".into()),
+            ..Default::default()
+        };
+        let err = HttpTransport::new(config, WinrmCredentials::new("u", "p", ""))
+            .err()
+            .expect("refused");
+        assert!(
+            matches!(&err, WinrmError::AuthFailed(m) if m.contains("invalid proxy URL")),
+            "{err:?}"
+        );
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn unsupported_proxy_scheme_warns_and_goes_direct() {
+        let config = WinrmConfig {
+            proxy: Some("ftp://proxy:21".into()),
+            ..Default::default()
+        };
+        assert!(HttpTransport::new(config, WinrmCredentials::new("u", "p", "")).is_ok());
+        assert!(logs_contain("scheme no proxy supports"));
     }
 
     #[test]

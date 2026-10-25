@@ -3013,23 +3013,6 @@ mod tests {
         std::fs::remove_file(&local_path).ok();
     }
 
-    // Valid self-signed test PEM for Certificate auth tests.
-    const TEST_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
-        MIIBXjCCAQWgAwIBAgIUMMmMPCKhqsfVxxq36Hmd4IHUTNgwCgYIKoZIzj0EAwIw\n\
-        ITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDAgFw03NTAxMDEwMDAw\n\
-        MDBaGA80MDk2MDEwMTAwMDAwMFowITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWdu\n\
-        ZWQgY2VydDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABPmdXVVusEfNSmt6aKUf\n\
-        lw2+69/9LSYPVO0KUgALGqjUvoAMAwE/6AWQDrN2EH/swrMHJbM5l2y4Y7GEYbav\n\
-        glKjGTAXMBUGA1UdEQQOMAyCCnRlc3QubG9jYWwwCgYIKoZIzj0EAwIDRwAwRAIg\n\
-        JjoSt8p+3HBP3/EGZ/icOAC/N0o03a6SUOjMwgFiCbQCIDc2+ShrQhU3FNeE4Gu1\n\
-        hOMpiIz+2YFoGkzaDJ6fFB6B\n\
-        -----END CERTIFICATE-----\n";
-    const TEST_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
-        MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg+nMC1P5m4rXIR86n\n\
-        DVStYeCVDra7xdrnpbNklaXDbkWhRANCAAT5nV1VbrBHzUpremilH5cNvuvf/S0m\n\
-        D1TtClIACxqo1L6ADAMBP+gFkA6zdhB/7MKzByWzOZdsuGOxhGG2r4JS\n\
-        -----END PRIVATE KEY-----\n";
-
     #[test]
     fn certificate_auth_reads_valid_pem_files() {
         let dir = unique_temp_path("winrm-rs-test-cert-valid");
@@ -3037,8 +3020,8 @@ mod tests {
         let cert_path = dir.join("test_cert.pem");
         let key_path = dir.join("test_key.pem");
 
-        std::fs::write(&cert_path, TEST_CERT_PEM).unwrap();
-        std::fs::write(&key_path, TEST_KEY_PEM).unwrap();
+        std::fs::write(&cert_path, crate::test_pki::EC_CERT_PEM).unwrap();
+        std::fs::write(&key_path, crate::test_pki::EC_KEY_PKCS8_PEM).unwrap();
 
         let config = WinrmConfig {
             auth_method: AuthMethod::Certificate,

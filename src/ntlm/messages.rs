@@ -816,7 +816,9 @@ mod tests {
         println!("fixed-rng-hooks-child-ran");
     }
 
-    #[cfg(not(feature = "__internal"))]
+    // Runs in every build where the hooks are compiled out: debug without
+    // `__internal`, and release with or without it (the release-profile job).
+    #[cfg(not(all(debug_assertions, feature = "__internal")))]
     #[test]
     fn fixed_rng_hooks_need_the_internal_feature() {
         #[expect(clippy::disallowed_methods, reason = "test-only subprocess")]

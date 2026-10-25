@@ -104,9 +104,8 @@ jobs:
 
   test-credssp:
     # The `credssp` feature needs OpenSSL headers. `__internal` also builds
-    # tests/proptest_wire_format.rs and replays its committed seeds. The release
-    # check compiles the `cfg(not(debug_assertions))` branches that no test
-    # build reaches.
+    # tests/proptest_wire_format.rs and replays its committed seeds. The
+    # release-only branches are built and tested by the release-profile job.
     name: Test (credssp)
     runs-on: ubuntu-latest
     permissions:
@@ -129,8 +128,6 @@ jobs:
       - run: pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
       - run: cargo nextest run --locked --features credssp,__internal
       - run: cargo test --doc --locked --features credssp
-      - name: Release build check (release-only branches)
-        run: cargo check --locked --release --lib --features credssp
 
   kerberos-windows:
     # The SSPI branch of cross-krb5 (and the `cfg(windows)` wrap code of
@@ -491,8 +488,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
 
   release-profile:
-    # The release profile compiles out the debug-only environment hooks; this
-    # job builds it and runs the tests that assert the hooks have no effect.
+    # The release profile compiles out the debug-only environment hooks, even
+    # with the internal `__internal` feature that enables them in debug builds.
+    # This job builds it and runs the tests with `__internal` on, so the test
+    # that asserts the hooks have no effect runs against the release code.
     name: Release profile
     runs-on: ubuntu-latest
     permissions:
@@ -508,7 +507,7 @@ jobs:
       - name: Install krb5 and OpenSSL headers
         run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libssl-dev pkg-config
       - run: cargo build --locked --release --all-features
-      - run: cargo test --locked --release --lib --features credssp,kerberos
+      - run: cargo test --locked --release --lib --features credssp,kerberos,__internal
 
   windows-system-proxy:
     # The test writes the per-user Windows proxy settings (HKCU) with an empty

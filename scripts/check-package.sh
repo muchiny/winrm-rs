@@ -2,8 +2,10 @@
 # Check the file list of the crate tarball against an allowlist.
 #
 # `src/test_pki.rs` (throwaway keys made for the tests, already public) and
-# `src/test_ntlm_server.rs` are `#[cfg(test)]` modules (src/lib.rs:95-98). They
-# ship deliberately, so the published sources still compile under `cfg(test)`.
+# `src/test_ntlm_server.rs` are `#[cfg(test)]` modules, and `src/test_proxy.rs`
+# (loopback CONNECT and SOCKS5 proxies) is a `#[cfg(all(test, feature =
+# "credssp"))]` module; all three are declared in src/lib.rs. They ship
+# deliberately, so the published sources still compile under `cfg(test)`.
 # Any other `src/test_*.rs` fails this check. `tests/` subdirectories are
 # refused: add one to the allowlist only on purpose.
 #
@@ -24,7 +26,7 @@ while IFS= read -r path; do
     if ! [[ $path =~ $allow ]]; then
         echo "unexpected in package: $path" >&2
         status=1
-    elif [[ $path == src/test_* && $path != src/test_pki.rs && $path != src/test_ntlm_server.rs ]]; then
+    elif [[ $path == src/test_* && $path != src/test_pki.rs && $path != src/test_ntlm_server.rs && $path != src/test_proxy.rs ]]; then
         echo "unexpected in package: $path" >&2
         status=1
     fi

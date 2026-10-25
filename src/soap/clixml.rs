@@ -775,6 +775,9 @@ mod tests {
     fn doubled_marker_decodes_the_same_at_every_cut() {
         let s: &[u8] = b"#< CLIXML\r\n#< CLIXML\r\n";
         let whole = decode(s);
+        // The first marker is dropped; the second, with no document after
+        // it, is plain text.
+        assert_eq!(whole, "#< CLIXML\r\n");
         for i in 0..=s.len() {
             assert_eq!(decode_chunks(&[&s[..i], &s[i..]]), whole, "cut at {i}");
             for j in i..=s.len() {

@@ -126,6 +126,7 @@ common_flags() {
   if [[ -n "$FUZZ_LEN_CONTROL" ]]; then
     printf '%s\n' "-len_control=${FUZZ_LEN_CONTROL}"
   fi
+  return 0
 }
 
 corpus_dirs() {
@@ -210,8 +211,9 @@ cmd_coverage() {
   echo "  rustup component add llvm-tools --toolchain nightly)"
 }
 
+# Prints the header comment: the comment lines before the `set` line.
 usage() {
-  sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,/^set /{/^#/p;}' "$0" | sed 's/^# \{0,1\}//'
   exit 1
 }
 

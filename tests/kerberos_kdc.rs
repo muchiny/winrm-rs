@@ -321,7 +321,7 @@ fn client(server: &MockServer, encryption: EncryptionMode) -> WinrmClient {
 /// AP-REP, made by a real acceptor for this very context, completes it.
 #[tokio::test]
 #[ignore = "needs the KDC of scripts/ci-kdc.sh"]
-async fn kdc_establish_completes_with_a_real_ap_rep() {
+async fn kdc_unsealed_completes_with_a_real_ap_rep() {
     let (server, acceptor) = serve(None).await;
     let shell = client(&server, EncryptionMode::Never)
         .create_shell("127.0.0.1")

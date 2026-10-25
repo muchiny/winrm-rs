@@ -23,7 +23,7 @@ env:
 
 jobs:
   fmt:
-    name: Format
+    name: Format and repository checks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -34,6 +34,16 @@ jobs:
           toolchain: nightly
           components: rustfmt
       - run: cargo fmt --all --check
+      # `cargo metadata --no-deps` only reads Cargo.toml: no build, no network.
+      - name: SECURITY.md lists the current minor
+        run: |
+          set -o pipefail
+          minor=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "winrm-rs") | .version' | cut -d. -f1,2)
+          [[ -n "$minor" ]] \
+            || { echo "::error::could not read the crate version with cargo metadata and jq"; exit 1; }
+          grep -Fq "| ${minor}.x" SECURITY.md \
+            || { echo "::error file=SECURITY.md::no '| ${minor}.x' row under Supported versions"; exit 1; }
       - name: Package contents
         run: scripts/check-package.sh
       - name: fuzz.sh argument checks
@@ -215,8 +225,8 @@ jobs:
       - name: Install OpenSSL headers
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
       # Runs with the `credssp` feature, so the CredSSP code is measured and
-      # gated too.
-      # Coverage runs without --features kerberos: the Kerberos FFI glue is exercised by the kerberos-kdc job, not counted here.
+      # gated too. Coverage runs without --features kerberos: the Kerberos
+      # FFI glue is exercised by the kerberos-kdc job, not counted here.
       - name: Generate coverage
         run: cargo llvm-cov --locked --features credssp --summary-only --fail-under-lines 95
       # Reuses the profile data of the run above: no rebuild. The feature list
@@ -258,6 +268,8 @@ jobs:
           toolchain: 1.98.0
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Install OpenSSL headers
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
       - name: Clippy report (JSON)
         run: |
           cargo clippy --locked --all-targets --features credssp --message-format=json -- \
@@ -327,12 +339,6 @@ jobs:
       # needs the OpenSSL headers.
       - name: Install krb5 and OpenSSL dev headers
         run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libssl-dev pkg-config
-      - name: SECURITY.md lists the current minor
-        run: |
-          minor=$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[] | select(.name == "winrm-rs") | .version' | cut -d. -f1,2)
-          grep -Fq "| ${minor}.x" SECURITY.md \
-            || { echo "::error file=SECURITY.md::no '| ${minor}.x' row under Supported versions"; exit 1; }
       - run: cargo doc --locked --no-deps --all-features
 
   hardening:

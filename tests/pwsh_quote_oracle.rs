@@ -6,7 +6,7 @@
 // builds a syntax tree and runs nothing. The test requires zero errors, one
 // statement, and a literal whose characters equal the input.
 //
-// Host state: `pwsh` must be on `PATH`. Without it the test is skipped with a
+// Host state: `pwsh` (`pwsh.exe` on Windows) must be on `PATH`. Without it the test is skipped with a
 // message; the CI job that runs it checks that `pwsh` is present.
 
 use std::path::PathBuf;
@@ -16,9 +16,10 @@ use std::path::PathBuf;
 const PARSE: &str = "$t=$null;$e=$null;$a=[System.Management.Automation.Language.Parser]::ParseInput($env:WINRM_RS_PS_INPUT,[ref]$t,[ref]$e);$el=$a.EndBlock.Statements[0].PipelineElements[0].CommandElements;'errors={0} statements={1} value={2}' -f $e.Count,$a.EndBlock.Statements.Count,(($el[1].Value.ToCharArray()|ForEach-Object{'{0:x4}' -f [int]$_}) -join ',')";
 
 fn pwsh_on_path() -> Option<PathBuf> {
+    let name = if cfg!(windows) { "pwsh.exe" } else { "pwsh" };
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
-        .map(|dir| dir.join("pwsh"))
+        .map(|dir| dir.join(name))
         .find(|candidate| candidate.is_file())
 }
 
@@ -45,6 +46,15 @@ fn escaped_paths_parse_as_one_literal_in_pwsh() {
         "C:\\temp\\a\u{2019})); calc #",
         "$(Write-Output pwned)",
         "a\u{201C}b\u{201D}",
+        "",
+        "a`b",
+        "a\nb",
+        "\u{2018}",
+        "\u{201A}",
+        "\u{201B}",
+        "a\u{1F600}b",
+        "caf\u{e9}",
+        "\u{6587}\u{4EF6}",
     ] {
         let script = format!(
             "Write-Output '{}'",
@@ -59,7 +69,9 @@ fn escaped_paths_parse_as_one_literal_in_pwsh() {
         assert_eq!(
             String::from_utf8_lossy(&out.stdout).trim_end(),
             format!("errors=0 statements=1 value={}", hex(input)),
-            "input {input:?}"
+            "input {input:?}\npwsh stdout: {}\npwsh stderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
         );
     }
 }

@@ -22,7 +22,7 @@ list=$(cargo package --list --locked --allow-dirty)
 
 status=0
 while IFS= read -r path; do
-    [ -n "$path" ] || continue
+    [[ -n "$path" ]] || continue
     if ! [[ $path =~ $allow ]]; then
         echo "unexpected in package: $path" >&2
         status=1

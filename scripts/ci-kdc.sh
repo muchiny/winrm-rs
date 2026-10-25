@@ -3,9 +3,12 @@
 # Starts a throwaway MIT KDC for the Kerberos integration tests
 # (tests/kerberos_kdc.rs) and gets a ticket for the test user.
 #
-#   eval "$(scripts/ci-kdc.sh)"
+#   out=$(scripts/ci-kdc.sh) && eval "$out"
 #   cargo nextest run --locked --features kerberos --test kerberos_kdc --run-ignored only
 #   kill "$KDC_PID"; rm -rf "$KDC_DIR"
+#
+# Use the `out=... && eval` form above: a bare `eval "$(scripts/ci-kdc.sh)"`
+# ignores the exit code, so a failed setup would go unnoticed.
 #
 # Realm WINRM.TEST, KDC on 127.0.0.1:60088 (unprivileged: the KDC itself never
 # runs under sudo). Everything lives in one new temporary directory: krb5.conf,
@@ -173,14 +176,24 @@ if [[ "$ready" != true ]]; then
   stop_kdc
   exit 1
 fi
-klist >&2
+# From here on, a failed step stops the KDC before exiting: a late failure
+# must not leave it running.
+klist >&2 || {
+  log "klist failed"
+  stop_kdc
+  exit 1
+}
 
 export KDC_PID
 export KDC_DIR="$D"
 names=(KRB5_CONFIG KRB5_KDC_PROFILE KRB5CCNAME KRB5_KTNAME KRB5RCACHETYPE KDC_PID KDC_DIR)
 if in_ci; then
   for name in "${names[@]}"; do
-    printf '%s=%s\n' "$name" "${!name}" >>"$GITHUB_ENV"
+    printf '%s=%s\n' "$name" "${!name}" >>"$GITHUB_ENV" || {
+      log "could not write $name to \$GITHUB_ENV"
+      stop_kdc
+      exit 1
+    }
   done
   log "environment written to \$GITHUB_ENV"
 else

@@ -122,6 +122,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   WARN when it is built, with the proxy's credentials redacted. Migration:
   none; call `WinrmClientBuilder::ignore_env_proxy` or set
   `WinrmConfig::proxy` to silence it.
+- `before_send` is consulted once a request holds its connection slot (NTLM
+  and Kerberos, except over plain HTTP with `EncryptionMode::Never`), so an
+  approval is no longer up to `operation_timeout_secs + 10` s old when the
+  request is sent. Under saturation a refusal is reported only when a slot
+  frees, and a request that gets no slot within `operation_timeout_secs + 10`
+  s fails with `WinrmError::Timeout`, not `Cancelled`, without calling the
+  hook. A request whose host is invalid no longer calls the hook. Migration:
+  where a hook refusal is expected under load, handle `WinrmError::Timeout`
+  as well as `Cancelled`; to stop a request still waiting for a slot, drop the
+  call's future.
 
 ### Added
 

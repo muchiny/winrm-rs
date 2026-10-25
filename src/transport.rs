@@ -207,6 +207,7 @@ const CONN_MAX_IDLE: Duration = Duration::from_secs(60);
 /// [`MAX_IDLE_TOTAL`]: 32 in total) come on top. Hosts are keyed by
 /// their string, ASCII case aside: `win01` and its address get separate
 /// budgets. Further requests wait for a slot, within the request timeout.
+/// A request takes its slot before the `before_send` hook is consulted.
 const MAX_CONNS_PER_HOST: usize = 32;
 
 /// Clean-up (Signal, Delete) exchanges in flight per host, on top of
@@ -255,6 +256,81 @@ pub(crate) struct SlotGuard {
 /// Key of `host` in the slot map: [`sanitize_host`], ASCII-lowercased.
 pub(crate) fn host_key(host: &str) -> String {
     sanitize_host(host).to_ascii_lowercase()
+}
+
+/// How [`HttpTransport::send_soap`] sends a request, from the configuration
+/// alone. [`Route::needs_conn_slot`] is the only place that decides which
+/// requests queue for a connection slot ([`MAX_CONNS_PER_HOST`] per host,
+/// [`MAX_CONNS_IN_FLIGHT_TOTAL`] per client).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+    /// Basic on the shared client.
+    Basic,
+    /// Client certificate on the shared client.
+    Certificate,
+    /// CredSSP, on its own connection per request.
+    CredSsp,
+    /// NTLM unsealed over plain HTTP, a handshake per request on the shared
+    /// client.
+    NtlmPlain,
+    /// NTLM unsealed over HTTPS, on a dedicated connection.
+    NtlmOverTls,
+    /// NTLM or Kerberos sealed, on a dedicated connection.
+    Sealed,
+    /// Kerberos unsealed over HTTPS, on a dedicated connection.
+    KerberosOverTls,
+    /// Kerberos unsealed over plain HTTP on the shared client; without the
+    /// `kerberos` feature, every Kerberos request (its error says the feature
+    /// is needed).
+    KerberosPlain,
+}
+
+impl Route {
+    /// The route of every request under `config`.
+    fn for_config(config: &WinrmConfig) -> Route {
+        let seals = seals_for(config);
+        match config.auth_method {
+            AuthMethod::Basic => Route::Basic,
+            AuthMethod::Certificate => Route::Certificate,
+            AuthMethod::CredSsp => Route::CredSsp,
+            AuthMethod::Ntlm if seals => Route::Sealed,
+            AuthMethod::Ntlm if config.use_tls => Route::NtlmOverTls,
+            AuthMethod::Ntlm => Route::NtlmPlain,
+            AuthMethod::Kerberos if !cfg!(feature = "kerberos") => Route::KerberosPlain,
+            AuthMethod::Kerberos if seals => Route::Sealed,
+            AuthMethod::Kerberos if config.use_tls => Route::KerberosOverTls,
+            AuthMethod::Kerberos => Route::KerberosPlain,
+        }
+    }
+
+    /// Whether a request on this route runs on a dedicated connection, and
+    /// so first takes a connection slot.
+    fn needs_conn_slot(self) -> bool {
+        matches!(
+            self,
+            Route::Sealed | Route::NtlmOverTls | Route::KerberosOverTls
+        )
+    }
+}
+
+/// Whether requests under `config` are sealed (NTLM and Kerberos only):
+/// `EncryptionMode::Auto` seals over plain HTTP only, `Always` over HTTPS
+/// too, `Never` never.
+fn seals_for(config: &WinrmConfig) -> bool {
+    matches!(config.auth_method, AuthMethod::Ntlm | AuthMethod::Kerberos)
+        && match config.encryption {
+            EncryptionMode::Always => true,
+            EncryptionMode::Never => false,
+            EncryptionMode::Auto => !config.use_tls,
+        }
+}
+
+/// The slot a dedicated route was given: always `Some` from
+/// [`HttpTransport::send_soap_with_retry`], else an internal error.
+fn dedicated_slot(slot: Option<SlotGuard>) -> Result<SlotGuard, WinrmError> {
+    slot.ok_or_else(|| {
+        WinrmError::AuthFailed("internal: dedicated path without a connection slot".into())
+    })
 }
 
 /// The security context that seals a connection's messages.
@@ -1013,15 +1089,24 @@ impl HttpTransport {
 
     /// Send an authenticated SOAP request and return the response body.
     ///
-    /// Dispatches to Basic or NTLM transport depending on the configured
-    /// [`AuthMethod`]. The response is checked for SOAP faults before
-    /// returning.
+    /// Dispatches by [`Route`]. A dedicated route runs under `slot`, which
+    /// the caller took ([`Self::send_soap_with_retry`]); a plain route drops
+    /// a slot it is given. With Kerberos through a forwarding proxy, the
+    /// proxy probe (`kerberos_proxy_probe`) runs first. The response is
+    /// checked for SOAP faults before returning.
     #[tracing::instrument(
         level = "debug",
-        skip(self, host, body),
+        skip(self, host, body, slot),
         fields(host = %log_host(host))
     )]
-    async fn send_soap(&self, host: &str, body: String, lane: Lane) -> Result<String, WinrmError> {
+    async fn send_soap(
+        &self,
+        host: &str,
+        body: String,
+        slot: Option<SlotGuard>,
+    ) -> Result<String, WinrmError> {
+        let route = self.route();
+        let slot = slot.filter(|_| route.needs_conn_slot());
         let url = self
             .checked_endpoint(host)
             .inspect_err(|e| debug!(error = %e, "request not sent: host refused"))?;
@@ -1031,8 +1116,13 @@ impl HttpTransport {
         );
         trace!(body = %body, "SOAP request body");
 
-        let response_text: String = match &self.config.auth_method {
-            AuthMethod::Basic => {
+        #[cfg(feature = "kerberos")]
+        if matches!(self.config.auth_method, AuthMethod::Kerberos) {
+            self.kerberos_proxy_probe(&url).await?;
+        }
+
+        let response_text: String = match route {
+            Route::Basic => {
                 let auth = BasicAuth::new(
                     &self.credentials.username,
                     self.credentials.password.expose_secret(),
@@ -1040,26 +1130,36 @@ impl HttpTransport {
                 );
                 auth.send_authenticated(&self.http, &url, body).await?
             }
-            AuthMethod::Ntlm => {
-                if self.seals() {
-                    self.send_sealed(host, &url, &body, lane).await?
-                } else if self.config.use_tls {
-                    self.send_ntlm_over_tls(host, &url, &body, lane).await?
-                } else {
-                    self.ntlm_auth_for(&url)
-                        .send_authenticated(&self.http, &url, body)
-                        .await?
-                }
+            Route::Sealed => {
+                self.send_sealed(host, &url, &body, dedicated_slot(slot)?)
+                    .await?
             }
-            AuthMethod::Kerberos => self.send_kerberos(host, &url, body, lane).await?,
-            AuthMethod::Certificate => {
+            Route::NtlmOverTls => {
+                self.send_ntlm_over_tls(host, &url, &body, dedicated_slot(slot)?)
+                    .await?
+            }
+            Route::KerberosOverTls => {
+                self.send_kerberos_over_tls(host, &url, &body, dedicated_slot(slot)?)
+                    .await?
+            }
+            Route::NtlmPlain => {
+                self.ntlm_auth_for(&url)
+                    .send_authenticated(&self.http, &url, body)
+                    .await?
+            }
+            Route::KerberosPlain => {
+                self.kerberos_auth(&url)?
+                    .send_authenticated(&self.http, &url, body)
+                    .await?
+            }
+            Route::Certificate => {
                 let auth = CertificateAuth {
                     max_response_bytes: self.max_response_bytes(),
                 };
                 auth.send_authenticated(&self.http, &url, body).await?
             }
             #[cfg(feature = "credssp")]
-            AuthMethod::CredSsp => {
+            Route::CredSsp => {
                 let auth = CredSspAuth {
                     username: self.credentials.username.clone(),
                     password: Zeroizing::new(self.credentials.password.expose_secret().to_string()),
@@ -1072,7 +1172,7 @@ impl HttpTransport {
                 auth.send_authenticated(&self.http, &url, body).await?
             }
             #[cfg(not(feature = "credssp"))]
-            AuthMethod::CredSsp => {
+            Route::CredSsp => {
                 return Err(WinrmError::AuthFailed(
                     "CredSSP authentication requires the `credssp` cargo feature".into(),
                 ));
@@ -1084,57 +1184,15 @@ impl HttpTransport {
         Ok(response_text)
     }
 
-    /// Kerberos dispatch: sealed ([`Self::seals`]); unsealed over HTTPS on an
-    /// authenticated dedicated connection; unsealed over HTTP
-    /// (`EncryptionMode::Never`) with a context per request. Over plain HTTP
-    /// through a forwarding proxy, [`Self::kerberos_proxy_probe`] runs first.
-    #[cfg(feature = "kerberos")]
-    async fn send_kerberos(
-        &self,
-        host: &str,
-        url: &str,
-        body: String,
-        lane: Lane,
-    ) -> Result<String, WinrmError> {
-        self.kerberos_proxy_probe(url).await?;
-        if self.seals() {
-            self.send_sealed(host, url, &body, lane).await
-        } else if self.config.use_tls {
-            self.send_kerberos_over_tls(host, url, &body, lane).await
-        } else {
-            self.kerberos_auth(url)?
-                .send_authenticated(&self.http, url, body)
-                .await
-        }
+    /// The [`Route`] of every request of this transport.
+    fn route(&self) -> Route {
+        Route::for_config(&self.config)
     }
 
-    /// Without the feature, the stub's error says it is needed (nothing is
-    /// sent, sealed or not).
-    #[cfg(not(feature = "kerberos"))]
-    async fn send_kerberos(
-        &self,
-        _host: &str,
-        url: &str,
-        body: String,
-        _lane: Lane,
-    ) -> Result<String, WinrmError> {
-        self.kerberos_auth(url)?
-            .send_authenticated(&self.http, url, body)
-            .await
-    }
-
-    /// Whether requests are sealed (NTLM and Kerberos only):
-    /// `EncryptionMode::Auto` seals over plain HTTP only, `Always` over HTTPS
-    /// too, `Never` never.
+    /// [`seals_for`] this transport's configuration.
+    #[cfg(test)]
     fn seals(&self) -> bool {
-        matches!(
-            self.config.auth_method,
-            AuthMethod::Ntlm | AuthMethod::Kerberos
-        ) && match self.config.encryption {
-            EncryptionMode::Always => true,
-            EncryptionMode::Never => false,
-            EncryptionMode::Auto => !self.config.use_tls,
-        }
+        seals_for(&self.config)
     }
 
     /// Kerberos authenticator for the endpoint `url` (service principal
@@ -1215,7 +1273,7 @@ impl HttpTransport {
         let refuse = match self.options.proxy_session_auth {
             ProxySessionAuth::Allow => return None,
             ProxySessionAuth::Require => true,
-            ProxySessionAuth::RequireWhenUnsealed => !self.seals(),
+            ProxySessionAuth::RequireWhenUnsealed => !seals_for(&self.config),
         };
         let forwarder = self.forwarding_proxy(url)?;
         Some(proxy::ProxyGate {
@@ -1538,24 +1596,23 @@ impl HttpTransport {
         host: &str,
         url: &str,
         body: &str,
-        lane: Lane,
+        slot: SlotGuard,
     ) -> Result<String, WinrmError> {
-        self.send_on_dedicated(host, url, body, true, lane).await
+        self.send_on_dedicated(host, url, body, true, slot).await
     }
 
     /// Send a request with Kerberos over HTTPS, unsealed (TLS protects it),
     /// on a dedicated connection authenticated once with channel binding and
     /// the server's AP-REP (see [`KerberosAuth::establish`]); later requests
     /// on that connection carry no `Authorization` header.
-    #[cfg(feature = "kerberos")]
     async fn send_kerberos_over_tls(
         &self,
         host: &str,
         url: &str,
         body: &str,
-        lane: Lane,
+        slot: SlotGuard,
     ) -> Result<String, WinrmError> {
-        self.send_on_dedicated(host, url, body, false, lane).await
+        self.send_on_dedicated(host, url, body, false, slot).await
     }
 
     /// Run one exchange on a dedicated authenticated connection to `host`:
@@ -1583,9 +1640,9 @@ impl HttpTransport {
         url: &str,
         body: &str,
         sealed: bool,
-        lane: Lane,
+        slot: SlotGuard,
     ) -> Result<String, WinrmError> {
-        let _slot = self.conn_slot(host, lane).await?;
+        let _slot = slot;
         let (mut conn, reused) = match self.take_conn(host, sealed) {
             Some(conn) => (conn, true),
             None => (self.open_dedicated_conn(host, url, sealed).await?, false),
@@ -1813,9 +1870,9 @@ impl HttpTransport {
         host: &str,
         url: &str,
         body: &str,
-        lane: Lane,
+        slot: SlotGuard,
     ) -> Result<String, WinrmError> {
-        let _slot = self.conn_slot(host, lane).await?;
+        let _slot = slot;
         let conn = match self.take_conn(host, false) {
             Some(conn) => conn,
             None => self.new_conn(host)?,
@@ -1846,9 +1903,12 @@ impl HttpTransport {
     /// [`Self::is_retryable`]) are retried; any other error is returned
     /// immediately.
     ///
-    /// The `before_send` hook, when set, runs at the start of every attempt,
-    /// before anything is authenticated, sealed or sent; a refusal returns
-    /// [`WinrmError::Cancelled`] and is never retried.
+    /// The `before_send` hook, when set, runs once per attempt: after the
+    /// host is validated and, on a route that [`Route::needs_conn_slot`],
+    /// after the attempt holds its connection slot; before anything is
+    /// authenticated, sealed or sent. A refusal returns
+    /// [`WinrmError::Cancelled`] and is never retried; a slot timeout returns
+    /// [`WinrmError::Timeout`] without calling it.
     pub(crate) async fn send_soap_with_retry(
         &self,
         host: &str,
@@ -1878,15 +1938,29 @@ impl HttpTransport {
         lane: Lane,
     ) -> Result<String, WinrmError> {
         let body = crate::soap::envelope::with_session_id(&body, &self.session_id);
+        // An invalid host fails here, before the hook: nothing could be sent.
+        if let Err(e) = validate_host(host) {
+            debug!(host = %log_host(host), error = %e, "request not sent: host refused");
+            return Err(e);
+        }
+        let route = self.route();
         let max = self.config.max_retries;
         for attempt in 0..=max {
+            // Take the slot first, so that an approval does not go stale
+            // during the slot wait. On a retryable error the slot was moved
+            // into `send_soap`, so it is released before the backoff sleep.
+            let slot = if route.needs_conn_slot() {
+                Some(self.conn_slot(host, lane).await?)
+            } else {
+                None
+            };
             if let Some(hook) = &self.before_send
                 && !hook()
             {
                 debug!("request refused by the before_send hook");
                 return Err(WinrmError::Cancelled);
             }
-            match self.send_soap(host, body.clone(), lane).await {
+            match self.send_soap(host, body.clone(), slot).await {
                 Ok(r) => return Ok(r),
                 Err(e) if attempt < max && Self::is_retryable(&e) => {
                     let delay = retry_delay(attempt);
@@ -3393,7 +3467,7 @@ mod tests {
         .unwrap();
         let host = "admin:hunter2@127.0.0.1";
         let sent = transport
-            .send_soap(host, "<s:Envelope/>".into(), Lane::Data)
+            .send_soap(host, "<s:Envelope/>".into(), None)
             .await;
         assert!(
             matches!(&sent, Err(WinrmError::AuthFailed(m)) if m.contains("invalid host")),
@@ -4518,9 +4592,10 @@ mod tests {
             ("127.0.0.1", port_a),
         ] {
             let url = format!("https://{host}:{port}/wsman");
+            let slot = transport.conn_slot(host, Lane::Data).await.unwrap();
             let reply = tokio::time::timeout(
                 Duration::from_secs(20),
-                transport.send_ntlm_over_tls(host, &url, "<soap/>", Lane::Data),
+                transport.send_ntlm_over_tls(host, &url, "<soap/>", slot),
             )
             .await
             .expect("NTLM exchange did not finish in 20 s")
@@ -4588,9 +4663,10 @@ mod tests {
         let transport = ntlm_tls_transport(port, spawn_connect_proxy());
         let url = format!("https://127.0.0.1:{port}/wsman");
         // Driven exactly like ntlm_cbt_binds_the_certificate_of_its_own_connection.
+        let slot = transport.conn_slot("127.0.0.1", Lane::Data).await.unwrap();
         tokio::time::timeout(
             Duration::from_secs(20),
-            transport.send_ntlm_over_tls("127.0.0.1", &url, "<soap/>", Lane::Data),
+            transport.send_ntlm_over_tls("127.0.0.1", &url, "<soap/>", slot),
         )
         .await
         .expect("did not finish in 20 s")
@@ -4627,9 +4703,10 @@ mod tests {
         let (port, seen) = spawn_ntlm_tls_server(EC_CERT_PEM, EC_KEY_PKCS8_PEM);
         let transport = ntlm_tls_transport(port, spawn_connect_proxy());
         let url = format!("https://127.0.0.1:{port}/wsman");
+        let slot = transport.conn_slot("127.0.0.1", Lane::Data).await.unwrap();
         tokio::time::timeout(
             Duration::from_secs(20),
-            transport.send_ntlm_over_tls("127.0.0.1", &url, "<soap/>", Lane::Data),
+            transport.send_ntlm_over_tls("127.0.0.1", &url, "<soap/>", slot),
         )
         .await
         .expect("did not finish in 20 s")
@@ -4738,8 +4815,9 @@ mod tests {
         let send = async {
             if via_proxy {
                 // Dedicated connection: CertCapturingVerifier -> NoVerifier.
+                let slot = transport.conn_slot("127.0.0.1", Lane::Data).await.unwrap();
                 transport
-                    .send_ntlm_over_tls("127.0.0.1", &url, "<soap/>", Lane::Data)
+                    .send_ntlm_over_tls("127.0.0.1", &url, "<soap/>", slot)
                     .await
             } else {
                 // Direct, as in `ntlm_cbt_comes_from_the_response_tls_details`.
@@ -5359,6 +5437,154 @@ mod tests {
         assert_eq!(transport.all_slots.available_permits(), 128);
     }
 
+    /// The hook is consulted once the request holds its slot: a switch turned
+    /// off while the request waited refuses it, and nothing reaches the host.
+    #[tokio::test]
+    async fn a_hook_flipped_during_the_slot_wait_refuses_the_request() {
+        let (_server, fake, mut transport, host) = sealed_setup().await;
+        let refuse = Arc::new(AtomicBool::new(false));
+        let r = Arc::clone(&refuse);
+        transport.set_before_send(Arc::new(move || !r.load(Ordering::SeqCst)));
+        let held = transport
+            .host_slots(&host)
+            .0
+            .try_acquire_many_owned(32)
+            .unwrap();
+        let (result, ()) = tokio::join!(
+            transport.send_soap_with_retry(&host, "<a/>".into()),
+            async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                refuse.store(true, Ordering::SeqCst);
+                drop(held);
+            }
+        );
+        assert!(matches!(result, Err(WinrmError::Cancelled)), "{result:?}");
+        assert_eq!(fake.handshakes(), 0, "log: {:?}", fake.log());
+        assert!(fake.sealed().is_empty());
+    }
+
+    /// No slot within the request timeout: `Timeout`, and the hook is never
+    /// called (time is paused, so the wait is instant).
+    #[tokio::test(start_paused = true)]
+    async fn the_hook_is_not_called_when_the_slot_wait_times_out() {
+        let config = WinrmConfig {
+            auth_method: AuthMethod::Ntlm,
+            operation_timeout_secs: 5,
+            ..Default::default()
+        };
+        let mut transport =
+            HttpTransport::new(config, WinrmCredentials::new(USER, PASS, "")).unwrap();
+        let (hook, calls) = counting_hook(usize::MAX);
+        transport.set_before_send(hook);
+        let _held = transport
+            .host_slots("127.0.0.1")
+            .0
+            .try_acquire_many_owned(32)
+            .unwrap();
+        let err = transport
+            .send_soap_with_retry("127.0.0.1", "<a/>".into())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WinrmError::Timeout(15)), "{err:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// A hook that panics while its attempt holds a slot releases the slot
+    /// (the permit's Drop runs on unwind).
+    #[tokio::test]
+    async fn a_panicking_hook_releases_its_conn_slot() {
+        let (_server, fake, mut transport, host) = sealed_setup().await;
+        transport.set_before_send(Arc::new(|| -> bool { panic!("hook") }));
+        let transport = Arc::new(transport);
+        let (t, h) = (Arc::clone(&transport), host.clone());
+        let joined =
+            tokio::spawn(async move { t.send_soap_with_retry(&h, "<a/>".into()).await }).await;
+        assert!(joined.unwrap_err().is_panic());
+        assert_eq!(
+            transport.host_slots(&host).0.available_permits(),
+            MAX_CONNS_PER_HOST
+        );
+        assert_eq!(
+            transport.all_slots.available_permits(),
+            MAX_CONNS_IN_FLIGHT_TOTAL
+        );
+        assert_eq!(fake.handshakes(), 0);
+    }
+
+    /// An invalid host fails before the hook: it uses up no approval.
+    #[tokio::test]
+    async fn the_hook_is_not_called_for_an_invalid_host() {
+        let mut transport = basic_transport(5985);
+        let (hook, calls) = counting_hook(usize::MAX);
+        transport.set_before_send(hook);
+        let err = transport
+            .send_soap_with_retry("bad host", "<a/>".into())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WinrmError::AuthFailed(_)), "{err:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// One route drives both the dispatch and the slot decision.
+    #[test]
+    fn route_follows_method_mode_and_scheme() {
+        use EncryptionMode::{Always, Auto, Never};
+        let route = |auth_method, encryption, use_tls| {
+            Route::for_config(&WinrmConfig {
+                auth_method,
+                encryption,
+                use_tls,
+                ..Default::default()
+            })
+        };
+        // (mode, use_tls, NTLM, Kerberos with the `kerberos` feature)
+        for (mode, tls, ntlm, krb) in [
+            (Auto, false, Route::Sealed, Route::Sealed),
+            (Auto, true, Route::NtlmOverTls, Route::KerberosOverTls),
+            (Always, false, Route::Sealed, Route::Sealed),
+            (Always, true, Route::Sealed, Route::Sealed),
+            (Never, false, Route::NtlmPlain, Route::KerberosPlain),
+            (Never, true, Route::NtlmOverTls, Route::KerberosOverTls),
+        ] {
+            let krb = if cfg!(feature = "kerberos") {
+                krb
+            } else {
+                Route::KerberosPlain
+            };
+            assert_eq!(
+                route(AuthMethod::Ntlm, mode.clone(), tls),
+                ntlm,
+                "NTLM {mode:?} tls={tls}"
+            );
+            assert_eq!(
+                route(AuthMethod::Kerberos, mode.clone(), tls),
+                krb,
+                "Kerberos {mode:?} tls={tls}"
+            );
+            assert_eq!(route(AuthMethod::Basic, mode.clone(), tls), Route::Basic);
+            assert_eq!(
+                route(AuthMethod::Certificate, mode.clone(), tls),
+                Route::Certificate
+            );
+            assert_eq!(
+                route(AuthMethod::CredSsp, mode.clone(), tls),
+                Route::CredSsp
+            );
+        }
+        for r in [Route::Sealed, Route::NtlmOverTls, Route::KerberosOverTls] {
+            assert!(r.needs_conn_slot(), "{r:?}");
+        }
+        for r in [
+            Route::Basic,
+            Route::Certificate,
+            Route::CredSsp,
+            Route::NtlmPlain,
+            Route::KerberosPlain,
+        ] {
+            assert!(!r.needs_conn_slot(), "{r:?}");
+        }
+    }
+
     /// Through a proxy (no TLS details on the response), a dedicated NTLM
     /// client whose verifier has seen two different server certificates
     /// cannot tell which one its connection uses: the handshake fails
@@ -5540,7 +5766,12 @@ mod tests {
                     .send_soap_with_retry("127.0.0.1", "<soap/>".into())
                     .await,
                 proxied
-                    .send_ntlm_over_tls("127.0.0.1", &url, "<soap/>", Lane::Data)
+                    .send_ntlm_over_tls(
+                        "127.0.0.1",
+                        &url,
+                        "<soap/>",
+                        proxied.conn_slot("127.0.0.1", Lane::Data).await.unwrap(),
+                    )
                     .await,
             ];
             // Basic goes through the transport's shared client: the server
@@ -5699,9 +5930,10 @@ mod tests {
         )
         .unwrap();
         let url = format!("https://127.0.0.1:{port}/wsman");
+        let slot = transport.conn_slot("127.0.0.1", Lane::Data).await.unwrap();
         let reply = tokio::time::timeout(
             Duration::from_secs(20),
-            transport.send_ntlm_over_tls("127.0.0.1", &url, "<soap/>", Lane::Data),
+            transport.send_ntlm_over_tls("127.0.0.1", &url, "<soap/>", slot),
         )
         .await
         .expect("did not finish in 20 s")
@@ -5742,8 +5974,9 @@ mod tests {
             transport.proxy_route().proxy_for(&url).map(|u| u.port()),
             Some(Some(proxy_port))
         );
+        let slot = transport.conn_slot("127.0.0.1", Lane::Data).await.unwrap();
         let reply = transport
-            .send_ntlm_over_tls("127.0.0.1", &url, "<soap/>", Lane::Data)
+            .send_ntlm_over_tls("127.0.0.1", &url, "<soap/>", slot)
             .await
             .unwrap();
         assert_eq!(reply, "<ok/>");
@@ -6968,9 +7201,10 @@ mod tests {
         };
 
         let trusting = transport_with(config(), &roots(&[&ca])).unwrap();
+        let slot = trusting.conn_slot("localhost", Lane::Data).await.unwrap();
         let reply = tokio::time::timeout(
             Duration::from_secs(20),
-            trusting.send_ntlm_over_tls("localhost", &url, "<soap/>", Lane::Data),
+            trusting.send_ntlm_over_tls("localhost", &url, "<soap/>", slot),
         )
         .await
         .expect("did not finish in 20 s")
@@ -6984,9 +7218,10 @@ mod tests {
 
         seen.lock().unwrap().clear();
         let plain = transport_with(config(), &TlsOptions::default()).unwrap();
+        let slot = plain.conn_slot("localhost", Lane::Data).await.unwrap();
         let refused = tokio::time::timeout(
             Duration::from_secs(20),
-            plain.send_ntlm_over_tls("localhost", &url, "<soap/>", Lane::Data),
+            plain.send_ntlm_over_tls("localhost", &url, "<soap/>", slot),
         )
         .await
         .expect("did not finish in 20 s");
@@ -7149,9 +7384,10 @@ mod tests {
 
     /// `send_ntlm_over_tls` to `127.0.0.1`, bounded.
     async fn ntlm_over_tls(t: &HttpTransport, url: &str) -> Result<String, WinrmError> {
+        let slot = t.conn_slot("127.0.0.1", Lane::Data).await.unwrap();
         tokio::time::timeout(
             Duration::from_secs(20),
-            t.send_ntlm_over_tls("127.0.0.1", url, "<soap/>", Lane::Data),
+            t.send_ntlm_over_tls("127.0.0.1", url, "<soap/>", slot),
         )
         .await
         .expect("did not finish in 20 s")

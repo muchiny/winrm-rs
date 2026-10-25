@@ -247,18 +247,26 @@ impl WinrmClientBuilder<Ready> {
     ///
     /// # When it runs
     ///
-    /// The hook admits a request; the request may go out some time later. With
-    /// NTLM or Kerberos, except over plain HTTP with `EncryptionMode::Never`, an
-    /// admitted request can then wait up to `operation_timeout_secs + 10` seconds
-    /// for a connection slot (32 per host and 128 per client; Signal and Delete
-    /// have 8 of their own per host), and a new connection's handshake (for
-    /// Kerberos, possibly a ticket request to the KDC) runs before it, bounded
-    /// as a whole by the same budget. Turning the hook to `false` stops the requests admitted after that,
-    /// not those already waiting. To stop those too, drop the call's future.
+    /// With NTLM or Kerberos, except over plain HTTP with
+    /// `EncryptionMode::Never`, each request first takes one of its host's 32
+    /// connection slots (128 per client; Signal and Delete have 8 of their own
+    /// per host), waiting up to `operation_timeout_secs + 10` seconds for one,
+    /// and only then consults the hook. An approved request goes out at
+    /// once on a pooled authenticated connection; on a new connection, that
+    /// connection's handshake (see above; for Kerberos, possibly a ticket
+    /// request to the KDC) runs first. Under saturation a refusal is therefore
+    /// reported only once a slot frees, and a request that gets no slot fails
+    /// with [`WinrmError::Timeout`] without calling the hook: a kill switch
+    /// then surfaces as `Timeout`, not `Cancelled`. Other methods consult the
+    /// hook at once. A request whose host is invalid fails before the hook.
+    ///
+    /// A request already on the wire cannot be recalled: to stop waiting for
+    /// it, drop the call's future.
     /// [`WinrmClient::run_command_with_cancel`](crate::WinrmClient::run_command_with_cancel)
     /// and `run_powershell_with_cancel` stop polling at once, but let a Create
-    /// that is already pending finish, for at most `operation_timeout_secs`
-    /// clamped to 1..=10 seconds, so that they can delete the shell.
+    /// that is already pending finish (at most `operation_timeout_secs` clamped
+    /// to 1..=10 seconds) so that they can delete the shell. The hook may run
+    /// while its request holds a connection slot: never block in it.
     ///
     /// # Scope
     ///

@@ -120,7 +120,7 @@ pub struct WinrmConfig {
     /// `run_powershell_with_timeout`, to bound them, or `*_with_cancel` to
     /// stop them from elsewhere).
     /// `Shell::run_command` additionally gives up after
-    /// `2 * operation_timeout_secs` in total.
+    /// `2 * operation_timeout_secs` in total, and then terminates the command.
     ///
     /// With [`AuthMethod::CredSsp`] one request usually takes five HTTP
     /// exchanges (at most 13) on one connection (the CredSSP handshake, then
@@ -291,12 +291,8 @@ pub struct WinrmConfig {
     ///   best effort;
     /// - [`Shell::run_command`](crate::Shell::run_command) and
     ///   [`Shell::run_powershell`](crate::Shell::run_powershell) (so
-    ///   `upload_file` too) only return the error: the command keeps running
-    ///   in the shell until [`Shell::close`](crate::Shell::close). To be able
-    ///   to stop it, start it with
-    ///   [`Shell::start_command`](crate::Shell::start_command), which returns
-    ///   its id for [`Shell::signal_ctrl_c`](crate::Shell::signal_ctrl_c) or
-    ///   [`WinrmClient::signal_terminate`](crate::WinrmClient::signal_terminate);
+    ///   `upload_file` too) send the command a terminate signal (best effort)
+    ///   and keep the shell open;
     /// - [`WinrmClient::run_wql`](crate::WinrmClient::run_wql) stops pulling
     ///   pages (the server keeps the enumeration until it expires).
     ///

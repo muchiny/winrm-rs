@@ -1118,6 +1118,82 @@ async fn run_powershell_with_timeout_expires_and_releases_shell() {
     assert_eq!(after, before, "shell leaked after the timeout");
 }
 
+/// Poll `observer` once a second, for at most 10 s, until no process matches
+/// the WMI `CommandLine like` filter `pattern`; the last count is returned.
+/// `run_powershell` encodes its own script, so it never matches itself.
+async fn wait_until_no_process_matches(
+    observer: &WinrmClient,
+    host: &str,
+    pattern: &str,
+) -> String {
+    let script = format!(
+        "(Get-CimInstance Win32_Process -Filter \"CommandLine like '{pattern}'\" | Measure-Object).Count"
+    );
+    let mut last = String::new();
+    for _ in 0..10 {
+        let out = observer
+            .run_powershell(host, &script)
+            .await
+            .expect("count processes");
+        last = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if last == "0" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    last
+}
+
+/// `Shell::run_command` terminates the remote command when it gives up, on
+/// its deadline (`2 * operation_timeout_secs`) and on `max_output_bytes`, and
+/// the shell stays usable.
+#[tokio::test]
+#[ignore]
+async fn shell_run_command_terminates_on_cap_and_deadline() {
+    let (observer, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+
+    // Deadline: operation_timeout_secs = 5 gives Timeout(10).
+    let (client, _) = test_client_with(|c| c.operation_timeout_secs = 5)
+        .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let shell = client.open_shell(&host).await.expect("open shell");
+    let err = shell
+        .run_command(
+            "powershell.exe",
+            &[
+                "-NoProfile",
+                "-Command",
+                "Start-Sleep 60; Write-Output late",
+            ],
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, WinrmError::Timeout(10)), "got {err:?}");
+    let left = wait_until_no_process_matches(&observer, &host, "%Start-Sleep 60%").await;
+
+    // Shell reuse after the terminate.
+    let again = shell.run_command("cmd", &["/c", "echo again"]).await;
+    shell.close().await.expect("close shell");
+    assert_eq!(left, "0", "the timed-out command is still running");
+    let again = again.expect("the shell must stay usable after a terminate");
+    assert!(String::from_utf8_lossy(&again.stdout).contains("again"));
+
+    // Cap: max_output_bytes = 1 MiB.
+    let (capped, _) = test_client_with(|c| c.max_output_bytes = Some(1 << 20))
+        .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let shell = capped.open_shell(&host).await.expect("open shell");
+    let err = shell
+        .run_command(
+            "powershell.exe",
+            &["-NoProfile", "-Command", "1..1000000 | % { 'x' * 100 }"],
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, WinrmError::Transfer(_)), "got {err:?}");
+    let left = wait_until_no_process_matches(&observer, &host, "%1..1000000%").await;
+    shell.close().await.expect("close shell");
+    assert_eq!(left, "0", "the capped command is still running");
+}
+
 /// A command that finishes inside the limit returns its output as
 /// `run_powershell` would, and leaves no shell.
 #[tokio::test]

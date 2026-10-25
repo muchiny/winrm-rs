@@ -179,6 +179,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `sign` / `sign_mech_list_mic` return `[0; 16]`, since their signatures
   cannot carry an error. Migration: treat an empty `seal` output as a failure
   and never send it as a body.
+- `Shell::run_command` (and `Shell::run_powershell`, `upload_file`) now tells
+  the command to terminate when it reaches `max_output_bytes` or its
+  `2 * operation_timeout_secs` deadline, instead of leaving it running. The
+  terminate sent after a completed command is bounded by
+  `min(operation_timeout_secs, 10)` s and no longer discards the output when
+  the deadline passes during it. Migration: a command that must outlive the
+  deadline belongs in `Shell::start_command` and `Shell::receive_next`, which
+  are not bounded.
 
 ### Added
 

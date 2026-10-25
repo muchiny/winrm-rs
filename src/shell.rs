@@ -47,6 +47,14 @@ impl ShellKind {
     }
 }
 
+/// How the polling loop of `Shell::run_command` ended.
+enum Polled {
+    /// The command finished.
+    Done(CommandOutput),
+    /// The output went past `max_output_bytes`, which is the value held.
+    OverCap(usize),
+}
+
 /// A reusable WinRM shell session.
 ///
 /// Created via [`WinrmClient::open_shell`]. The shell persists across
@@ -114,8 +122,18 @@ impl<'a> Shell<'a> {
 
     /// Execute a command in this shell.
     ///
-    /// Runs the command, polls for output until completion or timeout, and
-    /// returns the collected stdout, stderr, and exit code.
+    /// Runs the command and polls its output until it is done, for at most
+    /// `2 * operation_timeout_secs`. When that deadline passes, or the output
+    /// exceeds `max_output_bytes`, the command is told to terminate and the
+    /// error is returned ([`WinrmError::Timeout`] with
+    /// `2 * operation_timeout_secs`, or [`WinrmError::Transfer`]); the shell
+    /// stays open. The terminate request is best effort, bounded by
+    /// `operation_timeout_secs` capped at 10 s, so the call can take that
+    /// much longer than the deadline. A command that must run longer belongs
+    /// in [`start_command`](Self::start_command) and
+    /// [`receive_next`](Self::receive_next).
+    /// [`run_command_with_cancel`](Self::run_command_with_cancel) sends no
+    /// signal: a dropped future cannot.
     ///
     /// See [`WinrmClient::run_command`](crate::WinrmClient::run_command) (Arguments) for
     /// how `args` reach the host.
@@ -130,9 +148,8 @@ impl<'a> Shell<'a> {
             .await?;
         debug!(command_id = ?command_id, "shell command started");
 
-        let timeout_duration = Duration::from_secs(run_command_deadline_secs(
-            self.client.config().operation_timeout_secs,
-        ));
+        let deadline_secs = run_command_deadline_secs(self.client.config().operation_timeout_secs);
+        let timeout_duration = Duration::from_secs(deadline_secs);
         let max_output = self.client.config().max_output_bytes;
 
         let result = tokio::time::timeout(timeout_duration, async {
@@ -165,9 +182,7 @@ impl<'a> Shell<'a> {
                 if let Some(cap) = max_output
                     && received > cap
                 {
-                    return Err(WinrmError::Transfer(format!(
-                        "command output exceeded max_output_bytes ({cap})"
-                    )));
+                    return Ok(Polled::OverCap(cap));
                 }
 
                 exit_code = output.exit_code.or(exit_code);
@@ -183,26 +198,48 @@ impl<'a> Shell<'a> {
             }
             stderr.extend(stderr_decoder.finish());
 
-            // Best-effort signal terminate
-            self.client
-                .signal_terminate(&self.host, &self.shell_id, &command_id)
-                .await
-                .ok();
-
-            Ok(CommandOutput {
+            Ok(Polled::Done(CommandOutput {
                 stdout,
                 stderr,
                 exit_code: exit_code.unwrap_or(-1),
-            })
+            }))
         })
         .await;
 
+        // The terminate runs outside the timed future, so a deadline that
+        // passes during it cannot discard the output of a finished command.
         match result {
-            Ok(inner) => inner,
-            Err(_) => Err(WinrmError::Timeout(run_command_deadline_secs(
-                self.client.config().operation_timeout_secs,
-            ))),
+            Ok(Ok(Polled::Done(output))) => {
+                self.terminate_best_effort(&command_id).await;
+                Ok(output)
+            }
+            Ok(Ok(Polled::OverCap(cap))) => {
+                self.terminate_best_effort(&command_id).await;
+                Err(WinrmError::Transfer(format!(
+                    "command output exceeded max_output_bytes ({cap})"
+                )))
+            }
+            // A failed Receive says nothing about the command: no signal.
+            Ok(Err(e)) => Err(e),
+            Err(_) => {
+                self.terminate_best_effort(&command_id).await;
+                Err(WinrmError::Timeout(deadline_secs))
+            }
         }
+    }
+
+    /// Best effort: tell `command_id` to terminate, bounded by the client's
+    /// clean-up budget; a failure is logged at debug and ignored, so it never
+    /// replaces the result of the call.
+    async fn terminate_best_effort(&self, command_id: &str) {
+        crate::client::bounded(
+            self.client.cleanup_budget(),
+            self.client
+                .signal_terminate(&self.host, &self.shell_id, command_id),
+        )
+        .await
+        .inspect_err(|e| debug!(error = %e, "failed to terminate command (best-effort)"))
+        .ok();
     }
 
     /// Execute a command with cancellation support.
@@ -729,7 +766,7 @@ mod tests {
     use crate::config::{AuthMethod, EncryptionMode, WinrmConfig, WinrmCredentials};
     use crate::error::WinrmError;
     use crate::shell::ShellKind;
-    use wiremock::matchers::method;
+    use wiremock::matchers::{body_string_contains, method};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn test_creds() -> WinrmCredentials {
@@ -1816,6 +1853,212 @@ mod tests {
         let shell = client.open_shell("127.0.0.1").await.unwrap();
         let err = shell.run_command("slow", &[]).await.unwrap_err();
         assert!(matches!(err, WinrmError::Timeout(2)), "got {err:?}");
+    }
+
+    /// Number of terminate signals the server has received.
+    async fn terminate_count(server: &MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| String::from_utf8_lossy(&r.body).contains("signal/terminate"))
+            .count()
+    }
+
+    /// Route Receive to `receive` and Signal to an empty answer, after the
+    /// shell and command have been mounted.
+    async fn mount_receive_and_signal(server: &MockServer, receive: ResponseTemplate) {
+        Mock::given(method("POST"))
+            .and(body_string_contains("windows/shell/Receive"))
+            .respond_with(receive)
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("signal/terminate"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("<s:Envelope><s:Body/></s:Envelope>"),
+            )
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn shell_run_command_terminates_the_command_past_max_output_bytes() {
+        let server = MockServer::start().await;
+        mount_open_shell_and_command(&server).await;
+        // 5 bytes of stdout, still running.
+        mount_receive_and_signal(
+            &server,
+            ResponseTemplate::new(200).set_body_string(
+                r#"<s:Envelope><s:Body><rsp:ReceiveResponse>
+                <rsp:Stream Name="stdout" CommandId="TC">aGVsbG8=</rsp:Stream>
+                </rsp:ReceiveResponse></s:Body></s:Envelope>"#,
+            ),
+        )
+        .await;
+        let config = WinrmConfig {
+            max_output_bytes: Some(4),
+            ..basic_config(server.address().port())
+        };
+        let client = WinrmClient::new(config, test_creds()).unwrap();
+        let shell = client.open_shell("127.0.0.1").await.unwrap();
+
+        let err = shell.run_command("x", &[]).await.unwrap_err();
+
+        match err {
+            WinrmError::Transfer(msg) => {
+                assert_eq!(msg, "command output exceeded max_output_bytes (4)");
+            }
+            other => panic!("got {other:?}"),
+        }
+        assert_eq!(terminate_count(&server).await, 1);
+    }
+
+    #[tokio::test]
+    async fn shell_run_command_terminates_the_command_on_its_deadline() {
+        use std::time::{Duration, Instant};
+        let server = MockServer::start().await;
+        mount_open_shell_and_command(&server).await;
+        mount_receive_and_signal(
+            &server,
+            ResponseTemplate::new(200)
+                .set_body_string(DONE_OK)
+                .set_delay(Duration::from_secs(3)),
+        )
+        .await;
+        let config = WinrmConfig {
+            operation_timeout_secs: 1,
+            ..basic_config(server.address().port())
+        };
+        let client = WinrmClient::new(config, test_creds()).unwrap();
+        let shell = client.open_shell("127.0.0.1").await.unwrap();
+
+        let started = Instant::now();
+        let err = shell.run_command("x", &[]).await.unwrap_err();
+
+        assert!(matches!(err, WinrmError::Timeout(2)), "got {err:?}");
+        assert_eq!(terminate_count(&server).await, 1);
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_run_command_deadline_returns_when_the_terminate_hangs() {
+        use std::time::{Duration, Instant};
+        let server = MockServer::start().await;
+        mount_open_shell_and_command(&server).await;
+        // Receive and Signal both outlast the deadline and the clean-up
+        // budget: the original error comes back after about 3 s.
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(DONE_OK)
+                    .set_delay(Duration::from_secs(30)),
+            )
+            .mount(&server)
+            .await;
+        let config = WinrmConfig {
+            operation_timeout_secs: 1,
+            ..basic_config(server.address().port())
+        };
+        let client = WinrmClient::new(config, test_creds()).unwrap();
+        let shell = client.open_shell("127.0.0.1").await.unwrap();
+
+        let started = Instant::now();
+        let err = shell.run_command("x", &[]).await.unwrap_err();
+
+        assert!(matches!(err, WinrmError::Timeout(2)), "got {err:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_run_command_keeps_its_error_when_a_hook_refuses_the_terminate() {
+        let server = MockServer::start().await;
+        mount_open_shell_and_command(&server).await;
+        mount_receive_and_signal(
+            &server,
+            ResponseTemplate::new(200).set_body_string(
+                r#"<s:Envelope><s:Body><rsp:ReceiveResponse>
+                <rsp:Stream Name="stdout" CommandId="TC">aGVsbG8=</rsp:Stream>
+                </rsp:ReceiveResponse></s:Body></s:Envelope>"#,
+            ),
+        )
+        .await;
+        let config = WinrmConfig {
+            max_output_bytes: Some(4),
+            ..basic_config(server.address().port())
+        };
+        let client = WinrmClient::builder(config)
+            .credentials(test_creds())
+            .before_send_with(|req| req.kind() != crate::RequestKind::Signal)
+            .build()
+            .unwrap();
+        let shell = client.open_shell("127.0.0.1").await.unwrap();
+
+        let err = shell.run_command("x", &[]).await.unwrap_err();
+
+        assert!(
+            matches!(&err, WinrmError::Transfer(msg) if msg.contains("max_output_bytes (4)")),
+            "got {err:?}"
+        );
+        assert_eq!(terminate_count(&server).await, 0);
+    }
+
+    #[tokio::test]
+    async fn shell_run_command_sends_one_terminate_after_done() {
+        let server = MockServer::start().await;
+        mount_open_shell_and_command(&server).await;
+        mount_receive_and_signal(&server, ResponseTemplate::new(200).set_body_string(DONE_OK))
+            .await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        let shell = client.open_shell("127.0.0.1").await.unwrap();
+
+        let out = shell.run_command("x", &[]).await.unwrap();
+
+        assert_eq!(out.exit_code, 3);
+        assert_eq!(terminate_count(&server).await, 1);
+    }
+
+    #[tokio::test]
+    async fn shell_run_command_with_cancel_still_sends_no_signal() {
+        use std::time::Duration;
+        let server = MockServer::start().await;
+        mount_open_shell_and_command(&server).await;
+        mount_receive_and_signal(
+            &server,
+            ResponseTemplate::new(200)
+                .set_body_string(DONE_OK)
+                .set_delay(Duration::from_secs(2)),
+        )
+        .await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        let shell = client.open_shell("127.0.0.1").await.unwrap();
+        let token = tokio_util::sync::CancellationToken::new();
+        let canceller = {
+            let token = token.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                token.cancel();
+            })
+        };
+
+        let err = shell
+            .run_command_with_cancel("x", &[], token)
+            .await
+            .unwrap_err();
+        canceller.await.unwrap();
+
+        assert!(matches!(err, WinrmError::Cancelled), "got {err:?}");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(terminate_count(&server).await, 0);
     }
 
     #[tokio::test]

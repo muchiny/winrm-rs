@@ -7,6 +7,239 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-10-25
+
+HTTPS with a validated certificate becomes the default, and environment
+proxies, UNC transfer paths and interactive PowerShell become opt-in;
+`NtlmSession` leaves the public API. The release also carries the hardening
+and fixes made since 1.4.1. Read *Upgrading from 1.x* first.
+
+### Upgrading from 1.x
+
+Each entry below is a change that can break a program written for 1.x, in
+the order most programs meet them. `### Changed` lists every change in
+behaviour, these included, each with its migration.
+
+#### HTTPS on port 5986 is the default; `WinrmConfig::port` is `Option<u16>`
+
+Before (1.x): `WinrmConfig::default()` meant plain HTTP on port 5985, and
+`port` was a `u16`.
+
+After (2.0): `WinrmConfig::default()` connects over HTTPS (`use_tls = true`)
+with the certificate validated. `port` is `Option<u16>`: `None` (the default)
+means 5986 with `use_tls` and 5985 without, and
+`WinrmConfig::effective_port()` returns the port in use. `WinrmConfig::http()`
+and `WinrmConfig::https()` set it to `Some(5985)` and `Some(5986)`. When a
+client left on `port: None` cannot connect to 5986 and no proxy applies, a
+WARN says that a host with only the stock HTTP listener needs
+`WinrmConfig::http()`.
+
+Migration: a host that has only the stock HTTP listener (what
+`Enable-PSRemoting` creates) needs `WinrmConfig::http()`, the 1.x default
+(plain HTTP on 5985). An explicit port becomes `Some(..)`. A struct literal
+on `..WinrmConfig::http()` that sets `use_tls: true` must set `port` too, or
+it keeps 5985.
+
+```rust
+use winrm_rs::WinrmConfig;
+
+// 1.x
+// let config = WinrmConfig::default(); // plain HTTP, 5985
+// let config = WinrmConfig {
+//     port: 5986,
+//     use_tls: true,
+//     ..Default::default()
+// };
+
+// 2.0: keep plain HTTP on the stock listener
+let config = WinrmConfig::http();
+// or, in a struct literal
+let config = WinrmConfig {
+    operation_timeout_secs: 120,
+    ..WinrmConfig::http()
+};
+
+// 2.0: explicit port
+let config = WinrmConfig {
+    port: Some(5986),
+    ..WinrmConfig::default()
+};
+
+// 2.0: read the port in use
+let port: u16 = config.effective_port();
+```
+
+Plain HTTP does not authenticate the server (see the Security section of
+`WinrmConfig`); prefer `WinrmConfig::https()` with a certificate the client
+trusts.
+
+#### Environment proxies are opt-in
+
+Before (1.x): `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` were
+read for every client whose `WinrmConfig::proxy` was unset, CredSSP aside
+(it connected directly).
+
+After (2.0): they are read only by a client built with
+`WinrmClientBuilder::use_env_proxy(true)`; CredSSP then follows them too
+(`http://` and `socks5://` only). `WinrmConfig::proxy` applies as before, and
+CredSSP now goes through it too. `WinrmClientBuilder::ignore_env_proxy`, the
+inverse of `use_env_proxy`, is deprecated (`ignore_env_proxy(false)` turns
+the environment on).
+
+Migration: a client that must reach WinRM through the environment's proxy
+calls `use_env_proxy(true)`, or sets `WinrmConfig::proxy`.
+
+```rust
+// 1.x: environment proxies read unless WinrmConfig::proxy was set
+// 2.0
+let client = WinrmClient::builder(config)
+    .credentials(creds)
+    .use_env_proxy(true) // only if the host is reached through that proxy
+    .build()?;
+```
+
+#### `WinrmConfig::proxy` is an `Option<SecretString>`
+
+Before (1.x): `proxy: Option<String>`.
+
+After (2.0): `proxy: Option<SecretString>` (`winrm_rs::SecretString`,
+re-exported from `secrecy`). The proxy URL can hold credentials: the copy
+held by `WinrmConfig` and by the proxy route is wiped on drop, and `Debug`
+shows the URL with its user info redacted.
+
+Migration: wrap the URL with `SecretString::from`.
+
+```rust
+use winrm_rs::{SecretString, WinrmConfig};
+
+// 1.x: proxy: Some("http://proxy:8080".to_string()),
+let config = WinrmConfig {
+    proxy: Some(SecretString::from("http://proxy:8080")),
+    ..WinrmConfig::https()
+};
+```
+
+#### Basic over HTTPS with `accept_invalid_certs = true` is refused
+
+Before (1.x): the client built; only the general `accept_invalid_certs` WARN
+was logged.
+
+After (2.0): building the client fails with `WinrmError::AuthFailed`: the
+password would go to a server whose certificate is not verified.
+
+Migration: set `accept_invalid_certs = false` and either pin the listener
+certificate by SHA-256 fingerprint or trust its CA.
+
+```rust
+use winrm_rs::{AuthMethod, WinrmClient, WinrmConfig};
+
+let config = WinrmConfig {
+    auth_method: AuthMethod::Basic,
+    accept_invalid_certs: false, // was true in 1.x
+    ..WinrmConfig::https()
+};
+
+// Self-signed listener: pin its certificate
+let client = WinrmClient::builder(config.clone())
+    .credentials(creds.clone())
+    .pin_server_certificate_sha256("<64 hex digits>")
+    .build()?;
+
+// Listener signed by an internal CA: trust that CA
+let client = WinrmClient::builder(config)
+    .credentials(creds)
+    .add_root_certificates_pem("ca.pem")
+    .build()?;
+```
+
+#### Transfers accept only drive-absolute remote paths
+
+Before (1.x): any remote path that passed the length and control-character
+checks was accepted, UNC and WebDAV paths included.
+
+After (2.0): the default `RemotePathPolicy::LocalDrive` accepts only a drive
+letter, `:`, then `\` or `/` (for example `C:\data\a.txt`), and refuses a
+path whose last component, after resolving `.` and `..`, is a DOS device name
+(`CON`, `NUL`, `COM1`, `LPT1`, ...). UNC, WebDAV and device paths, `\\?\`
+long paths, relative paths and device names fail with `WinrmError::Transfer`
+before anything is sent.
+
+Migration: a program that reaches shares on purpose, typically a CredSSP
+double-hop, builds the client with `RemotePathPolicy::Any`. Only the builder
+can choose: `WinrmClient::new` always uses the default.
+
+```rust
+use winrm_rs::{RemotePathPolicy, WinrmClient};
+
+let client = WinrmClient::builder(config)
+    .credentials(creds)
+    .remote_path_policy(RemotePathPolicy::Any)
+    .build()?;
+```
+
+#### `run_powershell` starts PowerShell non-interactive
+
+Before (1.x): PowerShell started without `-NoProfile -NonInteractive`.
+
+After (2.0): `WinrmClient::run_powershell`, `run_powershell_with_timeout`
+and `run_powershell_with_cancel`, and `Shell::run_powershell` and
+`Shell::run_powershell_with_cancel`, start PowerShell with `-NoProfile
+-NonInteractive`: profile scripts do not run and a prompt fails at once
+instead of waiting for input. The transfer methods now always use these
+flags too.
+
+Migration: a script that relies on a profile, or that prompts, needs the
+builder switch. `WinrmClient::new` clients always use the flags.
+
+```rust
+let client = WinrmClient::builder(config)
+    .credentials(creds)
+    .non_interactive_powershell(false) // 1.x launch
+    .build()?;
+```
+
+#### `NtlmSession` is removed
+
+Before (1.x): `NtlmSession`, the NTLM sealing primitive the client uses
+internally, was public.
+
+After (2.0): it is gone. The client seals messages itself and no public API
+takes or returns it.
+
+Migration: none for `WinrmClient` users. Code that drove `NtlmSession`
+directly has no replacement in this crate.
+
+#### Building a client no longer installs ring as the process-wide provider
+
+Before (1.x): building a client installed the `ring` rustls provider as the
+process-wide default when none was installed yet.
+
+After (2.0): with no `tls_provider` call, the client uses the provider the
+application installed, else a private `ring` provider; it never installs one.
+Application code that relied on winrm-rs for the default, such as its own
+rustls configs built from the process default, now panics or fails.
+
+Migration: install the provider you want at start-up, or choose the provider
+for the client explicitly with `WinrmClientBuilder::tls_provider`.
+
+```rust
+use winrm_rs::TlsProvider;
+
+// At start-up, if your own code needs a process-wide default
+// (aws_lc_rs or another provider works as well):
+let _ = rustls::crypto::ring::default_provider().install_default();
+
+// Or choose per client:
+// TlsProvider::Ring: a private ring provider; the process default is neither
+//   read nor installed.
+// TlsProvider::ProcessDefault: the installed default; build fails with
+//   AuthFailed when there is none.
+let client = WinrmClient::builder(config)
+    .credentials(creds)
+    .tls_provider(TlsProvider::ProcessDefault)
+    .build()?;
+```
+
 ### Security
 
 - NTLM: the UTF-16 password copy, the NT and NTLMv2 hashes, the session base
@@ -77,11 +310,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   several hosts or clients, or run fewer requests at once; the `before_send`
   hook now runs after the slot is taken.
 - **A WARN for NTLM over plain HTTP.** Building a client with
-  `AuthMethod::Ntlm` and `use_tls = false` (the default configuration) logs
-  one WARN, target `winrm_rs::ntlm_over_http`: over plain HTTP, NTLM does
-  not authenticate the server and its handshake can be relayed, or recorded to
-  guess the password offline; sealing protects only the SOAP bodies. Nothing is refused. To
-  silence it alone, add `winrm_rs::ntlm_over_http=error` to the filter.
+  `AuthMethod::Ntlm` and `use_tls = false` (`WinrmConfig::http()`, the 1.x
+  default) logs one WARN, target `winrm_rs::ntlm_over_http`: over plain HTTP,
+  NTLM does not authenticate the server and its handshake can be relayed, or
+  recorded to guess the password offline; sealing protects only the SOAP
+  bodies. Nothing is refused. To silence it alone, add
+  `winrm_rs::ntlm_over_http=error` to the filter.
 - Kerberos: the ticket request runs on a thread of tokio's blocking pool, not
   on the thread of the calling task. On a Windows client it therefore uses the
   process's credentials, not an impersonation the caller set on its own
@@ -132,27 +366,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `EncryptionMode::Auto`.
 - **The operating system's proxy settings (Windows registry, macOS
   configuration) are never read**, whatever features other crates enable in
-  `reqwest` or `hyper-util`. Environment proxies keep working, as before.
-  Migration: if your requests reached WinRM only through the OS proxy, set
-  `WinrmConfig::proxy` or `HTTP_PROXY` / `HTTPS_PROXY`.
+  `reqwest` or `hyper-util`. Environment proxies are read only on request
+  (see the `use_env_proxy` entry below). Migration: if your requests reached
+  WinRM only through the OS proxy, set `WinrmConfig::proxy`, or set
+  `HTTP_PROXY` / `HTTPS_PROXY` and build the client with
+  `use_env_proxy(true)`.
 - **`WinrmConfig::proxy` with a scheme that no proxy supports (`ftp://`) is
   refused** when the client is built, with `WinrmError::AuthFailed`. It used
   to go direct. Migration: use an `http://`, `https://`, `socks4://`,
   `socks4a://`, `socks5://` or `socks5h://` proxy URL, or leave
   `WinrmConfig::proxy` unset to connect directly.
-- A proxy environment variable whose non-empty value is not a usable proxy
-  URL is ignored with a WARN. Migration: none; fix or unset the variable to silence
+- On a client that reads the environment (`use_env_proxy(true)`), a proxy
+  environment variable whose non-empty value is not a usable proxy URL is
+  ignored with a WARN. Migration: none; fix or unset the variable to silence
   the WARN.
-- A client for plain HTTP that may follow a proxy from the environment logs a
-  WARN when it is built, with the proxy's credentials redacted. Migration:
-  none; call `WinrmClientBuilder::ignore_env_proxy(true)` or set
-  `WinrmConfig::proxy` to silence it.
-- Basic over HTTPS with `accept_invalid_certs = true` logs a second WARN when
-  the client is built: the password goes to a server whose certificate is
-  not verified. 1.x warns; 2.0 will refuse it. Migration: none; pin the
-  certificate (`pin_server_certificate_sha256`) or add a root
-  (`add_root_certificates_pem`) and set `accept_invalid_certs = false` to
-  silence it.
+- A client for plain HTTP built with `use_env_proxy(true)` that may follow a
+  proxy from the environment logs a WARN when it is built, with the proxy's
+  credentials redacted. Migration: none; set `WinrmConfig::proxy`, or leave
+  `use_env_proxy` off, to silence it.
 - `before_send` is consulted once a request holds its connection slot (NTLM
   and Kerberos, except over plain HTTP with `EncryptionMode::Never`, and
   CredSSP), so the slot wait no longer ages an approval (it could add up to
@@ -168,8 +399,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   tunnel) instead of connecting directly. An `https://` or `socks4://` proxy
   is refused for CredSSP when the client is built. The outer TLS still runs
   end-to-end with the host under the client's verifier, and
-  `connect_timeout_secs` now covers the proxy handshake too. CredSSP still
-  reads no proxy environment variable. Migration: for CredSSP, use an
+  `connect_timeout_secs` now covers the proxy handshake too. CredSSP reads
+  the proxy environment variables only on a client built with
+  `use_env_proxy(true)` (see below). Migration: for CredSSP, use an
   `http://` or `socks5://` proxy, or unset `WinrmConfig::proxy` to keep
   connecting directly.
 - NTLM: the client now checks that the server's Type 2 negotiates Unicode,
@@ -181,26 +413,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   servers, which negotiate all of these; a server or proxy that answers with
   fewer flags must be configured to negotiate them (NTLMv2 session security
   with 128-bit keys; signing, sealing and key exchange for sealed traffic).
-- `NtlmSession` is deprecated; it is the internal NTLM sealing primitive and
-  will leave the public API in 2.0. It now enforces its call order and fails
-  closed after an error. Migration: none for `WinrmClient` users, whose NTLM
-  traffic the client seals itself (see `EncryptionMode`); code that drives
-  `NtlmSession` directly should stop doing so before 2.0.
-- `NtlmSession` enforces its contract: `sign_mech_list_mic` resets the client
-  RC4 keystream only when it is the first client operation (called later, it
-  signs without rewinding the keystream); after a failed `unseal` or
-  `verify_mech_list_mic`, or after `zeroize`, every later `unseal` and
-  `verify_mech_list_mic` returns `Err`; sequence numbers no longer wrap: the
-  message that carries `u32::MAX` goes out and the call after it fails.
-  `zeroize` wipes the keys and re-keys both RC4 handles from random bytes, so
-  a zeroized session never emits plaintext. Migration: call
-  `sign_mech_list_mic` first and once, and build a new session after an
-  error.
-- On a session that is unusable (after an error, after `zeroize`, or with an
-  exhausted sequence number) `NtlmSession::seal` returns an empty `Vec` and
-  `sign` / `sign_mech_list_mic` return `[0; 16]`, since their signatures
-  cannot carry an error. Migration: treat an empty `seal` output as a failure
-  and never send it as a body.
 - `Shell::run_command` (and `Shell::run_powershell`, `upload_file`) now tells
   the command to terminate when it reaches `max_output_bytes` or its
   `2 * operation_timeout_secs` deadline, instead of leaving it running. The
@@ -229,10 +441,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   winrm-rs installing it must now call `CryptoProvider::install_default`
   itself, or its own rustls configs built from the process default panic or
   fail.
-- `NtlmSession` is removed from the public API (deprecated since 1.5.0). It
-  was the crate's internal NTLM sealing primitive; the client seals messages
-  itself and no public API takes or returns it. Migration: none for
-  `WinrmClient` users; code that drove it directly has no replacement.
+- `NtlmSession` is removed from the public API. It was the crate's internal
+  NTLM sealing primitive; the client seals messages itself and no public API
+  takes or returns it. The sealing session the client keeps per connection
+  enforces its call order: `sign_mech_list_mic` resets the client RC4
+  keystream only when it is the first client operation; any error, such as a
+  failed unseal or mechListMIC check, makes every later call fail; sequence
+  numbers no longer wrap: the message that carries `u32::MAX` goes out and
+  the call after it fails. Its keys and RC4 state are wiped when it drops.
+  Migration: none for `WinrmClient` users; code that drove `NtlmSession`
+  directly has no replacement.
 - `run_powershell` starts PowerShell with `-NoProfile -NonInteractive` by
   default, so profile scripts do not run and a prompt fails at once. Scripts
   that rely on a profile, or that prompt, call
@@ -251,8 +469,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `ignore_env_proxy(false)` still turns them on. Migration: call
   `use_env_proxy(true)` to keep the 1.x behaviour.
 - Basic over HTTPS with `accept_invalid_certs = true` is refused when the
-  client is built (it logged a WARN in 1.5). Migration: pin the listener
-  certificate (`pin_server_certificate_sha256`) or trust its CA
+  client is built: the password would go to a server whose certificate is
+  not verified (1.x built it with only the general `accept_invalid_certs`
+  WARN). Migration: pin the listener certificate
+  (`pin_server_certificate_sha256`) or trust its CA
   (`add_root_certificates_pem`) and set `accept_invalid_certs = false`.
 - `WinrmConfig::default()` connects over HTTPS to port 5986, certificate
   validated. Migration: a host with only the stock HTTP listener (what
@@ -288,8 +508,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `TlsProvider::Ring` uses a private ring provider and never reads or installs
   the process-wide default. `TlsProvider::ProcessDefault` uses the provider
   the application installed and fails to build when there is none. Without
-  it, building a client still installs ring process-wide when no provider is
-  installed yet; 2.0 stops doing that.
+  it, the client uses the process-wide provider when one is installed, else
+  a private ring provider (see Changed).
 - **`WinrmClientBuilder::add_root_certificates_pem` and `platform_roots`**:
   trust an internal CA, or the operating system's certificate store, for the
   HTTPS listener, the CredSSP outer TLS and an `https://` proxy, without
@@ -304,8 +524,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   verified. Building a client with it set logs a WARN when an `https://`
   proxy applies to its endpoints. With `use_tls = true`, a host that has the
   name of an `https://` proxy is refused while it is set.
-- `WinrmClientBuilder::ignore_env_proxy(bool)`: with `true`, build a client
-  that does not read proxies from the environment.
+- `WinrmClientBuilder::ignore_env_proxy(bool)`, deprecated from the start:
+  the inverse of `use_env_proxy`, which replaces it (`ignore_env_proxy(false)`
+  reads the environment).
 - `ProxySessionAuth` and `WinrmClientBuilder::proxy_session_auth`.
 - `ProxySessionAuth::Require` refuses NTLM or Kerberos to an `http://`
   endpoint through a forwarding `http://` or `https://` proxy that does not
@@ -313,7 +534,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   6); `ProxySessionAuth::RequireWhenUnsealed` refuses only
   `EncryptionMode::Never` there and logs a WARN for sealed requests. Kerberos
   reads the header from an unauthenticated request per endpoint, repeated
-  until the server answers it with 401. The default, `Allow`, checks nothing and keeps today's behaviour.
+  until the server answers it with 401. The default, `Allow`, checks nothing
+  and keeps the 1.x behaviour.
 - **`WinrmClientBuilder::before_send_with`**, with `OutgoingRequest` and
   `RequestKind`: a `before_send` hook that sees each request's host (as the
   URL uses it), WS-Management action, kind and attempt number, for per-host
@@ -329,18 +551,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `RemotePathPolicy` and `WinrmClientBuilder::remote_path_policy`. With
   `RemotePathPolicy::LocalDrive`, the transfer methods accept only
   drive-absolute remote paths and refuse UNC, WebDAV and `\\.\` / `\\?\`
-  device paths before anything is sent. The default, `Any`, keeps today's
-  behaviour.
+  device paths before anything is sent. `LocalDrive` is the default (see
+  Changed); `Any` keeps the 1.x behaviour.
 - `quote_powershell_string`: quote a value as a PowerShell single-quoted
   literal, for passing untrusted values to `run_powershell` scripts.
-- `WinrmClientBuilder::non_interactive_powershell(true)` starts
-  `run_powershell` scripts with `-NoProfile -NonInteractive`.
+- `WinrmClientBuilder::non_interactive_powershell(bool)`: whether
+  `run_powershell` scripts start with `-NoProfile -NonInteractive`. On by
+  default (see Changed); `false` restores the 1.x launch.
 - `WinrmClientBuilder::log_soap_bodies(true)` logs every SOAP body at
   `trace`, target `winrm_rs::wire`, in plaintext. For debugging only.
   Clients built with `WinrmClient::new` cannot turn it on; use the builder.
 - `WinrmConfig::https()` (HTTPS on 5986, NTLM, certificate validated) and
-  `WinrmConfig::http()` (plain HTTP on 5985, today's default). The default
-  becomes HTTPS on 5986 in 2.0; `WinrmConfig::http()` keeps plain HTTP.
+  `WinrmConfig::http()` (plain HTTP on 5985, the 1.x default).
+  `WinrmConfig::default()` is now HTTPS on 5986 (see Changed).
 - `WinrmClientBuilder::use_env_proxy(bool)`.
 - `WinrmConfig::effective_port()`: the port a configuration connects to.
 
@@ -442,17 +665,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   whatever its resource URI; `reconnect_shell` treats a resource URI as
   PowerShell when it has a `/powershell` path segment, in any case (a URI that
   only contains `powershell` elsewhere now gives a `cmd` shell).
-- `NtlmSession::seal` and `NtlmSession::sign` no longer panic in debug builds
-  after 2^32 messages; the call after the message that carries `u32::MAX`
-  fails (see Changed).
+- NTLM sealing no longer panics in debug builds after 2^32 messages on one
+  connection; the call after the message that carries `u32::MAX` fails (see
+  the `NtlmSession` entry under Changed).
 - `NtlmError::InvalidMessage` is also returned for NTLM messages with
   oversized or out-of-range fields: a Type 3 field longer than a 16-bit
   length can hold is refused instead of being truncated.
 - `WinrmConfig::proxy` is checked when the client is built. A value that lost
   a slash (`socks5h:/proxy:1080`, `socks5h//proxy:1080`) used to become an
   `http://` proxy on a host named after the scheme. It is now refused, with an
-  error that does not repeat the credentials. A scheme that no proxy supports
-  (`ftp://`) still goes direct, now with a WARN. 1.5.0 will refuse it.
+  error that does not repeat the credentials, and so is a scheme that no
+  proxy supports (see Changed).
 - **A plain-HTTP client builds on a host without a system CA bundle.**
   reqwest loaded the operating system's roots for plain-HTTP clients (they
   are used only for an `https://` proxy) and failed to build when that store
@@ -481,16 +704,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the authentication is not bound to the connection and can be relayed, and
   what prevents it (HTTPS, `AllowUnencrypted = false`).
 - Transfer docs say what the paths reach. `upload_file` and `download_file*`
-  gain a `# Security` section: the remote path may be a UNC, WebDAV or
-  `\\.\` / `\\?\` device path reached with delegated credentials under
-  CredSSP or Basic, upload content is on the remote command line, and
+  gain a `# Security` section: under `RemotePathPolicy::Any` the remote path
+  may be a UNC, WebDAV or `\\.\` / `\\?\` device path reached with delegated
+  credentials under CredSSP or Basic, upload content is on the remote command
+  line, and
   `upload_file` reads through a symbolic link while `download_file` refuses
   one (see Changed). `run_powershell` says that its script text is on the
   command line.
 - The command-running methods say how `args` reach the host (one `cmd.exe`
   command line, unquoted), and `working_directory` and `env_vars` say how
-  they affect which program runs. `run_powershell` says that the host's
-  PowerShell profile scripts run first.
+  they affect which program runs. `run_powershell` says when the host's
+  PowerShell profile scripts run.
 - `AuthMethod::Certificate` and the README say that the client's private key
   stays in process memory, unwiped, inside `rustls` and `ring`.
   `CommandOutput` says that `stdout` and `stderr` are returned as the command
@@ -1541,7 +1765,9 @@ considered stable and covered by SemVer guarantees.
 - Raw command execution (`cmd.exe` or any executable)
 - Full shell lifecycle: create, execute, receive, signal, delete
 
-[Unreleased]: https://github.com/muchiny/winrm-rs/compare/v1.4.0...HEAD
+[Unreleased]: https://github.com/muchiny/winrm-rs/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/muchiny/winrm-rs/compare/v1.4.1...v2.0.0
+[1.4.1]: https://github.com/muchiny/winrm-rs/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/muchiny/winrm-rs/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/muchiny/winrm-rs/compare/v1.2.2...v1.3.0
 [1.2.2]: https://github.com/muchiny/winrm-rs/compare/v1.2.1...v1.2.2

@@ -152,10 +152,10 @@ impl<'a> Shell<'a> {
                     .client
                     .receive_output_raw(&self.host, &self.shell_id, &command_id)
                     .await?;
-                let progressed = !output.stdout.is_empty()
-                    || !output.stderr.is_empty()
-                    || output.exit_code.is_some()
-                    || output.done;
+                // An exit code without the Done state is not progress: only Done
+                // ends the loop, so a server answering that at once is paced.
+                let progressed =
+                    !output.stdout.is_empty() || !output.stderr.is_empty() || output.done;
                 received = received
                     .saturating_add(output.stdout.len())
                     .saturating_add(output.stderr.len());
@@ -1635,6 +1635,35 @@ mod tests {
         let took = started.elapsed();
         assert_eq!(out.exit_code, 3);
         // 50 + 100 + 200 + 400 ms after the 3rd to 6th quick empty polls.
+        assert!(
+            took >= Duration::from_millis(700) && took < Duration::from_secs(5),
+            "{took:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_run_command_paces_an_exit_code_without_done() {
+        use std::time::{Duration, Instant};
+        let server = MockServer::start().await;
+        mount_open_shell_and_command(&server).await;
+        // Answered at once, with an exit code but no Done state.
+        mount_ok(
+            &server,
+            "<s:Envelope><s:Body><rsp:ReceiveResponse>\
+             <rsp:ExitCode>5</rsp:ExitCode></rsp:ReceiveResponse></s:Body></s:Envelope>",
+            6,
+        )
+        .await;
+        mount_ok(&server, DONE_OK, 1).await;
+        mount_ok(&server, "<s:Envelope><s:Body/></s:Envelope>", u64::MAX).await;
+
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        let shell = client.open_shell("127.0.0.1").await.unwrap();
+        let started = Instant::now();
+        let out = shell.run_command("x", &[]).await.unwrap();
+        let took = started.elapsed();
+        assert_eq!(out.exit_code, 3);
+        // 50 + 100 + 200 + 400 ms after the 3rd to 6th quick polls.
         assert!(
             took >= Duration::from_millis(700) && took < Duration::from_secs(5),
             "{took:?}"

@@ -573,10 +573,9 @@ impl WinrmClient {
         loop {
             let polled_at = tokio::time::Instant::now();
             let output = self.receive_output_raw(host, shell_id, command_id).await?;
-            let progressed = !output.stdout.is_empty()
-                || !output.stderr.is_empty()
-                || output.exit_code.is_some()
-                || output.done;
+            // An exit code without the Done state is not progress: only Done
+            // ends the loop, so a server answering that at once is paced.
+            let progressed = !output.stdout.is_empty() || !output.stderr.is_empty() || output.done;
             received = received
                 .saturating_add(output.stdout.len())
                 .saturating_add(output.stderr.len());
@@ -977,8 +976,9 @@ pub(crate) fn timeout_secs(timeout: Duration) -> u64 {
 /// `OperationTimeout`; the command is still running and the caller should
 /// poll again. An honest server holds the Receive that long before
 /// answering. The crate's own loops still wait (see `PollPacer`) after the
-/// third answer in a row that brought nothing in under 250 ms, so a server
-/// or proxy that answers at once cannot make them spin. They cannot stop a
+/// third answer in a row that brought nothing in under 250 ms (an exit code
+/// without the Done state counts as nothing), so a server or proxy that
+/// answers at once cannot make them spin. They cannot stop a
 /// server that answers at once with a byte at a time: only a caller deadline
 /// or `max_output_bytes` ends that. Every other result passes through
 /// untouched.
@@ -4549,6 +4549,34 @@ mod tests {
         let took = started.elapsed();
         assert_eq!((out.stdout.as_slice(), out.exit_code), (&b"hello"[..], 7));
         // 50 + 100 + 200 + 400 ms after the 3rd to 6th quick empty polls.
+        assert!(
+            took >= Duration::from_millis(700) && took < Duration::from_secs(5),
+            "{took:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_command_paces_an_exit_code_without_done() {
+        use std::time::{Duration, Instant};
+        let server = MockServer::start().await;
+        mount_ok(&server, SHELL_S1, 1).await;
+        mount_ok(&server, COMMAND_C1, 1).await;
+        // Answered at once, with an exit code but no Done state.
+        mount_ok(
+            &server,
+            "<s:Envelope><s:Body><rsp:ReceiveResponse>\
+             <rsp:ExitCode>5</rsp:ExitCode></rsp:ReceiveResponse></s:Body></s:Envelope>",
+            6,
+        )
+        .await;
+        mount_ok(&server, DONE_HELLO, 1).await;
+        mount_ok(&server, EMPTY_BODY, u64::MAX).await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        let started = Instant::now();
+        let out = client.run_command("127.0.0.1", "x", &[]).await.unwrap();
+        let took = started.elapsed();
+        assert_eq!((out.stdout.as_slice(), out.exit_code), (&b"hello"[..], 7));
+        // 50 + 100 + 200 + 400 ms after the 3rd to 6th quick polls.
         assert!(
             took >= Duration::from_millis(700) && took < Duration::from_secs(5),
             "{took:?}"

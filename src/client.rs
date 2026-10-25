@@ -1346,7 +1346,7 @@ mod tests {
         let mut type2 = vec![0u8; 48];
         type2[0..8].copy_from_slice(b"NTLMSSP\0");
         type2[8..12].copy_from_slice(&2u32.to_le_bytes());
-        type2[20..24].copy_from_slice(&0x2008_8201_u32.to_le_bytes()); // UNICODE | NTLM | ESS | 128
+        type2[20..24].copy_from_slice(&0x2008_8201_u32.to_le_bytes()); // UNICODE | NTLM | ALWAYS_SIGN | ESS | 128
         type2[24..32].copy_from_slice(&[0x01; 8]); // server challenge
         // no target info (ti_len=0)
         let type2_b64 = B64.encode(&type2);
@@ -1372,6 +1372,43 @@ mod tests {
         let client = WinrmClient::new(ntlm_config(port), test_creds()).unwrap();
         let shell_id = client.create_shell("127.0.0.1").await.unwrap();
         assert_eq!(shell_id, "NTLM-SHELL");
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn refused_type2_still_logs_its_flags_and_av_ids() {
+        let server = MockServer::start().await;
+        let port = server.address().port();
+
+        // No 128-bit bit: refused. One NbComputerName pair (id 0x0001) then EOL.
+        let target_info = [1u8, 0, 0, 0, 0, 0, 0, 0];
+        let mut type2 = vec![0u8; 48];
+        type2[0..8].copy_from_slice(b"NTLMSSP\0");
+        type2[8..12].copy_from_slice(&2u32.to_le_bytes());
+        type2[20..24].copy_from_slice(&0x0008_8201_u32.to_le_bytes());
+        type2[24..32].copy_from_slice(&[0x01; 8]);
+        type2[40..42].copy_from_slice(&8u16.to_le_bytes());
+        type2[42..44].copy_from_slice(&8u16.to_le_bytes());
+        type2[44..48].copy_from_slice(&48u32.to_le_bytes());
+        type2.extend_from_slice(&target_info);
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401).append_header(
+                "WWW-Authenticate",
+                format!("Negotiate {}", B64.encode(&type2)),
+            ))
+            .mount(&server)
+            .await;
+
+        let client = WinrmClient::new(ntlm_config(port), test_creds()).unwrap();
+        let err = client.create_shell("127.0.0.1").await.unwrap_err();
+        assert!(
+            err.to_string().contains("did not negotiate NEGOTIATE_128"),
+            "{err}"
+        );
+        assert!(logs_contain("NTLM Type 2 received"));
+        assert!(logs_contain("0x00088201"));
+        assert!(logs_contain("0x0001"));
     }
 
     #[tokio::test]

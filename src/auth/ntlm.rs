@@ -199,11 +199,13 @@ impl NtlmAuth {
                 .map_err(|e| WinrmError::AuthFailed(format!("base64 decode: {e}")))?
         };
         let challenge = ntlm::decode_challenge_header(&www_auth).map_err(WinrmError::Ntlm)?;
+        // A Type 2 holds no secret (server challenge, names, timestamp). It is
+        // logged before the check, so a refused challenge is visible too.
+        tracing::trace!(target: "winrm_rs::ntlm::challenge", type2 = %token, "NTLM challenge received");
+        ntlm::log_challenge(&challenge);
         // Sealed (no SOAP body in the Type 3), the exchange must also grant
         // signing, sealing and key exchange.
         ntlm::check_challenge(&challenge, body.is_none()).map_err(WinrmError::Ntlm)?;
-        // A Type 2 holds no secret (server challenge, names, timestamp).
-        tracing::trace!(target: "winrm_rs::ntlm::challenge", type2 = %token, "NTLM challenge received");
 
         // Step 3: Send Type 3 (Authenticate), with the SOAP body or none
         // The domain for NTLMv2Hash must match what the user provided.

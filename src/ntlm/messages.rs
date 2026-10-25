@@ -193,6 +193,25 @@ pub(crate) fn check_challenge(ch: &ChallengeMessage, sealing: bool) -> Result<()
     Ok(())
 }
 
+/// Logs, at debug level, the negotiate flags of a Type 2 and the numeric ids
+/// of the `AV_PAIR`s in its target info.
+///
+/// Called before `check_challenge`, so a refused challenge is logged too.
+/// Only the flag word and the ids are logged: not the pair values (host and
+/// domain names) and not the message bytes.
+pub(crate) fn log_challenge(ch: &ChallengeMessage) {
+    let av_ids = av_pairs(&ch.target_info)
+        .map(|(id, _)| format!("{id:#06x}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    tracing::debug!(
+        target: "winrm_rs::ntlm::challenge",
+        flags = %format_args!("{:#010x}", ch.negotiate_flags),
+        av_ids = %av_ids,
+        "NTLM Type 2 received"
+    );
+}
+
 /// A length as the 16-bit value an NTLM security buffer or AV pair holds.
 ///
 /// `what` names the part of the Type 3 message, so an input that does not fit

@@ -1490,6 +1490,7 @@ async fn authenticate(
         .ok_or_else(|| WinrmError::AuthFailed("CredSSP: no negoToken from server".into()))?;
     let type2 = asn1::decode_spnego_token(&spnego_resp).map_err(WinrmError::CredSsp)?;
     let challenge = ntlm::parse_challenge(&type2).map_err(WinrmError::Ntlm)?;
+    ntlm::log_challenge(&challenge);
     ntlm::check_challenge(&challenge, true).map_err(WinrmError::Ntlm)?;
 
     // === Step 6: Build NTLM Type 3 + pubKeyAuth + clientNonce ===

@@ -6,7 +6,7 @@
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
-use winrm_rs::NtlmSession;
+use winrm_rs::__fuzz::SealingSession;
 
 #[derive(Arbitrary, Debug)]
 struct Input<'a> {
@@ -18,10 +18,12 @@ struct Input<'a> {
 }
 
 fuzz_target!(|input: Input<'_>| {
-    let mut session = NtlmSession::from_auth(&input.exported_session_key);
+    let mut session = SealingSession::from_auth(&input.exported_session_key);
 
     for (i, plaintext) in input.outgoing.iter().enumerate() {
-        let sealed = session.seal(plaintext);
+        let sealed = session
+            .seal(plaintext)
+            .expect("sequence numbers are far from exhausted");
         assert_eq!(sealed.len(), 16 + plaintext.len(), "signature framing");
         assert_eq!(
             u32::from_le_bytes(sealed[0..4].try_into().unwrap()),
@@ -36,13 +38,13 @@ fuzz_target!(|input: Input<'_>| {
     }
 
     // Signing shares the client RC4 stream with sealing; keep driving it.
-    let mut signer = NtlmSession::from_auth(&input.exported_session_key);
+    let mut signer = SealingSession::from_auth(&input.exported_session_key);
     for plaintext in &input.outgoing {
         let _ = signer.sign(plaintext);
     }
 
     // The receive side: arbitrary frames, none of which should ever panic.
-    let mut receiver = NtlmSession::from_auth(&input.exported_session_key);
+    let mut receiver = SealingSession::from_auth(&input.exported_session_key);
     for frame in &input.incoming {
         let _ = receiver.unseal(frame);
     }

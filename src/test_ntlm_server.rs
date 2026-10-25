@@ -27,7 +27,7 @@ use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 use crate::auth::ntlm::{seal_body, unseal_body};
-use crate::ntlm::NtlmSession;
+use crate::ntlm::SealingSession;
 use crate::ntlm::crypto::{Rc4State, compute_nt_hash, compute_ntlmv2_hash, hmac_md5};
 
 /// Credentials the fake server accepts (local account, empty domain).
@@ -85,7 +85,7 @@ pub(crate) enum Event {
 struct State {
     /// Type 3 answers still to send with `Connection: close`.
     close_after_auth: usize,
-    sessions: Vec<NtlmSession>,
+    sessions: Vec<SealingSession>,
     replies: VecDeque<Reply>,
     log: Vec<Event>,
 }
@@ -244,7 +244,7 @@ impl Respond for FakeNtlmServer {
                 }
                 Some([3, 0, 0, 0]) => {
                     let key = exported_session_key(&msg);
-                    state.sessions.push(NtlmSession::server_side(&key));
+                    state.sessions.push(*SealingSession::server_side(&key));
                     state.log.push(Event::Authenticate {
                         body_len: request.body.len(),
                     });
@@ -285,7 +285,8 @@ impl Respond for FakeNtlmServer {
                     body,
                     delay,
                 } => {
-                    let (content_type, sealed) = seal_body(&mut state.sessions[index], &body);
+                    let (content_type, sealed) =
+                        seal_body(&mut state.sessions[index], &body).expect("live server session");
                     ResponseTemplate::new(status)
                         .insert_header("content-type", content_type.as_str())
                         .set_body_bytes(sealed)
@@ -293,7 +294,8 @@ impl Respond for FakeNtlmServer {
                 }
                 Reply::Unauthorized => ResponseTemplate::new(401),
                 Reply::SealedThenClose(body) => {
-                    let (content_type, sealed) = seal_body(&mut state.sessions[index], &body);
+                    let (content_type, sealed) =
+                        seal_body(&mut state.sessions[index], &body).expect("live server session");
                     ResponseTemplate::new(200)
                         .insert_header("content-type", content_type.as_str())
                         .insert_header("connection", "close")

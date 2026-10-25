@@ -518,7 +518,7 @@ fn channel_bindings_with(hash: CbtHash, cert_der: &[u8]) -> [u8; 16] {
 
 /// RC4 (arcfour) cipher state for NTLM message sealing.
 ///
-/// Minimal inline implementation per the RC4 algorithm. Used by [`super::NtlmSession`]
+/// Minimal inline implementation per the RC4 algorithm. Used by [`super::SealingSession`]
 /// for encrypting/decrypting NTLM message signatures and payloads.
 ///
 /// The S-box (256 B) is derived from a sealing key and so is itself secret —

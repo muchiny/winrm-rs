@@ -41,7 +41,7 @@ drives; "invariant" is what it asserts beyond *must not panic*.
 | Target | Source | Invariant |
 |---|---|---|
 | `fuzz_ntlm_crypto` | NTOWFv1/v2, client blob, CBT, RC4, UTF-16 | blob framing is exact; RC4 self-inverse; UTF-16 roundtrips |
-| `fuzz_ntlm_seal` | `NtlmSession::seal`/`unseal` | seal prepends exactly 16 bytes |
+| `fuzz_ntlm_seal` | `SealingSession::seal`/`unseal` | seal prepends exactly 16 bytes |
 | `fuzz_ntlm_session` | multi-message seal/sign/unseal | signature version and sequence numbering across a conversation |
 | `fuzz_ntlm_unseal_body` | `auth/ntlm.rs::unseal_body` (MS-WSMV multipart/encrypted framing) | never panics; errors do not echo the body; a server-sealed frame round-trips exactly; a flipped bit is rejected or leaves the plaintext unchanged; any truncation is rejected |
 | `fuzz_kerberos_sealed` | `auth/sealed.rs::parse` with the Kerberos header rule, `auth/kerberos.rs` `check_acceptor_sealed` / `windows_layout`, `soap/parser.rs::check_relates_to` (no KDC needed) | never panics; errors stay short; a parsed token is a 16..=1024-byte header plus exactly `Length` bytes, and `check_acceptor_sealed` (given that length) accepts only EC = 0 and a header of 32 + RRC bytes; the layout conversion keeps the data, writes RRC = trailer length and is a right rotation by it |

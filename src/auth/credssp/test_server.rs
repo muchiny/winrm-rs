@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 
 use super::{MemBio, OpenSslMemTls};
 use crate::asn1;
-use crate::ntlm::NtlmSession;
+use crate::ntlm::SealingSession;
 use crate::test_ntlm_server::exported_session_key;
 use crate::test_pki::{RSA_CERT_PEM, RSA_KEY_PKCS1_PEM};
 
@@ -395,7 +395,7 @@ fn serve(
     let mut inner = inner_acceptor()?;
     let spk = inner_subject_public_key();
     let mut handshaking = true;
-    let mut session: Option<NtlmSession> = None;
+    let mut session: Option<Box<SealingSession>> = None;
     let mut first = true;
 
     while let Some((head, body)) = read_request(&mut tls)? {
@@ -508,7 +508,11 @@ fn serve(
 
 /// Check the client's Type 3 round and build the server's answer, or `None`
 /// when the server drops the context (bad mechListMIC or pubKeyAuth).
-fn authenticate(fault: Fault, ts: &asn1::TsRequest, spk: &[u8]) -> Option<(NtlmSession, Vec<u8>)> {
+fn authenticate(
+    fault: Fault,
+    ts: &asn1::TsRequest,
+    spk: &[u8],
+) -> Option<(Box<SealingSession>, Vec<u8>)> {
     let nego = ts.nego_token.as_deref()?;
     let type3 = asn1::decode_spnego_token(nego).ok()?;
     let client_mic = asn1::decode_spnego_mech_list_mic(nego).ok()??;
@@ -518,7 +522,7 @@ fn authenticate(fault: Fault, ts: &asn1::TsRequest, spk: &[u8]) -> Option<(NtlmS
     // 1-3: derive the key, verify the client mechListMIC (client seq 0, then
     // reset), unseal the client pubKeyAuth (client seq 1) and compare it.
     let key = exported_session_key(&type3);
-    let mut s = NtlmSession::server_side(&key);
+    let mut s = SealingSession::server_side(&key);
     s.verify_mech_list_mic(asn1::MECH_TYPE_LIST_NTLM, &client_mic)
         .ok()?;
     let client_hash = s.unseal(client_pub_key_auth).ok()?;
@@ -528,7 +532,11 @@ fn authenticate(fault: Fault, ts: &asn1::TsRequest, spk: &[u8]) -> Option<(NtlmS
 
     // 4: the server mechListMIC (server seq 0, then reset), unless skipped.
     let skip_mic = matches!(fault, Fault::NoMechListMic | Fault::NoFinalNegoToken);
-    let mut mic = (!skip_mic).then(|| s.sign_mech_list_mic(asn1::MECH_TYPE_LIST_NTLM));
+    let mut mic = if skip_mic {
+        None
+    } else {
+        Some(s.sign_mech_list_mic(asn1::MECH_TYPE_LIST_NTLM).ok()?)
+    };
     if let (Fault::TamperedMechListMic, Some(mic)) = (fault, mic.as_mut()) {
         mic[4] ^= 0x01;
     }
@@ -538,7 +546,7 @@ fn authenticate(fault: Fault, ts: &asn1::TsRequest, spk: &[u8]) -> Option<(NtlmS
         Fault::WrongServerHash => CLIENT_MAGIC,
         _ => SERVER_MAGIC,
     };
-    let sealed = s.seal(&binding_hash(magic, nonce, spk));
+    let sealed = s.seal(&binding_hash(magic, nonce, spk)).ok()?;
 
     // 6: the answer.
     let neg_state = match fault {

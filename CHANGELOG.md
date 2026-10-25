@@ -159,6 +159,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   servers, which negotiate all of these; a server or proxy that answers with
   fewer flags must be configured to negotiate them (NTLMv2 session security
   with 128-bit keys; signing, sealing and key exchange for sealed traffic).
+- `NtlmSession` is deprecated; it is the internal NTLM sealing primitive and
+  will leave the public API in 2.0. It now enforces its call order and fails
+  closed after an error. Migration: none for `WinrmClient` users, whose NTLM
+  traffic the client seals itself (see `EncryptionMode`); code that drives
+  `NtlmSession` directly should stop doing so before 2.0.
+- `NtlmSession` enforces its contract: `sign_mech_list_mic` resets the client
+  RC4 keystream only when it is the first client operation (called later, it
+  signs without rewinding the keystream); after a failed `unseal` or
+  `verify_mech_list_mic`, or after `zeroize`, every later `unseal` and
+  `verify_mech_list_mic` returns `Err`; sequence numbers no longer wrap: the
+  message that carries `u32::MAX` goes out and the call after it fails.
+  `zeroize` wipes the keys and re-keys both RC4 handles from random bytes, so
+  a zeroized session never emits plaintext. Migration: call
+  `sign_mech_list_mic` first and once, and build a new session after an
+  error.
+- On a session that is unusable (after an error, after `zeroize`, or with an
+  exhausted sequence number) `NtlmSession::seal` returns an empty `Vec` and
+  `sign` / `sign_mech_list_mic` return `[0; 16]`, since their signatures
+  cannot carry an error. Migration: treat an empty `seal` output as a failure
+  and never send it as a body.
 
 ### Added
 

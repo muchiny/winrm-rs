@@ -30,7 +30,7 @@ use crate::auth::kerberos::KerberosSession;
 use crate::auth::ntlm::{self as ntlm_auth, NtlmAuth};
 use crate::config::{AuthMethod, EncryptionMode, ProxySessionAuth, WinrmConfig, WinrmCredentials};
 use crate::error::{SoapError, WinrmError};
-use crate::ntlm::NtlmSession;
+use crate::ntlm::SealingSession;
 use crate::request::{OutgoingRequest, RequestKind};
 use crate::soap;
 use crate::tls::{CertHandle, ClientAuthCert, TlsOptions};
@@ -340,7 +340,7 @@ fn dedicated_slot(slot: Option<SlotGuard>) -> Result<SlotGuard, WinrmError> {
 
 /// The security context that seals a connection's messages.
 enum Sealer {
-    Ntlm(Box<NtlmSession>),
+    Ntlm(Box<SealingSession>),
     #[cfg(feature = "kerberos")]
     Kerberos(KerberosSession),
 }
@@ -373,7 +373,7 @@ impl Sealer {
     /// Seal `body`: the HTTP `Content-Type` and the framed body.
     fn seal(&mut self, body: &str) -> Result<(String, Vec<u8>), WinrmError> {
         match self {
-            Self::Ntlm(session) => Ok(ntlm_auth::seal_body(session, body)),
+            Self::Ntlm(session) => ntlm_auth::seal_body(session, body),
             #[cfg(feature = "kerberos")]
             Self::Kerberos(session) => session.seal_body(body),
         }
@@ -1615,7 +1615,7 @@ impl HttpTransport {
                     .authenticate(http, cert, url)
                     .await?;
                 Ok((
-                    Sealer::Ntlm(NtlmSession::boxed_from_auth(&session_key)),
+                    Sealer::Ntlm(SealingSession::boxed_from_auth(&session_key)),
                     closing,
                 ))
             }

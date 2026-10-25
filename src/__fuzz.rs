@@ -184,15 +184,70 @@ pub fn rc4_process(key: &[u8], data: &mut [u8]) {
 /// Unseal a multipart/encrypted WinRM response with the client session of
 /// `key` (`auth/ntlm.rs::unseal_body`).
 pub fn unseal_body(key: &[u8; 16], data: &[u8]) -> Result<String, WinrmError> {
-    let mut session = crate::ntlm::NtlmSession::from_auth(key);
+    let mut session = crate::ntlm::SealingSession::boxed_from_auth(key);
     crate::auth::ntlm::unseal_body(&mut session, data)
 }
 
 /// A response sealed by the server side of the session of `key`, framed as
 /// Windows frames it (`auth/ntlm.rs::seal_body` with server keys).
+///
+/// A fresh session cannot fail to seal; were it to, the empty frame would
+/// fail every unseal of it.
 pub fn seal_body_as_server(key: &[u8; 16], plaintext: &str) -> Vec<u8> {
-    let mut server = crate::ntlm::NtlmSession::server_side(key);
-    crate::auth::ntlm::seal_body(&mut server, plaintext).1
+    let mut server = crate::ntlm::SealingSession::server_side(key);
+    crate::auth::ntlm::seal_body(&mut server, plaintext)
+        .map(|(_, body)| body)
+        .unwrap_or_default()
+}
+
+/// The crate's NTLM sealing session (`ntlm::SealingSession`), client side.
+pub struct SealingSession {
+    inner: Box<crate::ntlm::SealingSession>,
+}
+
+impl SealingSession {
+    /// The client session of the exported session key `key`.
+    pub fn from_auth(key: &[u8; 16]) -> Self {
+        Self {
+            inner: crate::ntlm::SealingSession::boxed_from_auth(key),
+        }
+    }
+
+    /// The server side of the same session.
+    pub fn server_side(key: &[u8; 16]) -> Self {
+        Self {
+            inner: crate::ntlm::SealingSession::server_side(key),
+        }
+    }
+
+    /// Seal `plaintext`: `signature (16 bytes) || ciphertext`.
+    pub fn seal(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, NtlmError> {
+        self.inner.seal(plaintext)
+    }
+
+    /// Sign `data`: a 16-byte signature.
+    pub fn sign(&mut self, data: &[u8]) -> Result<[u8; 16], NtlmError> {
+        self.inner.sign(data)
+    }
+
+    /// Sign the SPNEGO `mechListMIC` (resets the keystream only when first).
+    pub fn sign_mech_list_mic(&mut self, mech_type_list: &[u8]) -> Result<[u8; 16], NtlmError> {
+        self.inner.sign_mech_list_mic(mech_type_list)
+    }
+
+    /// Verify the peer's SPNEGO `mechListMIC`.
+    pub fn verify_mech_list_mic(
+        &mut self,
+        mech_type_list: &[u8],
+        mic: &[u8],
+    ) -> Result<(), NtlmError> {
+        self.inner.verify_mech_list_mic(mech_type_list, mic)
+    }
+
+    /// Unseal (decrypt + verify) a message from the peer.
+    pub fn unseal(&mut self, sealed: &[u8]) -> Result<Vec<u8>, NtlmError> {
+        self.inner.unseal(sealed)
+    }
 }
 
 // ---------------------------------------------------------------------------

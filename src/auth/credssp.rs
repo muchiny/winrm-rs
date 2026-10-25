@@ -48,7 +48,7 @@
 // The last blocker was the SPNEGO mechListMIC RC4 reset: Windows re-keys the
 // NTLM sealing handle right after the MIC is computed/verified (sequence
 // number kept), so pubKeyAuth must be sealed at keystream offset 0 with
-// seq 1. See `NtlmSession::sign_mech_list_mic` / `verify_mech_list_mic`.
+// seq 1. See `SealingSession::sign_mech_list_mic` / `verify_mech_list_mic`.
 // How the server reports each failure, measured on Server 2025:
 //   - wrong password        → TSRequest errorCode STATUS_LOGON_FAILURE
 //   - bad mechListMIC       → TSRequest errorCode 0x8009030C
@@ -78,7 +78,7 @@ use crate::error::WinrmError;
 #[cfg(feature = "credssp")]
 use crate::ntlm;
 #[cfg(feature = "credssp")]
-use crate::ntlm::NtlmSession;
+use crate::ntlm::SealingSession;
 #[cfg(feature = "credssp")]
 use crate::transport::proxy::CredSspDial;
 
@@ -1514,7 +1514,7 @@ async fn authenticate(
             &type2,
         )
         .map_err(WinrmError::Ntlm)?;
-        (type3, NtlmSession::boxed_from_auth(&session_key))
+        (type3, SealingSession::boxed_from_auth(&session_key))
     };
     // Compute mechListMIC over the SPNEGO mech_type_list. This MUST happen
     // before sealing pubKeyAuth so that the latter uses seq=1 (matches
@@ -1522,7 +1522,9 @@ async fn authenticate(
     // returns STATUS_LOGON_FAILURE. `sign_mech_list_mic` also resets the
     // RC4 sealing handle afterwards, as Windows SPNEGO does — the
     // pubKeyAuth below must be sealed at keystream offset 0.
-    let mech_list_mic = ntlm_session.sign_mech_list_mic(asn1::MECH_TYPE_LIST_NTLM);
+    let mech_list_mic = ntlm_session
+        .sign_mech_list_mic(asn1::MECH_TYPE_LIST_NTLM)
+        .map_err(WinrmError::Ntlm)?;
 
     // Compute pubKeyAuth (v6): SHA256(magic + nonce + SubjectPublicKey).
     //
@@ -1543,7 +1545,7 @@ async fn authenticate(
         hasher.update(&subject_public_key);
         hasher.finalize().to_vec()
     };
-    let encrypted_pub_key_auth = ntlm_session.seal(&client_hash);
+    let encrypted_pub_key_auth = ntlm_session.seal(&client_hash).map_err(WinrmError::Ntlm)?;
 
     let spnego_authenticate = asn1::encode_spnego_response(&type3, Some(&mech_list_mic));
     let ts_req3 = asn1::encode_ts_request(
@@ -1677,7 +1679,7 @@ async fn authenticate(
     // (`operation_timeout_secs`). No `.await` inside this block.
     let encrypted_creds = {
         let ts_creds = asn1::encode_ts_credentials(&domain, &auth.username, &auth.password);
-        ntlm_session.seal(&ts_creds)
+        ntlm_session.seal(&ts_creds).map_err(WinrmError::Ntlm)?
     };
     let ts_req5 =
         asn1::encode_ts_request(CREDSSP_VERSION, None, None, Some(&encrypted_creds), None);

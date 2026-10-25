@@ -141,7 +141,7 @@ Over plain HTTP the client logs a WARN with target `winrm_rs::ntlm_over_http` at
 let client = WinrmClient::new(
     WinrmConfig {
         auth_method: AuthMethod::Kerberos,
-        ..WinrmConfig::default()
+        ..WinrmConfig::http()
     },
     WinrmCredentials::new("user", "", ""),
 )?;

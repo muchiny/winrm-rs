@@ -442,6 +442,8 @@ impl std::fmt::Debug for WinrmConfig {
             idle_timeout_secs,
             max_output_bytes,
         } = self;
+        // `expose_secret` feeds `redact_userinfo` only, which never copies
+        // the userinfo.
         let proxy = proxy
             .as_ref()
             .map(|p| crate::transport::redact_userinfo(p.expose_secret()));

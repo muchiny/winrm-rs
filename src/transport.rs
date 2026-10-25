@@ -922,8 +922,8 @@ impl HttpTransport {
     /// settings. Returns [`WinrmError::Http`] if the HTTP client cannot be
     /// constructed, and [`WinrmError::AuthFailed`] if the authentication
     /// method cannot be set up: Certificate or CredSSP without HTTPS, CredSSP
-    /// with `accept_invalid_certs`, Certificate auth without a usable
-    /// certificate and key, a crypto
+    /// or Basic over HTTPS with `accept_invalid_certs`, Certificate auth
+    /// without a usable certificate and key, a crypto
     /// provider, TLS verifier or client certificate that rustls rejects, an
     /// invalid [`WinrmConfig::proxy`], or, with the `credssp` feature, the
     /// CredSSP TLS contexts, and a [`WinrmConfig::proxy`] CredSSP cannot

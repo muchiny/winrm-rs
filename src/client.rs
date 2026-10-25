@@ -38,7 +38,7 @@ use crate::transport::{HttpTransport, TransportOptions};
 /// Every method that takes a `host` expects a bare host name, IPv4 address
 /// or bracketed IPv6 literal: `win01`, `win01.corp.local`, `10.0.0.5`,
 /// `[fe80::1]`. The scheme comes from [`WinrmConfig::use_tls`] and the port
-/// from [`WinrmConfig::port`]. A host with a scheme, user info, a path, a
+/// from [`WinrmConfig::effective_port`]. A host with a scheme, user info, a path, a
 /// port, or a character that would end the URL authority is refused with
 /// [`WinrmError::AuthFailed`] before anything is sent.
 ///
@@ -77,14 +77,14 @@ impl WinrmClient {
     ///
     /// [`WinrmError::Http`] if the HTTP client cannot be constructed.
     /// [`WinrmError::AuthFailed`] for a configuration refused before anything
-    /// is sent: Basic over plain HTTP without `EncryptionMode::Never`, Basic
-    /// over HTTPS with `accept_invalid_certs`, `EncryptionMode::Always` with a method that does not seal, Certificate
-    /// or CredSSP without `use_tls`, CredSSP with `accept_invalid_certs` or
-    /// with a proxy it cannot tunnel through, an invalid
-    /// [`WinrmConfig::proxy`], an unusable certificate and key, or a TLS
-    /// setup that rustls rejects. The full list is under
-    /// [`WinrmClientBuilder::build`], which also covers the options that only
-    /// the builder sets.
+    /// is sent: Basic over plain HTTP without `EncryptionMode::Never`; Basic
+    /// over HTTPS with `accept_invalid_certs`; `EncryptionMode::Always` with
+    /// a method that does not seal; Certificate or CredSSP without
+    /// `use_tls`; CredSSP with `accept_invalid_certs` or with a proxy it
+    /// cannot tunnel through; an invalid [`WinrmConfig::proxy`]; an unusable
+    /// certificate and key; or a TLS setup that rustls rejects. The full
+    /// list is under [`WinrmClientBuilder::build`], which also covers the
+    /// options that only the builder sets.
     ///
     /// TLS uses the process-wide rustls provider when the application
     /// installed one, else a private `ring` provider; it never installs one.

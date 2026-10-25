@@ -123,6 +123,26 @@ cargo +nightly fuzz run <target> fuzz/artifacts/<target>/crash-<hash>
   overflow checks are the more useful detector. The corpus is cached per target
   and minimised after each run; crashes upload as artifacts.
 
+## Long inputs
+
+The nightly `long-inputs` job (`fuzz.yml`) fuzzes the three Receive-path
+parsers (`fuzz_soap_parse`, `fuzz_soap_enumerate`, `fuzz_clixml_stderr`) with
+inputs up to 2 MiB (the default `max_response_bytes`) and a 10 s per-input
+timeout, so a superlinear parse shows up as a timeout. Turn every input it
+reports into a time-bounded unit test next to
+`extract_element_text_is_linear_on_unclosed_tags`, then fix the parser.
+
+To reproduce locally, one target at a time:
+
+```bash
+FUZZ_MAX_LEN=2097152 FUZZ_TIMEOUT=10 FUZZ_LEN_CONTROL=0 \
+  scripts/fuzz.sh run fuzz_soap_parse 120
+```
+
+`FUZZ_TIMEOUT` (libFuzzer per-input timeout, seconds) and `FUZZ_LEN_CONTROL`
+(`0` tries inputs up to `FUZZ_MAX_LEN` at once) are optional; when unset,
+`scripts/fuzz.sh` passes neither flag.
+
 ## Adding a target
 
 1. Write `fuzz_targets/fuzz_<name>.rs`. Assert an invariant, not just absence

@@ -143,3 +143,85 @@ jobs:
           path: fuzz/corpus/${{ matrix.target }}/
           retention-days: 7
           if-no-files-found: ignore
+
+  # `campaign` caps inputs at 8 KiB, where a quadratic parser still finishes in
+  # milliseconds. This job lifts the cap to the default `max_response_bytes`
+  # and sets a per-input timeout, so a superlinear parse shows up as a timeout.
+  long-inputs:
+    name: long ${{ matrix.target }} (address)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - fuzz_soap_parse
+          - fuzz_soap_enumerate
+          - fuzz_clixml_stderr
+    env:
+      FUZZ_MAX_LEN: "2097152"
+      FUZZ_TIMEOUT: "10"
+      FUZZ_LEN_CONTROL: "0"
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-24
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: fuzz
+          # The cargo-fuzz install below must run every time: a cached
+          # ~/.cargo/bin would satisfy it and the version pin would prove nothing.
+          cache-bin: "false"
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz@0.13.1 --locked
+
+      - name: Install OpenSSL headers (credssp feature)
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+
+      # Its own corpus: inputs grown under a 2 MiB cap must not leak into the
+      # 8 KiB campaign corpus. There is no minimise step, because a trimmed
+      # corpus would lose the long inputs this job exists to keep.
+      - name: Restore corpus
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-long-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-long-${{ matrix.target }}-
+
+      - name: Fuzz
+        env:
+          FUZZ_SANITIZER: address
+          FUZZ_TARGET: ${{ matrix.target }}
+          FUZZ_SECONDS: ${{ inputs.seconds || 900 }}
+        run: |
+          # `type: number` is only checked by the UI; an API dispatch still
+          # sends a string. Match the regex before any arithmetic comparison.
+          [[ "$FUZZ_SECONDS" =~ ^[1-9][0-9]{0,3}$ ]] && [ "$FUZZ_SECONDS" -le 3300 ] || {
+            echo "::error::seconds must be 1-3300 (job timeout is 60 min)"
+            exit 2
+          }
+          scripts/fuzz.sh run "$FUZZ_TARGET" "$FUZZ_SECONDS"
+
+      - name: Upload slow-input and crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: slow-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
+
+      - name: Upload corpus
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: corpus-long-${{ matrix.target }}
+          path: fuzz/corpus/${{ matrix.target }}/
+          retention-days: 7
+          if-no-files-found: ignore

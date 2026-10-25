@@ -245,6 +245,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `AuthMethod::Ntlm`; without it, the detected name is sent as before.
 - `WinrmClient::run_wql_with_timeout` and `WinrmClient::run_wql_with_cancel`
   bound or stop a WQL enumeration.
+- **`RemotePathPolicy` and `WinrmClientBuilder::remote_path_policy`.** With `RemotePathPolicy::LocalDrive`, the transfer methods accept only drive-absolute remote paths and refuse UNC, WebDAV and device paths before anything is sent. The default, `Any`, keeps today's behaviour.
 
 ### Fixed
 

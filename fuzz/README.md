@@ -61,7 +61,7 @@ drives; "invariant" is what it asserts beyond *must not panic*.
 | Target | Source | Invariant |
 |---|---|---|
 | `fuzz_transport_host` | `transport::sanitize_host`, `transport::validate_host` | no `/` or `@` survives; the rebuilt URL has one authority; an accepted host has no `?`, `#`, `\`, whitespace or control character, and its endpoint URL (when the URL parser takes it) reads back with that host, the port, `/wsman`, and no userinfo, query or fragment |
-| `fuzz_transfer_path` | `validate_remote_path`, `escape_ps_single_quoted` | accepted paths are bounded and control-free; every PowerShell single quote (U+0027, U+2018, U+2019, U+201A, U+201B) is doubled with itself and collapses back to the input |
+| `fuzz_transfer_path` | `validate_remote_path`, `validate_remote_path_for`, `escape_ps_single_quoted` | accepted paths are bounded and control-free; LocalDrive accepts only drive-absolute paths; every PowerShell single quote (U+0027, U+2018, U+2019, U+201A, U+201B) is doubled with itself and collapses back to the input |
 | `fuzz_powershell_encode` | `command::encode_powershell_command` | output is ASCII base64 and roundtrips |
 
 ### CredSSP ASN.1 / DER — pre-authentication attack surface

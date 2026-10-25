@@ -6,7 +6,8 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use winrm_rs::__fuzz::{escape_ps_single_quoted, validate_remote_path};
+use winrm_rs::__fuzz::{escape_ps_single_quoted, validate_remote_path, validate_remote_path_for};
+use winrm_rs::RemotePathPolicy;
 
 /// The five characters PowerShell accepts as a single quote, stated here
 /// independently of the implementation.
@@ -55,6 +56,25 @@ fuzz_target!(|data: &[u8]| {
             "control character accepted in a remote path"
         );
     }
+
+    // `LocalDrive` keeps the base checks and accepts only drive-absolute
+    // paths: a letter, `:`, then `\` or `/`.
+    if validate_remote_path_for(path, RemotePathPolicy::LocalDrive).is_ok() {
+        assert!(
+            accepted,
+            "LocalDrive accepted a path the base check refuses"
+        );
+        assert!(
+            matches!(path.as_bytes(), [d, b':', b'\\' | b'/', ..] if d.is_ascii_alphabetic()),
+            "LocalDrive accepted a path that is not drive-absolute"
+        );
+    }
+    // `Any` is the base check.
+    assert_eq!(
+        validate_remote_path_for(path, RemotePathPolicy::Any).is_ok(),
+        accepted,
+        "RemotePathPolicy::Any differs from the base check"
+    );
 
     // Quoting: every quote character is doubled with itself, so no run can end
     // the `'...'` literal early, and collapsing the pairs gives the path back.

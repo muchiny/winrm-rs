@@ -45,6 +45,7 @@ const MAX_REMOTE_PATH_LEN: usize = 260;
 ///
 /// This is not a safety check: UNC, WebDAV and device paths pass (see the
 /// `# Security` section of [`WinrmClient::upload_file`]).
+/// [`validate_remote_path_for`] adds the client's [`RemotePathPolicy`].
 pub(crate) fn validate_remote_path(path: &str) -> Result<(), WinrmError> {
     if path.len() > MAX_REMOTE_PATH_LEN {
         return Err(WinrmError::Transfer(format!(
@@ -57,6 +58,55 @@ pub(crate) fn validate_remote_path(path: &str) -> Result<(), WinrmError> {
         ));
     }
     Ok(())
+}
+
+/// Which `remote_path` forms the transfer methods accept.
+///
+/// [`Any`](Self::Any), the default in 1.x, accepts every path Windows can
+/// open, including UNC and WebDAV shares and device paths: CredSSP
+/// double-hop users need it to reach `\\fileserver\share`.
+/// [`LocalDrive`](Self::LocalDrive) accepts only drive-absolute paths
+/// (`C:\…` or `C:/…`) and refuses, before anything is sent: every path that
+/// starts with two separators (`\\host\share`, `//host/share`,
+/// `\\?\UNC\…`, `\\.\pipe\…`, and also `\\?\C:\…`), `\??\…`, drive-relative
+/// (`C:x`), root-relative (`\x`) and relative paths.
+///
+/// This is a lexical check. A symbolic link, junction, `subst` drive or
+/// mapped network drive on the host can still lead a drive-absolute path to
+/// a share.
+///
+/// Set it with
+/// [`WinrmClientBuilder::remote_path_policy`](crate::WinrmClientBuilder::remote_path_policy).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RemotePathPolicy {
+    /// Accept every remote path the base checks admit (length, no control
+    /// characters): the behaviour of every release before this type.
+    #[default]
+    Any,
+    /// Accept only drive-absolute remote paths: a letter, `:`, then `\` or
+    /// `/`.
+    LocalDrive,
+}
+
+/// [`validate_remote_path`], then the restriction `policy` adds.
+pub(crate) fn validate_remote_path_for(
+    path: &str,
+    policy: RemotePathPolicy,
+) -> Result<(), WinrmError> {
+    validate_remote_path(path)?;
+    match policy {
+        RemotePathPolicy::Any => Ok(()),
+        RemotePathPolicy::LocalDrive => {
+            if matches!(path.as_bytes(), [d, b':', b'\\' | b'/', ..] if d.is_ascii_alphabetic()) {
+                Ok(())
+            } else {
+                Err(WinrmError::Transfer(format!(
+                    "remote path {path:?} is not a drive-absolute path (RemotePathPolicy::LocalDrive)"
+                )))
+            }
+        }
+    }
 }
 
 /// The five characters PowerShell accepts as a single quote.
@@ -136,6 +186,8 @@ impl WinrmClient {
     ///   credentials unless it is configured for constrained delegation, and
     ///   then only to the targets that delegation allows. It is not a sandbox:
     ///   never pass an untrusted `remote_path`.
+    ///   With [`RemotePathPolicy::LocalDrive`](crate::RemotePathPolicy::LocalDrive)
+    ///   such paths are refused before anything is sent.
     /// - Each chunk of the file, up to 2000 bytes, travels as base64 inside the
     ///   `powershell.exe -EncodedCommand` command line. A host that audits
     ///   process command lines (Security event 4688, Sysmon event 1) or logs
@@ -150,7 +202,7 @@ impl WinrmClient {
         local_path: &Path,
         remote_path: &str,
     ) -> Result<u64, WinrmError> {
-        validate_remote_path(remote_path)?;
+        validate_remote_path_for(remote_path, self.remote_path_policy)?;
 
         let data = read_local(local_path).await?;
 
@@ -252,6 +304,8 @@ impl WinrmClient {
     ///   credentials unless it is configured for constrained delegation, and
     ///   then only to the targets that delegation allows. It is not a sandbox:
     ///   never pass an untrusted `remote_path`.
+    ///   With [`RemotePathPolicy::LocalDrive`](crate::RemotePathPolicy::LocalDrive)
+    ///   such paths are refused before anything is sent.
     /// - The file comes back as base64 on the command's stdout. PowerShell
     ///   transcription on the host, if enabled, records it.
     /// - `local_path` is written with this process's privileges. A symbolic
@@ -268,7 +322,7 @@ impl WinrmClient {
         remote_path: &str,
         local_path: &Path,
     ) -> Result<u64, WinrmError> {
-        validate_remote_path(remote_path)?;
+        validate_remote_path_for(remote_path, self.remote_path_policy)?;
         let encoded = encode_powershell_command(&download_script(remote_path));
         let output = self
             .run_command(host, POWERSHELL_EXE, &transfer_args(&encoded))
@@ -327,6 +381,8 @@ impl WinrmClient {
     ///   credentials unless it is configured for constrained delegation, and
     ///   then only to the targets that delegation allows. It is not a sandbox:
     ///   never pass an untrusted `remote_path`.
+    ///   With [`RemotePathPolicy::LocalDrive`](crate::RemotePathPolicy::LocalDrive)
+    ///   such paths are refused before anything is sent.
     /// - The file comes back as base64 on the command's stdout. PowerShell
     ///   transcription on the host, if enabled, records it.
     /// - `local_path` is written with this process's privileges. A symbolic
@@ -367,7 +423,7 @@ impl WinrmClient {
         local_path: &Path,
         timeout: std::time::Duration,
     ) -> Result<u64, WinrmError> {
-        validate_remote_path(remote_path)?;
+        validate_remote_path_for(remote_path, self.remote_path_policy)?;
         let encoded = encode_powershell_command(&download_script(remote_path));
         let output = self
             .run_command_with_timeout(host, POWERSHELL_EXE, &transfer_args(&encoded), timeout)
@@ -967,6 +1023,99 @@ mod tests {
         assert!(validate_remote_path(&exact).is_ok());
         let over = "a".repeat(261);
         assert!(validate_remote_path(&over).is_err());
+    }
+
+    #[test]
+    fn local_drive_policy_refuses_unc_and_device_paths() {
+        for p in [
+            r"\\h\s\f",
+            "//h/s/f",
+            r"\/h\s",
+            r"/\h\s",
+            r"\\?\UNC\h\s\f",
+            r"\??\UNC\h\s\f",
+            r"\\.\pipe\x",
+            r"\\h@80\x",
+            r"\\?\C:\x",
+            "C:x",
+            r"x\y",
+            r"\x",
+            "",
+            r"1:\x",
+            "C:",
+        ] {
+            assert!(
+                matches!(
+                    validate_remote_path_for(p, RemotePathPolicy::LocalDrive),
+                    Err(WinrmError::Transfer(_))
+                ),
+                "{p:?} accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn local_drive_policy_accepts_drive_absolute_paths() {
+        for p in [r"C:\a\b", "c:/a/b", r"Z:\"] {
+            assert!(
+                validate_remote_path_for(p, RemotePathPolicy::LocalDrive).is_ok(),
+                "{p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_drive_policy_keeps_the_base_checks() {
+        assert!(validate_remote_path_for("C:\\bad\x00", RemotePathPolicy::LocalDrive).is_err());
+        assert!(
+            validate_remote_path_for(
+                &format!("C:\\{}", "a".repeat(260)),
+                RemotePathPolicy::LocalDrive
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn local_drive_policy_names_itself_in_the_error() {
+        match validate_remote_path_for(r"\\h\s\f", RemotePathPolicy::LocalDrive) {
+            Err(WinrmError::Transfer(m)) => {
+                assert!(m.contains("RemotePathPolicy::LocalDrive"), "{m}");
+                assert!(m.contains(r#""\\\\h\\s\\f""#), "{m}");
+            }
+            other => panic!("expected Transfer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_policy_still_accepts_unc_paths() {
+        assert_eq!(RemotePathPolicy::default(), RemotePathPolicy::Any);
+        assert!(validate_remote_path_for(r"\\h\s\f", RemotePathPolicy::Any).is_ok());
+    }
+
+    /// `Any` is exactly the check every transfer ran before the policy
+    /// existed: same verdict as `validate_remote_path` on every form.
+    #[test]
+    fn any_policy_matches_the_base_check() {
+        let long = format!("C:\\{}", "a".repeat(260));
+        for p in [
+            r"\\h\s\f",
+            "//h/s/f",
+            r"\\?\UNC\h\s\f",
+            r"\\.\pipe\x",
+            "C:x",
+            r"x\y",
+            "",
+            r"C:\a\b",
+            "C:\\bad\x00",
+            long.as_str(),
+        ] {
+            assert_eq!(
+                validate_remote_path_for(p, RemotePathPolicy::Any).is_ok(),
+                validate_remote_path(p).is_ok(),
+                "{p:?}"
+            );
+        }
     }
 
     #[test]

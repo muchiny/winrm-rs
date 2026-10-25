@@ -8,6 +8,7 @@ use std::panic::AssertUnwindSafe;
 use crate::client::WinrmClient;
 use crate::config::{ProxySessionAuth, TlsProvider, WinrmConfig, WinrmCredentials};
 use crate::error::WinrmError;
+use crate::transfer::RemotePathPolicy;
 use crate::transport::TransportOptions;
 
 /// Typestate marker: credentials have not yet been provided.
@@ -36,6 +37,8 @@ pub struct WinrmClientBuilder<S = NeedsCredentials> {
     before_send: Option<AssertUnwindSafe<crate::transport::BeforeSend>>,
     /// Transport settings: TLS and proxy (plain data).
     options: TransportOptions,
+    /// Which `remote_path` forms the transfer methods accept.
+    remote_path_policy: RemotePathPolicy,
     _state: std::marker::PhantomData<S>,
 }
 
@@ -180,6 +183,7 @@ impl WinrmClientBuilder<NeedsCredentials> {
             credentials: None,
             before_send: None,
             options: TransportOptions::default(),
+            remote_path_policy: RemotePathPolicy::default(),
             _state: std::marker::PhantomData,
         }
     }
@@ -191,6 +195,7 @@ impl WinrmClientBuilder<NeedsCredentials> {
             credentials: Some(creds),
             before_send: self.before_send,
             options: self.options,
+            remote_path_policy: self.remote_path_policy,
             _state: std::marker::PhantomData,
         }
     }
@@ -476,6 +481,15 @@ impl WinrmClientBuilder<Ready> {
         self
     }
 
+    /// Restrict the `remote_path` of every transfer method; see
+    /// [`RemotePathPolicy`](crate::RemotePathPolicy). Use
+    /// [`RemotePathPolicy::LocalDrive`](crate::RemotePathPolicy::LocalDrive)
+    /// when remote paths come from anyone but you.
+    pub fn remote_path_policy(mut self, policy: RemotePathPolicy) -> Self {
+        self.remote_path_policy = policy;
+        self
+    }
+
     /// Build the [`WinrmClient`].
     ///
     /// Returns [`WinrmError::Http`] if the underlying HTTP client cannot be
@@ -492,6 +506,7 @@ impl WinrmClientBuilder<Ready> {
         if let Some(hook) = self.before_send {
             client.transport.set_before_send(hook.0);
         }
+        client.remote_path_policy = self.remote_path_policy;
         Ok(client)
     }
 }
@@ -507,6 +522,37 @@ mod tests {
         fn assert_unwind_safe<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
         assert_unwind_safe::<WinrmClientBuilder<NeedsCredentials>>();
         assert_unwind_safe::<WinrmClientBuilder<Ready>>();
+    }
+
+    /// The policy field must not cost the builder or the client an auto
+    /// trait either.
+    #[test]
+    fn builder_keeps_its_auto_traits() {
+        builder_stays_unwind_safe();
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<WinrmClientBuilder<NeedsCredentials>>();
+        assert_send_sync::<WinrmClientBuilder<Ready>>();
+        assert_send_sync::<WinrmClient>();
+    }
+
+    /// `remote_path_policy` reaches the client; without the call, and
+    /// through `WinrmClient::new`, the client has the default policy.
+    #[test]
+    fn builder_sets_the_remote_path_policy() {
+        let creds = || WinrmCredentials::new("u", "p", "");
+        let client = WinrmClient::builder(WinrmConfig::default())
+            .credentials(creds())
+            .remote_path_policy(RemotePathPolicy::LocalDrive)
+            .build()
+            .unwrap();
+        assert_eq!(client.remote_path_policy, RemotePathPolicy::LocalDrive);
+        let default = WinrmClient::builder(WinrmConfig::default())
+            .credentials(creds())
+            .build()
+            .unwrap();
+        assert_eq!(default.remote_path_policy, RemotePathPolicy::default());
+        let plain = WinrmClient::new(WinrmConfig::default(), creds()).unwrap();
+        assert_eq!(plain.remote_path_policy, RemotePathPolicy::default());
     }
 
     /// The provider choice survives the typestate transition, made before or

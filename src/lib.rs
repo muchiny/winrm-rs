@@ -151,6 +151,7 @@ pub use soap::namespaces::RESOURCE_URI_PSRP;
 pub use tokio_util::sync::CancellationToken;
 // Re-export soap types that are part of the public API
 pub use soap::{ReceiveOutput, StderrDecoder};
+pub use transfer::RemotePathPolicy;
 
 // Internal surface for the in-tree fuzz targets and property tests. NOT
 // part of the public API: anything in `__fuzz` may be removed or changed

@@ -324,6 +324,22 @@ reach. Uploads put the file content on the remote `powershell.exe` command
 line, which command-line auditing (event 4688) and script block logging
 (event 4104) record.
 
+To accept only drive-absolute remote paths (`C:\...`), and refuse UNC,
+WebDAV and device paths before anything is sent, build the client with
+`RemotePathPolicy::LocalDrive`:
+
+```rust
+use winrm_rs::{RemotePathPolicy, WinrmClient};
+
+let client = WinrmClient::builder(config)
+    .credentials(credentials)
+    .remote_path_policy(RemotePathPolicy::LocalDrive)
+    .build()?;
+```
+
+Use it when remote paths come from anyone but you. The check is lexical: a
+link, junction or mapped drive on the host can still lead to a share.
+
 ## Configuration
 
 `WinrmConfig` fields:

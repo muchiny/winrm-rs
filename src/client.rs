@@ -54,6 +54,8 @@ use crate::transport::{HttpTransport, TransportOptions};
 /// hosts from linking requests at this level, use one client per host.
 pub struct WinrmClient {
     pub(crate) transport: HttpTransport,
+    /// Which `remote_path` forms the transfer methods accept.
+    pub(crate) remote_path_policy: crate::transfer::RemotePathPolicy,
 }
 
 impl WinrmClient {
@@ -80,6 +82,7 @@ impl WinrmClient {
     ) -> Result<Self, WinrmError> {
         Ok(Self {
             transport: HttpTransport::new_with(config, credentials, opts)?,
+            remote_path_policy: crate::transfer::RemotePathPolicy::default(),
         })
     }
 
@@ -3644,6 +3647,91 @@ mod tests {
             err.contains("transfer error") || err.contains("failed to read"),
             "error should mention transfer: {err}"
         );
+    }
+
+    /// A client built with `RemotePathPolicy::LocalDrive`.
+    fn local_drive_client(port: u16) -> WinrmClient {
+        WinrmClient::builder(basic_config(port))
+            .credentials(test_creds())
+            .remote_path_policy(crate::RemotePathPolicy::LocalDrive)
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn upload_file_with_local_drive_policy_sends_nothing_for_a_unc_path() {
+        let server = MockServer::start().await;
+        let dir = unique_temp_path("winrm-rs-test-policy-upload");
+        std::fs::create_dir_all(&dir).unwrap();
+        let local_file = dir.join("upload.txt");
+        std::fs::write(&local_file, b"content").unwrap();
+
+        let client = local_drive_client(server.address().port());
+        let result = client
+            .upload_file("127.0.0.1", &local_file, r"\\other\share\f")
+            .await;
+
+        assert!(
+            matches!(result, Err(WinrmError::Transfer(_))),
+            "got {result:?}"
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Every transfer entry point checks the policy first: the error is the
+    /// policy's, not a local read error, and nothing reaches the server.
+    #[tokio::test]
+    async fn every_transfer_entry_point_applies_the_remote_path_policy() {
+        use std::time::Duration;
+        let server = MockServer::start().await;
+        let client = local_drive_client(server.address().port());
+        let local = std::path::Path::new("/nonexistent/winrm-rs");
+        let remote = "//h/s/f";
+
+        let results = [
+            (
+                "upload_file",
+                client.upload_file("127.0.0.1", local, remote).await,
+            ),
+            (
+                "download_file",
+                client.download_file("127.0.0.1", remote, local).await,
+            ),
+            (
+                "download_file_with_timeout",
+                client
+                    .download_file_with_timeout("127.0.0.1", remote, local, Duration::from_secs(5))
+                    .await,
+            ),
+        ];
+        for (name, result) in results {
+            match result {
+                Err(WinrmError::Transfer(m)) => {
+                    assert!(m.contains("RemotePathPolicy::LocalDrive"), "{name}: {m}");
+                }
+                other => panic!("{name}: expected Transfer, got {other:?}"),
+            }
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    /// Without the builder call, a UNC remote path goes to the host as
+    /// before.
+    #[tokio::test]
+    async fn default_policy_sends_a_unc_path_to_the_host() {
+        let server = MockServer::start().await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        let local = unique_temp_path("winrm-rs-test-policy-default");
+        let result = client
+            .download_file("127.0.0.1", r"\\other\share\f", &local)
+            .await;
+        if let Err(WinrmError::Transfer(m)) = &result {
+            assert!(!m.contains("RemotePathPolicy"), "{m}");
+        }
+        assert!(result.is_err(), "the mock server answers nothing useful");
+        assert!(!server.received_requests().await.unwrap().is_empty());
+        assert!(!local.exists());
     }
 
     // --- Phase 7: Mutant-killing tests ---

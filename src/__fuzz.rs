@@ -620,6 +620,14 @@ pub fn validate_remote_path(path: &str) -> Result<(), WinrmError> {
     crate::transfer::validate_remote_path(path)
 }
 
+/// `validate_remote_path`, then the restriction `policy` adds.
+pub fn validate_remote_path_for(
+    path: &str,
+    policy: crate::RemotePathPolicy,
+) -> Result<(), WinrmError> {
+    crate::transfer::validate_remote_path_for(path, policy)
+}
+
 /// Escape a value for a PowerShell single-quoted string literal.
 pub fn escape_ps_single_quoted(s: &str) -> String {
     crate::transfer::escape_ps_single_quoted(s)

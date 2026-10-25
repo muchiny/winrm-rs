@@ -119,6 +119,7 @@ mod command;
 mod config;
 mod error;
 mod ntlm;
+mod request;
 mod shell;
 mod soap;
 #[cfg(test)]
@@ -137,6 +138,7 @@ pub use config::{
 };
 pub use error::{CredSspError, NtlmError, SoapError, WinrmError};
 pub use ntlm::NtlmSession;
+pub use request::{OutgoingRequest, RequestKind};
 pub use secrecy::{ExposeSecret, SecretString};
 pub use shell::Shell;
 pub use soap::namespaces::RESOURCE_URI_PSRP;

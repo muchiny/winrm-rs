@@ -31,6 +31,7 @@ use crate::auth::ntlm::{self as ntlm_auth, NtlmAuth};
 use crate::config::{AuthMethod, EncryptionMode, ProxySessionAuth, WinrmConfig, WinrmCredentials};
 use crate::error::{SoapError, WinrmError};
 use crate::ntlm::NtlmSession;
+use crate::request::{OutgoingRequest, RequestKind};
 use crate::soap;
 use crate::tls::{CertHandle, ClientAuthCert, TlsOptions};
 use rustls::client::danger::ServerCertVerifier;
@@ -443,7 +444,12 @@ enum SealedFailure {
 }
 
 /// Gate checked before each request attempt: `true` sends, `false` refuses.
-pub(crate) type BeforeSend = Arc<dyn Fn() -> bool + Send + Sync>;
+pub(crate) type BeforeSend = Arc<dyn Fn(&OutgoingRequest<'_>) -> bool + Send + Sync>;
+
+/// A [`BeforeSend`] gate from a hook that does not look at the request.
+pub(crate) fn legacy_hook(hook: impl Fn() -> bool + Send + Sync + 'static) -> BeforeSend {
+    Arc::new(move |_: &OutgoingRequest<'_>| hook())
+}
 
 /// HTTP transport for WinRM SOAP requests.
 ///
@@ -1950,6 +1956,8 @@ impl HttpTransport {
             return Err(e);
         }
         let route = self.route();
+        let action = crate::soap::envelope::request_action(&body).unwrap_or("");
+        let kind = RequestKind::from_action(action);
         let max = self.config.max_retries;
         for attempt in 0..=max {
             // Take the slot first, so that an approval does not go stale
@@ -1960,10 +1968,11 @@ impl HttpTransport {
             } else {
                 None
             };
+            // `host` passed `validate_host`: it is the bare host the URL uses.
             if let Some(hook) = &self.before_send
-                && !hook()
+                && !hook(&OutgoingRequest::new(host, action, kind, attempt))
             {
-                debug!("request refused by the before_send hook");
+                debug!(?kind, attempt, "request refused by the before_send hook");
                 return Err(WinrmError::Cancelled);
             }
             match self.send_soap(host, body.clone(), slot).await {
@@ -3603,7 +3612,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let c = Arc::clone(&calls);
         (
-            Arc::new(move || c.fetch_add(1, Ordering::SeqCst) < allow),
+            legacy_hook(move || c.fetch_add(1, Ordering::SeqCst) < allow),
             calls,
         )
     }
@@ -3688,7 +3697,7 @@ mod tests {
         let server = MockServer::start().await;
         mount_ok_expecting(&server, 0).await;
         let mut transport = basic_transport(server.address().port());
-        transport.set_before_send(Arc::new(|| false));
+        transport.set_before_send(legacy_hook(|| false));
         let result = transport
             .send_soap_with_retry("127.0.0.1", "<a/>".into())
             .await;
@@ -3758,7 +3767,7 @@ mod tests {
         let server = MockServer::start().await;
         mount_ok_expecting(&server, 0).await;
         let mut transport = basic_transport(server.address().port());
-        transport.set_before_send(Arc::new(|| -> bool { panic!("hook") }));
+        transport.set_before_send(legacy_hook(|| -> bool { panic!("hook") }));
         let join_handle = tokio::spawn(async move {
             transport
                 .send_soap_with_retry("127.0.0.1", "<a/>".into())
@@ -3766,6 +3775,77 @@ mod tests {
         });
         assert!(join_handle.await.unwrap_err().is_panic());
         assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn before_send_with_sees_host_action_kind_and_attempt() {
+        use crate::request::{OutgoingRequest, RequestKind};
+        use crate::soap::namespaces::ACTION_RECEIVE;
+        crate::test_pki::install_test_provider();
+        let (_socket, port) = refused_port();
+        let mut transport = basic_transport_retrying(port, 1);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let s = Arc::clone(&seen);
+        transport.set_before_send(Arc::new(move |req: &OutgoingRequest<'_>| {
+            let row = (
+                req.host().to_string(),
+                req.action().to_string(),
+                req.kind(),
+                req.attempt(),
+            );
+            s.lock().unwrap().push(row);
+            true
+        }));
+        let envelope = crate::soap::envelope::receive_output_request(
+            &transport.endpoint("127.0.0.1"),
+            "S",
+            "C",
+            60,
+            153_600,
+        );
+        let result = transport.send_soap_with_retry("127.0.0.1", envelope).await;
+        assert!(
+            matches!(&result, Err(WinrmError::Http(e)) if e.is_connect()),
+            "{result:?}"
+        );
+        let receive = |attempt| {
+            (
+                "127.0.0.1".to_string(),
+                ACTION_RECEIVE.to_string(),
+                RequestKind::Receive,
+                attempt,
+            )
+        };
+        assert_eq!(*seen.lock().unwrap(), [receive(0), receive(1)]);
+    }
+
+    /// A decorated host string never reaches the hook: `validate_host`
+    /// refuses it first, so `host()` only ever holds a bare host.
+    #[tokio::test]
+    async fn before_send_with_is_not_called_for_a_decorated_host() {
+        use crate::request::OutgoingRequest;
+        crate::test_pki::install_test_provider();
+        let (_socket, port) = refused_port();
+        let mut transport = basic_transport_retrying(port, 0);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let s = Arc::clone(&seen);
+        transport.set_before_send(Arc::new(move |req: &OutgoingRequest<'_>| {
+            s.lock().unwrap().push(req.host().to_string());
+            true
+        }));
+        let err = transport
+            .send_soap_with_retry("admin:pw@127.0.0.1:5985/x", "<a/>".into())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, WinrmError::AuthFailed(m) if m.contains("invalid host")),
+            "{err:?}"
+        );
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "the hook was called: {:?}",
+            seen.lock().unwrap()
+        );
     }
 
     /// A refusal happens before anything is sealed, so the cached NTLM session
@@ -3776,7 +3856,7 @@ mod tests {
         let (_server, fake, mut transport, host) = sealed_setup().await;
         let refuse = Arc::new(AtomicBool::new(false));
         let r = Arc::clone(&refuse);
-        transport.set_before_send(Arc::new(move || !r.load(Ordering::SeqCst)));
+        transport.set_before_send(legacy_hook(move || !r.load(Ordering::SeqCst)));
 
         assert!(
             transport
@@ -5493,7 +5573,7 @@ mod tests {
         let (_server, fake, mut transport, host) = sealed_setup().await;
         let refuse = Arc::new(AtomicBool::new(false));
         let r = Arc::clone(&refuse);
-        transport.set_before_send(Arc::new(move || !r.load(Ordering::SeqCst)));
+        transport.set_before_send(legacy_hook(move || !r.load(Ordering::SeqCst)));
         let held = transport
             .host_slots(&host)
             .0
@@ -5548,7 +5628,7 @@ mod tests {
         let data = transport.host_slots(&host).0;
         let seen = Arc::new(AtomicUsize::new(usize::MAX));
         let s = Arc::clone(&seen);
-        transport.set_before_send(Arc::new(move || -> bool {
+        transport.set_before_send(legacy_hook(move || -> bool {
             s.store(data.available_permits(), Ordering::SeqCst);
             panic!("hook")
         }));

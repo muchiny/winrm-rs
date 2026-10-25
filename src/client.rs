@@ -1663,6 +1663,60 @@ mod tests {
         assert!(server.received_requests().await.unwrap().is_empty());
     }
 
+    /// One client, two hosts: the hook refuses one and serves the other. The
+    /// refused host is never contacted, not even resolved.
+    #[tokio::test]
+    async fn a_per_host_hook_refuses_one_host_only() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>S1</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = WinrmClient::builder(basic_config(server.address().port()))
+            .credentials(test_creds())
+            .before_send_with(|req| !req.host().eq_ignore_ascii_case("blocked.invalid"))
+            .build()
+            .unwrap();
+        let refused = client.create_shell("BLOCKED.invalid").await;
+        assert!(matches!(refused, Err(WinrmError::Cancelled)), "{refused:?}");
+        assert_eq!(client.create_shell("127.0.0.1").await.unwrap(), "S1");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// `before_send` and `before_send_with` set one gate: the last call wins.
+    #[tokio::test]
+    async fn the_last_gate_installed_wins() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>S1</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
+            ))
+            .mount(&server)
+            .await;
+        let port = server.address().port();
+        let open = WinrmClient::builder(basic_config(port))
+            .credentials(test_creds())
+            .before_send(|| false)
+            .before_send_with(|_| true)
+            .build()
+            .unwrap();
+        assert!(open.create_shell("127.0.0.1").await.is_ok());
+        let shut = WinrmClient::builder(basic_config(port))
+            .credentials(test_creds())
+            .before_send_with(|_| true)
+            .before_send(|| false)
+            .build()
+            .unwrap();
+        assert!(matches!(
+            shut.create_shell("127.0.0.1").await,
+            Err(WinrmError::Cancelled)
+        ));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
     /// The budget runs out after Create and Execute: the first Receive is
     /// refused and `run_command` reports it at once, neither polling nor
     /// waiting on the (also refused) clean-up.

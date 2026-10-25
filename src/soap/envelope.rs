@@ -54,6 +54,22 @@ pub(crate) fn with_session_id(envelope: &str, session_id: &str) -> String {
     envelope.replacen("</s:Header>", &element, 1)
 }
 
+/// Opening tag of the header's `wsa:Action`. Only [`build_header_for`]
+/// writes it, after values that are all escaped, so [`request_action`] can
+/// read the action back from a built envelope.
+const ACTION_TAG_OPEN: &str = r#"<wsa:Action s:mustUnderstand="true">"#;
+
+/// The `wsa:Action` URI of an envelope built by this module: the text
+/// between the first [`ACTION_TAG_OPEN`] and the next `</wsa:Action>`.
+/// `None` when either is missing.
+pub(crate) fn request_action(envelope: &str) -> Option<&str> {
+    envelope
+        .split_once(ACTION_TAG_OPEN)?
+        .1
+        .split_once("</wsa:Action>")
+        .map(|(action, _)| action)
+}
+
 /// Build the common SOAP envelope header.
 ///
 /// Most WS-Management operations share the same header structure.
@@ -107,7 +123,7 @@ fn build_header_for(
     <wsa:ReplyTo>
       <wsa:Address s:mustUnderstand="true">{REPLY_TO_ANONYMOUS}</wsa:Address>
     </wsa:ReplyTo>
-    <wsa:Action s:mustUnderstand="true">{action}</wsa:Action>
+    {ACTION_TAG_OPEN}{action}</wsa:Action>
     <wsman:MaxEnvelopeSize s:mustUnderstand="true">{max_envelope_size}</wsman:MaxEnvelopeSize>
     <wsa:MessageID>uuid:{message_id}</wsa:MessageID>
     <wsman:Locale xml:lang="en-US" s:mustUnderstand="false"/>
@@ -865,6 +881,7 @@ pub(crate) fn pull_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::request::RequestKind;
 
     #[test]
     fn enumerate_wql_request_default_namespace() {
@@ -1605,5 +1622,179 @@ mod tests {
         let del =
             delete_shell_request_for("http://h:5985/wsman", "S", RESOURCE_URI_CMD, 60, 153_600);
         assert!(del.contains("xmlns:wsmv="), "{del}");
+    }
+
+    /// One row per request builder: its name, an envelope it built, and the
+    /// kind the gate must see.
+    fn kind_table() -> Vec<(&'static str, String, RequestKind)> {
+        use RequestKind as K;
+        let (ep, ps, cmd) = ("http://h:5985/wsman", RESOURCE_URI_PSRP, RESOURCE_URI_CMD);
+        let cfg = crate::config::WinrmConfig::default();
+        let (t, m) = (60, 153_600);
+        vec![
+            (
+                "create_shell_request",
+                create_shell_request(ep, &cfg),
+                K::Create,
+            ),
+            (
+                "create_psrp_shell_request",
+                create_psrp_shell_request(ep, &cfg, "AAAA", ps, "S"),
+                K::Create,
+            ),
+            (
+                "execute_command_with_id_request",
+                execute_command_with_id_request(ep, "S", "c", &[], "C", t, m, ps),
+                K::Command,
+            ),
+            (
+                "execute_command_request",
+                execute_command_request(ep, "S", "c", &[], t, m),
+                K::Command,
+            ),
+            (
+                "execute_command_request_with_uri",
+                execute_command_request_with_uri(ep, "S", "c", &[], t, m, ps),
+                K::Command,
+            ),
+            (
+                "receive_psrp_request",
+                receive_psrp_request(ep, "S", Some("C"), t, m, ps),
+                K::Receive,
+            ),
+            (
+                "receive_output_request",
+                receive_output_request(ep, "S", "C", t, m),
+                K::Receive,
+            ),
+            (
+                "receive_output_request_with_uri",
+                receive_output_request_with_uri(ep, "S", "C", t, m, ps),
+                K::Receive,
+            ),
+            (
+                "send_input_request",
+                send_input_request(ep, "S", "C", b"x", false, t, m),
+                K::SendInput,
+            ),
+            (
+                "send_input_request_with_uri",
+                send_input_request_with_uri(ep, "S", "C", b"x", true, t, m, ps),
+                K::SendInput,
+            ),
+            (
+                "send_psrp_request",
+                send_psrp_request(ep, "S", b"x", t, m, ps),
+                K::SendInput,
+            ),
+            (
+                "signal_terminate_request",
+                signal_terminate_request(ep, "S", "C", t, m),
+                K::Signal,
+            ),
+            (
+                "signal_ctrl_c_request",
+                signal_ctrl_c_request(ep, "S", "C", t, m),
+                K::Signal,
+            ),
+            (
+                "signal_psrp_ctrl_c_request",
+                signal_psrp_ctrl_c_request(ep, "S", "C", ps, t, m),
+                K::Signal,
+            ),
+            (
+                "delete_shell_request_for",
+                delete_shell_request_for(ep, "S", cmd, t, m),
+                K::Delete,
+            ),
+            (
+                "disconnect_shell_request",
+                disconnect_shell_request(ep, "S", t, m),
+                K::Disconnect,
+            ),
+            (
+                "disconnect_shell_request_with_uri",
+                disconnect_shell_request_with_uri(ep, "S", t, m, ps),
+                K::Disconnect,
+            ),
+            (
+                "reconnect_shell_request",
+                reconnect_shell_request(ep, "S", t, m),
+                K::Reconnect,
+            ),
+            (
+                "reconnect_shell_request_with_uri",
+                reconnect_shell_request_with_uri(ep, "S", t, m, ps),
+                K::Reconnect,
+            ),
+            (
+                "enumerate_wql_request",
+                enumerate_wql_request(ep, "SELECT * FROM Win32_Service", None, t, m),
+                K::Enumerate,
+            ),
+            ("pull_request", pull_request(ep, "ctx", t, m), K::Pull),
+        ]
+    }
+
+    #[test]
+    fn every_request_builder_has_a_known_kind() {
+        for (name, envelope, kind) in kind_table() {
+            let action =
+                request_action(&envelope).unwrap_or_else(|| panic!("{name}: no wsa:Action"));
+            assert_eq!(RequestKind::from_action(action), kind, "{name}: {action}");
+        }
+    }
+
+    /// A new builder must get a row above, or a deny-list hook would see `Other`.
+    #[test]
+    fn every_request_builder_is_in_the_kind_table() {
+        let not_builders = ["xml_escape", "with_session_id", "request_action"];
+        let mut in_source: Vec<&str> = include_str!("envelope.rs")
+            .lines()
+            .filter_map(|l| l.strip_prefix("pub(crate) fn "))
+            .filter_map(|l| l.split_once('(').map(|(name, _)| name))
+            .filter(|name| !not_builders.contains(name))
+            .collect();
+        let mut in_table: Vec<&str> = kind_table().iter().map(|(name, _, _)| *name).collect();
+        in_source.sort_unstable();
+        in_table.sort_unstable();
+        assert_eq!(
+            in_source, in_table,
+            "a new request builder needs a row in kind_table"
+        );
+    }
+
+    #[test]
+    fn request_action_reads_the_header_action() {
+        let env = create_shell_request(
+            "http://h:5985/wsman",
+            &crate::config::WinrmConfig::default(),
+        );
+        assert_eq!(request_action(&env), Some(ACTION_CREATE));
+        assert_eq!(
+            request_action(&with_session_id(&env, "uuid:X")),
+            Some(ACTION_CREATE)
+        );
+        assert_eq!(request_action("<a/>"), None);
+        assert_eq!(
+            request_action(r#"<wsa:Action s:mustUnderstand="true">x"#),
+            None
+        );
+    }
+
+    /// A caller-influenced value before the header's action (here the WMI
+    /// namespace, spliced into the ResourceURI) cannot fake an action: it is escaped.
+    #[test]
+    fn request_action_ignores_an_action_tag_in_an_escaped_value() {
+        let ns =
+            r#"x"><wsa:Action s:mustUnderstand="true">http://other.invalid/</wsa:Action><y a=""#;
+        let env = enumerate_wql_request(
+            "http://h:5985/wsman",
+            "SELECT * FROM X",
+            Some(ns),
+            60,
+            153_600,
+        );
+        assert_eq!(request_action(&env), Some(ACTION_ENUMERATE));
     }
 }

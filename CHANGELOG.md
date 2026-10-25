@@ -174,6 +174,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `EncryptionMode::Never` there and logs a WARN for sealed requests. Kerberos
   reads the header from one unauthenticated request per endpoint. The
   default, `Allow`, checks nothing and keeps today's behaviour.
+- **`WinrmClientBuilder::before_send_with`**, with `OutgoingRequest` and
+  `RequestKind`: a `before_send` hook that sees each request's host (as the
+  URL uses it), WS-Management action, kind and attempt number, for per-host
+  quotas and kill switches. `before_send` is unchanged; the last of the two
+  calls wins.
 
 ### Fixed
 

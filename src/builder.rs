@@ -278,7 +278,8 @@ impl WinrmClientBuilder<Ready> {
     ///
     /// The hook is per client: it sees the requests to every host this client
     /// talks to, and cannot tell them apart. For a per-host quota or kill
-    /// switch, use one client per host.
+    /// switch, use [`Self::before_send_with`], which sees the host, or one
+    /// client per host.
     ///
     /// The hook is called from async code, possibly from several tasks at once:
     /// keep it short and never block in it (no blocking lock, no I/O). A panic
@@ -317,6 +318,66 @@ impl WinrmClientBuilder<Ready> {
     /// # assert_eq!(full.load(Ordering::Relaxed), u32::MAX, "the counter must not wrap");
     /// ```
     pub fn before_send(mut self, hook: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        self.before_send = Some(AssertUnwindSafe(crate::transport::legacy_hook(hook)));
+        self
+    }
+
+    /// Install a hook that sees each request before it is sent: the host it
+    /// goes to, its WS-Management action and kind, and its attempt number.
+    /// Return `true` to send, `false` to refuse. Everything
+    /// [`before_send`](Self::before_send) says holds here too: what the hook
+    /// counts, when it runs, and that a refusal also blocks the stop and
+    /// clean-up requests.
+    ///
+    /// One gate per client: `before_send` and `before_send_with` install the
+    /// same hook, and the last call wins.
+    ///
+    /// [`OutgoingRequest::host`] is the real destination; its documentation
+    /// says how to compare it. A per-host refusal does not free connection
+    /// capacity at once: with NTLM or Kerberos, except over plain HTTP with
+    /// `EncryptionMode::Never`, a request to a refused host still waits for one
+    /// of that host's 32 connection slots (128 per client) before the hook
+    /// refuses it, and that host's long polls may be holding them.
+    ///
+    /// Every request this crate builds has a known [`RequestKind`];
+    /// [`RequestKind::Other`] is only for an action this version does not know.
+    /// Prefer an allow-list of kinds to a deny-list.
+    ///
+    /// # Example: a budget per host
+    ///
+    /// ```
+    /// use std::collections::HashMap;
+    /// use std::sync::atomic::{AtomicU32, Ordering};
+    /// use winrm_rs::{WinrmClient, WinrmConfig, WinrmCredentials};
+    ///
+    /// // 100 SOAP requests for each of these hosts, nothing for any other.
+    /// let budgets: HashMap<String, AtomicU32> = ["win01.corp.example", "win02.corp.example"]
+    ///     .into_iter()
+    ///     .map(|host| (host.to_string(), AtomicU32::new(0)))
+    ///     .collect();
+    /// let client = WinrmClient::builder(WinrmConfig::default())
+    ///     .credentials(WinrmCredentials::new("admin", "pass", ""))
+    ///     .before_send_with(move |req| {
+    ///         let host = req.host().trim_end_matches('.').to_ascii_lowercase();
+    ///         budgets.get(&host).is_some_and(|sent| {
+    ///             sent.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+    ///                 n.checked_add(1).filter(|&next| next <= 100)
+    ///             })
+    ///             .is_ok()
+    ///         })
+    ///     })
+    ///     .build()
+    ///     .unwrap();
+    /// # drop(client);
+    /// ```
+    ///
+    /// [`OutgoingRequest::host`]: crate::OutgoingRequest::host
+    /// [`RequestKind`]: crate::RequestKind
+    /// [`RequestKind::Other`]: crate::RequestKind::Other
+    pub fn before_send_with(
+        mut self,
+        hook: impl Fn(&crate::OutgoingRequest<'_>) -> bool + Send + Sync + 'static,
+    ) -> Self {
         self.before_send = Some(AssertUnwindSafe(std::sync::Arc::new(hook)));
         self
     }

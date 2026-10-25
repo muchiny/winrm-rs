@@ -783,6 +783,17 @@ impl WinrmClient {
     /// outside its `Items`, or no `EnumerationContext`. Text inside the items,
     /// or a property element of that name, never ends the enumeration.
     ///
+    /// # No overall time limit
+    ///
+    /// The call returns when the server ends the enumeration, however long
+    /// that takes. `operation_timeout_secs` bounds each request, not the
+    /// enumeration, and the server decides how many pages it sends;
+    /// `max_output_bytes` caps the items collected. To bound the call, use
+    /// [`run_wql_with_timeout`](Self::run_wql_with_timeout), or stop it from
+    /// elsewhere with [`run_wql_with_cancel`](Self::run_wql_with_cancel).
+    /// Neither releases the enumeration on the server, which drops it when it
+    /// expires.
+    ///
     /// # Example
     /// ```rust,no_run
     /// # use winrm_rs::{WinrmClient, WinrmConfig, WinrmCredentials};
@@ -857,6 +868,125 @@ impl WinrmClient {
         }
 
         Ok(items)
+    }
+
+    /// Run a WQL query with a total time limit.
+    ///
+    /// Like [`run_wql`](Self::run_wql), but the whole call (the Enumerate
+    /// request and every Pull) must finish within `timeout`. When it does not,
+    /// the call stops and returns [`WinrmError::Timeout`] carrying `timeout`
+    /// rounded **up** to whole seconds, at least 1: `1500 ms` and `2 s` both
+    /// give `Timeout(2)`, and `Duration::ZERO` gives `Timeout(1)` without
+    /// sending anything. A `timeout` too large to add to the current time
+    /// never expires.
+    ///
+    /// No release request is sent on expiry: the server drops the enumeration
+    /// when its context expires.
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// # use std::time::Duration;
+    /// # use winrm_rs::{WinrmClient, WinrmConfig, WinrmCredentials, WinrmError};
+    /// # async fn example() -> Result<(), WinrmError> {
+    /// # let client = WinrmClient::new(WinrmConfig::default(), WinrmCredentials::new("u","p",""))?;
+    /// match client
+    ///     .run_wql_with_timeout(
+    ///         "server",
+    ///         "SELECT Name,State FROM Win32_Service",
+    ///         None,
+    ///         Duration::from_secs(30),
+    ///     )
+    ///     .await
+    /// {
+    ///     Ok(xml) => println!("{xml}"),
+    ///     Err(WinrmError::Timeout(secs)) => eprintln!("gave up after {secs}s"),
+    ///     Err(e) => return Err(e),
+    /// }
+    /// # Ok(()) }
+    /// ```
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, host, query),
+        fields(host = %crate::transport::log_host(host), query_len = query.len())
+    )]
+    pub async fn run_wql_with_timeout(
+        &self,
+        host: &str,
+        query: &str,
+        namespace: Option<&str>,
+        timeout: Duration,
+    ) -> Result<String, WinrmError> {
+        self.run_wql_until(host, query, namespace, deadline_stop(timeout))
+            .await
+    }
+
+    /// Run a WQL query that can be cancelled.
+    ///
+    /// Like [`run_wql`](Self::run_wql), but can be stopped via a
+    /// [`CancellationToken`](tokio_util::sync::CancellationToken). On
+    /// cancellation the call stops and returns [`WinrmError::Cancelled`]. A
+    /// token that is already cancelled returns at once without sending
+    /// anything.
+    ///
+    /// No release request is sent on cancellation: the server drops the
+    /// enumeration when its context expires.
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// # use winrm_rs::{WinrmClient, WinrmConfig, WinrmCredentials, WinrmError};
+    /// # async fn example() -> Result<(), WinrmError> {
+    /// # let client = WinrmClient::new(WinrmConfig::default(), WinrmCredentials::new("u","p",""))?;
+    /// let token = tokio_util::sync::CancellationToken::new();
+    /// // Cancel `token` from elsewhere to stop the enumeration.
+    /// let xml = client
+    ///     .run_wql_with_cancel("server", "SELECT Name FROM Win32_Process", None, token)
+    ///     .await?;
+    /// println!("{xml}");
+    /// # Ok(()) }
+    /// ```
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, host, query, cancel),
+        fields(host = %crate::transport::log_host(host), query_len = query.len())
+    )]
+    pub async fn run_wql_with_cancel(
+        &self,
+        host: &str,
+        query: &str,
+        namespace: Option<&str>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<String, WinrmError> {
+        // Honour a pre-cancelled token deterministically: nothing is sent.
+        if cancel.is_cancelled() {
+            return Err(WinrmError::Cancelled);
+        }
+        self.run_wql_until(host, query, namespace, cancelled(cancel))
+            .await
+    }
+
+    /// [`run_wql`](Self::run_wql) that ends early with `stop`'s error.
+    ///
+    /// A stop that is already due returns its error before anything is sent;
+    /// otherwise the enumeration is abandoned (its future dropped) when `stop`
+    /// resolves.
+    async fn run_wql_until(
+        &self,
+        host: &str,
+        query: &str,
+        namespace: Option<&str>,
+        stop: impl Future<Output = WinrmError>,
+    ) -> Result<String, WinrmError> {
+        let mut stop = pin!(stop);
+        if let Poll::Ready(reason) =
+            std::future::poll_fn(|cx| Poll::Ready(stop.as_mut().poll(cx))).await
+        {
+            return Err(reason);
+        }
+        tokio::select! {
+            biased;
+            result = self.run_wql(host, query, namespace) => result,
+            reason = &mut stop => Err(reason),
+        }
     }
 
     /// Open a reusable shell session on the given host.
@@ -4796,6 +4926,131 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+    }
+
+    /// Enumerate and every Pull answer with an empty page that keeps the
+    /// enumeration open; the Pulls take 100 ms.
+    async fn mount_endless_empty_enumeration(server: &MockServer) {
+        let empty_page = "<s:Envelope><s:Body><n:PullResponse><n:EnumerationContext>ctx-1</n:EnumerationContext>\
+                          <n:Items></n:Items></n:PullResponse></s:Body></s:Envelope>";
+        Mock::given(method("POST"))
+            .and(body_string_contains("enumeration/Enumerate"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(empty_page))
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("enumeration/Pull"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(empty_page)
+                    .set_delay(std::time::Duration::from_millis(100)),
+            )
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn run_wql_with_timeout_expires_on_endless_empty_pages() {
+        use std::time::{Duration, Instant};
+        let server = MockServer::start().await;
+        mount_endless_empty_enumeration(&server).await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+
+        let started = Instant::now();
+        let err = client
+            .run_wql_with_timeout("127.0.0.1", "SELECT * FROM X", None, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, WinrmError::Timeout(1)), "got {err:?}");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(900) && elapsed < Duration::from_secs(3),
+            "{elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_wql_with_timeout_zero_sends_nothing() {
+        use std::time::Duration;
+        let server = MockServer::start().await;
+        mount_endless_empty_enumeration(&server).await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+
+        let err = client
+            .run_wql_with_timeout("127.0.0.1", "SELECT * FROM X", None, Duration::ZERO)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, WinrmError::Timeout(1)), "got {err:?}");
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_wql_with_timeout_returns_items_in_time() {
+        use std::time::Duration;
+        let server = MockServer::start().await;
+        let enumerate_response = r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+          xmlns:wsen="http://schemas.xmlsoap.org/ws/2004/09/enumeration">
+          <s:Body>
+            <wsen:EnumerateResponse>
+              <wsen:Items><p:Win32_OS><p:Name>Windows</p:Name></p:Win32_OS></wsen:Items>
+              <wsen:EndOfSequence/>
+            </wsen:EnumerateResponse>
+          </s:Body>
+        </s:Envelope>"#;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(enumerate_response))
+            .mount(&server)
+            .await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+
+        let items = client
+            .run_wql_with_timeout(
+                "127.0.0.1",
+                "SELECT * FROM Win32_OS",
+                None,
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+
+        assert!(items.contains("Windows"), "got: {items}");
+    }
+
+    #[tokio::test]
+    async fn run_wql_with_cancel_stops_the_pull_loop() {
+        use std::time::Duration;
+        let server = MockServer::start().await;
+        mount_endless_empty_enumeration(&server).await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        let token = tokio_util::sync::CancellationToken::new();
+        let canceller = cancel_after(&token, Duration::from_millis(300));
+
+        let err = client
+            .run_wql_with_cancel("127.0.0.1", "SELECT * FROM X", None, token)
+            .await
+            .unwrap_err();
+        canceller.await.unwrap();
+
+        assert!(matches!(err, WinrmError::Cancelled), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn run_wql_with_cancel_pre_cancelled_sends_nothing() {
+        let server = MockServer::start().await;
+        mount_endless_empty_enumeration(&server).await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+
+        let err = client
+            .run_wql_with_cancel("127.0.0.1", "SELECT * FROM X", None, token)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, WinrmError::Cancelled), "got {err:?}");
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[test]

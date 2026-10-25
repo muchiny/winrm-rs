@@ -221,6 +221,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   The name is reduced as the detected one is (first label, ASCII letters,
   digits, `-` and `_`, upper-cased, 15 characters at most). It applies to
   `AuthMethod::Ntlm`; without it, the detected name is sent as before.
+- `WinrmClient::run_wql_with_timeout` and `WinrmClient::run_wql_with_cancel`
+  bound or stop a WQL enumeration.
 
 ### Fixed
 

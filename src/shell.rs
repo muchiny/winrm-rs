@@ -494,10 +494,11 @@ impl<'a> Shell<'a> {
     /// error, warning, verbose or debug record comes out on the poll that
     /// delivers its last byte, even though `powershell.exe` only closes its
     /// `<Objs>` document when it exits. Only a record split across Receive
-    /// responses is held back until its end arrives (and a `#< CLIXML` line
-    /// that raw stderr follows, until its document does), so a poll may
-    /// return an empty `stderr` while bytes are buffered; anything left comes
-    /// out on the `done` poll. Note that `powershell.exe` buffers its own stderr:
+    /// responses is held back until its end arrives, and a `#< CLIXML` line
+    /// that raw stderr follows is held until an `<Objs` document takes it or
+    /// until the `done` poll (the text after it comes out at once), so a poll
+    /// may return an empty `stderr` while bytes are buffered; anything left
+    /// comes out on the `done` poll. Note that `powershell.exe` buffers its own stderr:
     /// measured on Server 2025, it sends stderr in blocks of a few KiB and
     /// the rest at exit, so a few small errors still reach the client only
     /// when the command ends. Decoders of commands never polled to `done` are

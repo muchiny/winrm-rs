@@ -459,7 +459,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   was empty. The client now falls back to the built-in Mozilla roots.
 - Decoding PowerShell CLIXML on stderr now finds the document when raw stderr
   text arrives between the `#< CLIXML` marker and `<Objs`; error records were
-  returned as raw XML.
+  returned as raw XML. A `#< CLIXML` line alone on its line, with no document
+  after it, is now returned after the text that follows it.
 
 ### Documentation
 

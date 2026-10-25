@@ -31,6 +31,14 @@
 //! it. One marker is held at a time: another lone marker meanwhile is plain
 //! text where it stands.
 //!
+//! Two limits follow from deciding on the bytes alone. A document that
+//! follows raw stderr text without a newline (`[Console]::Error.Write('b')`
+//! then the document) is not recognised: `<Objs` is not at the start of a
+//! line, so it stays plain text, and leading spaces before `<Objs` on a line
+//! are not skipped. A marker line followed by too many blank bytes before
+//! the next text (63 after a CRLF, 64 after a lone LF) is not held: that is
+//! past the 64-byte header limit, so the marker is plain text where it stands.
+//!
 //! The output depends only on the bytes, never on how they were sliced.
 
 use std::fmt;
@@ -89,7 +97,8 @@ struct Scan {
 }
 
 /// Turns a stderr byte stream into readable text, decoding PowerShell CLIXML
-/// documents and passing every other byte through unchanged.
+/// documents and passing every other byte through unchanged (a lone
+/// `#< CLIXML` line may come out after the text that follows it).
 ///
 /// Feed each stderr slice to [`push`](Self::push) in order, then call
 /// [`finish`](Self::finish) once the command is done to release anything
@@ -226,6 +235,8 @@ impl ClixmlDecoder {
                         self.enter(Mode::Root);
                     }
                     Header::Wait => return out,
+                    // `Marker` and `Line` are never returned here: markers are
+                    // not looked for after a document.
                     Header::Text | Header::Marker(_) | Header::Line(_) => {
                         self.enter(Mode::Text);
                         self.at_line_start = true;
@@ -1169,6 +1180,48 @@ mod tests {
     }
 
     #[test]
+    fn held_marker_variants_decode_the_same_at_every_cut() {
+        let cases: [(&[u8], &str); 4] = [
+            // Bare `\n` line endings.
+            (
+                b"a\n#< CLIXML\nb\n<Objs><S S=\"Error\">e</S></Objs>",
+                "a\nb\ne",
+            ),
+            // A second lone marker while one is held stays plain text.
+            (
+                b"#< CLIXML\r\na\n#< CLIXML\r\nb\n<Objs><S S=\"Error\">e</S></Objs>",
+                "a\n#< CLIXML\r\nb\ne",
+            ),
+            // No document: the held marker comes out last, line ending kept.
+            (b"#< CLIXML\nb\n", "b\n#< CLIXML\n"),
+            (b"#< CLIXML\r\nb\r\n", "b\r\n#< CLIXML\r\n"),
+        ];
+        for (stream, expected) in cases {
+            assert_eq!(decode(stream), expected);
+            for i in 0..=stream.len() {
+                let (a, b) = stream.split_at(i);
+                assert_eq!(
+                    decode_chunks(&[a, b]),
+                    expected,
+                    "split at byte {i} of {:?}",
+                    String::from_utf8_lossy(stream)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn held_marker_decodes_the_same_one_byte_at_a_time() {
+        for (stream, expected) in [
+            (RAW_TEXT_THEN_DOC, RAW_TEXT_THEN_DOC_TEXT),
+            (b"#< CLIXML\r\nb\r\n<Ob".as_slice(), "b\r\n<Ob#< CLIXML\r\n"),
+        ] {
+            let chunks: Vec<&[u8]> = stream.chunks(1).collect();
+            assert_eq!(decode_chunks(&chunks), expected);
+        }
+    }
+
+    #[test]
     fn text_after_a_held_marker_is_released_at_once() {
         let mut d = ClixmlDecoder::new();
         assert_eq!(d.push(b"a\r\n#< CLIXML\r\nb\r\n"), b"a\r\nb\r\n");
@@ -1228,6 +1281,29 @@ mod tests {
         assert_eq!(decode(&stream), String::from_utf8_lossy(&stream));
     }
 
+    #[test]
+    fn blank_bytes_after_a_lone_marker_hold_it_up_to_the_header_limit() {
+        // The line ending counts: 62 blanks after CRLF (64 in all) still
+        // hold the marker, 63 do not; after a lone LF the limit is 64.
+        for (ending, blanks, held) in [
+            ("\r\n", 62, true),
+            ("\r\n", 63, false),
+            ("\n", 63, true),
+            ("\n", 64, false),
+        ] {
+            let stream = format!(
+                "#< CLIXML{ending}{}x\n<Objs><S S=\"Error\">e</S></Objs>",
+                " ".repeat(blanks)
+            );
+            let expected = if held {
+                format!("{}x\ne", " ".repeat(blanks))
+            } else {
+                stream.clone()
+            };
+            assert_eq!(decode(stream.as_bytes()), expected, "{ending:?} + {blanks}");
+        }
+    }
+
     /// A held marker, then 8 MiB of lines that each start like `<Objs`,
     /// pushed 1 KiB at a time: each push scans only its own bytes and holds
     /// back at most a few.
@@ -1244,7 +1320,11 @@ mod tests {
             assert!(d.pending.len() < 16, "{} bytes held", d.pending.len());
         }
         out.extend(d.finish());
-        assert!(started.elapsed() < Duration::from_secs(5));
+        // A wall-clock bound must only fail on a complexity regression, never
+        // on timing noise: a linear scan needs milliseconds for the 8 MiB
+        // above, a quadratic one minutes, and 60 s leaves a loaded CI runner
+        // three orders of magnitude of headroom.
+        assert!(started.elapsed() < Duration::from_secs(60));
         // Every byte comes back, the first marker line last.
         let mut expected = lines.clone();
         expected.extend_from_slice(b"#< CLIXML\r\n");

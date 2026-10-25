@@ -98,6 +98,7 @@ fn clixml_fragment() -> impl Strategy<Value = Vec<u8>> {
         Just(b"<Objs Version=\"1.1.0.1\">".to_vec()),
         Just(b"</Objs>".to_vec()),
         Just(b"\r\n<Objs>".to_vec()),
+        Just(b"x\r\n".to_vec()),
         Just(b"<S S=\"Error\">".to_vec()),
         Just(b"<S S=\"warning\">".to_vec()),
         Just(b"<S S=\"verbose\">".to_vec()),

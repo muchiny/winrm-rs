@@ -33,8 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   They now record `args_len`, `query_len` and, for `run_powershell` and
   `run_powershell_with_timeout`, `script_len`. This replaces the 1.3.0 advice
   to keep `winrm_rs` at `info`: `debug` no longer carries command content,
-  but `trace` still logs SOAP bodies. The crate docs gain a *Logging*
-  section.
+  and `trace` logs SOAP bodies only when the client opts in (see Changed).
+  The crate docs gain a *Logging* section.
 - Kerberos: a sealed answer must have a zero extra count (EC) and a security
   header whose length matches its rotation count (RRC), as Windows always
   sends. An unrotated token (RRC 0) in a 60-byte header, which older versions

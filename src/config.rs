@@ -7,31 +7,30 @@ use secrecy::SecretString;
 /// Configuration for a [`WinrmClient`](crate::WinrmClient) connection.
 ///
 /// Controls the transport (HTTP vs HTTPS), timeouts, and authentication
-/// method. [`Default::default()`] gives the settings of a Windows host's stock
-/// listener (`Enable-PSRemoting`, `winrm quickconfig`): HTTP on port 5985,
-/// NTLM, sealed SOAP bodies, 30 s connect / 60 s operation timeouts.
-///
-/// Planned for 2.0: the default becomes HTTPS on 5986, the settings of
-/// [`WinrmConfig::https()`]; [`WinrmConfig::http()`] keeps plain HTTP on 5985.
+/// method. [`Default::default()`] is HTTPS on port 5986 (since 2.0), NTLM,
+/// certificate validated, with sealing over HTTP only; 30 s connect / 60 s
+/// operation timeouts. [`WinrmConfig::http()`] gives a Windows host's stock
+/// listener (HTTP on 5985, what `Enable-PSRemoting` and `winrm quickconfig`
+/// create).
 ///
 /// # Security
 ///
-/// The default, NTLM over plain HTTP, protects the SOAP bodies (sealing, see
-/// [`EncryptionMode`]) but not the authentication. NTLM authenticates the
-/// client only, and over plain HTTP its handshake does not authenticate the
-/// server and is not bound to the TCP connection. A party on the network path
-/// can relay it, before this client notices, to a service that accepts NTLM
-/// without signing or channel binding (an SMB server without signing, LDAP
-/// without channel binding, AD CS web enrollment without Extended
+/// NTLM over plain HTTP ([`WinrmConfig::http()`]) protects the SOAP bodies
+/// (sealing, see [`EncryptionMode`]) but not the authentication. NTLM
+/// authenticates the client only, and over plain HTTP its handshake does not
+/// authenticate the server and is not bound to the TCP connection. A party on
+/// the network path can relay it, before this client notices, to a service that
+/// accepts NTLM without signing or channel binding (an SMB server without
+/// signing, LDAP without channel binding, AD CS web enrollment without Extended
 /// Protection, a WinRM listener that allows unencrypted messages, this one
-/// included). A passive observer who records the challenge and the response
-/// can guess the password offline. On a network you do not trust:
+/// included). A passive observer who records the challenge and the response can
+/// guess the password offline. On a network you do not trust:
 ///
-/// - use HTTPS with certificate validation (`use_tls = true`, `port = 5986`,
-///   `accept_invalid_certs = false`): TLS authenticates the server, and NTLM
-///   carries a channel binding to its certificate (MS-NLMP 2.2.2.1, RFC 5929
-///   `tls-server-end-point`), which a server with `CbtHardeningLevel`
-///   `Relaxed` or `Strict` checks;
+/// - use HTTPS with certificate validation (the default: `use_tls = true`,
+///   port 5986, `accept_invalid_certs = false`): TLS authenticates the
+///   server, and NTLM carries a channel binding to its certificate (MS-NLMP
+///   2.2.2.1, RFC 5929 `tls-server-end-point`), which a server with
+///   `CbtHardeningLevel` `Relaxed` or `Strict` checks;
 /// - or use [`AuthMethod::Kerberos`], which also authenticates the server
 ///   (AP-REP) but carries no channel binding over plain HTTP either.
 ///
@@ -48,8 +47,9 @@ use secrecy::SecretString;
 /// rather than a path, so it can be logged.
 #[derive(Clone)]
 pub struct WinrmConfig {
-    /// TCP port of the WinRM listener (default: 5985). It does not follow [`use_tls`](Self::use_tls): with `use_tls = true`, set the HTTPS listener's port (5986 on a stock Windows host).
-    pub port: u16,
+    /// TCP port of the WinRM listener. `None` (the default) means 5986 with
+    /// [`use_tls`](Self::use_tls), 5985 without; see [`Self::effective_port`].
+    pub port: Option<u16>,
     /// Whether to connect over HTTPS. When `true`, the endpoint URL uses `https://`.
     pub use_tls: bool,
     /// Accept invalid or self-signed TLS certificates.
@@ -327,8 +327,8 @@ pub struct WinrmConfig {
 impl Default for WinrmConfig {
     fn default() -> Self {
         Self {
-            port: 5985,
-            use_tls: false,
+            port: None,
+            use_tls: true,
             accept_invalid_certs: false,
             connect_timeout_secs: 30,
             operation_timeout_secs: 60,
@@ -351,7 +351,8 @@ impl Default for WinrmConfig {
 
 impl WinrmConfig {
     /// HTTPS on port 5986, NTLM, certificate validated, every other field as
-    /// in [`Default`]. TLS authenticates the server by its certificate and
+    /// in [`Default`] (which leaves the port to [`Self::effective_port`],
+    /// 5986 too). TLS authenticates the server by its certificate and
     /// NTLM carries a channel binding to it: the recommended setting on a
     /// network you do not trust. A listener whose certificate does not chain
     /// to a trusted root fails validation (see
@@ -375,16 +376,16 @@ impl WinrmConfig {
     pub fn https() -> Self {
         Self {
             use_tls: true,
-            port: 5986,
+            port: Some(5986),
             ..Self::default()
         }
     }
 
     /// Plain HTTP on port 5985, NTLM, sealed bodies: the settings of a
-    /// Windows host's stock listener, and today's [`Default`]. Read the
+    /// Windows host's stock listener, and the 1.x [`Default`]. Read the
     /// Security section of [`WinrmConfig`] first: over plain HTTP NTLM does
-    /// not authenticate the server. It keeps port 5985 when the default
-    /// changes in 2.0.
+    /// not authenticate the server. In a struct literal,
+    /// `..WinrmConfig::http()` keeps plain HTTP for the fields not named.
     ///
     /// ```no_run
     /// use winrm_rs::{WinrmClient, WinrmConfig, WinrmCredentials};
@@ -401,9 +402,17 @@ impl WinrmConfig {
     pub fn http() -> Self {
         Self {
             use_tls: false,
-            port: 5985,
+            port: Some(5985),
             ..Self::default()
         }
+    }
+
+    /// The TCP port this configuration connects to: [`port`](Self::port)
+    /// when set, otherwise 5986 with [`use_tls`](Self::use_tls) and 5985
+    /// without (the ports of a Windows host's stock listeners).
+    #[must_use]
+    pub fn effective_port(&self) -> u16 {
+        self.port.unwrap_or(if self.use_tls { 5986 } else { 5985 })
     }
 }
 
@@ -870,33 +879,55 @@ mod tests {
     fn https_preset_is_tls_on_5986() {
         let c = WinrmConfig::https();
         assert!(c.use_tls);
-        assert_eq!(c.port, 5986);
+        assert_eq!(c.port, Some(5986));
         assert!(!c.accept_invalid_certs);
         assert!(matches!(c.auth_method, AuthMethod::Ntlm));
         assert_eq!(c.encryption, EncryptionMode::Auto);
         assert_eq!(
-            crate::transport::endpoint_url(c.use_tls, "h", c.port),
+            crate::transport::endpoint_url(c.use_tls, "h", c.effective_port()),
+            "https://h:5986/wsman"
+        );
+        // `WinrmConfig` has no `PartialEq`; its `Debug` lists every field.
+        assert_eq!(
+            format!("{:?}", WinrmConfig { port: None, ..c }),
+            format!("{:?}", WinrmConfig::default())
+        );
+    }
+
+    #[test]
+    fn default_config_is_https_on_5986() {
+        let c = WinrmConfig::default();
+        assert!(c.use_tls);
+        assert_eq!(c.port, None);
+        assert_eq!(c.effective_port(), 5986);
+        assert!(matches!(c.auth_method, AuthMethod::Ntlm));
+        assert_eq!(
+            crate::transport::endpoint_url(c.use_tls, "h", c.effective_port()),
             "https://h:5986/wsman"
         );
     }
 
     #[test]
-    fn http_preset_equals_default() {
-        // `WinrmConfig` has no `PartialEq`; its `Debug` lists every field.
+    fn port_none_follows_use_tls() {
         assert_eq!(
-            format!("{:?}", WinrmConfig::http()),
-            format!("{:?}", WinrmConfig::default())
+            WinrmConfig {
+                use_tls: false,
+                ..Default::default()
+            }
+            .effective_port(),
+            5985
         );
+        assert_eq!(
+            WinrmConfig {
+                port: Some(6000),
+                ..Default::default()
+            }
+            .effective_port(),
+            6000
+        );
+        assert_eq!(WinrmConfig::http().port, Some(5985));
         assert!(!WinrmConfig::http().use_tls);
-        assert_eq!(WinrmConfig::http().port, 5985);
-    }
-
-    #[test]
-    fn default_config_uses_http_and_ntlm() {
-        let config = WinrmConfig::default();
-        assert_eq!(config.port, 5985);
-        assert!(!config.use_tls);
-        assert!(matches!(config.auth_method, AuthMethod::Ntlm));
+        assert_eq!(WinrmConfig::https().port, Some(5986));
     }
 
     #[test]

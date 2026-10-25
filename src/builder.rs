@@ -641,10 +641,10 @@ mod tests {
             .mount(&server)
             .await;
         let config = WinrmConfig {
-            port: server.address().port(),
+            port: Some(server.address().port()),
             auth_method: AuthMethod::Basic,
             encryption: EncryptionMode::Never,
-            ..Default::default()
+            ..WinrmConfig::http()
         };
         let client = WinrmClient::builder(config)
             .credentials(WinrmCredentials::new("admin", "pass", ""))
@@ -756,7 +756,7 @@ mod tests {
     fn tls_options_are_kept_across_credentials() {
         let result = WinrmClientBuilder::new(WinrmConfig {
             use_tls: true,
-            port: 5986,
+            port: Some(5986),
             ..Default::default()
         })
         .add_root_certificates_pem("/nonexistent/winrm-rs/ca.pem")
@@ -776,7 +776,7 @@ mod tests {
     fn pins_accumulate_across_credentials() {
         let builder = WinrmClientBuilder::new(WinrmConfig {
             use_tls: true,
-            port: 5986,
+            port: Some(5986),
             ..Default::default()
         })
         .pin_server_certificate_sha256("aa")
@@ -916,13 +916,13 @@ mod tests {
             .build()
             .unwrap();
         // Verify the client was constructed (endpoint uses config values)
-        assert_eq!(client.endpoint("test-host"), "http://test-host:5985/wsman");
+        assert_eq!(client.endpoint("test-host"), "https://test-host:5986/wsman");
     }
 
     #[test]
     fn builder_preserves_custom_config() {
         let config = WinrmConfig {
-            port: 5986,
+            port: Some(5986),
             use_tls: true,
             max_envelope_size: 512_000,
             ..Default::default()
@@ -941,7 +941,7 @@ mod tests {
             .credentials(WinrmCredentials::new("admin", "pass", ""))
             .build()
             .unwrap();
-        assert_eq!(client.endpoint("host"), "http://host:5985/wsman");
+        assert_eq!(client.endpoint("host"), "https://host:5986/wsman");
     }
     /// The Type 1 and Type 3 messages a client sent to `server`, in order of
     /// type, after one request that runs the NTLM handshake.
@@ -984,8 +984,8 @@ mod tests {
     fn ntlm_builder(server: &wiremock::MockServer) -> WinrmClientBuilder<Ready> {
         let config = WinrmConfig {
             auth_method: crate::AuthMethod::Ntlm,
-            port: server.address().port(),
-            ..Default::default()
+            port: Some(server.address().port()),
+            ..WinrmConfig::http()
         };
         WinrmClient::builder(config).credentials(WinrmCredentials::new(
             crate::test_ntlm_server::USER,

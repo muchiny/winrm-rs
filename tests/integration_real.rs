@@ -71,8 +71,8 @@ fn test_client_with(tweak: impl FnOnce(&mut WinrmConfig)) -> Option<(WinrmClient
     let mut config = WinrmConfig {
         auth_method: AuthMethod::Basic,
         encryption: EncryptionMode::Never,
-        port,
-        ..Default::default()
+        port: Some(port),
+        ..WinrmConfig::http()
     };
     tweak(&mut config);
     let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).ok()?;
@@ -418,8 +418,8 @@ fn test_client_ntlm() -> Option<(WinrmClient, String)> {
 
     let config = WinrmConfig {
         auth_method: AuthMethod::Ntlm,
-        port,
-        ..Default::default()
+        port: Some(port),
+        ..WinrmConfig::http()
     };
     let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).ok()?;
     Some((client, host))
@@ -544,9 +544,9 @@ async fn ntlm_through_a_forward_proxy() {
         let config = WinrmConfig {
             auth_method: AuthMethod::Ntlm,
             encryption: EncryptionMode::Auto,
-            port,
+            port: Some(port),
             proxy: Some(proxy.clone()),
-            ..Default::default()
+            ..WinrmConfig::http()
         };
         let client = WinrmClient::builder(config)
             .credentials(WinrmCredentials::new(user.clone(), pass.clone(), ""))
@@ -764,8 +764,8 @@ async fn upload_failure_leaves_no_shell_behind() {
     let client = WinrmClient::builder(WinrmConfig {
         auth_method: AuthMethod::Basic,
         encryption: EncryptionMode::Never,
-        port,
-        ..Default::default()
+        port: Some(port),
+        ..WinrmConfig::http()
     })
     .credentials(WinrmCredentials::new(user, pass, ""))
     .before_send(move || hook_sent.fetch_add(1, Ordering::SeqCst) + 1 != 6)
@@ -1449,9 +1449,9 @@ async fn shell_with_working_directory() {
     let config = WinrmConfig {
         auth_method: AuthMethod::Basic,
         encryption: EncryptionMode::Never,
-        port,
+        port: Some(port),
         working_directory: Some("C:\\Windows".into()),
-        ..Default::default()
+        ..WinrmConfig::http()
     };
     let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
     let output = client
@@ -1482,9 +1482,9 @@ async fn shell_with_env_vars() {
     let config = WinrmConfig {
         auth_method: AuthMethod::Basic,
         encryption: EncryptionMode::Never,
-        port,
+        port: Some(port),
         env_vars: vec![("WINRM_RS_TEST_VAR".into(), "hello_from_rust".into())],
-        ..Default::default()
+        ..WinrmConfig::http()
     };
     let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
     let output = client
@@ -1554,9 +1554,9 @@ async fn retry_config_works_with_real_server() {
     let config = WinrmConfig {
         auth_method: AuthMethod::Basic,
         encryption: EncryptionMode::Never,
-        port,
+        port: Some(port),
         max_retries: 2,
-        ..Default::default()
+        ..WinrmConfig::http()
     };
     let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
     // Should work normally — retries don't interfere with successful requests
@@ -1611,7 +1611,7 @@ async fn connect_timeout_is_honoured() {
         encryption: EncryptionMode::Never,
         connect_timeout_secs: 2,
         max_retries: 0,
-        ..Default::default()
+        ..WinrmConfig::http()
     };
     let client = WinrmClient::new(config, WinrmCredentials::new("u", "p", "")).unwrap();
 
@@ -1998,7 +1998,7 @@ async fn sealed_ntlm_client(
     let (client, _) = test_client_with(|c| {
         c.auth_method = AuthMethod::Ntlm;
         c.encryption = EncryptionMode::Auto; // the base config is Basic (Never)
-        c.port = forwarder.addr.port();
+        c.port = Some(forwarder.addr.port());
         tweak(c);
     })
     .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
@@ -2379,7 +2379,7 @@ async fn ntlm_encryption_always_over_https() {
         c.auth_method = AuthMethod::Ntlm;
         c.use_tls = true;
         c.accept_invalid_certs = true; // self-signed listener certificate
-        c.port = https_test_port();
+        c.port = Some(https_test_port());
         c.encryption = EncryptionMode::Always;
     })
     .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
@@ -2427,7 +2427,7 @@ async fn silent_command_completes_over_credssp() {
         auth_method: AuthMethod::CredSsp,
         use_tls: true,
         accept_invalid_certs: false,
-        port: https_test_port(),
+        port: Some(https_test_port()),
         operation_timeout_secs: SILENT_OP_SECS,
         ..Default::default()
     };
@@ -2455,9 +2455,9 @@ async fn shell_with_idle_timeout_works() {
     let config = WinrmConfig {
         auth_method: AuthMethod::Basic,
         encryption: EncryptionMode::Never,
-        port,
+        port: Some(port),
         idle_timeout_secs: Some(300),
-        ..Default::default()
+        ..WinrmConfig::http()
     };
     let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
     let output = client
@@ -2483,9 +2483,9 @@ async fn custom_user_agent_does_not_break() {
     let config = WinrmConfig {
         auth_method: AuthMethod::Basic,
         encryption: EncryptionMode::Never,
-        port,
+        port: Some(port),
         user_agent: Some("winrm-rs-test/0.1".into()),
-        ..Default::default()
+        ..WinrmConfig::http()
     };
     let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
     let output = client
@@ -2511,9 +2511,9 @@ async fn invalid_proxy_returns_http_error() {
     let config = WinrmConfig {
         auth_method: AuthMethod::Basic,
         encryption: EncryptionMode::Never,
-        port,
+        port: Some(port),
         proxy: Some("http://127.0.0.1:19999".into()),
-        ..Default::default()
+        ..WinrmConfig::http()
     };
     let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
     let result = client.run_command(&host, "whoami", &[]).await;
@@ -2767,7 +2767,7 @@ async fn http_proxy_connect_carries_https() {
         auth_method: AuthMethod::Basic,
         use_tls: true,
         accept_invalid_certs: false,
-        port: https_test_port(),
+        port: Some(https_test_port()),
         proxy: Some(proxy_url),
         ..Default::default()
     };
@@ -2892,7 +2892,7 @@ fn test_client_https_ntlm() -> Option<(WinrmClient, String)> {
         auth_method: AuthMethod::Ntlm,
         use_tls: true,
         accept_invalid_certs: true, // self-signed cert
-        port,
+        port: Some(port),
         ..Default::default()
     };
     let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).ok()?;
@@ -3031,7 +3031,7 @@ async fn basic_over_https_works() {
         auth_method: AuthMethod::Basic,
         use_tls: true,
         accept_invalid_certs: false,
-        port,
+        port: Some(port),
         ..Default::default()
     };
     // Basic sends the password: the listener certificate is pinned, since
@@ -3079,7 +3079,7 @@ async fn credssp_run_command_whoami() {
         auth_method: AuthMethod::CredSsp,
         use_tls: true,
         accept_invalid_certs: false,
-        port,
+        port: Some(port),
         ..Default::default()
     };
     let client = WinrmClient::builder(config)
@@ -3112,7 +3112,7 @@ async fn credssp_whoami_through(test: &str, proxy_url: String) -> Option<()> {
         auth_method: AuthMethod::CredSsp,
         use_tls: true,
         accept_invalid_certs: false,
-        port: https_test_port(),
+        port: Some(https_test_port()),
         proxy: Some(proxy_url),
         ..Default::default()
     };
@@ -3194,7 +3194,7 @@ async fn credssp_reads_a_large_framed_response() {
         auth_method: AuthMethod::CredSsp,
         use_tls: true,
         accept_invalid_certs: false,
-        port: https_test_port(),
+        port: Some(https_test_port()),
         ..Default::default()
     };
     let client = WinrmClient::builder(config)
@@ -3507,9 +3507,9 @@ async fn small_max_envelope_size() {
     let config = WinrmConfig {
         auth_method: AuthMethod::Basic,
         encryption: EncryptionMode::Never,
-        port,
+        port: Some(port),
         max_envelope_size: 8192,
-        ..Default::default()
+        ..WinrmConfig::http()
     };
     let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
     let output = client
@@ -3538,9 +3538,9 @@ async fn ntlm_encryption_always() {
 
     let config = WinrmConfig {
         auth_method: AuthMethod::Ntlm,
-        port,
+        port: Some(port),
         encryption: EncryptionMode::Always,
-        ..Default::default()
+        ..WinrmConfig::http()
     };
     let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
     let output = client
@@ -3564,9 +3564,9 @@ async fn ntlm_encryption_never() {
 
     let config = WinrmConfig {
         auth_method: AuthMethod::Ntlm,
-        port,
+        port: Some(port),
         encryption: EncryptionMode::Never,
-        ..Default::default()
+        ..WinrmConfig::http()
     };
     let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
     let output = client
@@ -3590,9 +3590,9 @@ async fn ntlm_encryption_auto_over_http() {
 
     let config = WinrmConfig {
         auth_method: AuthMethod::Ntlm,
-        port,
+        port: Some(port),
         encryption: EncryptionMode::Auto,
-        ..Default::default()
+        ..WinrmConfig::http()
     };
     let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
     let output = client
@@ -3619,8 +3619,8 @@ async fn builder_pattern_works() {
     let config = WinrmConfig {
         auth_method: AuthMethod::Basic,
         encryption: EncryptionMode::Never,
-        port,
-        ..Default::default()
+        port: Some(port),
+        ..WinrmConfig::http()
     };
     let client = WinrmClient::builder(config)
         .credentials(WinrmCredentials::new(user, pass, ""))
@@ -4115,7 +4115,7 @@ fn cert_client_from_env(
         auth_method: AuthMethod::Certificate,
         use_tls: true,
         accept_invalid_certs: true, // self-signed listener certificate
-        port: https_test_port(),
+        port: Some(https_test_port()),
         client_cert_pem: Some(cert),
         client_key_pem: Some(key),
         ..Default::default()
@@ -4386,8 +4386,8 @@ fn kerberos_client_from_env(tweak: impl FnOnce(&mut WinrmConfig)) -> (WinrmClien
     let pass = std::env::var("WINRM_TEST_KRB_PASS").expect(HINT);
     let mut config = WinrmConfig {
         auth_method: AuthMethod::Kerberos,
-        port,
-        ..Default::default()
+        port: Some(port),
+        ..WinrmConfig::http()
     };
     tweak(&mut config);
     let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, ""))
@@ -4535,7 +4535,7 @@ fn kerberos_https_client_from_env(tweak: impl FnOnce(&mut WinrmConfig)) -> (Winr
     kerberos_client_from_env(|c| {
         c.use_tls = true;
         c.accept_invalid_certs = true;
-        c.port = port;
+        c.port = Some(port);
         tweak(c);
     })
 }
@@ -4611,8 +4611,8 @@ fn dc_ntlm_sealed_client() -> (WinrmClient, String) {
     let config = WinrmConfig {
         auth_method: AuthMethod::Ntlm,
         encryption: EncryptionMode::Always,
-        port,
-        ..Default::default()
+        port: Some(port),
+        ..WinrmConfig::http()
     };
     let client = WinrmClient::new(config, WinrmCredentials::new("vagrant", "vagrant", "WINRM"))
         .expect("build NTLM client");
@@ -4698,7 +4698,7 @@ async fn sealed_kerberos_client(
     let forwarder = RecordingForwarder::start(format!("127.0.0.1:{dc_port}")).await;
     let port = forwarder.addr.port();
     let (client, host) = kerberos_client_from_env(|c| {
-        c.port = port;
+        c.port = Some(port);
         tweak(c);
     });
     (client, forwarder, host)
@@ -5190,7 +5190,7 @@ fn kerberos_client_through_relay(
     encryption: EncryptionMode,
 ) -> (WinrmClient, String) {
     kerberos_https_client_from_env(|c| {
-        c.port = relay.port;
+        c.port = Some(relay.port);
         c.encryption = encryption;
     })
 }
@@ -5310,7 +5310,7 @@ async fn always_seals_inside_tls_seen_by_a_relay_with_dc_cbt_none() {
             encryption: EncryptionMode::Always,
             use_tls: true,
             accept_invalid_certs: true,
-            port: relay.port,
+            port: Some(relay.port),
             ..Default::default()
         };
         let ntlm = WinrmClient::new(config, WinrmCredentials::new("vagrant", "vagrant", "WINRM"))
@@ -5386,8 +5386,8 @@ async fn sealed_download_after_upload_stays_on_its_connection_allow_unencrypted_
                     let forwarder = RecordingForwarder::start(format!("127.0.0.1:{dc_port}")).await;
                     let config = WinrmConfig {
                         auth_method: AuthMethod::Ntlm,
-                        port: forwarder.addr.port(),
-                        ..Default::default()
+                        port: Some(forwarder.addr.port()),
+                        ..WinrmConfig::http()
                     };
                     let client =
                         WinrmClient::new(config, WinrmCredentials::new("vagrant", "vagrant", "WINRM"))
@@ -5505,8 +5505,8 @@ fn gated_client(
     let mut config = WinrmConfig {
         auth_method: AuthMethod::Basic,
         encryption: EncryptionMode::Never,
-        port,
-        ..Default::default()
+        port: Some(port),
+        ..WinrmConfig::http()
     };
     tweak(&mut config);
     let hook = std::sync::Arc::clone(gate);
@@ -5600,7 +5600,7 @@ async fn before_send_refusal_leaves_a_sealed_ntlm_session_usable() {
     let (client, _) = gated_client(&gate, |c| {
         c.auth_method = AuthMethod::Ntlm;
         c.encryption = EncryptionMode::Auto; // the base config is Basic (Never)
-        c.port = forwarder.addr.port();
+        c.port = Some(forwarder.addr.port());
     });
 
     assert_refusal_leaves_session_usable(&client, SEALED_HOST, &gate).await;
@@ -5635,7 +5635,7 @@ async fn before_send_refusal_leaves_an_ntlm_https_session_usable() {
         c.encryption = EncryptionMode::Auto; // the base config is Basic (Never)
         c.use_tls = true;
         c.accept_invalid_certs = true;
-        c.port = https_test_port();
+        c.port = Some(https_test_port());
     });
     assert_refusal_leaves_session_usable(&client, &host, &gate).await;
 }
@@ -5659,7 +5659,7 @@ async fn before_send_refusal_leaves_a_credssp_session_usable() {
         auth_method: AuthMethod::CredSsp,
         use_tls: true,
         accept_invalid_certs: false,
-        port: https_test_port(),
+        port: Some(https_test_port()),
         ..Default::default()
     })
     .pin_server_certificate_sha256(&bench_https_pin().expect("WINRM_TEST_HTTPS_CERT_SHA256"))
@@ -5690,8 +5690,8 @@ async fn before_send_refusal_leaves_a_kerberos_session_usable() {
     let hook = std::sync::Arc::clone(&gate);
     let client = WinrmClient::builder(WinrmConfig {
         auth_method: AuthMethod::Kerberos,
-        port,
-        ..Default::default()
+        port: Some(port),
+        ..WinrmConfig::http()
     })
     .credentials(WinrmCredentials::new(user, pass, ""))
     .before_send(move || hook.check())
@@ -5848,7 +5848,7 @@ async fn custom_ca_https_listener_authenticates() {
             auth_method: method,
             use_tls: true,
             accept_invalid_certs: false,
-            port: https_test_port(),
+            port: Some(https_test_port()),
             ..Default::default()
         };
         let client = WinrmClient::builder(config)
@@ -5936,7 +5936,7 @@ async fn pinned_https_listener_authenticates() {
         let config = WinrmConfig {
             auth_method: method,
             use_tls: true,
-            port: https_test_port(),
+            port: Some(https_test_port()),
             ..Default::default()
         };
         let client = pinned_client(config, &pin, user.clone(), pass.clone())
@@ -5952,7 +5952,7 @@ async fn pinned_https_listener_authenticates() {
         let config = WinrmConfig {
             auth_method: AuthMethod::Certificate,
             use_tls: true,
-            port: https_test_port(),
+            port: Some(https_test_port()),
             client_cert_pem: Some(cert),
             client_key_pem: Some(key),
             ..Default::default()
@@ -5979,7 +5979,7 @@ async fn pinned_https_listener_authenticates() {
         let config = WinrmConfig {
             auth_method: AuthMethod::Kerberos,
             use_tls: true,
-            port,
+            port: Some(port),
             ..Default::default()
         };
         let client = pinned_client(
@@ -6018,7 +6018,7 @@ async fn pinned_https_listener_refuses_a_wrong_pin() {
         let config = WinrmConfig {
             auth_method: method,
             use_tls: true,
-            port: https_test_port(),
+            port: Some(https_test_port()),
             ..Default::default()
         };
         let client = pinned_client(config, &wrong, user.clone(), pass.clone())

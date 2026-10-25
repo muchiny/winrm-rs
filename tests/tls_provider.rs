@@ -14,7 +14,6 @@ fn tls_provider_ring_leaves_the_process_default_alone() {
     let build = |use_tls: bool, provider| {
         WinrmClient::builder(WinrmConfig {
             use_tls,
-            port: if use_tls { 5986 } else { 5985 },
             ..Default::default()
         })
         .tls_provider(provider)

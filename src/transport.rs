@@ -1000,7 +1000,7 @@ impl HttpTransport {
                 "NTLM over plain HTTP: the handshake does not authenticate the server and is \
                  not bound to the connection, so a party on the network path can relay it, \
                  or record it to guess the password offline; sealing protects only the SOAP \
-                 bodies. Use HTTPS (use_tls = true, port = 5986) or Kerberos"
+                 bodies. Use HTTPS (the default, WinrmConfig::https()) or Kerberos"
             );
         }
 
@@ -1094,7 +1094,10 @@ impl HttpTransport {
         // request computes its own dial (`credssp_dial_for`).
         #[cfg(feature = "credssp")]
         let credssp_dial = Arc::new(if matches!(config.auth_method, AuthMethod::CredSsp) {
-            route.credssp_dial(&endpoint_url(true, "localhost", config.port), false)?
+            route.credssp_dial(
+                &endpoint_url(true, "localhost", config.effective_port()),
+                false,
+            )?
         } else {
             proxy::CredSspDial::Direct
         });
@@ -1168,7 +1171,11 @@ impl HttpTransport {
     /// [`validate_host`] refuses, the result is never sent: every request
     /// goes through [`Self::checked_endpoint`], which refuses it first.
     pub(crate) fn endpoint(&self, host: &str) -> String {
-        endpoint_url(self.config.use_tls, &sanitize_host(host), self.config.port)
+        endpoint_url(
+            self.config.use_tls,
+            &sanitize_host(host),
+            self.config.effective_port(),
+        )
     }
 
     /// [`Self::endpoint`] for a host that [`validate_host`] accepts, else
@@ -2137,7 +2144,12 @@ impl HttpTransport {
                     );
                     tokio::time::sleep(delay).await;
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    if let Some(hint) = connect_hint(&self.config, &e) {
+                        tracing::warn!(host = %log_host(host), "{hint}");
+                    }
+                    return Err(e);
+                }
             }
         }
         unreachable!()
@@ -2163,6 +2175,47 @@ impl HttpTransport {
 /// saturating instead of overflowing for large `max_retries`.
 fn retry_delay(attempt: u32) -> Duration {
     Duration::from_millis(100u64.saturating_mul(2u64.saturating_pow(attempt)))
+}
+
+/// The WARN logged when a connection to the defaulted HTTPS port fails.
+const CONNECT_HINT: &str = "could not connect to the default HTTPS port 5986: a host with \
+                            only the stock HTTP listener (Enable-PSRemoting creates none on \
+                            5986) needs WinrmConfig::http() for port 5985";
+
+/// [`CONNECT_HINT`] when `err` is a failed connection and `config` left the
+/// port to its HTTPS default (`port: None`, `use_tls: true`): the 1.x
+/// default was HTTP on 5985, the stock listener of a Windows host. `None`
+/// for any other error or configuration.
+///
+/// A failure that rustls reports (an untrusted or mismatched certificate, a
+/// pin, no shared cipher suite) gets no hint: a TLS listener answered on
+/// 5986, and plain HTTP is not the fix for it.
+///
+/// Never fires for CredSSP: its connection failures are reported as
+/// [`WinrmError::AuthFailed`] or [`WinrmError::Timeout`], not
+/// [`WinrmError::Http`].
+fn connect_hint(config: &WinrmConfig, err: &WinrmError) -> Option<&'static str> {
+    let connect_failed = matches!(err, WinrmError::Http(e) if e.is_connect() && !is_tls_failure(e));
+    (config.port.is_none() && config.use_tls && connect_failed).then_some(CONNECT_HINT)
+}
+
+/// Whether a [`rustls::Error`] is in the cause chain of `err`. An
+/// `io::Error`'s `source()` skips the error it wraps, so the walk goes
+/// through `get_ref()` there.
+fn is_tls_failure(err: &reqwest::Error) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = current {
+        if e.is::<rustls::Error>() {
+            return true;
+        }
+        current = match e.downcast_ref::<std::io::Error>() {
+            Some(io) => io
+                .get_ref()
+                .map(|w| w as &(dyn std::error::Error + 'static)),
+            None => e.source(),
+        };
+    }
+    false
 }
 
 /// `reqwest::Client` for unit tests that bypass [`HttpTransport::new`]:
@@ -2248,7 +2301,7 @@ mod tests {
     fn basic_transport(port: u16) -> HttpTransport {
         let config = WinrmConfig {
             auth_method: AuthMethod::Basic,
-            port,
+            port: Some(port),
             use_tls: false,
             encryption: EncryptionMode::Never,
             ..Default::default()
@@ -2576,7 +2629,7 @@ mod tests {
     fn endpoint_https() {
         let config = WinrmConfig {
             use_tls: true,
-            port: 5986,
+            port: Some(5986),
             accept_invalid_certs: true,
             ..Default::default()
         };
@@ -2591,7 +2644,7 @@ mod tests {
     #[test]
     fn config_accessor() {
         let transport = basic_transport(5985);
-        assert_eq!(transport.config().port, 5985);
+        assert_eq!(transport.config().port, Some(5985));
         assert!(matches!(transport.config().auth_method, AuthMethod::Basic));
     }
 
@@ -3205,7 +3258,7 @@ mod tests {
         let (port, server) = spawn_mtls_server();
         let files = pem_files("mtls", RSA_CERT_PEM, RSA_KEY_PKCS1_PEM);
         let config = WinrmConfig {
-            port,
+            port: Some(port),
             proxy: Some(format!("http://127.0.0.1:{port}")),
             connect_timeout_secs: 5,
             operation_timeout_secs: 5,
@@ -3319,7 +3372,7 @@ mod tests {
         let addr = server.address();
         let config = WinrmConfig {
             auth_method: AuthMethod::Basic,
-            port: addr.port(),
+            port: Some(addr.port()),
             use_tls: false,
             encryption: EncryptionMode::Never,
             max_retries: 3,
@@ -3345,7 +3398,7 @@ mod tests {
         let addr = server.address();
         let config = WinrmConfig {
             auth_method: AuthMethod::Basic,
-            port: addr.port(),
+            port: Some(addr.port()),
             use_tls: false,
             encryption: EncryptionMode::Never,
             max_retries: 3,
@@ -3377,7 +3430,7 @@ mod tests {
         let config = WinrmConfig {
             use_tls: true,
             accept_invalid_certs: true,
-            port: 5986,
+            port: Some(5986),
             ..Default::default()
         };
         let creds = WinrmCredentials::new("admin", "pass", "");
@@ -3390,7 +3443,7 @@ mod tests {
         let config = WinrmConfig {
             use_tls: true,
             accept_invalid_certs: false,
-            port: 5986,
+            port: Some(5986),
             ..Default::default()
         };
         let creds = WinrmCredentials::new("admin", "pass", "");
@@ -3416,10 +3469,7 @@ mod tests {
     #[test]
     #[ignore = "run in a child process by plain_http_client_builds_without_system_roots"]
     fn plain_http_client_builds_without_system_roots_inner() {
-        let result = HttpTransport::new(
-            WinrmConfig::default(),
-            WinrmCredentials::new(USER, PASS, ""),
-        );
+        let result = HttpTransport::new(WinrmConfig::http(), WinrmCredentials::new(USER, PASS, ""));
         assert!(result.is_ok(), "{:?}", result.err());
         println!("{CHILD_RAN}");
     }
@@ -3563,7 +3613,7 @@ mod tests {
                 WinrmConfig {
                     use_tls,
                     accept_invalid_certs,
-                    port: 5986,
+                    port: Some(5986),
                     ..Default::default()
                 },
                 WinrmCredentials::new(USER, PASS, ""),
@@ -3584,7 +3634,7 @@ mod tests {
                 WinrmConfig {
                     auth_method: AuthMethod::CredSsp,
                     use_tls: true,
-                    port: 5986,
+                    port: Some(5986),
                     ..Default::default()
                 },
                 WinrmCredentials::new(USER, PASS, ""),
@@ -3669,7 +3719,7 @@ mod tests {
             let config = WinrmConfig {
                 auth_method: method,
                 use_tls: true,
-                port: 5986,
+                port: Some(5986),
                 encryption: EncryptionMode::Always,
                 ..Default::default()
             };
@@ -3682,26 +3732,26 @@ mod tests {
         let ntlm = WinrmConfig {
             auth_method: AuthMethod::Ntlm,
             use_tls: true,
-            port: 5986,
+            port: Some(5986),
             encryption: EncryptionMode::Always,
             ..Default::default()
         };
         assert!(HttpTransport::new(ntlm, creds()).is_ok());
     }
 
-    /// NTLM over plain HTTP is accepted (it is the default) but says at
+    /// NTLM over plain HTTP (`WinrmConfig::http()`) is accepted but says at
     /// construction what it leaves unprotected, under its own target.
     #[tracing_test::traced_test]
     #[test]
     fn ntlm_over_plain_http_is_accepted_with_a_warning() {
         let creds = || WinrmCredentials::new("admin", "pass", "");
-        assert!(HttpTransport::new(WinrmConfig::default(), creds()).is_ok());
+        assert!(HttpTransport::new(WinrmConfig::http(), creds()).is_ok());
         assert!(logs_contain("NTLM over plain HTTP"));
         assert!(logs_contain("winrm_rs::ntlm_over_http"));
         assert!(logs_contain("sealed=true"));
         let never = WinrmConfig {
             encryption: EncryptionMode::Never,
-            ..Default::default()
+            ..WinrmConfig::http()
         };
         assert!(HttpTransport::new(never, creds()).is_ok());
         assert!(logs_contain("sealed=false"));
@@ -3714,14 +3764,14 @@ mod tests {
         let creds = || WinrmCredentials::new("admin", "pass", "");
         let https = WinrmConfig {
             use_tls: true,
-            port: 5986,
+            port: Some(5986),
             ..Default::default()
         };
         assert!(HttpTransport::new(https, creds()).is_ok());
         let basic = WinrmConfig {
             auth_method: AuthMethod::Basic,
             encryption: EncryptionMode::Never,
-            ..Default::default()
+            ..WinrmConfig::http()
         };
         assert!(HttpTransport::new(basic, creds()).is_ok());
         assert!(!logs_contain("NTLM over plain HTTP"));
@@ -3757,7 +3807,7 @@ mod tests {
         let transport = HttpTransport::new(
             WinrmConfig {
                 auth_method: AuthMethod::Basic,
-                port,
+                port: Some(port),
                 use_tls: false,
                 encryption: EncryptionMode::Never,
                 max_retries: 0,
@@ -3864,7 +3914,7 @@ mod tests {
         let fake = FakeNtlmServer::mount(&server).await;
         let mut config = WinrmConfig {
             auth_method: AuthMethod::Ntlm,
-            port: server.address().port(),
+            port: Some(server.address().port()),
             use_tls: false,
             operation_timeout_secs: 10,
             ..Default::default()
@@ -3908,7 +3958,7 @@ mod tests {
     fn basic_transport_retrying(port: u16, max_retries: u32) -> HttpTransport {
         let config = WinrmConfig {
             auth_method: AuthMethod::Basic,
-            port,
+            port: Some(port),
             use_tls: false,
             encryption: EncryptionMode::Never,
             max_retries,
@@ -3924,6 +3974,77 @@ mod tests {
         socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let port = socket.local_addr().unwrap().port();
         (socket, port)
+    }
+
+    /// The hint names `WinrmConfig::http()` only when a connection to the
+    /// defaulted HTTPS port failed.
+    #[tokio::test]
+    async fn connect_hint_only_for_a_connect_failure_on_the_default_https_port() {
+        let (_socket, closed) = refused_port();
+        let err = basic_transport(closed)
+            .send_soap_with_retry("127.0.0.1", "<s:Envelope/>".into())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, WinrmError::Http(e) if e.is_connect()),
+            "{err:?}"
+        );
+        assert!(connect_hint(&WinrmConfig::default(), &err).is_some());
+        let explicit = WinrmConfig {
+            port: Some(5986),
+            ..Default::default()
+        };
+        assert!(connect_hint(&explicit, &err).is_none());
+        assert!(connect_hint(&WinrmConfig::http(), &err).is_none());
+        let plain_default_port = WinrmConfig {
+            use_tls: false,
+            ..Default::default()
+        };
+        assert!(connect_hint(&plain_default_port, &err).is_none());
+        assert!(connect_hint(&WinrmConfig::default(), &WinrmError::Timeout(1)).is_none());
+    }
+
+    /// A default client whose connection to port 5986 fails logs the hint
+    /// once, with the host and no credentials.
+    #[tokio::test]
+    async fn a_failed_connection_to_the_default_https_port_logs_the_connect_hint() {
+        // A local listener that closes every connection before the TLS
+        // handshake completes: a connect error that no other service on
+        // this host can answer. If port 5986 is taken here, the failure
+        // cannot be arranged.
+        let Ok(listener) = tokio::net::TcpListener::bind("127.0.0.1:5986").await else {
+            eprintln!("127.0.0.1:5986 is in use here: leg not checked");
+            return;
+        };
+        let closer = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        let (logs, _guard) = capture_logs();
+        let transport = HttpTransport::new(
+            WinrmConfig {
+                connect_timeout_secs: 5,
+                ..Default::default()
+            },
+            WinrmCredentials::new("admin", "hint-secret", ""),
+        )
+        .unwrap();
+        let err = transport
+            .send_soap_with_retry("127.0.0.1", "<s:Envelope/>".into())
+            .await
+            .unwrap_err();
+        closer.abort();
+        assert!(
+            matches!(&err, WinrmError::Http(e) if e.is_connect()),
+            "{err:?}"
+        );
+        let text = logs.text();
+        let hint_lines: Vec<&str> = text.lines().filter(|l| l.contains(CONNECT_HINT)).collect();
+        assert_eq!(hint_lines.len(), 1, "{text}");
+        assert!(hint_lines[0].contains("WARN"), "{text}");
+        assert!(hint_lines[0].contains("host=127.0.0.1"), "{text}");
+        assert!(!text.contains("hint-secret"), "{text}");
     }
 
     async fn mount_ok_expecting(server: &MockServer, times: u64) {
@@ -4531,10 +4652,10 @@ mod tests {
         });
         let config = WinrmConfig {
             auth_method: AuthMethod::Basic,
-            port,
+            port: Some(port),
             encryption: EncryptionMode::Never,
             max_retries: 2,
-            ..Default::default()
+            ..WinrmConfig::http()
         };
         let transport = HttpTransport::new(config, WinrmCredentials::new("u", "p", "")).unwrap();
         let err = transport
@@ -4702,7 +4823,7 @@ mod tests {
             auth_method: AuthMethod::CredSsp,
             use_tls: true,
             accept_invalid_certs: false,
-            port,
+            port: Some(port),
             connect_timeout_secs: 1,
             operation_timeout_secs: 5,
             ..Default::default()
@@ -5320,7 +5441,7 @@ mod tests {
             auth_method: AuthMethod::Ntlm,
             use_tls: true,
             accept_invalid_certs: true,
-            port,
+            port: Some(port),
             proxy: Some(format!("http://127.0.0.1:{proxy_port}")),
             connect_timeout_secs: 5,
             operation_timeout_secs: 5,
@@ -5692,8 +5813,8 @@ mod tests {
                 WinrmConfig {
                     auth_method: AuthMethod::Kerberos,
                     encryption: encryption.clone(),
-                    port,
-                    ..Default::default()
+                    port: Some(port),
+                    ..WinrmConfig::http()
                 },
                 WinrmCredentials::new("u", "p", ""),
             )
@@ -6450,7 +6571,7 @@ mod tests {
             auth_method: AuthMethod::Ntlm,
             use_tls: true,
             accept_invalid_certs: true,
-            port,
+            port: Some(port),
             connect_timeout_secs: 5,
             operation_timeout_secs: 5,
             ..Default::default()
@@ -6513,7 +6634,7 @@ mod tests {
                     auth_method,
                     use_tls: true,
                     accept_invalid_certs: !basic,
-                    port,
+                    port: Some(port),
                     proxy,
                     connect_timeout_secs: 5,
                     operation_timeout_secs: 5,
@@ -6696,7 +6817,7 @@ mod tests {
             auth_method: AuthMethod::Ntlm,
             use_tls: true,
             accept_invalid_certs: true,
-            port,
+            port: Some(port),
             // "localhost" for the proxy, "127.0.0.1" for the target: two names.
             proxy: Some(format!("https://localhost:{proxy}")),
             connect_timeout_secs: 5,
@@ -6737,7 +6858,7 @@ mod tests {
             auth_method: AuthMethod::Ntlm,
             use_tls: true,
             accept_invalid_certs: true,
-            port,
+            port: Some(port),
             connect_timeout_secs: 5,
             operation_timeout_secs: 5,
             ..Default::default()
@@ -6785,7 +6906,7 @@ mod tests {
             |n: &str| (n == "HTTP_PROXY").then(|| "http://user:s3cret@p.corp:3128".to_string());
         let config = WinrmConfig {
             auth_method: AuthMethod::Ntlm,
-            ..Default::default()
+            ..WinrmConfig::http()
         };
         HttpTransport::new_with_env(
             config,
@@ -6816,17 +6937,18 @@ mod tests {
         let https = WinrmConfig {
             auth_method: AuthMethod::Ntlm,
             use_tls: true,
-            port: 5986,
+            port: Some(5986),
             ..Default::default()
         };
+        // The other two legs are plain HTTP, where the WARN would apply.
         let explicit = WinrmConfig {
             auth_method: AuthMethod::Ntlm,
             proxy: Some("http://explicit.corp:1".into()),
-            ..Default::default()
+            ..WinrmConfig::http()
         };
         let plain = WinrmConfig {
             auth_method: AuthMethod::Ntlm,
-            ..Default::default()
+            ..WinrmConfig::http()
         };
         for (config, opts) in [
             (https, opted_in.clone()),
@@ -6869,6 +6991,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(t.proxy_route().proxy_for("http://h:5985/wsman"), None);
+        assert_eq!(t.proxy_route().proxy_for("https://h:5986/wsman"), None);
     }
 
     /// CredSSP follows the environment's proxies once they are opted in, per
@@ -7064,7 +7187,7 @@ mod tests {
     ) -> HttpTransport {
         let config = WinrmConfig {
             auth_method: AuthMethod::Ntlm,
-            port: server.address().port(),
+            port: Some(server.address().port()),
             use_tls: false,
             encryption,
             proxy: Some(format!("http://127.0.0.1:{proxy_port}")),
@@ -7263,11 +7386,11 @@ mod tests {
         let (proxy, seen) = spawn_forwarding_proxy(false);
         let config = WinrmConfig {
             auth_method: AuthMethod::Kerberos,
-            port: server.address().port(),
+            port: Some(server.address().port()),
             encryption: EncryptionMode::Never,
             proxy: Some(format!("http://127.0.0.1:{proxy}")),
             operation_timeout_secs: 5,
-            ..Default::default()
+            ..WinrmConfig::http()
         };
         let t = HttpTransport::new_with_env(
             config,
@@ -7311,11 +7434,11 @@ mod tests {
     ) -> HttpTransport {
         let config = WinrmConfig {
             auth_method: AuthMethod::Kerberos,
-            port: server.address().port(),
+            port: Some(server.address().port()),
             encryption: EncryptionMode::Never,
             proxy: Some(format!("http://127.0.0.1:{proxy_port}")),
             operation_timeout_secs: 5,
-            ..Default::default()
+            ..WinrmConfig::http()
         };
         HttpTransport::new_with_env(
             config,
@@ -7631,7 +7754,7 @@ mod tests {
                 ..cert_tls_config(&client_files)
             };
             let config = WinrmConfig {
-                port,
+                port: Some(port),
                 max_retries: 0,
                 connect_timeout_secs: 5,
                 operation_timeout_secs: 5,
@@ -7659,9 +7782,9 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let config = WinrmConfig {
             auth_method: AuthMethod::Ntlm,
-            port,
+            port: Some(port),
             operation_timeout_secs: 5,
-            ..Default::default()
+            ..WinrmConfig::http()
         };
         let transport = HttpTransport::new(config, WinrmCredentials::new(USER, PASS, "")).unwrap();
         let url = transport.endpoint("127.0.0.1");
@@ -7854,7 +7977,7 @@ mod tests {
     fn relayed_transport(relay: u16) -> HttpTransport {
         let config = WinrmConfig {
             auth_method: AuthMethod::Ntlm,
-            port: relay,
+            port: Some(relay),
             use_tls: false,
             max_retries: 0,
             operation_timeout_secs: 10,
@@ -7898,7 +8021,7 @@ mod tests {
         let (port, accepts) = spawn_closing_http_server();
         let config = WinrmConfig {
             connect_timeout_secs: 5,
-            ..Default::default()
+            ..WinrmConfig::http()
         };
         let gate = Arc::new(ConnGate {
             locked: AtomicBool::new(false),
@@ -7977,7 +8100,7 @@ mod tests {
             auth_method,
             use_tls: true,
             accept_invalid_certs: false,
-            port,
+            port: Some(port),
             max_retries: 0,
             connect_timeout_secs: 5,
             operation_timeout_secs: 5,
@@ -8061,6 +8184,26 @@ mod tests {
         let (_, read) =
             basic_against_sink(&roots(&[&ca]), CA_LEAF_PEM, CA_LEAF_KEY_PEM, "localhost").await;
         assert!(read > 0, "the listener must be trusted");
+    }
+
+    /// A certificate the client does not trust is a connect error too, but
+    /// a TLS listener answered: the hint that names plain HTTP stays silent.
+    #[tokio::test]
+    async fn no_connect_hint_when_the_listener_certificate_is_refused() {
+        use crate::test_pki::{CA_LEAF_KEY_PEM, CA_LEAF_PEM, RSA_CERT_PEM};
+        let other = root_file("hint-other-ca", RSA_CERT_PEM);
+        let (result, _) =
+            basic_against_sink(&roots(&[&other]), CA_LEAF_PEM, CA_LEAF_KEY_PEM, "localhost").await;
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, WinrmError::Http(e) if e.is_connect()),
+            "{err:?}"
+        );
+        assert!(
+            matches!(&err, WinrmError::Http(e) if is_tls_failure(e)),
+            "{err:?}"
+        );
+        assert!(connect_hint(&WinrmConfig::default(), &err).is_none());
     }
 
     #[tokio::test]

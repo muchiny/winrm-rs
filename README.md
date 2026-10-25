@@ -61,12 +61,12 @@ cargo add winrm-rs --features kerberos
 
 | Setting | Server authenticated | Authentication bound to the connection | SOAP bodies | Use |
 |---|---|---|---|---|
-| HTTPS + NTLM, certificate validated | yes (certificate) | yes (channel binding) | TLS | untrusted networks, hosts outside a domain |
+| HTTPS + NTLM, certificate validated (the default) | yes (certificate) | yes (channel binding) | TLS | untrusted networks, hosts outside a domain |
 | HTTPS + Kerberos, certificate validated | yes (certificate, AP-REP) | yes (channel binding, certificate pin) | TLS | domain members, connected to by name |
 | HTTPS + Certificate | yes (certificate) | yes (client certificate in the TLS handshake) | TLS | certificate-mapped accounts |
 | HTTPS + CredSSP, certificate validated or pinned (required) | yes (certificate) | inner TLS only | TLS | when the host must reach other machines with your credentials |
 | HTTP + Kerberos | yes (AP-REP) | no: a party on the path, or one controlling DNS, can relay the AP-REQ | sealed (`EncryptionMode::Auto`) | trusted networks |
-| HTTP + NTLM (`WinrmConfig::http()`, today's default) | no | no: the handshake can be relayed, or recorded to guess the password offline | sealed (`EncryptionMode::Auto`) | trusted networks only |
+| HTTP + NTLM (`WinrmConfig::http()`, the 1.x default) | no | no: the handshake can be relayed, or recorded to guess the password offline | sealed (`EncryptionMode::Auto`) | trusted networks only |
 | Basic | over HTTPS only, certificate verified (`accept_invalid_certs` is refused) | n/a | TLS; over HTTP only with `EncryptionMode::Never`, in plaintext (a WARN is logged) | HTTPS only |
 | any method with `accept_invalid_certs` | no | channel binding stops a relay to the real WinRM server only; CredSSP and Basic over HTTPS refuse this flag | TLS to whoever answers | test environments |
 
@@ -104,9 +104,7 @@ use winrm_rs::{AuthMethod, WinrmClient, WinrmConfig, WinrmCredentials};
 let client = WinrmClient::new(
     WinrmConfig {
         auth_method: AuthMethod::Basic,
-        use_tls: true,
-        port: 5986,
-        ..WinrmConfig::default()
+        ..WinrmConfig::https()
     },
     WinrmCredentials::new("admin", "password", ""),
 )?;
@@ -119,14 +117,14 @@ body travel in cleartext.
 ### NTLM authentication (default)
 
 ```rust
-// Plain HTTP on 5985 (the default): see "Choosing a transport".
+// Plain HTTP on 5985 (the 1.x default): see "Choosing a transport".
 let client = WinrmClient::new(
     WinrmConfig::http(),
     WinrmCredentials::new("admin", "password", "MYDOMAIN"),
 )?;
 
-// HTTPS on 5986: the certificate authenticates the server, and NTLM
-// carries a channel binding to it.
+// HTTPS on 5986 (the default): the certificate authenticates the server,
+// and NTLM carries a channel binding to it.
 let client = WinrmClient::new(
     WinrmConfig::https(),
     WinrmCredentials::new("admin", "password", "MYDOMAIN"),
@@ -203,11 +201,9 @@ relayed onto another one: see [Choosing a transport](#choosing-a-transport).
 let client = WinrmClient::new(
     WinrmConfig {
         auth_method: AuthMethod::Certificate,
-        use_tls: true,
-        port: 5986,
         client_cert_pem: Some("/path/to/cert.pem".into()),
         client_key_pem: Some("/path/to/key.pem".into()),
-        ..WinrmConfig::default()
+        ..WinrmConfig::https()
     },
     WinrmCredentials::new("admin", "", ""),
 )?;
@@ -226,7 +222,7 @@ private CA, add its certificate; `platform_roots(true)` trusts the operating
 system's certificate store instead.
 
 ```rust
-let client = WinrmClient::builder(WinrmConfig { use_tls: true, port: 5986, ..Default::default() })
+let client = WinrmClient::builder(WinrmConfig::https())
     .add_root_certificates_pem("/etc/winrm/corp-ca.pem")
     .credentials(WinrmCredentials::new("admin", "pass", ""))
     .build()?;
@@ -245,7 +241,7 @@ roots, not with the pin, so a host that has the name of such a proxy is refused
 while a pin is set.
 
 ```rust
-let client = WinrmClient::builder(WinrmConfig { use_tls: true, port: 5986, ..Default::default() })
+let client = WinrmClient::builder(WinrmConfig::https())
     .pin_server_certificate_sha256("3f:a1:...:9c") // 64 hex digits, `:` optional
     .credentials(WinrmCredentials::new("admin", "pass", ""))
     .build()?;
@@ -364,8 +360,8 @@ to a share. It does not limit which local files a path names.
 
 | Field | Default | Description |
 |---|---|---|
-| `port` | `5985` | Listener port; does not follow `use_tls` (set 5986 for HTTPS) |
-| `use_tls` | `false` | Use HTTPS instead of HTTP |
+| `port` | `None` | Listener port; `None` is 5986 with `use_tls`, 5985 without (`effective_port()`) |
+| `use_tls` | `true` | Use HTTPS instead of HTTP (`WinrmConfig::http()` turns it off) |
 | `accept_invalid_certs` | `false` | Skip certificate chain and host-name checks (test only; see its rustdoc) |
 | `connect_timeout_secs` | `30` | TCP connection timeout |
 | `operation_timeout_secs` | `60` | WinRM operation timeout (SOAP-level) |

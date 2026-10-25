@@ -254,6 +254,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   client is built (it logged a WARN in 1.5). Migration: pin the listener
   certificate (`pin_server_certificate_sha256`) or trust its CA
   (`add_root_certificates_pem`) and set `accept_invalid_certs = false`.
+- `WinrmConfig::default()` connects over HTTPS to port 5986, certificate
+  validated. Migration: a host with only the stock HTTP listener (what
+  `Enable-PSRemoting` creates) needs `WinrmConfig::http()`, or
+  `..WinrmConfig::http()` in a struct literal; a failed connection to the
+  defaulted HTTPS port logs a WARN that says so.
+- `WinrmConfig::port` is `Option<u16>`; `None` (the default) means 5986 with
+  `use_tls`, 5985 without. Migration: `port: 5986` becomes
+  `port: Some(5986)`, and a read of the port in use calls
+  `WinrmConfig::effective_port()`.
 
 ### Added
 
@@ -318,6 +327,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `WinrmConfig::http()` (plain HTTP on 5985, today's default). The default
   becomes HTTPS on 5986 in 2.0; `WinrmConfig::http()` keeps plain HTTP.
 - `WinrmClientBuilder::use_env_proxy(bool)`.
+- `WinrmConfig::effective_port()`: the port a configuration connects to.
 
 ### Fixed
 

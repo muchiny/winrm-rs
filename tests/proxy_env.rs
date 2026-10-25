@@ -118,11 +118,11 @@ async fn child_sends(host: &str, use_env: Option<bool>) {
     let config = WinrmConfig {
         auth_method: AuthMethod::Basic,
         encryption: EncryptionMode::Never,
-        port,
+        port: Some(port),
         connect_timeout_secs: 2,
         operation_timeout_secs: 2,
         max_retries: 0,
-        ..Default::default()
+        ..WinrmConfig::http()
     };
     let mut builder = WinrmClient::builder(config).credentials(WinrmCredentials::new("u", "p", ""));
     if let Some(on) = use_env {

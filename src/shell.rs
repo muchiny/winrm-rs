@@ -800,12 +800,12 @@ mod tests {
 
     fn basic_config(port: u16) -> WinrmConfig {
         WinrmConfig {
-            port,
+            port: Some(port),
             auth_method: AuthMethod::Basic,
             encryption: EncryptionMode::Never,
             connect_timeout_secs: 5,
             operation_timeout_secs: 10,
-            ..Default::default()
+            ..WinrmConfig::http()
         }
     }
 
@@ -1304,12 +1304,12 @@ mod tests {
             .await;
 
         let config = WinrmConfig {
-            port,
+            port: Some(port),
             auth_method: AuthMethod::Basic,
             encryption: EncryptionMode::Never,
             connect_timeout_secs: 30,
             operation_timeout_secs: 3, // * 2 = 6s timeout, + 2 = 5s
-            ..Default::default()
+            ..WinrmConfig::http()
         };
         let client = WinrmClient::new(config, test_creds()).unwrap();
         let shell = client.open_shell("127.0.0.1").await.unwrap();
@@ -1377,12 +1377,12 @@ mod tests {
             .await;
 
         let config = WinrmConfig {
-            port,
+            port: Some(port),
             auth_method: AuthMethod::Basic,
             encryption: EncryptionMode::Never,
             connect_timeout_secs: 30,
             operation_timeout_secs: 1, // * 2 = 2s (ample), / 2 = 0s (instant timeout)
-            ..Default::default()
+            ..WinrmConfig::http()
         };
         let client = WinrmClient::new(config, test_creds()).unwrap();
         let shell = client.open_shell("127.0.0.1").await.unwrap();
@@ -2225,9 +2225,9 @@ mod tests {
         let _fake = crate::test_ntlm_server::FakeNtlmServer::mount(&server).await;
         let config = WinrmConfig {
             auth_method: AuthMethod::Ntlm,
-            port: server.address().port(),
+            port: Some(server.address().port()),
             operation_timeout_secs: 10,
-            ..Default::default()
+            ..WinrmConfig::http()
         };
         let client = WinrmClient::new(
             config,

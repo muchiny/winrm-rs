@@ -1294,12 +1294,12 @@ mod tests {
 
     fn basic_config(port: u16) -> WinrmConfig {
         WinrmConfig {
-            port,
+            port: Some(port),
             auth_method: AuthMethod::Basic,
             encryption: EncryptionMode::Never,
             connect_timeout_secs: 5,
             operation_timeout_secs: 10,
-            ..Default::default()
+            ..WinrmConfig::http()
         }
     }
 
@@ -1314,13 +1314,13 @@ mod tests {
 
     fn ntlm_config(port: u16) -> WinrmConfig {
         WinrmConfig {
-            port,
+            port: Some(port),
             auth_method: AuthMethod::Ntlm,
             connect_timeout_secs: 5,
             operation_timeout_secs: 10,
             // Mocks don't support NTLM sealing; disable encryption for unit tests.
             encryption: EncryptionMode::Never,
-            ..Default::default()
+            ..WinrmConfig::http()
         }
     }
 
@@ -1329,13 +1329,13 @@ mod tests {
         let config = WinrmConfig::default();
         let creds = WinrmCredentials::new("admin", "pass", "");
         let client = WinrmClient::new(config, creds).unwrap();
-        assert_eq!(client.endpoint("win-01"), "http://win-01:5985/wsman");
+        assert_eq!(client.endpoint("win-01"), "https://win-01:5986/wsman");
     }
 
     #[test]
     fn client_builds_https_endpoint() {
         let config = WinrmConfig {
-            port: 5986,
+            port: Some(5986),
             use_tls: true,
             ..Default::default()
         };
@@ -2203,7 +2203,7 @@ mod tests {
             .credentials(WinrmCredentials::new("admin", "pass", ""))
             .build()
             .unwrap();
-        assert_eq!(client.endpoint("host"), "http://host:5985/wsman");
+        assert_eq!(client.endpoint("host"), "https://host:5986/wsman");
     }
 
     #[tokio::test]
@@ -2401,13 +2401,13 @@ mod tests {
 
     fn retry_config(port: u16, max_retries: u32) -> WinrmConfig {
         WinrmConfig {
-            port,
+            port: Some(port),
             auth_method: AuthMethod::Basic,
             encryption: EncryptionMode::Never,
             connect_timeout_secs: 5,
             operation_timeout_secs: 10,
             max_retries,
-            ..Default::default()
+            ..WinrmConfig::http()
         }
     }
 
@@ -2498,7 +2498,7 @@ mod tests {
             ..Default::default()
         };
         let client = WinrmClient::new(config, test_creds()).unwrap();
-        assert_eq!(client.endpoint("host"), "http://host:5985/wsman");
+        assert_eq!(client.endpoint("host"), "https://host:5986/wsman");
     }
 
     #[cfg(not(feature = "kerberos"))]
@@ -3663,13 +3663,13 @@ mod tests {
         });
 
         let config = WinrmConfig {
-            port,
+            port: Some(port),
             auth_method: AuthMethod::Basic,
             encryption: EncryptionMode::Never,
             connect_timeout_secs: 2,
             operation_timeout_secs: 5,
             max_retries: 3,
-            ..Default::default()
+            ..WinrmConfig::http()
         };
         let client = WinrmClient::new(config, test_creds()).unwrap();
         let result = client.create_shell("127.0.0.1").await;
@@ -4010,13 +4010,13 @@ mod tests {
         });
 
         let config = WinrmConfig {
-            port,
+            port: Some(port),
             auth_method: AuthMethod::Basic,
             encryption: EncryptionMode::Never,
             connect_timeout_secs: 2,
             operation_timeout_secs: 5,
             max_retries: 1,
-            ..Default::default()
+            ..WinrmConfig::http()
         };
         let client = WinrmClient::new(config, test_creds()).unwrap();
         let result = client.create_shell("127.0.0.1").await;
@@ -4049,13 +4049,13 @@ mod tests {
         });
 
         let config = WinrmConfig {
-            port,
+            port: Some(port),
             auth_method: AuthMethod::Basic,
             encryption: EncryptionMode::Never,
             connect_timeout_secs: 2,
             operation_timeout_secs: 5,
             max_retries: 0,
-            ..Default::default()
+            ..WinrmConfig::http()
         };
         let client = WinrmClient::new(config, test_creds()).unwrap();
         let result = client.create_shell("127.0.0.1").await;
@@ -4108,12 +4108,12 @@ mod tests {
             .await;
 
         let config = WinrmConfig {
-            port,
+            port: Some(port),
             auth_method: AuthMethod::Basic,
             encryption: EncryptionMode::Never,
             connect_timeout_secs: 30,
             operation_timeout_secs: 1,
-            ..Default::default()
+            ..WinrmConfig::http()
         };
         let client = WinrmClient::new(config, test_creds()).unwrap();
         let shell = client.open_shell("127.0.0.1").await.unwrap();
@@ -4268,13 +4268,13 @@ mod tests {
     async fn retry_backoff_is_exponential_not_additive() {
         let (_held, port) = refusing_port();
         let config = WinrmConfig {
-            port,
+            port: Some(port),
             auth_method: AuthMethod::Basic,
             encryption: EncryptionMode::Never,
             connect_timeout_secs: 2,
             operation_timeout_secs: 5,
             max_retries: 2,
-            ..Default::default()
+            ..WinrmConfig::http()
         };
         let client = WinrmClient::new(config, test_creds()).unwrap();
         let start = std::time::Instant::now();
@@ -5014,12 +5014,12 @@ mod tests {
         };
         let client = WinrmClient::new(
             WinrmConfig {
-                port,
+                port: Some(port),
                 auth_method: AuthMethod::Basic,
                 encryption: EncryptionMode::Never,
                 connect_timeout_secs: 2,
                 max_retries: 0,
-                ..Default::default()
+                ..WinrmConfig::http()
             },
             test_creds(),
         )

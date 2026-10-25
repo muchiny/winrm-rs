@@ -1156,7 +1156,7 @@ mod tests {
                 .build()
                 .unwrap();
             let config = crate::config::WinrmConfig {
-                port: 9,
+                port: Some(9),
                 connect_timeout_secs: 1,
                 ..Default::default()
             };

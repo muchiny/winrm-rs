@@ -28,7 +28,7 @@ fn split_host_port(uri: &str) -> (String, u16) {
 fn basic_client(uri: &str) -> (WinrmClient, String) {
     let (host, port) = split_host_port(uri);
     let config = WinrmConfig {
-        port,
+        port: Some(port),
         use_tls: false,
         accept_invalid_certs: false,
         connect_timeout_secs: 5,

@@ -305,7 +305,7 @@ async fn serve(foreign_ap_rep: Option<Vec<u8>>) -> (MockServer, Arc<Acceptor>) {
 
 fn client(server: &MockServer, encryption: EncryptionMode) -> WinrmClient {
     let config = WinrmConfig {
-        port: server.address().port(),
+        port: Some(server.address().port()),
         use_tls: false,
         auth_method: AuthMethod::Kerberos,
         encryption,

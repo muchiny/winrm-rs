@@ -3134,7 +3134,7 @@ mod tests {
             auth_method: AuthMethod::CredSsp,
             use_tls: true,
             accept_invalid_certs: false,
-            port,
+            port: Some(port),
             ..Default::default()
         };
         let t = HttpTransport::new_with(

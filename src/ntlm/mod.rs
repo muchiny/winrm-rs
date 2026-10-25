@@ -156,6 +156,12 @@ impl SealingSession {
         self.client_seq_num = Some(n);
     }
 
+    /// Test-only setter used to drive the server sequence counter to its limit.
+    #[cfg(test)]
+    fn set_server_seq_num(&mut self, n: u32) {
+        self.server_seq_num = Some(n);
+    }
+
     /// Derive the four session keys (client/server seal/sign) from the
     /// exported session key per MS-NLMP section 3.4.4, reset the sequence
     /// numbers, and initialise the RC4 handles, all in place.
@@ -348,6 +354,10 @@ impl SealingSession {
     /// signs with its seq 0 and resets its sealing state, so its next sealed
     /// message (the CredSSP pubKeyAuth echo) is at seq 1, keystream offset 0.
     ///
+    /// Unlike [`Self::sign_mech_list_mic`], which resets the client keystream
+    /// only when it is the first client operation, this always resets the
+    /// server keystream after a valid MIC.
+    ///
     /// # Errors
     ///
     /// Returns [`NtlmError::InvalidMessage`] if the MIC is not 16 bytes, has
@@ -480,12 +490,14 @@ impl SealingSession {
 /// # Errors and the dead session
 ///
 /// The session is unusable after an error. Once [`Self::unseal`] or
-/// [`Self::verify_mech_list_mic`] has failed, after
-/// [`Zeroize::zeroize`], or once a sequence number reaches `u32::MAX`, every
-/// later call fails: `unseal` and `verify_mech_list_mic` return `Err`,
-/// [`Self::seal`] returns an empty `Vec` and [`Self::sign`] and
-/// [`Self::sign_mech_list_mic`] return `[0; 16]`. An empty `Vec` is never a
-/// sealed message: do not send it as a body.
+/// [`Self::verify_mech_list_mic`] has failed, or after
+/// [`Zeroize::zeroize`], every later call fails: `unseal` and
+/// `verify_mech_list_mic` return `Err`, [`Self::seal`] returns an empty `Vec`
+/// and [`Self::sign`] and [`Self::sign_mech_list_mic`] return `[0; 16]`. An
+/// empty `Vec` is never a sealed message: do not send it as a body.
+///
+/// Sequence numbers never wrap: once a message carried `u32::MAX`, the next
+/// call in that direction fails and poisons the session.
 ///
 /// # Memory hygiene
 ///
@@ -718,6 +730,95 @@ mod tests {
         );
         assert_eq!(public.seal(b"body"), internal.seal(b"body").unwrap());
         assert_eq!(public.sign(b"data"), internal.sign(b"data").unwrap());
+    }
+
+    #[test]
+    fn unseal_after_a_failed_mech_list_mic_is_refused() {
+        let key = [0x42; 16];
+        let mut client = SealingSession::boxed_from_auth(&key);
+        let mut server = SealingSession::server_side(&key);
+        let mut mic = server.sign_mech_list_mic(b"mechs").unwrap();
+        mic[0] = 2; // rejected before any keystream is used
+        assert!(client.verify_mech_list_mic(b"mechs", &mic).is_err());
+        // Seq 0 at keystream offset 0: what the client would still accept,
+        // were the session not poisoned.
+        let good = SealingSession::server_side(&key).seal(b"first").unwrap();
+        let err = client.unseal(&good).unwrap_err();
+        assert!(
+            matches!(err, NtlmError::InvalidMessage(ref m) if m.contains("unusable")),
+            "a session that failed a mechListMIC stays failed: {err}"
+        );
+    }
+
+    #[test]
+    fn unseal_refuses_server_sequence_exhaustion() {
+        let key = [0x42; 16];
+        let mut client = SealingSession::boxed_from_auth(&key);
+        let mut server = SealingSession::server_side(&key);
+        server.set_client_seq_num(u32::MAX);
+        client.set_server_seq_num(u32::MAX);
+        let last = server.seal(b"last").unwrap();
+        assert_eq!(client.unseal(&last).unwrap(), b"last", "seq u32::MAX");
+        let err = client.unseal(&last).unwrap_err();
+        assert!(matches!(err, NtlmError::InvalidMessage(ref m) if m.contains("exhausted")));
+        assert!(
+            client.seal(b"to server").is_err(),
+            "server-side exhaustion poisons the whole session"
+        );
+    }
+
+    #[test]
+    fn verify_mech_list_mic_refuses_server_sequence_exhaustion() {
+        let key = [0x42; 16];
+        let mut client = SealingSession::boxed_from_auth(&key);
+        let mut server = SealingSession::server_side(&key);
+        server.set_client_seq_num(u32::MAX);
+        client.set_server_seq_num(u32::MAX);
+        let mic = server.sign_mech_list_mic(b"mechs").unwrap();
+        client.verify_mech_list_mic(b"mechs", &mic).unwrap();
+        let err = client.verify_mech_list_mic(b"mechs", &mic).unwrap_err();
+        assert!(matches!(err, NtlmError::InvalidMessage(ref m) if m.contains("exhausted")));
+        assert!(
+            client.sign(b"to server").is_err(),
+            "server-side exhaustion poisons the whole session"
+        );
+    }
+
+    /// The first `n` keystream bytes of `handle`, without advancing it.
+    fn keystream(handle: &crypto::Rc4State, n: usize) -> Vec<u8> {
+        let mut bytes = vec![0u8; n];
+        handle.clone().process(&mut bytes);
+        bytes
+    }
+
+    #[test]
+    #[expect(deprecated)]
+    fn zeroize_wipes_the_keys_and_rekeys_both_rc4_handles() {
+        let key = [0x42; 16];
+        let fresh = SealingSession::boxed_from_auth(&key);
+        let mut s = NtlmSession::from_auth(&key);
+        s.zeroize();
+        let wiped = &s.inner;
+        for k in [
+            wiped.client_sign_key,
+            wiped.server_sign_key,
+            wiped.client_seal_key,
+            wiped.server_seal_key,
+        ] {
+            assert_eq!(k, [0; 16], "a key survived zeroize");
+        }
+        for (dead, live) in [
+            (&wiped.client_seal_handle, &fresh.client_seal_handle),
+            (&wiped.server_seal_handle, &fresh.server_seal_handle),
+        ] {
+            let stream = keystream(dead, 32);
+            assert_ne!(
+                stream,
+                keystream(live, 32),
+                "RC4 still keyed from the old key"
+            );
+            assert_ne!(stream, vec![0u8; 32], "identity keystream");
+        }
     }
 
     #[test]

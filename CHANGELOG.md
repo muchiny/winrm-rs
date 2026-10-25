@@ -316,7 +316,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   PowerShell when it has a `/powershell` path segment, in any case (a URI that
   only contains `powershell` elsewhere now gives a `cmd` shell).
 - `NtlmSession::seal` and `NtlmSession::sign` no longer panic in debug builds
-  after 2^32 messages; the sequence number wraps.
+  after 2^32 messages; the call after the message that carries `u32::MAX`
+  fails (see Changed).
 - `NtlmError::InvalidMessage` is also returned for NTLM messages with
   oversized or out-of-range fields: a Type 3 field longer than a 16-bit
   length can hold is refused instead of being truncated.

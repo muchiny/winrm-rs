@@ -43,9 +43,34 @@ fuzz_target!(|input: Input<'_>| {
         let _ = signer.sign(plaintext);
     }
 
-    // The receive side: arbitrary frames, none of which should ever panic.
-    let mut receiver = SealingSession::from_auth(&input.exported_session_key);
+    // The receive side. An incoming entry whose first byte is odd is sealed
+    // by the server and must unseal to itself, which carries the sequence
+    // numbers and keystream across messages; any other entry is pushed at
+    // `unseal` raw and must never panic. A session is spent after an error
+    // (the next genuine frame is refused), so each error starts a new pair
+    // and every frame is parsed.
+    let key = &input.exported_session_key;
+    let mut receiver = SealingSession::from_auth(key);
+    let mut server = SealingSession::server_side(key);
     for frame in &input.incoming {
-        let _ = receiver.unseal(frame);
+        if frame.first().is_some_and(|b| b & 1 == 1) {
+            let genuine = server.seal(frame).expect("a live server session seals");
+            let plaintext = receiver
+                .unseal(&genuine)
+                .expect("a live session accepts a genuine frame");
+            assert_eq!(plaintext, *frame, "unseal returns what the server sealed");
+            continue;
+        }
+        if receiver.unseal(frame).is_err() {
+            let next = server.seal(frame).expect("a live server session seals");
+            assert!(
+                receiver.unseal(&next).is_err(),
+                "a session that failed an unseal accepted a genuine frame"
+            );
+        }
+        // After an error, or after a raw frame that unsealed (only one built
+        // with the session keys can), the pair is spent or out of step.
+        receiver = SealingSession::from_auth(key);
+        server = SealingSession::server_side(key);
     }
 });

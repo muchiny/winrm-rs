@@ -2145,7 +2145,8 @@ impl HttpTransport {
                     tokio::time::sleep(delay).await;
                 }
                 Err(e) => {
-                    if let Some(hint) = connect_hint(&self.config, &e) {
+                    let proxied = self.route.proxy_for(&self.endpoint(host)).is_some();
+                    if let Some(hint) = connect_hint(&self.config, proxied, &e) {
                         tracing::warn!(host = %log_host(host), "{hint}");
                     }
                     return Err(e);
@@ -2178,17 +2179,21 @@ fn retry_delay(attempt: u32) -> Duration {
 }
 
 /// The WARN logged when a connection to the defaulted HTTPS port fails.
-const CONNECT_HINT: &str = "could not connect to the default HTTPS port 5986: a host with \
-                            only the stock HTTP listener (Enable-PSRemoting creates none on \
-                            5986) needs WinrmConfig::http() for port 5985";
+const CONNECT_HINT: &str = "could not connect to the host on the default HTTPS port 5986: check \
+                            the host name; a host with only the stock HTTP listener \
+                            (Enable-PSRemoting creates none on 5986) needs WinrmConfig::http() \
+                            for port 5985";
 
 /// [`CONNECT_HINT`] when `err` is a failed connection and `config` left the
 /// port to its HTTPS default (`port: None`, `use_tls: true`): the 1.x
 /// default was HTTP on 5985, the stock listener of a Windows host. `None`
-/// for any other error or configuration.
+/// for any other error or configuration. A host name that does not resolve
+/// is a failed connection too, so a mistyped host name also gets the hint.
 ///
-/// With a proxy set there is no hint either: a failed connection is then the
-/// proxy's (unreachable, or a name it could not resolve), and
+/// With a proxy there is no hint either, whether set in
+/// [`WinrmConfig::proxy`] or taken from the environment (`proxied`: the
+/// request went through a proxy of the route): a failed connection is then
+/// the proxy's (unreachable, or a name it could not resolve), and
 /// `WinrmConfig::http()` would not fix it.
 ///
 /// The hint is also silent when `connect_timeout_secs >=
@@ -2204,10 +2209,10 @@ const CONNECT_HINT: &str = "could not connect to the default HTTPS port 5986: a 
 /// Never fires for CredSSP: its connection failures are reported as
 /// [`WinrmError::AuthFailed`] or [`WinrmError::Timeout`], not
 /// [`WinrmError::Http`].
-fn connect_hint(config: &WinrmConfig, err: &WinrmError) -> Option<&'static str> {
+fn connect_hint(config: &WinrmConfig, proxied: bool, err: &WinrmError) -> Option<&'static str> {
     let connect_failed = matches!(err, WinrmError::Http(e) if e.is_connect() && !is_tls_failure(e));
-    (config.port.is_none() && config.use_tls && config.proxy.is_none() && connect_failed)
-        .then_some(CONNECT_HINT)
+    let direct = config.proxy.is_none() && !proxied;
+    (config.port.is_none() && config.use_tls && direct && connect_failed).then_some(CONNECT_HINT)
 }
 
 /// Whether a [`rustls::Error`] is in the cause chain of `err`. An
@@ -4001,19 +4006,19 @@ mod tests {
             matches!(&err, WinrmError::Http(e) if e.is_connect()),
             "{err:?}"
         );
-        assert!(connect_hint(&WinrmConfig::default(), &err).is_some());
+        assert!(connect_hint(&WinrmConfig::default(), false, &err).is_some());
         let explicit = WinrmConfig {
             port: Some(5986),
             ..Default::default()
         };
-        assert!(connect_hint(&explicit, &err).is_none());
-        assert!(connect_hint(&WinrmConfig::http(), &err).is_none());
+        assert!(connect_hint(&explicit, false, &err).is_none());
+        assert!(connect_hint(&WinrmConfig::http(), false, &err).is_none());
         let plain_default_port = WinrmConfig {
             use_tls: false,
             ..Default::default()
         };
-        assert!(connect_hint(&plain_default_port, &err).is_none());
-        assert!(connect_hint(&WinrmConfig::default(), &WinrmError::Timeout(1)).is_none());
+        assert!(connect_hint(&plain_default_port, false, &err).is_none());
+        assert!(connect_hint(&WinrmConfig::default(), false, &WinrmError::Timeout(1)).is_none());
     }
 
     /// With a proxy set, a connect failure is the proxy's (unreachable, or
@@ -4029,12 +4034,71 @@ mod tests {
             matches!(&err, WinrmError::Http(e) if e.is_connect()),
             "{err:?}"
         );
-        assert!(connect_hint(&WinrmConfig::default(), &err).is_some());
+        assert!(connect_hint(&WinrmConfig::default(), false, &err).is_some());
         let proxied = WinrmConfig {
             proxy: Some(SecretString::from("http://127.0.0.1:1")),
             ..Default::default()
         };
-        assert!(connect_hint(&proxied, &err).is_none());
+        assert!(connect_hint(&proxied, false, &err).is_none());
+    }
+
+    /// A client that opted in to the environment's proxies and whose request
+    /// goes through `HTTPS_PROXY` gets no hint either: the failed connection
+    /// is the proxy's.
+    #[tokio::test]
+    async fn no_connect_hint_when_an_environment_proxy_applies() {
+        let (_socket, closed) = refused_port();
+        let (logs, _guard) = capture_logs();
+        let env = move |n: &str| (n == "HTTPS_PROXY").then(|| format!("http://127.0.0.1:{closed}"));
+        let transport = HttpTransport::new_with_env(
+            WinrmConfig {
+                connect_timeout_secs: 5,
+                ..Default::default()
+            },
+            WinrmCredentials::new("admin", "hint-secret", ""),
+            TransportOptions {
+                use_env_proxy: true,
+                ..Default::default()
+            },
+            env,
+        )
+        .unwrap();
+        let err = transport
+            .send_soap_with_retry("win01.test", "<s:Envelope/>".into())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, WinrmError::Http(e) if e.is_connect()),
+            "{err:?}"
+        );
+        let text = logs.text();
+        assert!(!text.contains(CONNECT_HINT), "{text}");
+        // The same error on a direct route would get the hint.
+        assert!(connect_hint(&WinrmConfig::default(), false, &err).is_some());
+        assert!(connect_hint(&WinrmConfig::default(), true, &err).is_none());
+    }
+
+    /// A host name that does not resolve fails as a connect error too, so
+    /// it also gets the hint.
+    #[tokio::test]
+    async fn an_unresolvable_host_gets_the_connect_hint() {
+        let transport = HttpTransport::new(
+            WinrmConfig {
+                connect_timeout_secs: 5,
+                ..Default::default()
+            },
+            WinrmCredentials::new("admin", "pass", ""),
+        )
+        .unwrap();
+        let err = transport
+            .send_soap_with_retry("no-such-host.invalid", "<s:Envelope/>".into())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, WinrmError::Http(e) if e.is_connect()),
+            "{err:?}"
+        );
+        assert!(connect_hint(&WinrmConfig::default(), false, &err).is_some());
     }
 
     /// A default client whose connection to port 5986 fails logs the hint
@@ -8241,7 +8305,7 @@ mod tests {
             matches!(&err, WinrmError::Http(e) if is_tls_failure(e)),
             "{err:?}"
         );
-        assert!(connect_hint(&WinrmConfig::default(), &err).is_none());
+        assert!(connect_hint(&WinrmConfig::default(), false, &err).is_none());
     }
 
     #[tokio::test]

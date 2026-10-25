@@ -11,9 +11,10 @@ on:
   workflow_dispatch:
     inputs:
       seconds:
-        description: "Seconds to fuzz each target"
+        description: "Seconds to fuzz each target (1-3300)"
         required: false
-        default: "900"
+        default: 900
+        type: number
 
 permissions:
   contents: read
@@ -100,16 +101,24 @@ jobs:
       - name: Fuzz
         env:
           FUZZ_SANITIZER: ${{ matrix.sanitizer }}
+          FUZZ_TARGET: ${{ matrix.target }}
+          FUZZ_SECONDS: ${{ inputs.seconds || 900 }}
         run: |
-          scripts/fuzz.sh run "${{ matrix.target }}" \
-            "${{ github.event.inputs.seconds || '900' }}"
+          # `type: number` is only checked by the UI; an API dispatch still
+          # sends a string. Match the regex before any arithmetic comparison.
+          [[ "$FUZZ_SECONDS" =~ ^[1-9][0-9]{0,3}$ ]] && [ "$FUZZ_SECONDS" -le 3300 ] || {
+            echo "::error::seconds must be 1-3300 (job timeout is 60 min)"
+            exit 2
+          }
+          scripts/fuzz.sh run "$FUZZ_TARGET" "$FUZZ_SECONDS"
 
       # Keeps the cached corpus from growing without bound across nights.
       - name: Minimise corpus
         if: success()
         env:
           FUZZ_SANITIZER: ${{ matrix.sanitizer }}
-        run: scripts/fuzz.sh cmin "${{ matrix.target }}"
+          FUZZ_TARGET: ${{ matrix.target }}
+        run: scripts/fuzz.sh cmin "$FUZZ_TARGET"
 
       - name: Upload crash artifacts
         if: failure()

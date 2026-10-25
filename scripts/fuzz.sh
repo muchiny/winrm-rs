@@ -141,6 +141,11 @@ cmd_run() {
   local only="${1:-}"
   local seconds="${2:-$FUZZ_TIME}"
   local rc=0
+  # Checked before any cargo call: the value ends up in a libFuzzer flag.
+  [[ "$seconds" =~ ^[1-9][0-9]{0,5}$ ]] || {
+    echo "seconds must be a positive integer (got '$seconds')" >&2
+    return 2
+  }
   for target in $(select_targets "$only"); do
     echo "=== run $target (${seconds}s, sanitizer=$FUZZ_SANITIZER)"
     # shellcheck disable=SC2046

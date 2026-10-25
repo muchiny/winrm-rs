@@ -30,6 +30,8 @@ jobs:
       - run: cargo fmt --all --check
       - name: Package contents
         run: scripts/check-package.sh
+      - name: fuzz.sh argument checks
+        run: scripts/test-fuzz-args.sh
 
   clippy:
     name: Clippy

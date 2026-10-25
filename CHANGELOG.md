@@ -266,6 +266,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `WinrmConfig::proxy` is an `Option<SecretString>`: build it with
   `SecretString::from(url)`. The crate's copy of the proxy URL, which can
   hold credentials, is wiped on drop.
+- `RemotePathPolicy::LocalDrive` also refuses DOS device names (`CON`,
+  `NUL`, `COM1`, `LPT1`, ...) as the last path component, with or without
+  an extension. Migration: `RemotePathPolicy::Any` accepts them.
 
 ### Added
 

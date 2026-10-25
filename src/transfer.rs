@@ -74,6 +74,13 @@ pub(crate) fn validate_remote_path(path: &str) -> Result<(), WinrmError> {
 /// WebDAV shares and device paths: CredSSP double-hop users need it to reach
 /// `\\fileserver\share`.
 ///
+/// `LocalDrive` also refuses a drive-absolute path whose last component is a
+/// DOS device name (`CON`, `PRN`, `AUX`, `NUL`, `CONIN$`, `CONOUT$`,
+/// `COM0`-`COM9`, `LPT0`-`LPT9`, in any case, with or without an extension):
+/// Windows opens the device instead of a file, and a printer port can be
+/// redirected to a network printer. `C:\x\LPT1` and `C:\x\nul.txt` are
+/// refused; `C:\con\file.txt` and `C:\x\com10` are not.
+///
 /// This is a lexical check. A symbolic link, junction, `subst` drive or
 /// mapped network drive on the host can still lead a drive-absolute path to
 /// a share.
@@ -88,12 +95,15 @@ pub enum RemotePathPolicy {
     /// characters): the behaviour of every release before 2.0.
     Any,
     /// Accept only drive-absolute remote paths: a letter, `:`, then `\` or
-    /// `/`. The default since 2.0.
+    /// `/`, whose last component is not a DOS device name. The default since
+    /// 2.0.
     #[default]
     LocalDrive,
 }
 
-/// [`validate_remote_path`], then the restriction `policy` adds.
+/// [`validate_remote_path`], then the restriction `policy` adds: under
+/// [`RemotePathPolicy::LocalDrive`], a drive-absolute path whose last
+/// component is not a DOS device name ([`names_dos_device`]).
 pub(crate) fn validate_remote_path_for(
     path: &str,
     policy: RemotePathPolicy,
@@ -102,15 +112,55 @@ pub(crate) fn validate_remote_path_for(
     match policy {
         RemotePathPolicy::Any => Ok(()),
         RemotePathPolicy::LocalDrive => {
-            if matches!(path.as_bytes(), [d, b':', b'\\' | b'/', ..] if d.is_ascii_alphabetic()) {
-                Ok(())
-            } else {
-                Err(WinrmError::Transfer(format!(
+            if !matches!(path.as_bytes(), [d, b':', b'\\' | b'/', ..] if d.is_ascii_alphabetic()) {
+                return Err(WinrmError::Transfer(format!(
                     "remote path {path:?} is not a drive-absolute path (RemotePathPolicy::LocalDrive)"
-                )))
+                )));
             }
+            if names_dos_device(path) {
+                return Err(WinrmError::Transfer(format!(
+                    "remote path {path:?} ends in a DOS device name (RemotePathPolicy::LocalDrive)"
+                )));
+            }
+            Ok(())
         }
     }
+}
+
+/// Whether the last component of `path` is a name that legacy Win32 path
+/// rules map to a DOS device wherever it appears: `CON`, `PRN`, `AUX`,
+/// `NUL`, `CONIN$`, `CONOUT$`, `COM0`-`COM9`, `LPT0`-`LPT9` and `COM¹`,
+/// `COM²`, `COM³`, `LPT¹`, `LPT²`, `LPT³`, in any case. Trailing dots and
+/// spaces are dropped first, and the name is cut at its first `.` or `:`
+/// with the spaces before that cut dropped too, so `nul.`, `COM1.txt`,
+/// `con .txt` and `LPT1:` all count. Earlier components are not checked:
+/// a directory named `con` is not opened as a device.
+fn names_dos_device(path: &str) -> bool {
+    let last = path.rsplit(['\\', '/']).next().unwrap_or(path);
+    let trimmed = last.trim_end_matches([' ', '.']);
+    let stem = trimmed
+        .split(['.', ':'])
+        .next()
+        .unwrap_or(trimmed)
+        .trim_end_matches(' ')
+        .to_ascii_uppercase();
+    if matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) {
+        return true;
+    }
+    let Some(number) = stem
+        .strip_prefix("COM")
+        .or_else(|| stem.strip_prefix("LPT"))
+    else {
+        return false;
+    };
+    let mut chars = number.chars();
+    matches!(
+        (chars.next(), chars.next()),
+        (Some('0'..='9' | '¹' | '²' | '³'), None)
+    )
 }
 
 impl WinrmClient {
@@ -160,10 +210,11 @@ impl WinrmClient {
     ///   then only to the targets that delegation allows. It is not a sandbox:
     ///   never pass an untrusted `remote_path`.
     ///   By default ([`RemotePathPolicy::LocalDrive`](crate::RemotePathPolicy::LocalDrive),
-    ///   since 2.0) UNC, WebDAV and device paths are refused before anything
-    ///   is sent; it does not limit which local files a path names. A client
-    ///   built with `.remote_path_policy(RemotePathPolicy::Any)` lets them
-    ///   through.
+    ///   since 2.0) UNC, WebDAV and device paths, and a last component that
+    ///   is a DOS device name (`NUL`, `COM1`, `LPT1`, ...), are refused before
+    ///   anything is sent; it does not limit which local files a path names.
+    ///   A client built with `.remote_path_policy(RemotePathPolicy::Any)`
+    ///   lets them through.
     /// - Each chunk of the file, up to 2000 bytes, travels as base64 inside the
     ///   `powershell.exe -EncodedCommand` command line. A host that audits
     ///   process command lines (Security event 4688, Sysmon event 1) or logs
@@ -281,10 +332,11 @@ impl WinrmClient {
     ///   then only to the targets that delegation allows. It is not a sandbox:
     ///   never pass an untrusted `remote_path`.
     ///   By default ([`RemotePathPolicy::LocalDrive`](crate::RemotePathPolicy::LocalDrive),
-    ///   since 2.0) UNC, WebDAV and device paths are refused before anything
-    ///   is sent; it does not limit which local files a path names. A client
-    ///   built with `.remote_path_policy(RemotePathPolicy::Any)` lets them
-    ///   through.
+    ///   since 2.0) UNC, WebDAV and device paths, and a last component that
+    ///   is a DOS device name (`NUL`, `COM1`, `LPT1`, ...), are refused before
+    ///   anything is sent; it does not limit which local files a path names.
+    ///   A client built with `.remote_path_policy(RemotePathPolicy::Any)`
+    ///   lets them through.
     /// - The file comes back as base64 on the command's stdout. PowerShell
     ///   transcription on the host, if enabled, records it.
     /// - `local_path` is written with this process's privileges. A symbolic
@@ -994,6 +1046,63 @@ mod tests {
     #[test]
     fn local_drive_policy_accepts_drive_absolute_paths() {
         for p in [r"C:\a\b", "c:/a/b", r"Z:\"] {
+            assert!(
+                validate_remote_path_for(p, RemotePathPolicy::LocalDrive).is_ok(),
+                "{p:?}"
+            );
+        }
+    }
+
+    /// A last component that legacy Win32 path rules map to a DOS device
+    /// (`C:\x\LPT1` opens the printer port, which may be redirected to a
+    /// network printer) is refused under `LocalDrive`, whatever its case,
+    /// extension or trailing dots and spaces.
+    #[test]
+    fn local_drive_policy_refuses_dos_device_names() {
+        for p in [
+            r"C:\x\LPT1",
+            r"C:\x\com1.txt",
+            r"C:\CON",
+            r"C:\dir\nul.",
+            r"C:\dir\aux ",
+            r"C:\dir\COM¹",
+            r"C:\x\lpt³.log",
+            r"C:\x\LPT0",
+            r"C:\x\COM9",
+            r"C:\x\prn.tar.gz",
+            r"C:\x\con .txt",
+            r"C:\x\NUL:",
+            "C:/x/conin$",
+            r"C:\x\CONOUT$",
+        ] {
+            match validate_remote_path_for(p, RemotePathPolicy::LocalDrive) {
+                Err(WinrmError::Transfer(m)) => assert!(m.contains("DOS device"), "{p:?}: {m}"),
+                other => panic!("{p:?}: expected Transfer, got {other:?}"),
+            }
+            assert!(
+                validate_remote_path_for(p, RemotePathPolicy::Any).is_ok(),
+                "{p:?} refused under Any"
+            );
+        }
+    }
+
+    /// Only a last component that is exactly a device name counts: longer
+    /// names, other digits and directory components named like a device
+    /// pass.
+    #[test]
+    fn local_drive_policy_accepts_names_that_only_look_like_devices() {
+        for p in [
+            r"C:\x\console.txt",
+            r"C:\x\com10",
+            r"C:\x\LPT11",
+            r"C:\x\lpt.txt",
+            r"C:\CONFIG",
+            r"C:\con\file.txt",
+            r"C:\x\COM⁴",
+            r"C:\x\nul_file",
+            r"C:\x\.con",
+            r"C:\x\auxiliary.log",
+        ] {
             assert!(
                 validate_remote_path_for(p, RemotePathPolicy::LocalDrive).is_ok(),
                 "{p:?}"

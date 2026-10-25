@@ -327,8 +327,11 @@ let bytes = client.download_file("win-server", "C:\\remote\\file.bin", Path::new
 `remote_path` is opened as the remote account. Since 2.0 the client accepts
 only drive-absolute remote paths (`C:\...`) and refuses UNC, WebDAV and
 device paths, `\\?\` long paths and relative paths before anything is sent
-(`RemotePathPolicy::LocalDrive`, the default). With the `Any` policy, a path
-may name a UNC share or a device path, and under CredSSP or Basic a UNC path
+(`RemotePathPolicy::LocalDrive`, the default). It also refuses a path whose
+last component is a DOS device name (`CON`, `NUL`, `COM1`, `LPT1`, ...):
+Windows opens the device instead of a file, and a printer port may be
+redirected to a network printer. With the `Any` policy, a path may name a
+UNC share or a device path, and under CredSSP or Basic a UNC path
 is reached with your credentials: never pass an untrusted path. On the host,
 blocking outbound SMB (445) and WebDAV, the "Network security: Restrict NTLM:
 Outgoing NTLM traffic to remote servers" policy, a disabled WebClient service

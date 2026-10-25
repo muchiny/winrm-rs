@@ -768,6 +768,25 @@ mod tests {
         }
     }
 
+    /// The stream of the committed proptest seed
+    /// (`tests/proptest_wire_format.proptest-regressions`): every one-cut and
+    /// two-cut slicing decodes like the whole stream.
+    #[test]
+    fn doubled_marker_decodes_the_same_at_every_cut() {
+        let s: &[u8] = b"#< CLIXML\r\n#< CLIXML\r\n";
+        let whole = decode(s);
+        for i in 0..=s.len() {
+            assert_eq!(decode_chunks(&[&s[..i], &s[i..]]), whole, "cut at {i}");
+            for j in i..=s.len() {
+                assert_eq!(
+                    decode_chunks(&[&s[..i], &s[i..j], &s[j..]]),
+                    whole,
+                    "cuts at {i},{j}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn marker_alone_then_document_split_inside_an_escape() {
         // What Server 2025 sends for large stderr: the marker in one Receive,

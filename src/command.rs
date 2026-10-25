@@ -242,10 +242,32 @@ mod tests {
             "x'\u{2019}\u{2018}\u{201A}\u{201B}'y",
             "\u{201B}",
             "a'; Write-Output pwned; '",
+            // Characters that are special elsewhere in PowerShell stay
+            // verbatim inside the literal: nothing is added, dropped or
+            // rewritten.
+            "line one\nline two\r\nline three",
+            "a\0b",
+            "tab\there\u{7f}\u{1b}[0m",
+            "$env:USERNAME $(Write-Output pwned) ${x}",
+            "`n `' `` `\"",
+            "\"double\" and 'single'",
+            "\u{2028}\u{85}",
         ] {
             let quoted = quote_powershell_string(input);
+            assert!(
+                quoted.starts_with('\'') && quoted.ends_with('\''),
+                "{input:?}"
+            );
             let inner = &quoted[1..quoted.len() - 1];
             assert_eq!(collapse_quote_pairs(inner).as_deref(), Some(input));
+            // Only the five quote characters were touched: without them the
+            // inner text is the input.
+            let quote_free = |s: &str| {
+                s.chars()
+                    .filter(|c| !PS_SINGLE_QUOTES.contains(c))
+                    .collect::<String>()
+            };
+            assert_eq!(quote_free(inner), quote_free(input), "{input:?}");
         }
     }
 }

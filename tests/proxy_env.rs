@@ -4,6 +4,9 @@
 // environment. Each test re-runs this binary as a child process with the
 // proxy variables it needs (the parent's own are removed first), so no test
 // changes the environment of this process.
+//
+// Host state: `no_proxy_star_goes_direct` sends to the host name `localhost`,
+// which must resolve to the loopback address.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -15,6 +18,10 @@ use winrm_rs::{AuthMethod, EncryptionMode, WinrmClient, WinrmConfig, WinrmCreden
 const CHILD: &str = "WINRM_RS_CHILD";
 /// The port of the WinRM endpoint the child sends to.
 const TARGET_PORT: &str = "WINRM_RS_TARGET_PORT";
+/// Printed by the child once its request has been sent, so the parent knows
+/// the child ran the test to its end (the exit status alone cannot tell a
+/// test that ran from one that was filtered out).
+const RAN: &str = "winrm-rs-child-ran";
 /// Removed from the child's environment before the test sets its own.
 const INHERITED: [&str; 9] = [
     "HTTP_PROXY",
@@ -74,7 +81,7 @@ fn is_child() -> bool {
 
 /// Run the test `test` of this binary in a child process whose proxy
 /// variables are exactly `env`, aimed at the endpoint port `target_port`,
-/// and check that it ran and passed.
+/// and check that it exited successfully after printing [`RAN`].
 fn run_child(test: &str, target_port: u16, env: &[(&str, String)]) {
     let exe = std::env::current_exe().unwrap();
     #[expect(clippy::disallowed_methods, reason = "test-only subprocess")]
@@ -97,8 +104,8 @@ fn run_child(test: &str, target_port: u16, env: &[(&str, String)]) {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        stdout.contains("1 passed"),
-        "the test did not run in the child:\n{stdout}"
+        stdout.contains(RAN),
+        "the test did not run to its end in the child:\n{stdout}"
     );
 }
 
@@ -123,6 +130,7 @@ async fn child_sends(host: &str, ignore_env: bool) {
         .build()
         .unwrap();
     let _ = client.open_shell(host).await;
+    println!("{RAN}");
 }
 
 #[tokio::test]

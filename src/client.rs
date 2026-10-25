@@ -5308,9 +5308,14 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(err, WinrmError::Timeout(1)), "got {err:?}");
+        // Real time: the mock server answers over real sockets, and a paused
+        // clock would run the 1 s deadline out before the first reply, so the
+        // test could not tell an expiring enumeration from a stalled one. The
+        // lower bound cannot fail on a loaded machine (a timer never fires
+        // early); the upper one only has to stay below the outer limit.
         let elapsed = started.elapsed();
         assert!(
-            elapsed >= Duration::from_millis(900) && elapsed < Duration::from_secs(3),
+            elapsed >= Duration::from_millis(900) && elapsed < Duration::from_secs(8),
             "{elapsed:?}"
         );
     }

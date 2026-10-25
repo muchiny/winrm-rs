@@ -813,6 +813,7 @@ mod tests {
             create_authenticate_message_internal(&challenge, "u", "p", "", None, None, None, &[])
                 .unwrap();
         assert_ne!(*key_a, *key_b);
+        println!("fixed-rng-hooks-child-ran");
     }
 
     #[cfg(not(feature = "__internal"))]
@@ -824,6 +825,7 @@ mod tests {
                 "--exact",
                 "ntlm::messages::tests::fixed_rng_hooks_child",
                 "--ignored",
+                "--nocapture",
                 "--test-threads=1",
             ])
             .env("CREDSSP_FIXED_CC", "0011223344556677")
@@ -833,8 +835,8 @@ mod tests {
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(out.status.success(), "{stdout}");
         assert!(
-            stdout.contains("1 passed"),
-            "child test did not run: {stdout}"
+            stdout.contains("fixed-rng-hooks-child-ran"),
+            "child test did not run to its end: {stdout}"
         );
     }
 

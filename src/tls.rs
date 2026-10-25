@@ -1029,6 +1029,9 @@ fn shown_path(value: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    //! `platform_roots_flag_replaces_the_webpki_roots` reads the operating
+    //! system's certificate store: it passes whether or not the store is
+    //! usable, and checks which verifier the option selects.
     use super::*;
     use rustls::internal::msgs::codec::{Codec, Reader};
 
@@ -1405,6 +1408,34 @@ mod tests {
         match platform_verifier(Err(e)) {
             Err(WinrmError::AuthFailed(m)) => assert!(m.contains("platform_roots(true)"), "{m}"),
             other => panic!("expected AuthFailed, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    /// `platform_roots` selects the operating system's verifier for an HTTPS
+    /// origin: it is that verifier, or an error naming the option when the
+    /// store is unusable, and never the built-in Mozilla roots. (Depends on
+    /// the host's certificate store only through which of the two happens.)
+    #[test]
+    fn platform_roots_flag_replaces_the_webpki_roots() {
+        let p = Arc::new(rustls::crypto::ring::default_provider());
+        let default = server_verifiers(&TlsOptions::default(), true, false, &[], &p).unwrap();
+        assert!(
+            format!("{:?}", default.origin).starts_with("WebPkiServerVerifier"),
+            "{:?}",
+            default.origin
+        );
+        let opts = TlsOptions {
+            platform_roots: true,
+            ..Default::default()
+        };
+        match server_verifiers(&opts, true, false, &[], &p) {
+            Ok(v) => {
+                let origin = format!("{:?}", v.origin);
+                // The platform verifier wraps a WebPKI one in a `Verifier`.
+                assert!(origin.starts_with("Verifier {"), "{origin}");
+            }
+            Err(WinrmError::AuthFailed(m)) => assert!(m.contains("platform_roots(true)"), "{m}"),
+            Err(e) => panic!("expected AuthFailed, got {e:?}"),
         }
     }
 

@@ -42,6 +42,16 @@ fn collapse_pairs(escaped: &str) -> Option<String> {
     Some(out)
 }
 
+/// The `LocalDrive` grammar, stated independently of the implementation: an
+/// ASCII letter, `:`, then a backslash or a forward slash.
+fn drive_absolute(path: &str) -> bool {
+    let mut chars = path.chars();
+    matches!(
+        (chars.next(), chars.next(), chars.next()),
+        (Some(letter), Some(':'), Some('\\' | '/')) if letter.is_ascii_alphabetic()
+    )
+}
+
 fuzz_target!(|data: &[u8]| {
     let Ok(path) = std::str::from_utf8(data) else {
         return;
@@ -57,18 +67,15 @@ fuzz_target!(|data: &[u8]| {
         );
     }
 
-    // `LocalDrive` keeps the base checks and accepts only drive-absolute
-    // paths: a letter, `:`, then `\` or `/`.
-    if validate_remote_path_for(path, RemotePathPolicy::LocalDrive).is_ok() {
-        assert!(
-            accepted,
-            "LocalDrive accepted a path the base check refuses"
-        );
-        assert!(
-            matches!(path.as_bytes(), [d, b':', b'\\' | b'/', ..] if d.is_ascii_alphabetic()),
-            "LocalDrive accepted a path that is not drive-absolute"
-        );
-    }
+    // `LocalDrive` is the base check plus the drive-absolute grammar, in both
+    // directions: it accepts exactly the paths the base check accepts that
+    // are a letter, `:`, then `\` or `/` (so `\\?\C:\x`, `\\host\share`,
+    // `C:x`, `\x` and relative paths are all refused).
+    assert_eq!(
+        validate_remote_path_for(path, RemotePathPolicy::LocalDrive).is_ok(),
+        accepted && drive_absolute(path),
+        "LocalDrive differs from the base check plus the drive-absolute grammar"
+    );
     // `Any` is the base check.
     assert_eq!(
         validate_remote_path_for(path, RemotePathPolicy::Any).is_ok(),

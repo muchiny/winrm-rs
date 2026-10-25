@@ -839,6 +839,9 @@ async fn store_download(local_path: &Path, data: Vec<u8>) -> Result<(), WinrmErr
 
 #[cfg(test)]
 mod tests {
+    //! The FIFO tests need the `mkfifo` command; without it they print
+    //! "mkfifo not available: test skipped" and pass without testing anything
+    //! (`with_fifo_guard` gives `None`).
     use super::*;
 
     #[test]

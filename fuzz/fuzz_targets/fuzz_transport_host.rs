@@ -10,13 +10,17 @@
 //! endpoint URL, when the URL parser accepts it, reads back with that host,
 //! the configured port, the `/wsman` path, and no userinfo, query or
 //! fragment. A URL the parser refuses fails the request before anything is
-//! sent, so it is allowed. A host that is not a bracketed IPv6 literal is
-//! refused when the parser would rewrite it (short or octal IPv4 forms,
-//! fullwidth characters, decomposed accents), so an accepted ASCII host
-//! reads back as its lowercase self, addresses included.
+//! sent, so it is allowed. A host is refused when the parser would rewrite
+//! it (short or octal IPv4 forms, fullwidth characters, decomposed accents,
+//! an IPv6 literal not in its canonical form), so an accepted ASCII host
+//! reads back as its lowercase self, addresses and bracketed IPv6 literals
+//! included. An accepted bracketed literal is an IPv6 address that is neither
+//! IPv4-mapped (`::ffff:a.b.c.d`) nor IPv4-compatible (`::a.b.c.d`, other than
+//! `::` and `::1`): those stand for an IPv4 address and are refused.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
+use std::net::Ipv6Addr;
 use winrm_rs::__fuzz::{accepted_host_endpoint, sanitize_host};
 
 fuzz_target!(|data: &[u8]| {
@@ -71,11 +75,32 @@ fuzz_target!(|data: &[u8]| {
             !parts.has_query && !parts.has_fragment && !parts.has_userinfo,
             "{url:?} grew a query, fragment or userinfo: {parts:?}"
         );
-        if accepted.is_ascii() && !accepted.starts_with('[') {
+        if accepted.is_ascii() {
             assert_eq!(
                 parts.host.as_deref(),
                 Some(accepted.to_ascii_lowercase().as_str()),
                 "{url:?} reads back with another host"
+            );
+        }
+        if let Some(literal) = accepted
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
+            let addr: Ipv6Addr = literal
+                .parse()
+                .unwrap_or_else(|e| panic!("accepted {accepted:?} is not an IPv6 address: {e}"));
+            // Stated here, not taken from the implementation: the two ranges
+            // that stand for an IPv4 address.
+            assert!(
+                addr.to_ipv4_mapped().is_none(),
+                "IPv4-mapped literal accepted: {accepted:?}"
+            );
+            let compatible = addr.segments()[..6] == [0; 6]
+                && addr != Ipv6Addr::UNSPECIFIED
+                && addr != Ipv6Addr::LOCALHOST;
+            assert!(
+                !compatible,
+                "IPv4-compatible literal accepted: {accepted:?}"
             );
         }
     }

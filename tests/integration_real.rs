@@ -30,7 +30,9 @@
 //! The Kerberos tests (`kerberos_*`, `silent_command_completes_over_kerberos`,
 //! `--features kerberos`) target a separate domain controller bench instead
 //! and, like the certificate tests, panic by design without its `eval`: see
-//! the "Kerberos" section at the end of this file.
+//! the "Kerberos" section at the end of this file. The relay tests there make
+//! the relay's certificate with the `openssl` command, which must be on the
+//! `PATH`.
 //!
 //! BENCH ONLY: the `setup_*` and `enable_*` tests change the host's
 //! configuration (HTTPS listener, CredSSP, CBT hardening, a trusted root CA

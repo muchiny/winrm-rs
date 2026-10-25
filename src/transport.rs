@@ -2199,6 +2199,12 @@ pub(crate) fn capture_logs() -> (LogBuf, tracing::subscriber::DefaultGuard) {
 
 #[cfg(test)]
 mod tests {
+    //! Host state these tests rely on: `localhost` resolves to the loopback
+    //! address (the proxy and TLS tests name servers `localhost`); the
+    //! re-exec tests run a copy of this test binary (`current_exe`), and
+    //! `plain_http_client_builds_without_system_roots` also relies on
+    //! `rustls-native-certs` reading `SSL_CERT_FILE` / `SSL_CERT_DIR`
+    //! (Linux only).
     use super::*;
     use crate::tls::NoVerifier;
     use wiremock::matchers::method;
@@ -2302,6 +2308,15 @@ mod tests {
             "[fe80::1]:5985",
             "evil.example/.corp.local",
             "win01.corp.local@evil.example",
+            // Boundaries: each of these leaves a valid host once stripped.
+            "win01/",
+            "/win01",
+            "@win01",
+            "win01@",
+            "://win01",
+            "win01:",
+            ":5985",
+            "[fe80::1]:",
         ] {
             let err = validate_host(host).unwrap_err().to_string();
             assert!(
@@ -2314,17 +2329,34 @@ mod tests {
 
     #[test]
     fn validate_host_refuses_non_canonical_ipv4_forms() {
-        for host in [
-            "10.1",
-            "0x0a.0.0.1",
-            "167772161",
-            "010.0.0.1",
-            "10.0.0.1.",
-            "\u{ff11}\u{ff10}.0.0.1",
+        // Each form with the address the URL parser reads it as, which the
+        // error must name.
+        for (host, read_as) in [
+            ("10.1", "10.0.0.1"),
+            ("0x0a.0.0.1", "10.0.0.1"),
+            ("167772161", "10.0.0.1"),
+            ("010.0.0.1", "8.0.0.1"),
+            ("10.0.0.1.", "10.0.0.1"),
+            ("\u{ff11}\u{ff10}.0.0.1", "10.0.0.1"),
         ] {
             let err = validate_host(host).unwrap_err().to_string();
             assert!(
                 err.contains("invalid host") && err.contains("reads it as"),
+                "{host:?}: {err}"
+            );
+            assert!(err.contains(&format!("as {read_as:?}")), "{host:?}: {err}");
+        }
+    }
+
+    /// A host the character check lets through but the URL parser cannot
+    /// parse at all (a last label that looks numeric but is not an address;
+    /// an IPv6 literal with nine groups) is refused with the parser's error.
+    #[test]
+    fn validate_host_refuses_a_host_that_makes_an_unparsable_url() {
+        for host in ["999.1.1.1", "1.2.3.4.5.6", "[1:2:3:4:5:6:7:8:9]"] {
+            let err = validate_host(host).unwrap_err().to_string();
+            assert!(
+                err.contains("invalid host") && err.contains("an unparsable URL ("),
                 "{host:?}: {err}"
             );
         }
@@ -3338,6 +3370,11 @@ mod tests {
         assert!(transport.server_verifier.is_none());
     }
 
+    /// Printed on its own line by the inner tests that a parent test re-runs in
+    /// a child process, once they have run to their end: the exit status alone
+    /// cannot tell a test that ran from one the name filter did not match.
+    const CHILD_RAN: &str = "winrm-rs-child-ran";
+
     /// A plain-HTTP client builds on a host whose OS certificate store is
     /// empty. Run by [`plain_http_client_builds_without_system_roots`] in a
     /// child process whose environment empties that store; on its own it
@@ -3350,6 +3387,7 @@ mod tests {
             WinrmCredentials::new(USER, PASS, ""),
         );
         assert!(result.is_ok(), "{:?}", result.err());
+        println!("{CHILD_RAN}");
     }
 
     /// Runs [`plain_http_client_builds_without_system_roots_inner`] in a child
@@ -3381,8 +3419,8 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(
-            stdout.contains("1 passed"),
-            "the inner test did not run:\n{stdout}"
+            stdout.contains(CHILD_RAN),
+            "the inner test did not run to its end:\n{stdout}"
         );
     }
 
@@ -3431,6 +3469,7 @@ mod tests {
             Some("POST /wsman HTTP/1.1"),
             "the request did not go direct"
         );
+        println!("{CHILD_RAN}");
     }
 
     /// Runs [`an_empty_route_ignores_reqwest_s_own_proxy_lookup_inner`] in a
@@ -3472,8 +3511,8 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(
-            stdout.contains("1 passed"),
-            "the inner test did not run:\n{stdout}"
+            stdout.contains(CHILD_RAN),
+            "the inner test did not run to its end:\n{stdout}"
         );
         assert!(proxy_seen.lock().unwrap().is_empty());
     }
@@ -5623,7 +5662,7 @@ mod tests {
     fn kerberos_spn_host_is_the_tls_server_name_host() {
         let transport = basic_transport(5986);
         for host in VALID_HOSTS {
-            let url = endpoint_url(true, &sanitize_host(host), 5986);
+            let url = endpoint_url(true, host, 5986);
             let parsed = url_host(&url).unwrap();
             let spn = transport.kerberos_auth(&url).unwrap().service_principal;
             let spn_host = spn.strip_prefix("HTTP/").unwrap();
@@ -7341,6 +7380,44 @@ mod tests {
         assert_eq!(read.load(Ordering::SeqCst), 0);
     }
 
+    /// `accept_invalid_certs` does not reach a host with the server name of
+    /// the `https://` proxy: the proxy's verifier gets that name, so the
+    /// host's certificate is verified strictly and the request fails with an
+    /// ordinary certificate error (there is no named refusal for this case,
+    /// which the pin and the opt-out have). Any other host name is accepted
+    /// unverified, as the flag says.
+    #[tokio::test]
+    async fn accept_invalid_certs_still_verifies_a_host_named_like_the_https_proxy() {
+        use crate::test_pki::TEST_CA_PEM;
+        use crate::test_pki::{
+            CA_LEAF_KEY_PEM, CA_LEAF_PEM, NON_CA_SELF_SIGNED_KEY_PEM, NON_CA_SELF_SIGNED_PEM,
+        };
+        let ca = root_file("ca-invalid-certs-name", TEST_CA_PEM);
+        let p = spawn_https_connect_proxy(CA_LEAF_PEM, CA_LEAF_KEY_PEM);
+        for (host, accepted) in [("localhost", false), ("127.0.0.1", true)] {
+            // The listener's certificate is self-signed and not trusted.
+            let (port, read) = crate::test_pki::spawn_tls_sink(crate::test_pki::server_config(
+                NON_CA_SELF_SIGNED_PEM,
+                NON_CA_SELF_SIGNED_KEY_PEM,
+            ));
+            let config = WinrmConfig {
+                accept_invalid_certs: true,
+                proxy: Some(format!("https://localhost:{p}")),
+                ..tls_config(AuthMethod::Basic, port)
+            };
+            let t = transport_with(config, &roots(&[&ca])).unwrap();
+            let result = send_basic(&t, host).await;
+            let read = read.load(Ordering::SeqCst);
+            if accepted {
+                assert!(read > 0, "{host}: accept_invalid_certs applies: {result:?}");
+            } else {
+                let chain = http_error_chain(result);
+                assert!(chain.contains("UnknownIssuer"), "{host}: {chain}");
+                assert_eq!(read, 0, "{host}");
+            }
+        }
+    }
+
     /// A server that accepts the connection and never answers leaves the
     /// handshake, retry included, to the budget it was given.
     #[tokio::test]
@@ -7939,6 +8016,42 @@ mod tests {
             }
             other => panic!("expected AuthFailed, got {:?}", other.map(|_| ())),
         }
+    }
+
+    /// The `AuthFailed` message of building a transport that trusts `pem`.
+    fn root_file_error(tag: &str, pem: &str) -> (PemFiles, String) {
+        let file = root_file(tag, pem);
+        match transport_with(tls_config(AuthMethod::Basic, 5986), &roots(&[&file])) {
+            Err(WinrmError::AuthFailed(m)) => (file, m),
+            other => panic!("expected AuthFailed, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
+    fn root_file_with_malformed_pem_is_a_clear_error() {
+        let pem = "-----BEGIN CERTIFICATE-----\n!!! not base64 !!!\n-----END CERTIFICATE-----\n";
+        let (file, m) = root_file_error("bad-pem", pem);
+        assert!(m.starts_with("invalid PEM in root certificates"), "{m}");
+        assert!(m.contains(&file.cert), "{m}");
+        assert!(
+            !m.contains("not base64"),
+            "the payload must not be echoed: {m}"
+        );
+    }
+
+    /// A well-formed CERTIFICATE section that is not a certificate is
+    /// refused when the roots are loaded, and the message numbers it.
+    #[test]
+    fn root_file_with_an_unusable_trust_anchor_names_its_position() {
+        use crate::test_pki::TEST_CA_PEM;
+        let junk = "-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n";
+        let (file, m) = root_file_error("junk-anchor", junk);
+        assert!(m.contains("root certificate 1 in "), "{m}");
+        assert!(m.contains("is not a usable trust anchor"), "{m}");
+        assert!(m.contains(&file.cert), "{m}");
+
+        let (_, m) = root_file_error("junk-second", &format!("{TEST_CA_PEM}{junk}"));
+        assert!(m.contains("root certificate 2 in "), "{m}");
     }
 
     #[test]

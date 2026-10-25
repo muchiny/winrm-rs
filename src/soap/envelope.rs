@@ -1748,11 +1748,36 @@ mod tests {
     /// A new builder must get a row above, or a deny-list hook would see `Other`.
     #[test]
     fn every_request_builder_is_in_the_kind_table() {
-        let not_builders = ["xml_escape", "with_session_id", "request_action"];
-        let mut in_source: Vec<&str> = include_str!("envelope.rs")
+        // The functions of this file that are not request builders.
+        let not_builders = [
+            "xml_escape",
+            "with_session_id",
+            "request_action",
+            "build_header",
+            "build_header_for",
+            "signal_request",
+        ];
+        // The non-test source, so the helpers of the test module do not count.
+        let source = include_str!("envelope.rs");
+        let source = source.split("#[cfg(test)]").next().unwrap();
+        // Every `fn` of any visibility, qualifier or indentation: a builder
+        // that is private, `async`, `const` or inside an `impl` is not missed.
+        let mut in_source: Vec<&str> = source
             .lines()
-            .filter_map(|l| l.strip_prefix("pub(crate) fn "))
-            .filter_map(|l| l.split_once('(').map(|(name, _)| name))
+            .filter_map(|line| {
+                let mut rest = line.trim_start();
+                loop {
+                    let stripped = ["pub(crate) ", "pub(super) ", "pub ", "const ", "async "]
+                        .iter()
+                        .find_map(|prefix| rest.strip_prefix(prefix));
+                    match stripped {
+                        Some(next) => rest = next,
+                        None => break,
+                    }
+                }
+                let signature = rest.strip_prefix("fn ")?;
+                signature.split(['(', '<']).next()
+            })
             .filter(|name| !not_builders.contains(name))
             .collect();
         let mut in_table: Vec<&str> = kind_table().iter().map(|(name, _, _)| *name).collect();
@@ -1762,6 +1787,40 @@ mod tests {
             in_source, in_table,
             "a new request builder needs a row in kind_table"
         );
+        // One header writer: a second place that writes `wsa:Action` would
+        // build envelopes the table does not see.
+        assert_eq!(
+            source.matches("{ACTION_TAG_OPEN}").count(),
+            1,
+            "only build_header_for writes the wsa:Action header"
+        );
+    }
+
+    /// A new `ACTION_*` constant needs a `RequestKind` and a table row, or a
+    /// hook would see `Other` for it.
+    #[test]
+    fn every_action_constant_has_a_kind_and_a_table_row() {
+        use std::collections::BTreeSet;
+        let constants = include_str!("namespaces.rs")
+            .lines()
+            .filter(|l| l.starts_with("pub(crate) const ACTION_"))
+            .count();
+        let table = kind_table();
+        let actions: BTreeSet<&str> = table
+            .iter()
+            .map(|(name, envelope, _)| request_action(envelope).unwrap_or_else(|| panic!("{name}")))
+            .collect();
+        assert_eq!(
+            actions.len(),
+            constants,
+            "each ACTION_ constant is the action of some row of kind_table"
+        );
+        let kinds: BTreeSet<String> = table
+            .iter()
+            .map(|(_, _, kind)| format!("{kind:?}"))
+            .collect();
+        assert!(!kinds.contains("Other"), "{kinds:?}");
+        assert_eq!(kinds.len(), constants, "{kinds:?}");
     }
 
     #[test]

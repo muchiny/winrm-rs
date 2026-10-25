@@ -810,6 +810,28 @@ mod tests {
         assert_eq!(route.proxy_for("http://win01:5985/wsman"), None);
     }
 
+    /// Ignoring the environment does not drop `WinrmConfig::proxy`: the
+    /// explicit proxy still applies, and the environment is still not read.
+    #[test]
+    fn explicit_proxy_applies_when_the_environment_is_ignored() {
+        let config = WinrmConfig {
+            proxy: Some("http://explicit.corp:8080".into()),
+            ..Default::default()
+        };
+        let route = ProxyRoute::resolve(&config, false, |name: &str| -> Option<String> {
+            panic!("{name} was read")
+        })
+        .unwrap();
+        for ep in ["http://win01:5985/wsman", "https://win01:5986/wsman"] {
+            assert_eq!(
+                route.proxy_for(ep).unwrap().host_str(),
+                Some("explicit.corp"),
+                "{ep}"
+            );
+        }
+        assert_eq!(route.env_http_proxy(), None);
+    }
+
     #[test]
     fn unsupported_explicit_proxy_scheme_is_refused() {
         let config = WinrmConfig {

@@ -32,11 +32,13 @@ pub enum WinrmError {
     /// - the `WinrmClient::*_with_timeout` methods report the caller's
     ///   `timeout` rounded up to whole seconds (at least 1);
     /// - a request that needs a dedicated connection (NTLM or Kerberos
-    ///   sealing, NTLM over HTTPS, Kerberos over HTTPS) and waited for one of
-    ///   the 32 connection slots of the client longer than one request may
-    ///   take reports `operation_timeout_secs + 10`; nothing was sent.
+    ///   sealing, NTLM over HTTPS, Kerberos over HTTPS) and waited for a
+    ///   connection slot (32 per host and 128 per client; Signal and Delete
+    ///   have 8 more per host) longer than one request may take, or whose new
+    ///   connection did not finish its authentication within that time,
+    ///   reports `operation_timeout_secs + 10`; nothing was sent;
     /// - a Kerberos ticket request (the KDC exchange) that runs longer than
-    ///   one request may take reports `operation_timeout_secs + 10`.
+    ///   one request may take reports `operation_timeout_secs + 10`;
     /// - with `AuthMethod::CredSsp`, a TCP connect plus TLS handshake longer
     ///   than `connect_timeout_secs` reports that value, and one HTTP exchange
     ///   longer than `operation_timeout_secs + 10` reports that value; only a

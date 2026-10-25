@@ -43,9 +43,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Changed
 
 - NTLM: the AUTHENTICATE message's workstation name now comes from
-  `HOSTNAME`, `/proc/sys/kernel/hostname` (Linux) or `COMPUTERNAME` (Windows),
-  cut to its first label and 15 characters. The crate no longer runs the
-  `hostname` program.
+  `HOSTNAME`, `/proc/sys/kernel/hostname` (Linux) or `COMPUTERNAME` (Windows):
+  its first label, ASCII letters, numbers, `-` and `_` only, upper-cased and
+  cut to 15 characters. On other systems it is empty unless `HOSTNAME` is
+  exported. The crate no longer runs the `hostname` program.
 - Server text quoted in errors (the `code` and `reason` of `SoapError::Fault`,
   quoted HTTP bodies, remote stderr in transfer errors) is trimmed and kept on
   one line. Tabs and line breaks become spaces, and other control and
@@ -55,9 +56,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **A WARN for NTLM over plain HTTP.** Building a client with
   `AuthMethod::Ntlm` and `use_tls = false` (the default configuration) logs
   one WARN, target `winrm_rs::ntlm_over_http`: over plain HTTP, NTLM does
-  not authenticate the server and its handshake can be relayed or guessed
-  offline; sealing protects only the SOAP bodies. Nothing is refused. To
+  not authenticate the server and its handshake can be relayed, or recorded to
+  guess the password offline; sealing protects only the SOAP bodies. Nothing is refused. To
   silence it alone, add `winrm_rs::ntlm_over_http=error` to the filter.
+- Kerberos: the ticket request runs on a thread of tokio's blocking pool, not
+  on the thread of the calling task. On a Windows client it therefore uses the
+  process's credentials, not an impersonation the caller set on its own
+  thread.
 - **`upload_file` and `download_file` start Windows PowerShell by its full
   path.** They run `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe
   -NoProfile -NonInteractive`: profile scripts no longer run before each
@@ -77,8 +82,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - NTLM: the AUTHENTICATE message now builds its own `TargetInfo` AV list
   (channel binding, target name, flags, single EOL) instead of copying the
   server's bytes. For a conformant Windows challenge the bytes are unchanged.
-- NTLM over HTTPS now sends a MIC, `MsvAvFlags`, the target name and a zero LM
-  response, as NTLM over HTTP already did.
+- NTLM over HTTPS now sends a MIC, `MsvAvFlags`, the target name, this
+  machine's workstation name and a zero LM response, as NTLM over HTTP
+  already did.
 - A sealed or Kerberos-over-TLS request now stays on its authenticated
   connection instead of occasionally racing onto a fresh one and failing with
   401: once the handshake has completed, the dedicated client opens no new
@@ -95,9 +101,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   a page into an error.
 - A very large `operation_timeout_secs` no longer panics, or wraps to a short
   timeout, when the client is built or in `Shell::run_command`.
-- `run_command`, `run_powershell`, `run_command_with_cancel`,
-  `run_powershell_with_cancel`, `Shell::run_command` and `run_wql` wait before
-  polling again when the server answers three or more times in a row, at
+- `run_command` and `run_powershell` (with their `_with_timeout` and
+  `_with_cancel` forms), `Shell::run_command`, the file transfers and
+  `run_wql` wait before polling again when the server answers three or more times in a row, at
   once, with nothing (50 ms doubling to 1 s). An exit code without the Done
   state counts as nothing.
 - CredSSP now requires the server's final SPNEGO token to carry
@@ -113,7 +119,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   a deadline is `WinrmError::Timeout`.
 - CredSSP builds its TLS configuration and its OpenSSL context once per client
   instead of once per request, so the system CA bundle is no longer read for
-  every request.
+  every request. An OpenSSL setup error now fails `WinrmClient::new` instead of
+  the first request.
 - CredSSP reads each response strictly by its `Content-Length`: a chunked,
   compressed or unframed response, or a short body, is now an error instead
   of being misread. CredSSP requests send `Accept-Encoding: identity`, and
@@ -165,8 +172,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `open_psrp_shell` XML-escapes `creation_xml_b64` like every other value it
   puts in the envelope (valid base64 is unchanged).
 - A shell opened with `open_psrp_shell` is handled as a PowerShell shell
-  whatever the case of its resource URI; `reconnect_shell` recognises the
-  `/powershell` path segment case-insensitively.
+  whatever its resource URI; `reconnect_shell` treats a resource URI as
+  PowerShell when it has a `/powershell` path segment, in any case (a URI that
+  only contains `powershell` elsewhere now gives a `cmd` shell).
+- `NtlmSession::seal` and `NtlmSession::sign` no longer panic in debug builds
+  after 2^32 messages; the sequence number wraps.
 - `NtlmError::InvalidMessage` is also returned for NTLM messages with
   oversized or out-of-range fields: a Type 3 field longer than a 16-bit
   length can hold is refused instead of being truncated.
@@ -202,6 +212,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   command line, unquoted), and `working_directory` and `env_vars` say how
   they affect which program runs. `run_powershell` says that the host's
   PowerShell profile scripts run first.
+- `AuthMethod::Certificate` and the README say that the client's private key
+  stays in process memory, unwiped, inside `rustls` and `ring`.
+  `CommandOutput` says that `stdout` and `stderr` are returned as the command
+  wrote them, and `Shell::receive_next` how to pace a polling loop.
 
 ## [1.4.1] - 2026-10-24
 

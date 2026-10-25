@@ -113,9 +113,10 @@ impl WinrmClientBuilder<Ready> {
     /// The hook admits a request; the request may go out some time later. With
     /// NTLM or Kerberos, except over plain HTTP with `EncryptionMode::Never`, an
     /// admitted request can then wait up to `operation_timeout_secs + 10` seconds
-    /// for one of the client's 32 connection slots, and a new connection's
-    /// handshake (for Kerberos, possibly a ticket request to the KDC) runs before
-    /// it. Turning the hook to `false` stops the requests admitted after that,
+    /// for a connection slot (32 per host and 128 per client; Signal and Delete
+    /// have 8 of their own per host), and a new connection's handshake (for
+    /// Kerberos, possibly a ticket request to the KDC) runs before it, bounded
+    /// as a whole by the same budget. Turning the hook to `false` stops the requests admitted after that,
     /// not those already waiting. To stop those too, drop the call's future.
     /// [`WinrmClient::run_command_with_cancel`](crate::WinrmClient::run_command_with_cancel)
     /// and `run_powershell_with_cancel` stop polling at once, but let a Create

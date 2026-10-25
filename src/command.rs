@@ -27,7 +27,8 @@ pub struct CommandOutput {
 /// WinRS runs the command line through `cmd.exe /C`, which expands
 /// `%SystemRoot%`, so a `powershell.exe` placed in the working directory or
 /// found through a `PATH` set by the caller does not decide which
-/// interpreter runs.
+/// interpreter runs. A `SystemRoot` entry in `WinrmConfig::env_vars` does:
+/// it sets the directory this path starts from.
 pub(crate) const POWERSHELL_EXE: &str =
     r"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe";
 

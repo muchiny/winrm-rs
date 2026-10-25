@@ -243,8 +243,9 @@ pub struct WinrmConfig {
     /// `PATH` and `PATHEXT` decide which program a bare command name runs,
     /// and `PSModulePath` decides which PowerShell modules load by name.
     /// Values that come from untrusted input can therefore redirect what
-    /// runs. The transfer scripts start PowerShell by its full path, so
-    /// `PATH` does not change their interpreter.
+    /// runs. `SystemRoot` decides which PowerShell the transfer scripts start
+    /// (`%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`). They
+    /// start it by its full path, so `PATH` does not change their interpreter.
     pub env_vars: Vec<(String, String)>,
     /// Message encryption mode for NTLM and Kerberos (default:
     /// [`EncryptionMode::Auto`]).

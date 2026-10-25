@@ -76,6 +76,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Builds cargo-fuzz (below). With nightly, the old rustix pinned by its
+      # Cargo.lock turns on rustc-internal attributes that current nightlies
+      # no longer have. Only the fuzz targets need nightly, which the next
+      # step makes the default toolchain.
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-24
+        with:
+          toolchain: 1.98.0
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-24
         with:
           toolchain: nightly
@@ -89,7 +96,7 @@ jobs:
       # 2024-03 snapshot that resolves, exits in 19ms and installs nothing, and
       # cargo-fuzz is no longer in the action's tool manifest.
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz@0.13.1 --locked
+        run: cargo +1.98.0 install cargo-fuzz@0.13.1 --locked
 
       - name: Install OpenSSL headers (credssp feature)
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
@@ -172,6 +179,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Builds cargo-fuzz (below): see the campaign job.
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-24
+        with:
+          toolchain: 1.98.0
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-24
         with:
           toolchain: nightly
@@ -182,7 +193,7 @@ jobs:
           # ~/.cargo/bin would satisfy it and the version pin would prove nothing.
           cache-bin: "false"
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz@0.13.1 --locked
+        run: cargo +1.98.0 install cargo-fuzz@0.13.1 --locked
 
       - name: Install OpenSSL headers (credssp feature)
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config

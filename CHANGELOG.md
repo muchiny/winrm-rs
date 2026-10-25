@@ -53,6 +53,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   bidirectional formatting characters are written as `\u{..}` escapes. The
   `code` and `reason` fields hold the neutralised text.
 - Debug logs print shell and command ids quoted and escaped (`shell_id="…"`).
+- CredSSP requests wait for a per-host connection slot like the other
+  connection-bound methods, so concurrent calls no longer open an unbounded
+  number of connections. They count against the same limits (32 per host, 128
+  per client), and a CredSSP request holds its slot for its whole exchange.
+  A caller that ran more than 32 CredSSP requests at once against one host now
+  sees the excess wait for a slot, for at most `operation_timeout_secs + 10`
+  seconds before `WinrmError::Timeout`. To migrate, spread the load over
+  several hosts or clients, or run fewer requests at once; the `before_send`
+  hook now runs after the slot is taken.
 - **A WARN for NTLM over plain HTTP.** Building a client with
   `AuthMethod::Ntlm` and `use_tls = false` (the default configuration) logs
   one WARN, target `winrm_rs::ntlm_over_http`: over plain HTTP, NTLM does

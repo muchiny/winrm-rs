@@ -697,6 +697,10 @@ pub enum AuthMethod {
     ///
     /// Every request runs a new CredSSP exchange and delegates the password
     /// again, so the target receives it for as long as you send it requests.
+    /// Each request waits for one of its host's 32 connection slots (128 per
+    /// client, shared with the other connection-bound methods) and holds it
+    /// for the whole exchange, so no more than 32 CredSSP logons per host run
+    /// at once.
     /// When you are done, call [`Shell::close`](crate::Shell::close) rather
     /// than [`Shell::disconnect`](crate::Shell::disconnect), and set a short
     /// [`WinrmConfig::idle_timeout_secs`] so the server reaps a shell this

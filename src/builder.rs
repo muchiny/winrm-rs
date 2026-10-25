@@ -248,11 +248,13 @@ impl WinrmClientBuilder<Ready> {
     /// # When it runs
     ///
     /// With NTLM or Kerberos, except over plain HTTP with
-    /// `EncryptionMode::Never`, each request first takes one of its host's 32
-    /// connection slots (128 per client; Signal and Delete have 8 of their own
+    /// `EncryptionMode::Never`, and with CredSSP, each request first takes one
+    /// of its host's 32 connection slots (128 per client; Signal and Delete have 8 of their own
     /// per host), waiting up to `operation_timeout_secs + 10` seconds for one,
-    /// and only then consults the hook. An approved request goes out at
-    /// once on a pooled authenticated connection; on a new connection, that
+    /// and only then consults the hook. A CredSSP request holds its slot for
+    /// its whole exchange (it has no pooled connection), so the per-host limit
+    /// also caps concurrent CredSSP logons. Otherwise an approved request goes
+    /// out at once on a pooled authenticated connection; on a new connection, that
     /// connection's handshake (see above; for Kerberos, possibly a ticket
     /// request to the KDC) runs first. Sealed Kerberos over plain HTTP through
     /// a forwarding proxy, under `ProxySessionAuth::Require` or

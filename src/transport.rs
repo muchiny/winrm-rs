@@ -199,14 +199,17 @@ const MAX_IDLE_TOTAL: usize = 32;
 /// HTTP.sys, so a reused connection is normally still the authenticated one.
 const CONN_MAX_IDLE: Duration = Duration::from_secs(60);
 
-/// Dedicated-connection exchanges (sealed, NTLM over TLS, Kerberos over TLS)
-/// in flight: 32 per host and 128 per client. Signal and Delete use their own
+/// Dedicated-connection exchanges (sealed, NTLM over TLS, Kerberos over TLS,
+/// CredSSP) in flight: 32 per host and 128 per client. Signal and Delete use their own
 /// lane of 8 slots per host, outside both limits, so clean-up never queues
 /// behind data requests. At most 128 + 8 × hosts sockets are in use at once;
 /// the idle pooled connections ([`MAX_IDLE_PER_HOST`]: 8 per host,
 /// [`MAX_IDLE_TOTAL`]: 32 in total) come on top. Hosts are keyed by
 /// their string, ASCII case aside: `win01` and its address get separate
-/// budgets. Further requests wait for a slot, within the request timeout.
+/// budgets. Further requests wait for a slot, within the request timeout. A
+/// CredSSP request holds its slot for its whole exchange (usually five
+/// rounds on its own connection), so the cap also caps concurrent CredSSP
+/// logons.
 /// A request takes its slot before the `before_send` hook is consulted.
 const MAX_CONNS_PER_HOST: usize = 32;
 
@@ -268,7 +271,8 @@ enum Route {
     Basic,
     /// Client certificate on the shared client.
     Certificate,
-    /// CredSSP, on its own connection per request.
+    /// CredSSP, on its own connection per request, which holds a connection
+    /// slot for its whole exchange.
     CredSsp,
     /// NTLM unsealed over plain HTTP, a handshake per request on the shared
     /// client.
@@ -308,7 +312,7 @@ impl Route {
     fn needs_conn_slot(self) -> bool {
         matches!(
             self,
-            Route::Sealed | Route::NtlmOverTls | Route::KerberosOverTls
+            Route::Sealed | Route::NtlmOverTls | Route::KerberosOverTls | Route::CredSsp
         )
     }
 }
@@ -1160,6 +1164,8 @@ impl HttpTransport {
             }
             #[cfg(feature = "credssp")]
             Route::CredSsp => {
+                // Held until the exchange ends (dropped at the end of this arm).
+                let _slot = dedicated_slot(slot)?;
                 let auth = CredSspAuth {
                     username: self.credentials.username.clone(),
                     password: Zeroizing::new(self.credentials.password.expose_secret().to_string()),
@@ -4464,6 +4470,49 @@ mod tests {
         assert_eq!(test_server::delegations(&log.lock().unwrap()), 1);
     }
 
+    /// A CredSSP request waits for a connection slot of its host before it
+    /// opens a socket, and holds it for the whole exchange.
+    #[cfg(feature = "credssp")]
+    #[tokio::test]
+    async fn credssp_requests_take_a_connection_slot() {
+        use crate::auth::credssp::test_server::{self, Fault};
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
+        let (port, log) = test_server::spawn(Fault::Honest, EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let t = Arc::new(credssp_test_transport(port));
+        let held = t
+            .host_slots("127.0.0.1")
+            .0
+            .try_acquire_many_owned(MAX_CONNS_PER_HOST as u32)
+            .unwrap();
+        let task = tokio::spawn({
+            let t = Arc::clone(&t);
+            // Through the retry loop, the only caller that takes slots.
+            async move {
+                t.send_soap_with_retry("127.0.0.1", "<s:Envelope/>".into())
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!task.is_finished(), "the request did not wait for a slot");
+        assert!(
+            test_server::rounds(&log.lock().unwrap()).is_empty(),
+            "a round reached the server without a slot"
+        );
+        drop(held);
+        let out = tokio::time::timeout(Duration::from_secs(20), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(out, test_server::MOCK_REPLY);
+        assert_eq!(test_server::delegations(&log.lock().unwrap()), 1);
+        // The slot went back when the exchange ended.
+        assert_eq!(
+            t.host_slots("127.0.0.1").0.available_permits(),
+            MAX_CONNS_PER_HOST
+        );
+    }
+
     /// A relay presenting another certificate in front of the real server is
     /// refused at the outer TLS handshake, before any request reaches it.
     #[cfg(feature = "credssp")]
@@ -5587,13 +5636,17 @@ mod tests {
                 Route::CredSsp
             );
         }
-        for r in [Route::Sealed, Route::NtlmOverTls, Route::KerberosOverTls] {
+        for r in [
+            Route::Sealed,
+            Route::NtlmOverTls,
+            Route::KerberosOverTls,
+            Route::CredSsp,
+        ] {
             assert!(r.needs_conn_slot(), "{r:?}");
         }
         for r in [
             Route::Basic,
             Route::Certificate,
-            Route::CredSsp,
             Route::NtlmPlain,
             Route::KerberosPlain,
         ] {

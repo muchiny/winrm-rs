@@ -18,6 +18,9 @@ use crate::error::{NtlmError, SoapError, WinrmError};
 
 pub use crate::ntlm::messages::ChallengeMessage;
 
+/// Type 2 flag bits a Type 3 never repeats.
+pub const TYPE3_NEVER_ECHO: u32 = crate::ntlm::crypto::TYPE3_NEVER_ECHO;
+
 /// Parse a raw NTLM Type 2 (Challenge) message.
 pub fn parse_challenge(data: &[u8]) -> Result<ChallengeMessage, NtlmError> {
     crate::ntlm::messages::parse_challenge(data)

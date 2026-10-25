@@ -9,8 +9,8 @@ pub(crate) mod messages;
 
 // Re-export crate-internal API
 pub(crate) use messages::{
-    create_authenticate_message_http, create_negotiate_message, decode_challenge_header,
-    encode_authorization,
+    check_challenge, create_authenticate_message_http, create_negotiate_message,
+    decode_challenge_header, encode_authorization,
 };
 // `parse_challenge` is only reached from outside `ntlm::messages` by the
 // CredSSP path; `crate::__fuzz` calls it through its full path. Tests inside

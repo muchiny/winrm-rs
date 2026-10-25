@@ -150,6 +150,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   reads no proxy environment variable. Migration: for CredSSP, use an
   `http://` or `socks5://` proxy, or unset `WinrmConfig::proxy` to keep
   connecting directly.
+- NTLM: the client now checks that the server's Type 2 negotiates Unicode,
+  NTLMv2 session security and 128-bit (and, when sealing, signing, sealing,
+  key exchange and the NetBIOS names), refusing anything weaker, and no longer
+  echoes server-only flag bits into the Type 3. A Type 2 whose TargetInfo lies
+  outside the message is refused instead of read as empty. Migration: none for
+  Windows servers, which negotiate all of these; a server or proxy that
+  answers with fewer flags must be configured to negotiate them (NTLMv2
+  session security with 128-bit keys; signing, sealing and key exchange for
+  sealed traffic).
 
 ### Added
 

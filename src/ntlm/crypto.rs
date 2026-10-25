@@ -23,13 +23,30 @@ pub(crate) const NEGOTIATE_OEM: u32 = 0x0000_0002;
 pub(crate) const REQUEST_TARGET: u32 = 0x0000_0004;
 pub(crate) const NEGOTIATE_SIGN: u32 = 0x0000_0010;
 pub(crate) const NEGOTIATE_SEAL: u32 = 0x0000_0020;
+pub(crate) const NEGOTIATE_DATAGRAM: u32 = 0x0000_0040;
+pub(crate) const NEGOTIATE_LM_KEY: u32 = 0x0000_0080;
 pub(crate) const NEGOTIATE_NTLM: u32 = 0x0000_0200;
+pub(crate) const NEGOTIATE_ANONYMOUS: u32 = 0x0000_0800;
+pub(crate) const NEGOTIATE_OEM_DOMAIN_SUPPLIED: u32 = 0x0000_1000;
+pub(crate) const NEGOTIATE_OEM_WORKSTATION_SUPPLIED: u32 = 0x0000_2000;
 pub(crate) const NEGOTIATE_ALWAYS_SIGN: u32 = 0x0000_8000;
 pub(crate) const NEGOTIATE_EXTENDED_SESSIONSECURITY: u32 = 0x0008_0000;
+pub(crate) const NEGOTIATE_IDENTIFY: u32 = 0x0010_0000;
 pub(crate) const NEGOTIATE_VERSION: u32 = 0x0200_0000;
 pub(crate) const NEGOTIATE_128: u32 = 0x2000_0000;
 pub(crate) const NEGOTIATE_KEY_EXCH: u32 = 0x4000_0000;
 pub(crate) const NEGOTIATE_56: u32 = 0x8000_0000;
+
+/// Flag bits of a Type 2 that the Type 3 never repeats: they describe the
+/// server's side of the exchange (datagram mode, the LM key, an anonymous
+/// context, the OEM name hints, identify-level) and none applies to this
+/// client's NTLMv2 authentication.
+pub(crate) const TYPE3_NEVER_ECHO: u32 = NEGOTIATE_DATAGRAM
+    | NEGOTIATE_LM_KEY
+    | NEGOTIATE_ANONYMOUS
+    | NEGOTIATE_OEM_DOMAIN_SUPPLIED
+    | NEGOTIATE_OEM_WORKSTATION_SUPPLIED
+    | NEGOTIATE_IDENTIFY;
 
 pub(crate) const TYPE1_FLAGS: u32 = NEGOTIATE_UNICODE
     | REQUEST_TARGET
@@ -60,6 +77,7 @@ pub(crate) const TYPE1_FLAGS_CREDSSP: u32 = NEGOTIATE_UNICODE
 
 // AV_PAIR IDs (MS-NLMP 2.2.2.1)
 pub(crate) const AV_EOL: u16 = 0x0000;
+pub(crate) const AV_NB_COMPUTER_NAME: u16 = 0x0001;
 pub(crate) const AV_NB_DOMAIN_NAME: u16 = 0x0002;
 pub(crate) const AV_FLAGS_ID: u16 = 0x0006;
 pub(crate) const AV_TIMESTAMP: u16 = 0x0007;

@@ -161,14 +161,43 @@ impl FakeNtlmServer {
     }
 }
 
-/// The Type 2 challenge the fake server sends (no target info).
+/// The Type 2 challenge the fake server sends: the flags a Windows server
+/// grants a sealing client, and a target info naming the NetBIOS domain and
+/// computer.
 pub(crate) fn challenge_header() -> String {
+    use crate::ntlm::crypto::{
+        AV_EOL, AV_NB_COMPUTER_NAME, AV_NB_DOMAIN_NAME, NEGOTIATE_128, NEGOTIATE_ALWAYS_SIGN,
+        NEGOTIATE_EXTENDED_SESSIONSECURITY, NEGOTIATE_KEY_EXCH, NEGOTIATE_NTLM, NEGOTIATE_SEAL,
+        NEGOTIATE_SIGN, NEGOTIATE_UNICODE, to_utf16le,
+    };
+    let flags = NEGOTIATE_UNICODE
+        | NEGOTIATE_NTLM
+        | NEGOTIATE_EXTENDED_SESSIONSECURITY
+        | NEGOTIATE_ALWAYS_SIGN
+        | NEGOTIATE_SIGN
+        | NEGOTIATE_SEAL
+        | NEGOTIATE_KEY_EXCH
+        | NEGOTIATE_128;
+    let mut target_info = Vec::new();
+    for (id, value) in [
+        (AV_NB_DOMAIN_NAME, to_utf16le("WORKGROUP")),
+        (AV_NB_COMPUTER_NAME, to_utf16le("WIN01")),
+        (AV_EOL, Vec::new()),
+    ] {
+        target_info.extend_from_slice(&id.to_le_bytes());
+        target_info.extend_from_slice(&u16::try_from(value.len()).unwrap().to_le_bytes());
+        target_info.extend_from_slice(&value);
+    }
     let mut type2 = vec![0u8; 48];
     type2[0..8].copy_from_slice(b"NTLMSSP\0");
     type2[8..12].copy_from_slice(&2u32.to_le_bytes());
-    // UNICODE | NTLM | ALWAYS_SIGN | EXTENDED_SESSIONSECURITY
-    type2[20..24].copy_from_slice(&0x0008_8201_u32.to_le_bytes());
+    type2[20..24].copy_from_slice(&flags.to_le_bytes());
     type2[24..32].copy_from_slice(&[0x01; 8]);
+    let len = u16::try_from(target_info.len()).unwrap();
+    type2[40..42].copy_from_slice(&len.to_le_bytes());
+    type2[42..44].copy_from_slice(&len.to_le_bytes());
+    type2[44..48].copy_from_slice(&48u32.to_le_bytes());
+    type2.extend_from_slice(&target_info);
     format!("Negotiate {}", B64.encode(&type2))
 }
 

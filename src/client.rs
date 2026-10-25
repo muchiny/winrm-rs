@@ -1346,7 +1346,7 @@ mod tests {
         let mut type2 = vec![0u8; 48];
         type2[0..8].copy_from_slice(b"NTLMSSP\0");
         type2[8..12].copy_from_slice(&2u32.to_le_bytes());
-        type2[20..24].copy_from_slice(&0x0008_8201_u32.to_le_bytes()); // flags
+        type2[20..24].copy_from_slice(&0x2008_8201_u32.to_le_bytes()); // UNICODE | NTLM | ESS | 128
         type2[24..32].copy_from_slice(&[0x01; 8]); // server challenge
         // no target info (ti_len=0)
         let type2_b64 = B64.encode(&type2);
@@ -1382,7 +1382,7 @@ mod tests {
         let mut type2 = vec![0u8; 48];
         type2[0..8].copy_from_slice(b"NTLMSSP\0");
         type2[8..12].copy_from_slice(&2u32.to_le_bytes());
-        type2[20..24].copy_from_slice(&0x0008_8201_u32.to_le_bytes());
+        type2[20..24].copy_from_slice(&0x2008_8201_u32.to_le_bytes());
         type2[24..32].copy_from_slice(&[0x01; 8]);
         let type2_b64 = B64.encode(&type2);
 
@@ -1453,7 +1453,7 @@ mod tests {
         let mut type2 = vec![0u8; 48];
         type2[0..8].copy_from_slice(b"NTLMSSP\0");
         type2[8..12].copy_from_slice(&2u32.to_le_bytes());
-        type2[20..24].copy_from_slice(&0x0008_8201_u32.to_le_bytes());
+        type2[20..24].copy_from_slice(&0x2008_8201_u32.to_le_bytes());
         type2[24..32].copy_from_slice(&[0x01; 8]);
         let type2_b64 = B64.encode(&type2);
 
@@ -1488,7 +1488,7 @@ mod tests {
         let mut type2 = vec![0u8; 48];
         type2[0..8].copy_from_slice(b"NTLMSSP\0");
         type2[8..12].copy_from_slice(&2u32.to_le_bytes());
-        type2[20..24].copy_from_slice(&0x0008_8201_u32.to_le_bytes());
+        type2[20..24].copy_from_slice(&0x2008_8201_u32.to_le_bytes());
         type2[24..32].copy_from_slice(&[0x01; 8]);
         let type2_b64 = B64.encode(&type2);
 

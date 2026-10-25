@@ -108,13 +108,19 @@ pub fn parse_challenge(data: &[u8]) -> Result<ChallengeMessage, NtlmError> {
     let (target_info, target_domain, timestamp) = if data.len() >= 48 {
         let ti_len = u16::from_le_bytes([data[40], data[41]]) as usize;
         let ti_offset = u32::from_le_bytes([data[44], data[45], data[46], data[47]]) as usize;
-        match ti_offset.checked_add(ti_len) {
-            Some(end) if end <= data.len() => {
-                let ti = data[ti_offset..end].to_vec();
-                let (domain, ts) = parse_av_pairs(&ti);
-                (ti, domain, ts)
-            }
-            _ => (Vec::new(), String::new(), None),
+        if ti_len == 0 {
+            // A zero-length buffer is legal whatever its offset.
+            (Vec::new(), String::new(), None)
+        } else {
+            let ti = ti_offset
+                .checked_add(ti_len)
+                .and_then(|end| data.get(ti_offset..end))
+                .ok_or_else(|| {
+                    NtlmError::InvalidMessage("NTLM Type 2: TargetInfo outside the message".into())
+                })?
+                .to_vec();
+            let (domain, ts) = parse_av_pairs(&ti);
+            (ti, domain, ts)
         }
     } else {
         (Vec::new(), String::new(), None)
@@ -127,6 +133,64 @@ pub fn parse_challenge(data: &[u8]) -> Result<ChallengeMessage, NtlmError> {
         target_domain,
         timestamp,
     })
+}
+
+/// Refuses a Type 2 that negotiates too little (MS-NLMP 2.2.2.5).
+///
+/// The client always authenticates with NTLMv2 and extended session security,
+/// in Unicode, with 128-bit keys, so a server that did not grant those is
+/// weaker than the client will accept. When `sealing` is set the exchange also
+/// carries signed and sealed traffic, so signing, sealing and key exchange are
+/// required, and so are the NetBIOS computer and domain names in the target
+/// info. An anonymous or datagram context is refused in every case. The first
+/// failed check is returned.
+pub(crate) fn check_challenge(ch: &ChallengeMessage, sealing: bool) -> Result<(), NtlmError> {
+    const ALWAYS: [(u32, &str); 4] = [
+        (NEGOTIATE_UNICODE, "NEGOTIATE_UNICODE"),
+        (NEGOTIATE_NTLM, "NEGOTIATE_NTLM"),
+        (
+            NEGOTIATE_EXTENDED_SESSIONSECURITY,
+            "NEGOTIATE_EXTENDED_SESSIONSECURITY",
+        ),
+        (NEGOTIATE_128, "NEGOTIATE_128"),
+    ];
+    const SEALING: [(u32, &str); 3] = [
+        (NEGOTIATE_SIGN, "NEGOTIATE_SIGN"),
+        (NEGOTIATE_SEAL, "NEGOTIATE_SEAL"),
+        (NEGOTIATE_KEY_EXCH, "NEGOTIATE_KEY_EXCH"),
+    ];
+    const REFUSED: [(u32, &str); 2] = [
+        (NEGOTIATE_ANONYMOUS, "NEGOTIATE_ANONYMOUS"),
+        (NEGOTIATE_DATAGRAM, "NEGOTIATE_DATAGRAM"),
+    ];
+    let required = ALWAYS.iter().chain(SEALING.iter().filter(|_| sealing));
+    for (bit, name) in required {
+        if ch.negotiate_flags & bit == 0 {
+            return Err(NtlmError::InvalidMessage(format!(
+                "NTLM Type 2: the server did not negotiate {name}"
+            )));
+        }
+    }
+    for (bit, name) in REFUSED {
+        if ch.negotiate_flags & bit != 0 {
+            return Err(NtlmError::InvalidMessage(format!(
+                "NTLM Type 2: the server set {name}, which this client refuses"
+            )));
+        }
+    }
+    if sealing {
+        for (id, name) in [
+            (AV_NB_COMPUTER_NAME, "MsvAvNbComputerName"),
+            (AV_NB_DOMAIN_NAME, "MsvAvNbDomainName"),
+        ] {
+            if !av_pairs(&ch.target_info).any(|(found, _)| found == id) {
+                return Err(NtlmError::InvalidMessage(format!(
+                    "NTLM Type 2: target info has no {name}"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A length as the 16-bit value an NTLM security buffer or AV pair holds.
@@ -261,7 +325,8 @@ pub(crate) fn create_authenticate_message_internal(
 ) -> Result<(Vec<u8>, Zeroizing<[u8; 16]>), NtlmError> {
     // Use the server's negotiated flags (from Type 2) for the Type 3 response,
     // augmented with KEY_EXCH and VERSION to enable message sealing.
-    let flags = challenge.negotiate_flags | NEGOTIATE_KEY_EXCH | NEGOTIATE_VERSION;
+    let flags =
+        (challenge.negotiate_flags & !TYPE3_NEVER_ECHO) | NEGOTIATE_KEY_EXCH | NEGOTIATE_VERSION;
     let with_key_exch = flags & NEGOTIATE_KEY_EXCH != 0;
     create_authenticate_message_full(
         challenge,
@@ -577,7 +642,7 @@ pub fn create_authenticate_message_credssp(
     type1_bytes: &[u8],
     type2_bytes: &[u8],
 ) -> Result<(Vec<u8>, Zeroizing<[u8; 16]>), NtlmError> {
-    let flags = challenge.negotiate_flags
+    let flags = (challenge.negotiate_flags & !TYPE3_NEVER_ECHO)
         | NEGOTIATE_KEY_EXCH
         | NEGOTIATE_SEAL
         | NEGOTIATE_SIGN
@@ -849,8 +914,10 @@ mod tests {
         msg[40..42].copy_from_slice(&100u16.to_le_bytes());
         msg[44..48].copy_from_slice(&48u32.to_le_bytes());
 
-        let challenge = parse_challenge(&msg).unwrap();
-        assert!(challenge.target_info.is_empty());
+        assert!(matches!(
+            parse_challenge(&msg),
+            Err(NtlmError::InvalidMessage(ref m)) if m == "NTLM Type 2: TargetInfo outside the message"
+        ));
     }
 
     #[test]
@@ -1875,6 +1942,168 @@ mod tests {
         assert_eq!(
             value(&pairs, AV_FLAGS_ID),
             Some(2u32.to_le_bytes().to_vec())
+        );
+    }
+
+    /// A Windows-shaped TargetInfo: NB domain, NB computer, EOL.
+    fn nb_ti() -> Vec<u8> {
+        [
+            av(0x0002, &to_utf16le("CORP")),
+            av(0x0001, &to_utf16le("WIN01")),
+            av(0x0000, &[]),
+        ]
+        .concat()
+    }
+
+    fn refusal(ch: &ChallengeMessage, sealing: bool) -> String {
+        match check_challenge(ch, sealing) {
+            Err(NtlmError::InvalidMessage(m)) => m,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn type2_missing_ntlm_ess_128_or_unicode_is_refused() {
+        assert!(check_challenge(&challenge_with(nb_ti()), false).is_ok());
+        assert!(check_challenge(&challenge_with(nb_ti()), true).is_ok());
+        for (bit, name) in [
+            (NEGOTIATE_UNICODE, "NEGOTIATE_UNICODE"),
+            (NEGOTIATE_NTLM, "NEGOTIATE_NTLM"),
+            (
+                NEGOTIATE_EXTENDED_SESSIONSECURITY,
+                "NEGOTIATE_EXTENDED_SESSIONSECURITY",
+            ),
+            (NEGOTIATE_128, "NEGOTIATE_128"),
+        ] {
+            let mut ch = challenge_with(nb_ti());
+            ch.negotiate_flags &= !bit;
+            for sealing in [false, true] {
+                assert_eq!(
+                    refusal(&ch, sealing),
+                    format!("NTLM Type 2: the server did not negotiate {name}")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn type2_setting_anonymous_or_datagram_is_refused() {
+        for (bit, name) in [
+            (NEGOTIATE_ANONYMOUS, "NEGOTIATE_ANONYMOUS"),
+            (NEGOTIATE_DATAGRAM, "NEGOTIATE_DATAGRAM"),
+        ] {
+            let mut ch = challenge_with(nb_ti());
+            ch.negotiate_flags |= bit;
+            assert_eq!(
+                refusal(&ch, false),
+                format!("NTLM Type 2: the server set {name}, which this client refuses")
+            );
+        }
+    }
+
+    #[test]
+    fn type2_target_info_out_of_bounds_is_refused() {
+        // 48-byte header plus 4 bytes; TargetInfo declared at offset 48, length 8.
+        let mut t2 = vec![0u8; 52];
+        t2[0..8].copy_from_slice(b"NTLMSSP\0");
+        t2[8..12].copy_from_slice(&2u32.to_le_bytes());
+        t2[20..24].copy_from_slice(&TEST_FLAGS.to_le_bytes());
+        t2[40..42].copy_from_slice(&8u16.to_le_bytes());
+        t2[44..48].copy_from_slice(&48u32.to_le_bytes());
+        assert!(
+            matches!(parse_challenge(&t2), Err(NtlmError::InvalidMessage(ref m)) if m == "NTLM Type 2: TargetInfo outside the message")
+        );
+        // A zero-length buffer with any offset stays legal.
+        t2[40..42].copy_from_slice(&0u16.to_le_bytes());
+        t2[44..48].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(parse_challenge(&t2).unwrap().target_info.is_empty());
+    }
+
+    #[test]
+    fn sealing_type2_without_sign_seal_key_exch_is_refused() {
+        for (bit, name) in [
+            (NEGOTIATE_SIGN, "NEGOTIATE_SIGN"),
+            (NEGOTIATE_SEAL, "NEGOTIATE_SEAL"),
+            (NEGOTIATE_KEY_EXCH, "NEGOTIATE_KEY_EXCH"),
+        ] {
+            let mut ch = challenge_with(nb_ti());
+            ch.negotiate_flags &= !bit;
+            assert_eq!(
+                refusal(&ch, true),
+                format!("NTLM Type 2: the server did not negotiate {name}")
+            );
+            assert!(
+                check_challenge(&ch, false).is_ok(),
+                "{name} is required only when sealing"
+            );
+        }
+    }
+
+    #[test]
+    fn sealing_type2_without_nb_names_is_refused() {
+        let only_domain = [av(0x0002, &to_utf16le("CORP")), av(0x0000, &[])].concat();
+        let only_computer = [av(0x0001, &to_utf16le("WIN01")), av(0x0000, &[])].concat();
+        assert_eq!(
+            refusal(&challenge_with(only_domain.clone()), true),
+            "NTLM Type 2: target info has no MsvAvNbComputerName"
+        );
+        assert_eq!(
+            refusal(&challenge_with(only_computer), true),
+            "NTLM Type 2: target info has no MsvAvNbDomainName"
+        );
+        assert!(check_challenge(&challenge_with(only_domain), false).is_ok());
+        assert!(check_challenge(&challenge_with(Vec::new()), false).is_ok());
+    }
+
+    #[test]
+    fn type3_never_echoes_lm_key_identify_datagram_anonymous() {
+        let mut ch = challenge_with(nb_ti());
+        ch.negotiate_flags |= TYPE3_NEVER_ECHO;
+        let type3_flags = |type3: &[u8]| u32::from_le_bytes(type3[60..64].try_into().unwrap());
+        let (http, _) = create_authenticate_message_http(
+            &ch,
+            "user",
+            "pass",
+            "",
+            &create_negotiate_message(),
+            &[0u8; 32],
+            "HTTP/win01",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            type3_flags(&http),
+            TEST_FLAGS,
+            "{:#010x}",
+            type3_flags(&http)
+        );
+        #[cfg(feature = "credssp")]
+        {
+            let (credssp, _) = create_authenticate_message_credssp(
+                &ch,
+                "user",
+                "pass",
+                "",
+                "HTTP/win01",
+                &create_negotiate_message_credssp(),
+                &[0u8; 32],
+            )
+            .unwrap();
+            assert_eq!(
+                type3_flags(&credssp) & TYPE3_NEVER_ECHO,
+                0,
+                "{:#010x}",
+                type3_flags(&credssp)
+            );
+        }
+    }
+
+    #[test]
+    fn windows_2025_type2_gives_unchanged_type3_flags() {
+        // 0xe28a8235 maps to 0xe28a8235 (no masked bit set).
+        assert_eq!(
+            (0xe28a_8235u32 & !TYPE3_NEVER_ECHO) | NEGOTIATE_KEY_EXCH | NEGOTIATE_VERSION,
+            0xe28a_8235
         );
     }
 }

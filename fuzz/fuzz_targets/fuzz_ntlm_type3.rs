@@ -14,8 +14,8 @@
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use winrm_rs::__fuzz::{
-    ChallengeMessage, create_authenticate_message, create_authenticate_message_http,
-    create_negotiate_message,
+    ChallengeMessage, TYPE3_NEVER_ECHO, create_authenticate_message,
+    create_authenticate_message_http, create_negotiate_message,
 };
 
 #[derive(Arbitrary, Debug)]
@@ -51,6 +51,15 @@ fn check_type3(msg: &[u8]) {
         u32::from_le_bytes(msg[8..12].try_into().unwrap()),
         3,
         "bad message type"
+    );
+
+    // The flags are a server-controlled input; the datagram, LM-key,
+    // anonymous, OEM-name and identify bits are never repeated.
+    let type3_flags = u32::from_le_bytes(msg[60..64].try_into().unwrap());
+    assert_eq!(
+        type3_flags & TYPE3_NEVER_ECHO,
+        0,
+        "Type 3 echoes a server-only flag: {type3_flags:#010x}"
     );
 
     for (at, name) in SECURITY_BUFFERS {

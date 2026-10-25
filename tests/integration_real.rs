@@ -4419,6 +4419,23 @@ fn kerberos_client_from_env(tweak: impl FnOnce(&mut WinrmConfig)) -> (WinrmClien
     (client, host)
 }
 
+/// NTLM credentials for the DC bench, from the variables `vm-connect-dc.sh`
+/// exports: `WINRM_TEST_KRB_USER` is the Kerberos principal
+/// (`vagrant@WINRM.TEST`), so the account is the part before `@` and the
+/// domain is the first label of the realm (`WINRM`). A missing variable
+/// panics, like the Kerberos tests; no password is ever defaulted.
+#[cfg(feature = "kerberos")]
+fn krb_bench_ntlm_credentials() -> WinrmCredentials {
+    const HINT: &str = "eval \"$(tests/scripts/vm-connect-dc.sh)\" and kinit vagrant@WINRM.TEST";
+    let principal = std::env::var("WINRM_TEST_KRB_USER").expect(HINT);
+    let pass = std::env::var("WINRM_TEST_KRB_PASS").expect(HINT);
+    let (account, realm) = principal
+        .split_once('@')
+        .expect("WINRM_TEST_KRB_USER must be a principal such as vagrant@WINRM.TEST");
+    let domain = realm.split('.').next().unwrap_or(realm);
+    WinrmCredentials::new(account, pass, domain)
+}
+
 /// `AuthMethod::Kerberos` end to end against a domain controller: the
 /// command runs as the domain user whose TGT is in the cache.
 #[cfg(feature = "kerberos")]
@@ -4639,8 +4656,7 @@ fn dc_ntlm_sealed_client() -> (WinrmClient, String) {
         port: Some(port),
         ..WinrmConfig::http()
     };
-    let client = WinrmClient::new(config, WinrmCredentials::new("vagrant", "vagrant", "WINRM"))
-        .expect("build NTLM client");
+    let client = WinrmClient::new(config, krb_bench_ntlm_credentials()).expect("build NTLM client");
     (client, host)
 }
 
@@ -5365,9 +5381,7 @@ async fn always_seals_inside_tls_seen_by_a_relay_with_dc_cbt_none() {
                 port: Some(relay.port),
                 ..Default::default()
             };
-            let ntlm =
-                WinrmClient::new(config, WinrmCredentials::new("vagrant", "vagrant", "WINRM"))
-                    .expect("NTLM client");
+            let ntlm = WinrmClient::new(config, krb_bench_ntlm_credentials()).expect("NTLM client");
             ntlm.run_command(&host, "whoami", &[])
                 .await
                 .unwrap_or_else(|e| panic!("NTLM {mode:?} through the relay: {e}"));
@@ -5448,7 +5462,7 @@ async fn sealed_download_after_upload_stays_on_its_connection_allow_unencrypted_
                         ..WinrmConfig::http()
                     };
                     let client =
-                        WinrmClient::new(config, WinrmCredentials::new("vagrant", "vagrant", "WINRM"))
+                        WinrmClient::new(config, krb_bench_ntlm_credentials())
                             .expect("NTLM client");
                     (client, forwarder, "dc.winrm.test".to_string())
                 };

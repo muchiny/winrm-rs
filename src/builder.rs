@@ -159,6 +159,16 @@ impl<S> WinrmClientBuilder<S> {
         self.options.tls.accept_invalid_proxy_certs = accept;
         self
     }
+
+    /// Do not read proxies from the environment for this client.
+    /// `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY` and their
+    /// lower-case forms are ignored. Only [`WinrmConfig::proxy`] applies; with
+    /// it `None`, every request goes direct. The operating system's proxy
+    /// settings are never read, and CredSSP never uses a proxy.
+    pub fn ignore_env_proxy(mut self) -> Self {
+        self.options.use_env_proxy = false;
+        self
+    }
 }
 
 impl WinrmClientBuilder<NeedsCredentials> {
@@ -409,6 +419,23 @@ mod tests {
                 .tls
                 .accept_invalid_proxy_certs
         );
+    }
+
+    /// `ignore_env_proxy` reaches the transport, and the default keeps the
+    /// environment.
+    #[test]
+    fn ignore_env_proxy_reaches_the_transport() {
+        let client = WinrmClientBuilder::new(WinrmConfig::default())
+            .credentials(WinrmCredentials::new("u", "p", ""))
+            .ignore_env_proxy()
+            .build()
+            .unwrap();
+        assert!(!client.transport.options().use_env_proxy);
+        let default = WinrmClientBuilder::new(WinrmConfig::default())
+            .credentials(WinrmCredentials::new("u", "p", ""))
+            .build()
+            .unwrap();
+        assert!(default.transport.options().use_env_proxy);
     }
 
     /// `TlsProvider::Ring` reaches the transport: its TLS configuration

@@ -118,6 +118,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - A proxy environment variable whose non-empty value is not a usable proxy
   URL is ignored with a WARN. Migration: none; fix or unset the variable to silence
   the WARN.
+- A client for plain HTTP that will follow a proxy from the environment logs a
+  WARN when it is built, with the proxy's credentials redacted. Migration:
+  none; call `WinrmClientBuilder::ignore_env_proxy` or set
+  `WinrmConfig::proxy` to silence it.
 
 ### Added
 
@@ -140,6 +144,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   without `accept_invalid_certs`. While a pin is set, a host that has the name
   of an `https://` proxy is refused.
 - `WinrmClientBuilder::danger_accept_invalid_proxy_certs`.
+- `WinrmClientBuilder::ignore_env_proxy`: build a client that does not read
+  proxies from the environment.
 
 ### Fixed
 

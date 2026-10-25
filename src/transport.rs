@@ -834,6 +834,17 @@ impl HttpTransport {
         // the verifier of a dedicated single-connection client (see `AuthConn`).
         let route = proxy::ProxyRoute::resolve(&config, opts.use_env_proxy, var)?;
         debug!(route = ?route, "proxy route");
+        // The host is not known here, hence "may": it depends on `NO_PROXY`.
+        if !config.use_tls
+            && let Some(proxy) = route.env_http_proxy()
+        {
+            tracing::warn!(
+                proxy = %log_host(proxy),
+                "plain-HTTP WinRM traffic may follow a proxy from the environment \
+                 (HTTP_PROXY / ALL_PROXY) for every host not in NO_PROXY; set \
+                 WinrmConfig::proxy or call WinrmClientBuilder::ignore_env_proxy to choose"
+            );
+        }
         let proxy_names = route.https_proxy_server_names();
         let crate::tls::ServerVerifiers { origin, proxy } = crate::tls::server_verifiers(
             &opts.tls,
@@ -909,6 +920,12 @@ impl HttpTransport {
     #[cfg(test)]
     fn proxy_route(&self) -> &proxy::ProxyRoute {
         &self.route
+    }
+
+    /// The options this transport was built with, for tests.
+    #[cfg(test)]
+    pub(crate) fn options(&self) -> TransportOptions {
+        self.options.clone()
     }
 
     /// Install the gate checked before every request attempt.
@@ -5620,6 +5637,76 @@ mod tests {
             type3_channel_bindings(&seen.lock().unwrap()[0]),
             Some(cbt_of(EC_CERT_PEM))
         );
+    }
+
+    /// Plain HTTP that may follow a proxy from the environment is logged when
+    /// the client is built, with the proxy's userinfo redacted.
+    #[tracing_test::traced_test]
+    #[test]
+    fn env_proxy_for_plain_http_is_logged_redacted() {
+        let env =
+            |n: &str| (n == "HTTP_PROXY").then(|| "http://user:s3cret@p.corp:3128".to_string());
+        let config = WinrmConfig {
+            auth_method: AuthMethod::Ntlm,
+            ..Default::default()
+        };
+        HttpTransport::new_with_env(
+            config,
+            WinrmCredentials::new("u", "p", ""),
+            TransportOptions::default(),
+            env,
+        )
+        .unwrap();
+        assert!(logs_contain("may follow a proxy from the environment"));
+        assert!(logs_contain("<redacted>@p.corp:3128"));
+        assert!(!logs_contain("s3cret"));
+    }
+
+    /// No such WARN over HTTPS (the bodies are protected there and the proxy
+    /// only tunnels), nor when `WinrmConfig::proxy` is set.
+    #[tracing_test::traced_test]
+    #[test]
+    fn no_env_proxy_warning_over_https_or_with_an_explicit_proxy() {
+        let env = |n: &str| (n == "HTTP_PROXY").then(|| "http://p.corp:3128".to_string());
+        let https = WinrmConfig {
+            auth_method: AuthMethod::Ntlm,
+            use_tls: true,
+            port: 5986,
+            ..Default::default()
+        };
+        let explicit = WinrmConfig {
+            auth_method: AuthMethod::Ntlm,
+            proxy: Some("http://explicit.corp:1".into()),
+            ..Default::default()
+        };
+        for config in [https, explicit] {
+            HttpTransport::new_with_env(
+                config,
+                WinrmCredentials::new("u", "p", ""),
+                TransportOptions::default(),
+                env,
+            )
+            .unwrap();
+        }
+        assert!(!logs_contain("may follow a proxy"));
+    }
+
+    /// With the environment ignored, no variable is read and no proxy applies.
+    #[test]
+    fn ignore_env_proxy_reads_no_environment() {
+        let opts = TransportOptions {
+            use_env_proxy: false,
+            ..TransportOptions::default()
+        };
+        let t = HttpTransport::new_with_env(
+            WinrmConfig::default(),
+            WinrmCredentials::new("u", "p", ""),
+            opts,
+            |n: &str| -> Option<String> { panic!("{n} was read") },
+        )
+        .unwrap();
+        assert_eq!(t.proxy_route().proxy_for("http://win01:5985/wsman"), None);
+        assert!(!t.options().use_env_proxy);
     }
 
     /// Basic over plain HTTP through an `https://` proxy on loopback whose

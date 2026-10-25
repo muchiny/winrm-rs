@@ -210,6 +210,9 @@ pub struct WinrmConfig {
     /// when `REQUEST_METHOD` is set (CGI). A non-empty value that is not a
     /// usable proxy URL is ignored with a WARN. The operating system's proxy
     /// settings are never read.
+    /// [`WinrmClientBuilder::ignore_env_proxy`](crate::WinrmClientBuilder::ignore_env_proxy)
+    /// turns environment proxies off for one client. `NO_PROXY=*` does it for
+    /// the whole process (for host names, not IP addresses).
     ///
     /// Kerberos over HTTPS pins the server certificate in the connection's
     /// verifier and refuses a TLS handshake for any other server name than

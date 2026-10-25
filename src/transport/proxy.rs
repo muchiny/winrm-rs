@@ -211,13 +211,6 @@ impl ProxyRoute {
 
     /// The environment's proxy for `http://` endpoints, `None` when
     /// [`WinrmConfig::proxy`] is set or the environment gives none.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "read by the tests until a caller needs the environment route"
-        )
-    )]
     pub(crate) fn env_http_proxy(&self) -> Option<&str> {
         if self.explicit.is_some() {
             return None;

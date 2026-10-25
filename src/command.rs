@@ -72,7 +72,8 @@ pub(crate) fn escape_ps_single_quoted(s: &str) -> String {
 /// The result is a single literal for any input: every one of the five
 /// characters PowerShell reads as a single quote is doubled, and no other
 /// character is special inside a verbatim string, so `$`, backticks and
-/// double quotes stay literal. Use it to put an untrusted value into a
+/// double quotes stay literal. NUL and control characters are kept as they
+/// are; the cmdlet receiving the value decides whether it accepts them. Use it to put an untrusted value into a
 /// script passed to [`WinrmClient::run_powershell`](crate::WinrmClient::run_powershell):
 /// the script travels through `-EncodedCommand`, which carries it unchanged.
 ///

@@ -202,7 +202,11 @@ pub struct WinrmConfig {
     /// `socks5h://` proxies in cleartext too (RFC 1929). `socks4://` and
     /// `socks4a://` ignore them. An `https://` proxy receives them inside TLS.
     /// See [`accept_invalid_certs`](Self::accept_invalid_certs) for how the
-    /// proxy's certificate is verified.
+    /// proxy's certificate is verified. The trusted roots for that leg depend
+    /// on the transport: the operating system's store for `use_tls = false`,
+    /// the built-in Mozilla roots for `use_tls = true`, plus the roots added
+    /// with `add_root_certificates_pem` in both cases, unless
+    /// `platform_roots(true)` makes it the operating system's store.
     ///
     /// A URL whose scheme is not `http`, `https`, `socks4`, `socks4a`,
     /// `socks5` or `socks5h` (`ftp://`, for one) is refused when the client
@@ -261,7 +265,8 @@ pub struct WinrmConfig {
     /// `PATH` and `PATHEXT` decide which program a bare command name runs,
     /// and `PSModulePath` decides which PowerShell modules load by name.
     /// Values that come from untrusted input can therefore redirect what
-    /// runs. `SystemRoot` decides which PowerShell the transfer scripts start
+    /// runs. `SystemRoot` decides which PowerShell `run_powershell*`,
+    /// `Shell::run_powershell*` and the transfer scripts start
     /// (`%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`). They
     /// start it by its full path, so `PATH` does not change their interpreter.
     pub env_vars: Vec<(String, String)>,
@@ -343,10 +348,12 @@ impl WinrmConfig {
     /// HTTPS on port 5986, NTLM, certificate validated, every other field as
     /// in [`Default`]. TLS authenticates the server by its certificate and
     /// NTLM carries a channel binding to it: the recommended setting on a
-    /// network you do not trust. A listener with a self-signed certificate
-    /// does not pass validation; do not reach for `accept_invalid_certs` (see
-    /// its Security section). Trust its CA with
-    /// [`add_root_certificates_pem`](crate::WinrmClientBuilder::add_root_certificates_pem).
+    /// network you do not trust. A listener whose certificate does not chain
+    /// to a trusted root fails validation (see
+    /// [`add_root_certificates_pem`](crate::WinrmClientBuilder::add_root_certificates_pem)
+    /// and
+    /// [`pin_server_certificate_sha256`](crate::WinrmClientBuilder::pin_server_certificate_sha256));
+    /// do not reach for `accept_invalid_certs` (see its Security section).
     ///
     /// ```no_run
     /// use winrm_rs::{WinrmClient, WinrmConfig, WinrmCredentials};
@@ -667,7 +674,9 @@ pub enum AuthMethod {
     /// machine's name: `HOSTNAME` if set, else `/proc/sys/kernel/hostname` on
     /// Linux or `COMPUTERNAME` on Windows. It is cut to its first label and 15
     /// characters. On other systems it is empty unless `HOSTNAME` is exported.
-    /// It matters only for accounts restricted to named workstations.
+    /// It matters only for accounts restricted to named workstations. Unless
+    /// set with [`WinrmClientBuilder::ntlm_workstation`](crate::WinrmClientBuilder::ntlm_workstation),
+    /// which overrides it.
     Ntlm,
     /// Kerberos authentication (requires `kerberos` feature and prior `kinit`).
     ///

@@ -42,6 +42,15 @@ use crate::transport::{HttpTransport, TransportOptions};
 /// port, or a character that would end the URL authority is refused with
 /// [`WinrmError::AuthFailed`] before anything is sent.
 ///
+/// The host must also be written the way the URL parser keeps it, so that
+/// the host on the wire is the one you passed: an IPv4 address in dotted-quad
+/// decimal (not `10.1`, `010.0.0.1`, `0x0a.0.0.1` or `167772161`), an IPv6
+/// literal in brackets and in its compressed RFC 5952 form (`[2001:db8::1]`,
+/// not `[2001:0db8::1]` or `[0:0::1]`), and no fullwidth characters or
+/// decomposed accents. An IPv6 literal that stands for an IPv4 address
+/// (`[::ffff:10.0.0.1]`, `[::10.0.0.1]`) is refused: pass the dotted quad.
+/// The error names the form to use.
+///
 /// # Session identifier
 ///
 /// Every request this client sends carries the same `wsmv:SessionId`
@@ -62,8 +71,20 @@ impl WinrmClient {
     /// Create a new [`WinrmClient`] from the given configuration and credentials.
     ///
     /// Builds the underlying HTTP client with the configured timeouts and TLS
-    /// settings. Returns [`WinrmError::Http`] if the HTTP client cannot be
-    /// constructed (e.g. invalid TLS configuration).
+    /// settings.
+    ///
+    /// # Errors
+    ///
+    /// [`WinrmError::Http`] if the HTTP client cannot be constructed.
+    /// [`WinrmError::AuthFailed`] for a configuration refused before anything
+    /// is sent: Basic over plain HTTP without `EncryptionMode::Never`,
+    /// `EncryptionMode::Always` with a method that does not seal, Certificate
+    /// or CredSSP without `use_tls`, CredSSP with `accept_invalid_certs` or
+    /// with a proxy it cannot tunnel through, an invalid
+    /// [`WinrmConfig::proxy`], an unusable certificate and key, or a TLS
+    /// setup that rustls rejects. The full list is under
+    /// [`WinrmClientBuilder::build`], which also covers the options that only
+    /// the builder sets.
     ///
     /// TLS uses the process-wide rustls provider, and installs `ring` as that
     /// default first when none is installed. Use [`WinrmClient::builder`] with

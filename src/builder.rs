@@ -159,8 +159,11 @@ impl<S> WinrmClientBuilder<S> {
     /// This concerns the proxy leg only: the WinRM server's certificate is
     /// verified as before. While it is set with `use_tls = true`, a WinRM
     /// host that has the name of the `https://` proxy is refused, since its
-    /// handshake could not be told from the proxy's. Building a client with
-    /// it set logs a WARN when an `https://` proxy applies to its endpoints
+    /// handshake could not be told from the proxy's.
+    ///
+    /// It applies to an `https://` proxy from [`WinrmConfig::proxy`] and to
+    /// one taken from the environment alike. Building a client with it set
+    /// logs a WARN when an `https://` proxy applies to its endpoints
     /// ([`WinrmConfig::proxy`], else the environment's proxy for the
     /// endpoints' scheme). Default: `false`.
     pub fn danger_accept_invalid_proxy_certs(mut self, accept: bool) -> Self {
@@ -266,22 +269,23 @@ impl WinrmClientBuilder<Ready> {
     ///
     /// With NTLM or Kerberos, except over plain HTTP with
     /// `EncryptionMode::Never`, and with CredSSP, each request first takes one
-    /// of its host's 32 connection slots (128 per client; Signal and Delete have 8 of their own
-    /// per host), waiting up to `operation_timeout_secs + 10` seconds for one,
-    /// and only then consults the hook. A CredSSP request holds its slot for
-    /// its whole exchange (it has no pooled connection), so the per-host limit
-    /// also caps concurrent CredSSP logons. Otherwise an approved request goes
-    /// out at once on a pooled authenticated connection; on a new connection, that
-    /// connection's handshake (see above; for Kerberos, possibly a ticket
-    /// request to the KDC) runs first. Sealed Kerberos over plain HTTP through
-    /// a forwarding proxy, under `ProxySessionAuth::Require` or
-    /// `RequireWhenUnsealed`, also sends one unauthenticated probe request
-    /// after the approval, until a 401 answer to it is cached. Under
-    /// saturation a refusal is therefore reported only once a slot frees, and
-    /// a request that gets no slot fails with [`WinrmError::Timeout`] without
-    /// calling the hook: a kill switch then surfaces as `Timeout`, not
-    /// `Cancelled`. Other requests consult the hook at once. A request whose
-    /// host is invalid fails before the hook.
+    /// of its host's 32 data-request slots (plus 8 clean-up slots of their
+    /// own for Signal and Delete; 128 data slots per client), waiting up to
+    /// `operation_timeout_secs + 10` seconds for one, and only then consults
+    /// the hook. A CredSSP request holds its slot for its whole exchange (it
+    /// has no pooled connection), so the per-host limit also caps concurrent
+    /// CredSSP logons. Otherwise an approved request goes out at once on a
+    /// pooled authenticated connection; on a new connection, that connection's
+    /// handshake (see above; for Kerberos, possibly a ticket request to the
+    /// KDC) runs first. Kerberos over plain HTTP through a forwarding proxy,
+    /// sealed or not, under `ProxySessionAuth::Require` or
+    /// `RequireWhenUnsealed`, also sends an unauthenticated probe request
+    /// after the approval, repeated until the server answers it with 401 and
+    /// that answer is kept. Under saturation a refusal is therefore reported
+    /// only once a slot frees, and a request that gets no slot fails with
+    /// [`WinrmError::Timeout`] without calling the hook: a kill switch then
+    /// surfaces as `Timeout`, not `Cancelled`. Other requests consult the hook
+    /// at once. A request whose host is invalid fails before the hook.
     ///
     /// A request already on the wire cannot be recalled: to stop waiting for
     /// it, drop the call's future.
@@ -352,9 +356,10 @@ impl WinrmClientBuilder<Ready> {
     /// [`OutgoingRequest::host`] is the real destination; its documentation
     /// says how to compare it. A per-host refusal does not free connection
     /// capacity at once: with NTLM or Kerberos, except over plain HTTP with
-    /// `EncryptionMode::Never`, a request to a refused host still waits for one
-    /// of that host's 32 connection slots (128 per client) before the hook
-    /// refuses it, and that host's long polls may be holding them.
+    /// `EncryptionMode::Never`, and with CredSSP, a request to a refused host
+    /// still waits for one of that host's 32 data-request slots (128 per
+    /// client) before the hook refuses it, and that host's long polls may be
+    /// holding them.
     ///
     /// Every request this crate builds has a known [`RequestKind`];
     /// [`RequestKind::Other`] is only for an action this version does not know.
@@ -495,7 +500,8 @@ impl WinrmClientBuilder<Ready> {
     /// waiting. Off by default in 1.x; on by default from 2.0.
     ///
     /// It applies to `run_powershell`, `run_powershell_with_timeout` and
-    /// `run_powershell_with_cancel` on the client and on [`Shell`](crate::Shell).
+    /// `run_powershell_with_cancel` on the client, and to `run_powershell` and
+    /// `run_powershell_with_cancel` on [`Shell`](crate::Shell).
     /// The transfer methods always start PowerShell with these flags.
     pub fn non_interactive_powershell(mut self, on: bool) -> Self {
         self.options.non_interactive_powershell = on;
@@ -529,8 +535,37 @@ impl WinrmClientBuilder<Ready> {
 
     /// Build the [`WinrmClient`].
     ///
-    /// Returns [`WinrmError::Http`] if the underlying HTTP client cannot be
-    /// constructed.
+    /// # Errors
+    ///
+    /// [`WinrmError::Http`] if the underlying HTTP client cannot be
+    /// constructed. [`WinrmError::AuthFailed`] when the configuration is
+    /// refused before anything is sent:
+    ///
+    /// - `AuthMethod::Basic` over plain HTTP, unless `encryption` is
+    ///   `EncryptionMode::Never`;
+    /// - `EncryptionMode::Always` with a method other than NTLM or Kerberos;
+    /// - `AuthMethod::Certificate` or `AuthMethod::CredSsp` without
+    ///   `use_tls = true`, or Certificate without a usable certificate and
+    ///   key;
+    /// - `AuthMethod::CredSsp` with `accept_invalid_certs = true`, or with a
+    ///   [`WinrmConfig::proxy`] it cannot tunnel through (an `https://` or
+    ///   `socks4://` proxy);
+    /// - a [`WinrmConfig::proxy`] that is not a valid `http://`, `https://`,
+    ///   `socks4://`, `socks4a://`, `socks5://` or `socks5h://` URL (a proxy
+    ///   environment variable that is not usable is ignored with a WARN
+    ///   instead);
+    /// - [`pin_server_certificate_sha256`](Self::pin_server_certificate_sha256)
+    ///   with a value that is not 64 hex digits, with
+    ///   `accept_invalid_certs = true`, or without `use_tls = true`;
+    /// - a file given to
+    ///   [`add_root_certificates_pem`](Self::add_root_certificates_pem) that
+    ///   cannot be read or holds no usable certificate,
+    ///   [`platform_roots(true)`](Self::platform_roots) on a system whose
+    ///   certificate store cannot be used, or a crypto provider that rustls
+    ///   rejects, or [`TlsProvider::ProcessDefault`] with none installed.
+    ///
+    /// A host that cannot be used (see [`WinrmClient`]) is refused when a
+    /// request is made, not here.
     pub fn build(self) -> Result<WinrmClient, WinrmError> {
         // SAFETY: The typestate pattern guarantees that `credentials` is
         // `Some` when `build()` is callable (state = Ready).

@@ -156,8 +156,9 @@ impl WinrmClient {
     ///   credentials unless it is configured for constrained delegation, and
     ///   then only to the targets that delegation allows. It is not a sandbox:
     ///   never pass an untrusted `remote_path`.
-    ///   With [`RemotePathPolicy::LocalDrive`](crate::RemotePathPolicy::LocalDrive)
-    ///   such paths are refused before anything is sent.
+    ///   With [`RemotePathPolicy::LocalDrive`](crate::RemotePathPolicy::LocalDrive),
+    ///   UNC, WebDAV and device paths are refused before anything is sent; it
+    ///   does not limit which local files a path names.
     /// - Each chunk of the file, up to 2000 bytes, travels as base64 inside the
     ///   `powershell.exe -EncodedCommand` command line. A host that audits
     ///   process command lines (Security event 4688, Sysmon event 1) or logs
@@ -274,8 +275,9 @@ impl WinrmClient {
     ///   credentials unless it is configured for constrained delegation, and
     ///   then only to the targets that delegation allows. It is not a sandbox:
     ///   never pass an untrusted `remote_path`.
-    ///   With [`RemotePathPolicy::LocalDrive`](crate::RemotePathPolicy::LocalDrive)
-    ///   such paths are refused before anything is sent.
+    ///   With [`RemotePathPolicy::LocalDrive`](crate::RemotePathPolicy::LocalDrive),
+    ///   UNC, WebDAV and device paths are refused before anything is sent; it
+    ///   does not limit which local files a path names.
     /// - The file comes back as base64 on the command's stdout. PowerShell
     ///   transcription on the host, if enabled, records it.
     /// - `local_path` is written with this process's privileges. A symbolic
@@ -313,56 +315,11 @@ impl WinrmClient {
     /// transfer from the host, not the local write that follows it. No local
     /// file is created or modified on timeout.
     ///
-    /// `local_path` is replaced atomically once the whole remote file has
-    /// arrived: the data goes to a temporary `.winrm-rs-<random>.tmp` file in
-    /// the same directory, which is then renamed over `local_path`, so a failed
-    /// write leaves `local_path` as it was. On Unix, on filesystems that store
-    /// Unix modes, a new file is created with mode 0600 (`chmod` it afterwards
-    /// if others must read it). An existing file keeps its permission bits,
-    /// minus the set-user-ID and set-group-ID bits, and, when this process may
-    /// set them, its owner and group; ACLs and extended attributes are not
-    /// carried over. A symbolic link at `local_path` is refused (resolve it
-    /// yourself and pass its target), and so is anything that is not a
-    /// regular file; directories along the path are still resolved through
-    /// links. A read-only destination is refused as before. In a sticky,
-    /// world-writable directory such as `/tmp`, an existing file owned by
-    /// neither this user nor the directory's owner is refused, as Linux's
-    /// `fs.protected_regular` rule refuses a plain write there. The file is
-    /// rewritten in place, which is not atomic, when its directory is not
-    /// writable, when it has other hard links, or when its owner cannot be
-    /// kept. On Windows the rename fails while another process holds
-    /// `local_path` open without delete sharing.
-    ///
-    /// Nothing local is created or modified when the remote read fails or
-    /// times out. The write runs on tokio's blocking pool: dropping the future
-    /// while it runs does not stop it, so the file may still be written after
-    /// the caller gave up.
+    /// The local file is written as `download_file` writes it, and the same
+    /// cautions apply; see its documentation, including its `# Security`
+    /// section.
     ///
     /// Returns the number of bytes downloaded.
-    ///
-    /// # Security
-    ///
-    /// - `remote_path` is opened by `[IO.File]` as the remote account. It can
-    ///   name any local path, a UNC or WebDAV share (`\\server\share\f`,
-    ///   `//server/share/f`) or a device path (`\\?\…`, `\\.\…`). Under CredSSP
-    ///   or Basic, and probably under Certificate auth, the remote session holds
-    ///   reusable credentials, so a UNC path makes the host authenticate as you
-    ///   to the server it names. Under NTLM or Kerberos the host forwards no
-    ///   credentials unless it is configured for constrained delegation, and
-    ///   then only to the targets that delegation allows. It is not a sandbox:
-    ///   never pass an untrusted `remote_path`.
-    ///   With [`RemotePathPolicy::LocalDrive`](crate::RemotePathPolicy::LocalDrive)
-    ///   such paths are refused before anything is sent.
-    /// - The file comes back as base64 on the command's stdout. PowerShell
-    ///   transcription on the host, if enabled, records it.
-    /// - `local_path` is written with this process's privileges. A symbolic
-    ///   link at `local_path` itself is refused, but the directories above it
-    ///   are resolved through links. Check an untrusted local path yourself
-    ///   before passing it. A party able to write in the destination
-    ///   directory can make the local write block (with a FIFO put at
-    ///   `local_path`); the limit of
-    ///   [`download_file_with_timeout`](Self::download_file_with_timeout)
-    ///   does not cover the local write.
     ///
     /// # Example
     /// ```rust,no_run

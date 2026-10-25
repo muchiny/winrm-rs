@@ -3,8 +3,9 @@
 //! Usage: WINRM_HOST=win-server WINRM_USER=admin WINRM_PASS=password [WINRM_CA=ca.pem] [WINRM_HTTP=1] cargo run --example basic
 //!
 //! By default the example connects over HTTPS on 5986 and validates the
-//! listener certificate. `WINRM_CA` names a PEM file with the CA (or, for a
-//! self-signed listener certificate, the certificate) to trust. `WINRM_HTTP=1`
+//! listener certificate. `WINRM_CA` names a PEM file with the CA to trust (a
+//! self-signed listener certificate works only if it is a CA certificate;
+//! otherwise pin it, see the README). `WINRM_HTTP=1`
 //! selects plain HTTP on 5985, where NTLM does not authenticate the server
 //! (README, "Choosing a transport").
 

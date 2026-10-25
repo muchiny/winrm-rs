@@ -383,9 +383,8 @@ impl CredSspConnection {
     /// The outer TLS leg uses `tls.outer`, which carries the verifier of the
     /// client. Nothing inside CredSSP replaces it: the inner TLS is not
     /// verified (MS-CSSP 1.3) and `pubKeyAuth` binds only the inner TLS key.
-    /// The outer TLS verifier is the transport's; CredSSP is refused under
-    /// `accept_invalid_certs`. Through a proxy, the handshake still runs
-    /// end-to-end with the host: the tunnel only relays its bytes.
+    /// Through a proxy, the handshake still runs end-to-end with the host:
+    /// the tunnel only relays its bytes.
     async fn connect(
         endpoint: &CredSspEndpoint,
         tls: &CredSspTls,

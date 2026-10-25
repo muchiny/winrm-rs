@@ -28,6 +28,8 @@ async fn main() -> Result<(), winrm_rs::WinrmError> {
 
 A listener whose certificate comes from an internal CA: build the client with
 `WinrmClient::builder(WinrmConfig::https()).credentials(..).add_root_certificates_pem("ca.pem").build()`.
+For a self-signed listener, see
+[Trusting an internal CA or pinning the certificate](#trusting-an-internal-ca-or-pinning-the-certificate).
 Plain HTTP on 5985 (`WinrmConfig::http()`) does not authenticate the server:
 see [Choosing a transport](#choosing-a-transport).
 
@@ -92,7 +94,7 @@ much as the client's:
 
 ## Usage
 
-Hosts are bare names or addresses (`win01`, `10.0.0.5`, `[fe80::1]`); the port is `WinrmConfig::port`. A host with a scheme, user info, path or port is refused.
+Hosts are bare names or addresses (`win01`, `10.0.0.5`, `[fe80::1]`); the port is `WinrmConfig::port`. A host with a scheme, user info, path or port is refused. So is a host the URL parser would write differently, such as `10.1` or `[0:0::1]`; the error names the form to use. Write an IPv4 address in dotted-quad decimal and an IPv6 literal in brackets, in its compressed form; an IPv6 literal that stands for an IPv4 address (`[::ffff:10.0.0.1]`) is refused: pass the dotted quad.
 
 ### Basic authentication
 
@@ -337,8 +339,8 @@ line, which command-line auditing (event 4688) and script block logging
 (event 4104) record.
 
 To accept only drive-absolute remote paths (`C:\...`), and refuse UNC,
-WebDAV and device paths before anything is sent, build the client with
-`RemotePathPolicy::LocalDrive`:
+WebDAV and `\\.\` / `\\?\` device paths before anything is sent, build the
+client with `RemotePathPolicy::LocalDrive`:
 
 ```rust
 use winrm_rs::{RemotePathPolicy, WinrmClient};
@@ -350,7 +352,8 @@ let client = WinrmClient::builder(config)
 ```
 
 Use it when remote paths come from anyone but you. The check is lexical: a
-link, junction or mapped drive on the host can still lead to a share.
+link, junction or mapped drive on the host can still lead to a share. It does
+not limit which local files a path names.
 
 ## Configuration
 
@@ -375,7 +378,7 @@ link, junction or mapped drive on the host can still lead to a share.
 ### Proxies
 
 - `proxy` takes `http://`, `https://`, `socks4://`, `socks4a://`, `socks5://` or `socks5h://` URLs; one without a scheme is taken as `http://`, and any other scheme is refused when the client is built. CredSSP is tunnelled through `http://` (`CONNECT`) and `socks5://` / `socks5h://` proxies, with TLS end-to-end to the host; it refuses an `https://` or `socks4://` proxy when the client is built, and it does not read the proxy environment variables.
-- With `proxy` unset, the environment applies: `HTTP_PROXY` for `http://` endpoints, `HTTPS_PROXY` for `https://` endpoints, `ALL_PROXY` for both when the specific one is unset or unusable, and `NO_PROXY` for exclusions (names, domain suffixes, IP addresses, CIDR ranges, and `*` for every host name but no IP address; list `0.0.0.0/0,::/0` to leave every address out). Upper case is read before lower case, and a set but empty value counts as set; none applies when `REQUEST_METHOD` is set (CGI). A non-empty value that is not a usable proxy URL is ignored with a WARN. The operating system's proxy settings are never read. `WinrmClientBuilder::ignore_env_proxy(true)` turns environment proxies off for one client; `NO_PROXY=*` does it for the whole process (for host names, not IP addresses). Plain-HTTP traffic that follows an environment proxy is logged with a WARN when the client is built.
+- With `proxy` unset, the environment applies: `HTTP_PROXY` for `http://` endpoints, `HTTPS_PROXY` for `https://` endpoints, `ALL_PROXY` for both when the specific one is unset or unusable, and `NO_PROXY` for exclusions (names, domain suffixes, IP addresses, CIDR ranges, and `*` for every host name but no IP address; list `0.0.0.0/0,::/0` to leave every address out). Upper case is read before lower case, and a set but empty value counts as set; none applies when `REQUEST_METHOD` is set (CGI). A non-empty value that is not a usable proxy URL is ignored with a WARN. The operating system's proxy settings are never read. `WinrmClientBuilder::ignore_env_proxy(true)` turns environment proxies off for one client; `NO_PROXY=*` does it for the whole process (for host names, not IP addresses). A client for plain HTTP may follow an environment proxy for every host not in `NO_PROXY` unless `ignore_env_proxy(true)` or `proxy` is set; building it logs a WARN when one applies.
 - Over plain HTTP, an `http://` or `https://` proxy forwards each request and keeps the server connection that NTLM or Kerberos authenticated; WinRM then sends sealed requests on it without credentials. A proxy that shares those server connections between its clients (RFC 4559 section 6 forbids it) lets its other users send requests that run as you, whenever the server accepts unencrypted messages. Keep `AllowUnencrypted = false` on the server, and prefer HTTPS or a SOCKS proxy. See [Choosing a transport](#choosing-a-transport). With `WinrmClientBuilder::proxy_session_auth(ProxySessionAuth::RequireWhenUnsealed)` or `Require`, the client needs `Proxy-Support: Session-Based-Authentication` on the server's 401 through such a proxy before it authenticates: `RequireWhenUnsealed` refuses `EncryptionMode::Never` without it and logs a WARN in sealed modes, `Require` refuses both. The default, `ProxySessionAuth::Allow`, does not check, so that deployments through proxies that do not send the header keep working.
 - Credentials in a proxy URL reach `http://` and `socks5://` proxies in cleartext (`socks4://` ignores them); an `https://` proxy receives them inside TLS.
 
@@ -395,8 +398,8 @@ winrm-rs logs through `tracing`. Below `trace` it logs no command text, argument
 | **v1.0** | Stable public API, TLS channel binding, CI/CD | Done |
 | **v1.4** | `before_send` request hook | **Current** |
 | **v1.5** | `WinrmConfig::https()` / `http()` presets, opt-in SOAP body logging | Planned |
-| **v2.0** | HTTPS on 5986 by default | Planned |
 | **v1.x** | CredSSP stabilization (`--features credssp`) | Planned |
+| **v2.0** | HTTPS on 5986 by default | Planned |
 
 ## Comparison
 
@@ -471,7 +474,7 @@ cargo test --test integration_real -- --ignored
 |---|---|---|
 | *(default)* | stable | NTLMv2, Basic, Certificate auth; no optional deps |
 | `kerberos` | stable | Pulls `cross-krb5`; requires a working `kinit` |
-| `credssp` | **experimental** | Double-hop delegation. CredSSP refuses `accept_invalid_certs = true`: set it to false and either pin the listener certificate with `pin_server_certificate_sha256` or trust its CA with `add_root_certificates_pem`. Validated end-to-end against Windows Server 2025 (live `credssp_run_command_whoami`); not yet exercised on other host generations. Up to 1.4.1 it ignored `proxy`, `max_retries`, `connect_timeout_secs`, `operation_timeout_secs` and `user_agent`; since 1.4.2 it applies both timeouts and `user_agent`, and still ignores `max_retries` (see `AuthMethod::CredSsp`); since 1.5.0 it is tunnelled through `WinrmConfig::proxy` (an `http://` or `socks5://` one), which it ignored before. Since 1.5.0 each request waits for, and holds for its whole exchange, one of the connection slots shared with the other connection-bound methods (32 per host, 128 per client). Delegates your cleartext password to the target: use it only toward hosts you trust as much as the account. Links the host OpenSSL; see below. |
+| `credssp` | **experimental** | Double-hop delegation. Needs `use_tls = true` with a verified certificate: it refuses `accept_invalid_certs = true`, so pin the listener certificate with `pin_server_certificate_sha256` or trust its CA with `add_root_certificates_pem`. Reaches the host through no proxy, or an `http://` or `socks5://` one set in `WinrmConfig::proxy`; it reads no proxy environment variable. It does not apply `max_retries` (see `AuthMethod::CredSsp`). Each request holds one of the connection slots shared with the other connection-bound methods for its whole exchange (32 per host, 128 per client). Validated end-to-end against Windows Server 2025; not yet exercised on other host generations. Delegates your cleartext password to the target: use it only toward hosts you trust as much as the account. Links the host OpenSSL; see below. |
 
 ### `credssp` and the host OpenSSL
 

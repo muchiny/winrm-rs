@@ -93,10 +93,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   transfer scripts are affected; they never relied on a profile. A profile
   that customises the remote session no longer applies to `upload_file` or
   `download_file`.
-- With `use_tls = false` and `accept_invalid_certs`, an `https://` proxy must
-  now prove it holds its certificate's key, as the WinRM server must since
-  1.4.1. The plain-HTTP TLS configuration is now built by the crate rather
-  than by reqwest.
+- The plain-HTTP half of the next entry: with `use_tls = false` and
+  `accept_invalid_certs`, an `https://` proxy must now prove it holds its
+  certificate's key, as the WinRM server must since 1.4.1. The plain-HTTP TLS
+  configuration is now built by the crate rather than by reqwest.
 - **`accept_invalid_certs` no longer turns off verification of an `https://`
   proxy's certificate.** The proxy leg is verified with the trusted roots,
   including those added with `add_root_certificates_pem` and `platform_roots`.
@@ -143,7 +143,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - A proxy environment variable whose non-empty value is not a usable proxy
   URL is ignored with a WARN. Migration: none; fix or unset the variable to silence
   the WARN.
-- A client for plain HTTP that will follow a proxy from the environment logs a
+- A client for plain HTTP that may follow a proxy from the environment logs a
   WARN when it is built, with the proxy's credentials redacted. Migration:
   none; call `WinrmClientBuilder::ignore_env_proxy(true)` or set
   `WinrmConfig::proxy` to silence it.
@@ -154,8 +154,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (`add_root_certificates_pem`) and set `accept_invalid_certs = false` to
   silence it.
 - `before_send` is consulted once a request holds its connection slot (NTLM
-  and Kerberos, except over plain HTTP with `EncryptionMode::Never`), so the
-  slot wait no longer ages an approval (it could add up to
+  and Kerberos, except over plain HTTP with `EncryptionMode::Never`, and
+  CredSSP), so the slot wait no longer ages an approval (it could add up to
   `operation_timeout_secs + 10` s); on a new connection the handshake still
   runs between the approval and the request. Under saturation a refusal is
   reported only when a slot frees, and a request that gets no slot within
@@ -242,10 +242,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **`WinrmClientBuilder::pin_server_certificate_sha256`**: accept the listener
   only by its certificate's SHA-256 fingerprint (self-signed listeners,
   connections by IP), on the HTTPS transport and the CredSSP outer TLS,
-  without `accept_invalid_certs`. While a pin is set, a host that has the name
-  of an `https://` proxy is refused.
-- `WinrmClientBuilder::danger_accept_invalid_proxy_certs`. Building a client
-  with it set logs a WARN when an `https://` proxy applies to its endpoints.
+  without `accept_invalid_certs`. With `use_tls = true`, a host that has the
+  name of an `https://` proxy is refused while a pin is set.
+- `WinrmClientBuilder::danger_accept_invalid_proxy_certs` turns off
+  verification of an `https://` proxy's certificate; the WinRM server stays
+  verified. Building a client with it set logs a WARN when an `https://`
+  proxy applies to its endpoints. With `use_tls = true`, a host that has the
+  name of an `https://` proxy is refused while it is set.
 - `WinrmClientBuilder::ignore_env_proxy(bool)`: with `true`, build a client
   that does not read proxies from the environment.
 - `ProxySessionAuth` and `WinrmClientBuilder::proxy_session_auth`.
@@ -254,8 +257,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   announce `Proxy-Support: Session-Based-Authentication` (RFC 4559 section
   6); `ProxySessionAuth::RequireWhenUnsealed` refuses only
   `EncryptionMode::Never` there and logs a WARN for sealed requests. Kerberos
-  reads the header from one unauthenticated request per endpoint. The
-  default, `Allow`, checks nothing and keeps today's behaviour.
+  reads the header from an unauthenticated request per endpoint, repeated
+  until the server answers it with 401. The default, `Allow`, checks nothing and keeps today's behaviour.
 - **`WinrmClientBuilder::before_send_with`**, with `OutgoingRequest` and
   `RequestKind`: a `before_send` hook that sees each request's host (as the
   URL uses it), WS-Management action, kind and attempt number, for per-host
@@ -268,13 +271,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `AuthMethod::Ntlm`; without it, the detected name is sent as before.
 - `WinrmClient::run_wql_with_timeout` and `WinrmClient::run_wql_with_cancel`
   bound or stop a WQL enumeration.
-- **`RemotePathPolicy` and `WinrmClientBuilder::remote_path_policy`.** With `RemotePathPolicy::LocalDrive`, the transfer methods accept only drive-absolute remote paths and refuse UNC, WebDAV and device paths before anything is sent. The default, `Any`, keeps today's behaviour.
-- `quote_powershell_string`: quote a value as a PowerShell single-quoted literal, for passing untrusted values to `run_powershell` scripts.
-- `WinrmClientBuilder::non_interactive_powershell(true)` starts `run_powershell` scripts with `-NoProfile -NonInteractive`.
+- `RemotePathPolicy` and `WinrmClientBuilder::remote_path_policy`. With
+  `RemotePathPolicy::LocalDrive`, the transfer methods accept only
+  drive-absolute remote paths and refuse UNC, WebDAV and `\\.\` / `\\?\`
+  device paths before anything is sent. The default, `Any`, keeps today's
+  behaviour.
+- `quote_powershell_string`: quote a value as a PowerShell single-quoted
+  literal, for passing untrusted values to `run_powershell` scripts.
+- `WinrmClientBuilder::non_interactive_powershell(true)` starts
+  `run_powershell` scripts with `-NoProfile -NonInteractive`.
 - `WinrmClientBuilder::log_soap_bodies(true)` logs every SOAP body at
   `trace`, target `winrm_rs::wire`, in plaintext. For debugging only.
   Clients built with `WinrmClient::new` cannot turn it on; use the builder.
-- `WinrmConfig::https()` (HTTPS on 5986, NTLM, certificate validated) and `WinrmConfig::http()` (plain HTTP on 5985, today's default). The default becomes HTTPS on 5986 in 2.0; `WinrmConfig::http()` keeps plain HTTP.
+- `WinrmConfig::https()` (HTTPS on 5986, NTLM, certificate validated) and
+  `WinrmConfig::http()` (plain HTTP on 5985, today's default). The default
+  becomes HTTPS on 5986 in 2.0; `WinrmConfig::http()` keeps plain HTTP.
 
 ### Fixed
 
@@ -409,10 +420,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the authentication is not bound to the connection and can be relayed, and
   what prevents it (HTTPS, `AllowUnencrypted = false`).
 - Transfer docs say what the paths reach. `upload_file` and `download_file*`
-  gain a `# Security` section: the remote path may be a UNC or device path
-  reached with delegated credentials under CredSSP or Basic, upload content
-  is on the remote command line, and the local path follows symbolic links.
-  `run_powershell` says that its script text is on the command line.
+  gain a `# Security` section: the remote path may be a UNC, WebDAV or
+  `\\.\` / `\\?\` device path reached with delegated credentials under
+  CredSSP or Basic, upload content is on the remote command line, and
+  `upload_file` reads through a symbolic link while `download_file` refuses
+  one (see Changed). `run_powershell` says that its script text is on the
+  command line.
 - The command-running methods say how `args` reach the host (one `cmd.exe`
   command line, unquoted), and `working_directory` and `env_vars` say how
   they affect which program runs. `run_powershell` says that the host's
@@ -424,6 +437,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `before_send_with` documents a kill switch that still lets `Signal` and
   `Delete` through, so running commands and PSRP pipelines can be stopped,
   and `Shell::disconnect` documents its Delete fallback under a refusing hook.
+- `WinrmClientBuilder::build` and `WinrmClient::new` gain an `# Errors`
+  section listing the configurations refused when the client is built, and
+  the *Host strings* section of `WinrmClient` says which host forms are
+  accepted. The crate-level *Logging* section lists the WARNs the client
+  logs.
 
 ## [1.4.1] - 2026-10-24
 

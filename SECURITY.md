@@ -85,8 +85,9 @@ We will credit reporters in the release notes and CHANGELOG (unless you prefer t
   `CbtHardeningLevel = Strict`, and SMB and LDAP signing plus Extended
   Protection on the account's other services.
 - What `accept_invalid_certs = true` gives up, as its documentation states:
-  the server is not authenticated, CredSSP's outer TLS is not bound to the
-  authentication, and the certificate of an `https://` proxy is not verified.
+  the server is not authenticated. CredSSP refuses the flag.
+- What `danger_accept_invalid_proxy_certs(true)` gives up: the `https://`
+  proxy is not authenticated. The WinRM server stays verified.
 - Windows server settings: `AllowUnencrypted = true`,
   `CbtHardeningLevel = None`, SMB signing, LDAP channel binding, Extended
   Protection on other services.

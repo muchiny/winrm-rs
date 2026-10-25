@@ -348,7 +348,8 @@ impl ServerCertVerifier for NoVerifier {
 /// `RefUnwindSafe`).
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TlsOptions {
-    /// The rustls crypto provider; `None` keeps the 1.x behaviour (see
+    /// The rustls crypto provider; `None` means the process default provider
+    /// if one is installed, else a private `ring` provider (see
     /// [`crypto_provider`]).
     pub(crate) provider: Option<TlsProvider>,
     /// PEM files of extra trust anchors, in the order they were added.

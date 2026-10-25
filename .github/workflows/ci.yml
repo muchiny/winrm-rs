@@ -239,6 +239,12 @@ jobs:
       # needs the OpenSSL headers.
       - name: Install krb5 and OpenSSL dev headers
         run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libssl-dev pkg-config
+      - name: SECURITY.md lists the current minor
+        run: |
+          minor=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "winrm-rs") | .version' | cut -d. -f1,2)
+          grep -Fq "| ${minor}.x" SECURITY.md \
+            || { echo "::error file=SECURITY.md::no '| ${minor}.x' row under Supported versions"; exit 1; }
       - run: cargo doc --locked --no-deps --all-features
 
   hardening:

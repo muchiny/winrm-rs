@@ -8,10 +8,10 @@ use secrecy::{ExposeSecret, SecretString};
 ///
 /// Controls the transport (HTTP vs HTTPS), timeouts, and authentication
 /// method. [`Default::default()`] is HTTPS on port 5986 (since 2.0), NTLM,
-/// certificate validated, with sealing over HTTP only; 30 s connect / 60 s
-/// operation timeouts. [`WinrmConfig::http()`] gives a Windows host's stock
-/// listener (HTTP on 5985, what `Enable-PSRemoting` and `winrm quickconfig`
-/// create).
+/// certificate validated, with sealing over HTTP and over HTTPS with
+/// `accept_invalid_certs`; 30 s connect / 60 s operation timeouts.
+/// [`WinrmConfig::http()`] gives a Windows host's stock listener (HTTP on
+/// 5985, what `Enable-PSRemoting` and `winrm quickconfig` create).
 ///
 /// # Security
 ///
@@ -581,8 +581,9 @@ impl std::fmt::Debug for EnvVarNames<'_> {
 /// On a Windows client, Kerberos sealing goes through the SSPI branch of
 /// `cross-krb5`, which the `kerberos-windows` CI job builds and lints and
 /// which has not been tested against a server: with the `kerberos` feature,
-/// [`Self::Auto`] now seals Kerberos over HTTP, and [`Self::Never`] is the
-/// way back if that fails.
+/// [`Self::Auto`] now seals Kerberos over HTTP and over HTTPS with
+/// `accept_invalid_certs`, and [`Self::Never`] is the way back if that
+/// fails.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub enum EncryptionMode {
     /// Seal every SOAP body over HTTP (NTLM and Kerberos), and over HTTPS
@@ -595,7 +596,7 @@ pub enum EncryptionMode {
     /// clear (with NTLM, the first one rides in the request that completes
     /// the authentication). Sealing keeps it unreadable to a server that
     /// does not hold the session key. 1.x, whose default was plain HTTP,
-    /// sealed this case only over HTTP.
+    /// did not seal over HTTPS, even with `accept_invalid_certs`.
     #[default]
     Auto,
     /// Seal every SOAP body, over HTTPS too (inside TLS).
@@ -732,14 +733,15 @@ pub enum AuthMethod {
     /// that this client's connection reaches it: a relay passes the AP-REP
     /// through. Message confidentiality and integrity come from HTTPS, or from
     /// Kerberos sealing ([`EncryptionMode::Auto`] over HTTP or with
-    /// `accept_invalid_certs`, or [`EncryptionMode::Always`]). Both run on dedicated connections
-    /// authenticated once, and require the AP-REP. Over HTTPS the AP-REQ
-    /// carries a channel binding (RFC 5929 `tls-server-end-point`) computed for
-    /// the certificate learnt on an unauthenticated probe request; that
-    /// certificate is then pinned in the connection's own verifier, so the
-    /// connection that carries the AP-REQ, and every later one, presents that
-    /// same certificate or fails at its TLS handshake before any HTTP byte is
-    /// written (validated against `CbtHardeningLevel = Relaxed` and `Strict`).
+    /// `accept_invalid_certs`, or [`EncryptionMode::Always`]). Both run on
+    /// dedicated connections authenticated once, and require the AP-REP. Over
+    /// HTTPS the AP-REQ carries a channel binding (RFC 5929
+    /// `tls-server-end-point`) computed for the certificate learnt on an
+    /// unauthenticated probe request; that certificate is then pinned in the
+    /// connection's own verifier, so the connection that carries the AP-REQ,
+    /// and every later one, presents that same certificate or fails at its TLS
+    /// handshake before any HTTP byte is written (validated against
+    /// `CbtHardeningLevel = Relaxed` and `Strict`).
     /// The pin applies to the server name `reqwest` uses, the host of the
     /// parsed endpoint URL; once pinned, a handshake for another name is
     /// refused (the `https://` proxy's own leg aside), and a host that is no
@@ -750,8 +752,8 @@ pub enum AuthMethod {
     /// key); they do not stop a party with a certificate of its own from
     /// reading unsealed traffic ([`EncryptionMode::Auto`] seals in this mode,
     /// [`EncryptionMode::Never`] does not) or relaying the token to a service
-    /// that ignores channel binding. A certificate whose signature algorithm defines no
-    /// binding hash (Ed25519, unknown) is refused. With
+    /// that ignores channel binding. A certificate whose signature algorithm
+    /// defines no binding hash (Ed25519, unknown) is refused. With
     /// [`EncryptionMode::Never`] over HTTP, each request authenticates with a
     /// fresh context, the AP-REP is checked only when the answer carries one,
     /// and body and answer cross the network in plaintext, unprotected. See

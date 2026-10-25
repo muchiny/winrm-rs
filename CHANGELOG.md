@@ -273,9 +273,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `RemotePathPolicy::Any` accepts them.
 - `EncryptionMode::Auto` seals NTLM and Kerberos messages over HTTPS when
   `accept_invalid_certs` is set, as it does over plain HTTP, so an
-  unverified server never receives a request body in clear. Migration: none
-  needed; to rely on TLS alone, pin the listener certificate or trust its
-  CA and leave `accept_invalid_certs` false.
+  unverified server never receives a request body in clear. Migration: a
+  Kerberos realm without AES keys (only RFC 4121 tokens are accepted), or a
+  Windows client whose Kerberos sealing fails, sets `EncryptionMode::Never`
+  (the 1.x HTTPS behaviour); pinning the listener certificate or trusting
+  its CA and leaving `accept_invalid_certs` false relies on TLS alone.
 
 ### Added
 

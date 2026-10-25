@@ -5346,9 +5346,9 @@ async fn always_seals_inside_tls_seen_by_a_relay_with_dc_cbt_none() {
 
 /// `CbtHardeningLevel = Strict` requires channel bindings: Kerberos over
 /// HTTPS still works, unsealed (`Never`) and sealed (`Auto` without
-/// certificate verification, `Always`), since the
-/// AP-REQ carries them; through the relay it is refused, and the split relay
-/// fails at the handshake as under `Relaxed`.
+/// certificate verification, `Always`), since the AP-REQ carries them;
+/// through the relay it is refused, and the split relay fails at the
+/// handshake as under `Relaxed`.
 #[cfg(feature = "kerberos")]
 #[tokio::test]
 #[ignore]

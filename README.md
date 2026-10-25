@@ -37,7 +37,7 @@ see [Choosing a transport](#choosing-a-transport).
 
 - **NTLMv2 authentication** -- pure Rust, no OpenSSL or system SSPI required
 - **Basic authentication** -- over HTTPS; over plain HTTP only with `EncryptionMode::Never`, the explicit plaintext opt-in
-- **Kerberos authentication** -- via `cross-krb5`, feature-gated (`--features kerberos`); raw Kerberos GSS-API tokens under the `Negotiate` scheme, messages sealed with the Kerberos context over HTTP
+- **Kerberos authentication** -- via `cross-krb5`, feature-gated (`--features kerberos`); raw Kerberos GSS-API tokens under the `Negotiate` scheme, messages sealed with the Kerberos context over HTTP, and over HTTPS with `accept_invalid_certs`
 - **Certificate authentication** -- TLS client certificate auth
 - **PowerShell execution** -- scripts auto-encoded as UTF-16LE Base64 (`-EncodedCommand`)
 - **Raw command execution** -- `cmd.exe` command lines (the host runs every command through `cmd.exe /C`; arguments are not quoted)
@@ -152,11 +152,12 @@ let out = client.run_command("server.corp.example", "whoami", &[]).await?;
 Kerberos authenticates the client and, through its AP-REP, the server
 (required for sealing and over HTTPS; only `EncryptionMode::Never` over
 plain HTTP accepts an answer without it). Message confidentiality comes from
-HTTPS (`use_tls = true`) or, over HTTP, from Kerberos sealing, which
-`EncryptionMode::Auto` (the default) applies: each SOAP body is wrapped with
-the connection's Kerberos context (GSS-API wrap with confidentiality; only
-RFC 4121 tokens, so AES session keys: an RC4-only realm needs
-`EncryptionMode::Never`), so the server can keep `AllowUnencrypted = false`.
+HTTPS (`use_tls = true`) or, over HTTP and over HTTPS with
+`accept_invalid_certs`, from Kerberos sealing, which `EncryptionMode::Auto`
+(the default) applies: each SOAP body is wrapped with the connection's
+Kerberos context (GSS-API wrap with confidentiality; only RFC 4121 tokens, so
+AES session keys: an RC4-only realm needs `EncryptionMode::Never`), so the
+server can keep `AllowUnencrypted = false`.
 `EncryptionMode::Never` sends the bodies in plaintext over HTTP. Over HTTPS
 the AP-REQ carries a channel binding (RFC 5929 `tls-server-end-point`)
 computed for the certificate learnt on an unauthenticated probe request;
@@ -374,7 +375,7 @@ to a share. It does not limit which local files a path names.
 | `client_cert_pem` | `None` | Path to client cert PEM (Certificate auth) |
 | `client_key_pem` | `None` | Path to client key PEM (Certificate auth) |
 | `proxy` | `None` | Proxy URL as a `SecretString` (e.g. `SecretString::from("http://proxy:8080")`), wiped on drop; CredSSP takes `http://` and `socks5://` only |
-| `encryption` | `Auto` | Message sealing for NTLM and Kerberos: `Auto` (over HTTP only), `Always`, `Never`. Basic over plain HTTP requires `Never`; `Always` with Basic, Certificate or CredSSP is refused |
+| `encryption` | `Auto` | Message sealing for NTLM and Kerberos: `Auto` (over HTTP, and over HTTPS with `accept_invalid_certs`), `Always`, `Never`. Basic over plain HTTP requires `Never`; `Always` with Basic, Certificate or CredSSP is refused |
 | `max_output_bytes` | `Some(64 MiB)` | Cap on a command's stdout+stderr; `None` removes it |
 
 ### Proxies

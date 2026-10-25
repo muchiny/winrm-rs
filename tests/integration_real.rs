@@ -401,8 +401,10 @@ async fn run_wql_pages_to_the_end_with_a_small_envelope() {
         .trim()
         .parse()
         .unwrap();
-    // One start tag per instance: `<p:Win32_Service xmlns:p=... >`.
-    assert_eq!(xml.matches(":Win32_Service ").count(), expected);
+    // One `Name` key per instance. Counting `<p:Win32_Service ...>` start
+    // tags missed subclass instances: `SELECT * FROM Win32_Service` also
+    // returns TermService as a `<p:Win32_TerminalService ...>`.
+    assert_eq!(xml.matches("<p:Name>").count(), expected);
 }
 
 // === NTLM authentication ===

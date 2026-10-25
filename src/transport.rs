@@ -3,6 +3,8 @@
 // Manages the reqwest HTTP client, authentication dispatch, and retry logic.
 // Extracted from client.rs.
 
+#![warn(clippy::arithmetic_side_effects)]
+
 pub(crate) mod proxy;
 
 use std::future::Future;
@@ -2100,7 +2102,7 @@ impl HttpTransport {
                 Err(e) if attempt < max && Self::is_retryable(&e) => {
                     let delay = retry_delay(attempt);
                     tracing::warn!(
-                        attempt = attempt + 1,
+                        attempt = attempt.saturating_add(1),
                         max_retries = max,
                         delay_ms = delay.as_millis() as u64,
                         "retrying after transient HTTP error"
@@ -2198,6 +2200,10 @@ pub(crate) fn capture_logs() -> (LogBuf, tracing::subscriber::DefaultGuard) {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "test fixtures do arithmetic on small constants"
+)]
 mod tests {
     //! Host state these tests rely on: `localhost` resolves to the loopback
     //! address (the proxy and TLS tests name servers `localhost`); the

@@ -3,6 +3,8 @@
 // Wraps a shell ID and provides methods to run commands, send input,
 // and signal Ctrl+C within a persistent shell.
 
+#![warn(clippy::arithmetic_side_effects)]
+
 use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;

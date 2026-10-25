@@ -55,6 +55,12 @@ koySnOGaSI9xAiEAnlCMdQbfDAQpp3i9w9M2UCeHia4DZzG+kSK8NOKSx44=
 -----END CERTIFICATE-----
 ";
 
+/// SHA-256 fingerprint of [`EC_CERT_PEM`] as `openssl x509 -fingerprint
+/// -sha256 -noout` prints it, in lower case (a known-answer vector for the
+/// pin).
+pub(crate) const EC_CERT_SHA256_OPENSSL: &str = "a7:65:5d:cc:be:aa:e6:bc:34:44:5a:6a:76:36:7f:33:\
+     17:3b:aa:f1:27:ad:b0:7e:40:d8:f0:c4:eb:de:6f:64";
+
 /// Key of [`EC_CERT_PEM`], SEC1 encoding (`EC PRIVATE KEY`).
 pub(crate) const EC_KEY_SEC1_PEM: &str = "\
 -----BEGIN EC PRIVATE KEY-----

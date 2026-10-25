@@ -399,6 +399,12 @@ pub(crate) struct HttpTransport {
     /// Called before each attempt of [`Self::send_soap_with_retry`]; `false`
     /// refuses the request.
     before_send: Option<BeforeSend>,
+    /// With `pin_server_certificate_sha256`, the server names of the
+    /// `https://` proxies ([`proxy_server_names`]): their handshakes are not
+    /// pinned (see [`crate::tls::ProxyRoutingVerifier`]), so a host with one
+    /// of these names is refused (see [`Self::checked_endpoint`]). Empty
+    /// without a pin.
+    pinned_proxy_names: Vec<rustls::pki_types::ServerName<'static>>,
 }
 
 /// Largest response body read from the server: four times the envelope size
@@ -455,9 +461,11 @@ fn proxy_env(name: &str) -> Option<String> {
 /// `https://` endpoint, and skips the proxy for hosts in `NO_PROXY`): a
 /// name listed here that reqwest does not use is never the name of a
 /// handshake, since the dedicated client only connects to the endpoint (no
-/// redirects) and to its proxy, so the extra exception is inert, unless it
-/// is the endpoint's own name: the endpoint is then verified as a proxy
-/// would be, never less strictly than without a pin. `http://`,
+/// redirects) and to its proxy, so the extra exception is inert. A WinRM
+/// host with one of these names is refused while a
+/// `pin_server_certificate_sha256` pin is set
+/// ([`HttpTransport::checked_endpoint`]), since its handshake would not be
+/// pinned. `http://`,
 /// scheme-less (taken as `http://`) and SOCKS proxies only relay bytes and
 /// do no TLS of their own. A proxy from system settings
 /// (`hyper-util/client-proxy-system`, which another crate in the build may
@@ -780,14 +788,20 @@ impl HttpTransport {
         // NTLM channel binding takes the server certificate of the connection
         // that carried the challenge: from the response (`tls_info`), or from
         // the verifier of a dedicated single-connection client (see `AuthConn`).
+        let proxy_names = proxy_server_names(&config, proxy_env);
         let origin = crate::tls::server_verifiers(
             opts,
             config.use_tls,
             config.accept_invalid_certs,
-            &proxy_server_names(&config, proxy_env),
+            &proxy_names,
             &provider,
         )?
         .origin;
+        let pinned_proxy_names = if opts.pins.is_empty() {
+            Vec::new()
+        } else {
+            proxy_names
+        };
         let (client_tls, server_verifier) = if config.use_tls {
             let tls_builder = crate::tls::client_config_builder(&provider)?
                 .dangerous()
@@ -836,6 +850,7 @@ impl HttpTransport {
             kdc_slots: Arc::new(tokio::sync::Semaphore::new(MAX_KDC_IN_FLIGHT)),
             session_id: format!("uuid:{}", uuid::Uuid::new_v4().to_string().to_uppercase()),
             before_send: None,
+            pinned_proxy_names,
         })
     }
 
@@ -875,9 +890,25 @@ impl HttpTransport {
 
     /// [`Self::endpoint`] for a host that [`validate_host`] accepts, else
     /// the error that says why not.
+    ///
+    /// Every request takes its URL here, whatever the auth method (the
+    /// shared client, the dedicated connections and CredSSP, which takes its
+    /// TLS server name from this URL). While a pin is set, a host whose TLS
+    /// server name is that of an `https://` proxy is refused: its handshake
+    /// would be verified as the proxy's, without the pin.
     fn checked_endpoint(&self, host: &str) -> Result<String, WinrmError> {
         validate_host(host)?;
-        Ok(self.endpoint(host))
+        let url = self.endpoint(host);
+        if !self.pinned_proxy_names.is_empty()
+            && url_server_name(&url).is_some_and(|name| self.pinned_proxy_names.contains(&name))
+        {
+            return Err(WinrmError::AuthFailed(format!(
+                "pin_server_certificate_sha256: host {} has the name of an https:// proxy; the \
+                 pin cannot be applied to it, refusing",
+                log_host(host)
+            )));
+        }
+        Ok(url)
     }
 
     /// Access the transport configuration.
@@ -903,7 +934,7 @@ impl HttpTransport {
     async fn send_soap(&self, host: &str, body: String, lane: Lane) -> Result<String, WinrmError> {
         let url = self
             .checked_endpoint(host)
-            .inspect_err(|e| debug!(error = %e, "request not sent: invalid host"))?;
+            .inspect_err(|e| debug!(error = %e, "request not sent: host refused"))?;
         debug!(
             url = %crate::error::quote_server_text(&url, 256),
             "sending WinRM SOAP request"
@@ -5807,6 +5838,15 @@ mod tests {
         }
     }
 
+    /// The test helpers agree with `openssl` on the test certificate.
+    #[test]
+    fn sha256_hex_matches_the_openssl_fingerprint() {
+        use crate::test_pki::{EC_CERT_PEM, EC_CERT_SHA256_OPENSSL};
+        let hex = sha256_hex(EC_CERT_PEM);
+        assert_eq!(openssl_form(&hex), EC_CERT_SHA256_OPENSSL.to_uppercase());
+        assert_eq!(hex, EC_CERT_SHA256_OPENSSL.replace(':', ""));
+    }
+
     /// `hex` in upper case with `:` between bytes, as `openssl x509
     /// -fingerprint` prints it.
     fn openssl_form(hex: &str) -> String {
@@ -5961,6 +6001,75 @@ mod tests {
         );
     }
 
+    /// A host with the server name of the `https://` proxy would be verified
+    /// as the proxy is (trusted roots, no pin): while a pin is set it is
+    /// refused before anything is sent, whatever the auth method, even when
+    /// its certificate chains to a trusted root.
+    #[tokio::test]
+    async fn pin_refuses_a_host_named_like_the_https_proxy() {
+        use crate::test_pki::{CA_LEAF_KEY_PEM, CA_LEAF_PEM, EC_CERT_PEM, TEST_CA_PEM};
+        let ca = root_file("ca-pin-shared-name", TEST_CA_PEM);
+        let p = spawn_https_connect_proxy(CA_LEAF_PEM, CA_LEAF_KEY_PEM);
+        #[cfg(feature = "credssp")]
+        let methods = [AuthMethod::Basic, AuthMethod::Ntlm, AuthMethod::CredSsp];
+        #[cfg(not(feature = "credssp"))]
+        let methods = [AuthMethod::Basic, AuthMethod::Ntlm];
+        for method in methods {
+            let label = format!("{method:?}");
+            let (port, read) = crate::test_pki::spawn_tls_sink(crate::test_pki::server_config(
+                CA_LEAF_PEM,
+                CA_LEAF_KEY_PEM,
+            ));
+            let config = WinrmConfig {
+                proxy: Some(format!("https://LOCALHOST:{p}")),
+                ..tls_config(method, port)
+            };
+            // A pin the listener does not match, next to a root it chains to.
+            let opts = TlsOptions {
+                pins: vec![sha256_hex(EC_CERT_PEM)],
+                ..roots(&[&ca])
+            };
+            let t = transport_with(config, &opts).unwrap();
+            match send_basic(&t, "localhost").await {
+                Err(WinrmError::AuthFailed(m)) => assert_eq!(
+                    m,
+                    "pin_server_certificate_sha256: host localhost has the name of an https:// \
+                     proxy; the pin cannot be applied to it, refusing",
+                    "{label}"
+                ),
+                other => panic!("{label}: expected AuthFailed, got {other:?}"),
+            }
+            assert_eq!(read.load(Ordering::SeqCst), 0, "{label}");
+        }
+    }
+
+    /// The same proxy and roots, with a host that is not the proxy's name
+    /// and the listener's own pin: accepted through the proxy.
+    #[tokio::test]
+    async fn pin_accepts_a_host_not_named_like_the_https_proxy() {
+        use crate::test_pki::{CA_LEAF_KEY_PEM, CA_LEAF_PEM, TEST_CA_PEM};
+        let ca = root_file("ca-pin-other-name", TEST_CA_PEM);
+        let p = spawn_https_connect_proxy(CA_LEAF_PEM, CA_LEAF_KEY_PEM);
+        let (port, read) = crate::test_pki::spawn_tls_sink(crate::test_pki::server_config(
+            CA_LEAF_PEM,
+            CA_LEAF_KEY_PEM,
+        ));
+        let config = WinrmConfig {
+            proxy: Some(format!("https://localhost:{p}")),
+            ..tls_config(AuthMethod::Basic, port)
+        };
+        let opts = TlsOptions {
+            pins: vec![sha256_hex(CA_LEAF_PEM)],
+            ..roots(&[&ca])
+        };
+        let t = transport_with(config, &opts).unwrap();
+        let _ = send_basic(&t, "127.0.0.1").await;
+        assert!(
+            read.load(Ordering::SeqCst) > 0,
+            "the pinned listener must be reached through the proxy"
+        );
+    }
+
     /// The build-time refusal of a pin, as `WinrmError::AuthFailed(m)`.
     fn build_refusal(config: WinrmConfig, opts: &TlsOptions) -> String {
         match transport_with(config, opts) {
@@ -6038,6 +6147,31 @@ mod tests {
         match send_basic(&t, "127.0.0.1").await {
             Err(WinrmError::AuthFailed(m)) => {
                 assert!(m.starts_with("CredSSP outer TLS:"), "{m}");
+            }
+            other => panic!("expected AuthFailed, got {other:?}"),
+        }
+        assert_eq!(read.load(Ordering::SeqCst), 0);
+    }
+
+    /// Kerberos over HTTPS: a wrong pin refuses the unauthenticated probe
+    /// that learns the certificate, reported as the pinned check (no ticket
+    /// is asked for).
+    #[cfg(feature = "kerberos")]
+    #[tokio::test]
+    async fn kerberos_probe_reports_a_wrong_pin_as_such() {
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM, RSA_CERT_PEM};
+        let (port, read) = crate::test_pki::spawn_tls_sink(crate::test_pki::server_config(
+            EC_CERT_PEM,
+            EC_KEY_PKCS8_PEM,
+        ));
+        let t = transport_with(
+            tls_config(AuthMethod::Kerberos, port),
+            &pinned(&[&sha256_hex(RSA_CERT_PEM)]),
+        )
+        .unwrap();
+        match send_basic(&t, "127.0.0.1").await {
+            Err(WinrmError::AuthFailed(m)) => {
+                assert!(m.contains("pinned certificate check"), "{m}");
             }
             other => panic!("expected AuthFailed, got {other:?}"),
         }

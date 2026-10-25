@@ -118,8 +118,10 @@ impl<S> WinrmClientBuilder<S> {
     /// The server must still prove it holds the certificate's key. The leg to
     /// an `https://` proxy is not pinned: it is verified with the trusted
     /// roots ([`add_root_certificates_pem`](Self::add_root_certificates_pem),
-    /// [`platform_roots`](Self::platform_roots)). A proxy that `reqwest` takes
-    /// from system settings is refused while a pin is set.
+    /// [`platform_roots`](Self::platform_roots)). A WinRM host that has the
+    /// name of such a proxy is refused while a pin is set, since its
+    /// handshake could not be told from the proxy's. An `https://` proxy that
+    /// `reqwest` takes from system settings is refused while a pin is set.
     ///
     /// [`build`](WinrmClientBuilder::build) fails with
     /// [`WinrmError::AuthFailed`] for a malformed fingerprint, with

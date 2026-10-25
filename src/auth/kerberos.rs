@@ -516,7 +516,7 @@ impl KerberosAuth {
             .header("Content-Length", "0")
             .send()
             .await
-            .map_err(WinrmError::Http)?;
+            .map_err(crate::auth::send_error)?;
         let peer = crate::auth::peer_certificate(&resp, cert);
         let _ = crate::auth::read_body_capped(resp, self.max_response_bytes).await;
         match peer {

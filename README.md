@@ -228,7 +228,9 @@ For a self-signed listener, or a connection by IP address, pin the listener
 certificate by its SHA-256 fingerprint instead. The pin is then the whole trust
 decision for the WinRM server: chain, dates and host name are not checked, and
 the pin must be updated when the certificate is renewed (pin both fingerprints
-during the switch).
+during the switch). The leg to an `https://` proxy is verified with the trusted
+roots, not with the pin, so a host that has the name of such a proxy is refused
+while a pin is set.
 
 ```rust
 let client = WinrmClient::builder(WinrmConfig { use_tls: true, port: 5986, ..Default::default() })

@@ -484,10 +484,10 @@ impl ServerCertVerifier for PinnedVerifier {
 /// The signature callbacks and [`ServerCertVerifier::supported_verify_schemes`]
 /// receive no server name and go to `origin`; both verifiers must check
 /// signatures with the same provider algorithms, which [`server_verifiers`]
-/// guarantees. When the WinRM endpoint and a proxy share a server name, the
-/// `proxy` verifier applies to both: the endpoint must then pass the trusted
-/// roots and the name check, and its pin is not consulted (a self-signed
-/// endpoint is refused).
+/// guarantees. A handshake whose server name is a proxy's always goes to
+/// `proxy`, so the pin would not apply to a WinRM host with that name: the
+/// transport refuses such a host before connecting while a pin is set
+/// (`HttpTransport::checked_endpoint`).
 #[derive(Debug)]
 pub(crate) struct ProxyRoutingVerifier {
     origin: Arc<dyn ServerCertVerifier>,
@@ -697,7 +697,8 @@ pub(crate) struct ServerVerifiers {
     /// Verifies the certificate of an `https://` proxy.
     #[expect(
         dead_code,
-        reason = "the leg to an https proxy still verifies with `origin`"
+        reason = "read by the proxy-leg verification change; until then the leg to an https \
+                  proxy verifies with `origin`, and the pin router gets `strict` directly"
     )]
     pub(crate) proxy: Arc<dyn ServerCertVerifier>,
 }
@@ -1627,6 +1628,28 @@ mod tests {
         use sha2::Digest as _;
         let der = CertificateDer::from_pem_slice(pem.as_bytes()).unwrap();
         sha2::Sha256::digest(der.as_ref()).into()
+    }
+
+    /// Known answer: the fingerprint `openssl` prints for the test
+    /// certificate parses to the digest the verifier computes.
+    #[test]
+    fn openssl_fingerprint_of_the_test_certificate_is_the_der_digest() {
+        use crate::test_pki::{EC_CERT_PEM, EC_CERT_SHA256_OPENSSL};
+        assert_eq!(
+            parse_sha256_fingerprint(EC_CERT_SHA256_OPENSSL).unwrap(),
+            der_sha256(EC_CERT_PEM)
+        );
+        let p = rustls::crypto::ring::default_provider();
+        let verifier = PinnedVerifier::new(
+            vec![parse_sha256_fingerprint(EC_CERT_SHA256_OPENSSL).unwrap()],
+            &p,
+        );
+        let cert = CertificateDer::from_pem_slice(EC_CERT_PEM.as_bytes()).unwrap();
+        assert!(
+            verifier
+                .verify_server_cert(&cert, &[], &target("win01"), &[], UnixTime::now())
+                .is_ok()
+        );
     }
 
     #[test]

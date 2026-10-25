@@ -93,7 +93,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **`WinrmClientBuilder::pin_server_certificate_sha256`**: accept the listener
   only by its certificate's SHA-256 fingerprint (self-signed listeners,
   connections by IP), on the HTTPS transport and the CredSSP outer TLS,
-  without `accept_invalid_certs`.
+  without `accept_invalid_certs`. While a pin is set, a host that has the name
+  of an `https://` proxy is refused.
 
 ### Fixed
 

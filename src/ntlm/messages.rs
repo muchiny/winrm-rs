@@ -333,6 +333,10 @@ fn authenticate_target_info(
 /// The session key is wrapped in `Zeroizing` so it is wiped from the caller's
 /// stack when dropped — closes the gap that compiler optimisation otherwise
 /// leaves at -O2 (no automatic wipe for plain `[u8; 16]` returns).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the handshake inputs are distinct values"
+)]
 pub(crate) fn create_authenticate_message_internal(
     challenge: &ChallengeMessage,
     username: &str,
@@ -341,6 +345,7 @@ pub(crate) fn create_authenticate_message_internal(
     channel_bindings: Option<[u8; 16]>,
     mic_input: Option<(&[u8], &[u8])>,
     target_name: Option<&str>,
+    workstation: &[u8],
 ) -> Result<(Vec<u8>, Zeroizing<[u8; 16]>), NtlmError> {
     // Use the server's negotiated flags (from Type 2) for the Type 3 response,
     // augmented with KEY_EXCH and VERSION to enable message sealing.
@@ -358,6 +363,7 @@ pub(crate) fn create_authenticate_message_internal(
         mic_input,
         target_name,
         None,
+        workstation,
     )
 }
 
@@ -378,6 +384,7 @@ pub(crate) fn create_authenticate_message_full(
     mic_input: Option<(&[u8], &[u8])>,
     target_name: Option<&str>,
     display_domain: Option<&str>,
+    workstation: &[u8],
 ) -> Result<(Vec<u8>, Zeroizing<[u8; 16]>), NtlmError> {
     let nt_hash = compute_nt_hash(password);
     let ntlmv2_hash = compute_ntlmv2_hash(&nt_hash, username, domain);
@@ -470,9 +477,10 @@ pub(crate) fn create_authenticate_message_full(
     let domain_for_sb = display_domain.unwrap_or(domain);
     let domain_bytes = to_utf16le(domain_for_sb);
     let user_bytes = to_utf16le(username);
-    // Workstation: this machine's name; empty when no MIC is required.
+    // Workstation: the name the caller gives (UTF-16LE); empty when no MIC is
+    // required.
     let workstation_bytes: &[u8] = if mic_input.is_some() {
-        workstation()
+        workstation
     } else {
         &[]
     };
@@ -603,8 +611,17 @@ pub(crate) fn create_authenticate_message(
     password: &str,
     domain: &str,
 ) -> Result<Vec<u8>, NtlmError> {
-    create_authenticate_message_internal(challenge, username, password, domain, None, None, None)
-        .map(|(msg, _)| msg)
+    create_authenticate_message_internal(
+        challenge,
+        username,
+        password,
+        domain,
+        None,
+        None,
+        None,
+        &[],
+    )
+    .map(|(msg, _)| msg)
 }
 
 /// The NTLM Type 3 (Authenticate) message of the HTTP and HTTPS handshakes,
@@ -616,7 +633,9 @@ pub(crate) fn create_authenticate_message(
 /// `MsvAvFlags` pair with the MIC bit (0x2), an `MsvAvTargetName` pair holding
 /// `target_name`, the `Workstation` field, and an LM response of 24 zero
 /// bytes. Over HTTPS the caller passes `channel_bindings`, which adds an
-/// `MsvAvChannelBindings` pair; over plain HTTP it passes `None`.
+/// `MsvAvChannelBindings` pair; over plain HTTP it passes `None`. `workstation`
+/// is the `Workstation` field as UTF-16LE: [`workstation`] unless the caller
+/// set a name.
 #[expect(
     clippy::too_many_arguments,
     reason = "the handshake inputs are distinct values"
@@ -630,6 +649,7 @@ pub(crate) fn create_authenticate_message_http(
     type2: &[u8],
     target_name: &str,
     channel_bindings: Option<[u8; 16]>,
+    workstation: &[u8],
 ) -> Result<(Vec<u8>, Zeroizing<[u8; 16]>), NtlmError> {
     create_authenticate_message_internal(
         challenge,
@@ -639,6 +659,7 @@ pub(crate) fn create_authenticate_message_http(
         channel_bindings,
         Some((type1, type2)),
         Some(target_name),
+        workstation,
     )
 }
 
@@ -677,6 +698,7 @@ pub fn create_authenticate_message_credssp(
         Some((type1_bytes, type2_bytes)),
         Some(spn),
         Some(""), // empty domain in Type 3 SB for local accounts
+        workstation(),
     )
 }
 
@@ -785,10 +807,10 @@ mod tests {
         // The exported session key is the random session key when key exchange
         // is on, and does not depend on the challenge or the clock.
         let (_, key_a) =
-            create_authenticate_message_internal(&challenge, "u", "p", "", None, None, None)
+            create_authenticate_message_internal(&challenge, "u", "p", "", None, None, None, &[])
                 .unwrap();
         let (_, key_b) =
-            create_authenticate_message_internal(&challenge, "u", "p", "", None, None, None)
+            create_authenticate_message_internal(&challenge, "u", "p", "", None, None, None, &[])
                 .unwrap();
         assert_ne!(*key_a, *key_b);
     }
@@ -1066,7 +1088,14 @@ mod tests {
         };
 
         let (msg, session_key) = create_authenticate_message_internal(
-            &challenge, "user", "password", "DOMAIN", None, None, None,
+            &challenge,
+            "user",
+            "password",
+            "DOMAIN",
+            None,
+            None,
+            None,
+            &[],
         )
         .unwrap();
 
@@ -1088,11 +1117,25 @@ mod tests {
         };
 
         let (_, key1) = create_authenticate_message_internal(
-            &challenge, "admin", "pass", "DOM", None, None, None,
+            &challenge,
+            "admin",
+            "pass",
+            "DOM",
+            None,
+            None,
+            None,
+            &[],
         )
         .unwrap();
         let (_, key2) = create_authenticate_message_internal(
-            &challenge, "admin", "pass", "DOM", None, None, None,
+            &challenge,
+            "admin",
+            "pass",
+            "DOM",
+            None,
+            None,
+            None,
+            &[],
         )
         .unwrap();
 
@@ -1110,7 +1153,14 @@ mod tests {
             timestamp: Some([0x42; 8]),
         };
         let (msg, key) = create_authenticate_message_internal(
-            &challenge, "user", "pass", "DOM", None, None, None,
+            &challenge,
+            "user",
+            "pass",
+            "DOM",
+            None,
+            None,
+            None,
+            &[],
         )
         .unwrap();
 
@@ -1172,6 +1222,7 @@ mod tests {
             &[0u8; 32],
             "HTTP/host",
             Some(cbt),
+            workstation(),
         )
         .unwrap();
         // Should be a valid NTLM Type 3 message
@@ -1200,6 +1251,7 @@ mod tests {
                 &[0u8; 32],
                 "HTTP/host",
                 cb,
+                workstation(),
             )
             .unwrap()
             .0
@@ -1468,6 +1520,7 @@ mod tests {
             &[0u8; 32], // fake type2
             "HTTP/host.domain.com",
             None,
+            workstation(),
         )
         .unwrap();
         assert_eq!(&msg[0..8], b"NTLMSSP\0");
@@ -1571,7 +1624,30 @@ mod tests {
             Some((&create_negotiate_message(), &[0u8; 32])),
             Some(spn),
             Some(""),
+            workstation(),
         )
+    }
+
+    /// The `Workstation` field of the Type 3 carries the bytes the caller
+    /// passes, reduced as the detected name is.
+    #[test]
+    fn type3_carries_the_given_workstation() {
+        let ws = sanitize_workstation("seattle.corp.example");
+        let (type3, _) = create_authenticate_message_http(
+            &challenge_with(Vec::new()),
+            "user",
+            "pass",
+            "",
+            &create_negotiate_message(),
+            &[0u8; 32],
+            "HTTP/win01",
+            None,
+            &ws,
+        )
+        .unwrap();
+        let len = usize::from(u16::from_le_bytes([type3[44], type3[45]]));
+        let off = u32::from_le_bytes(type3[48..52].try_into().unwrap()) as usize;
+        assert_eq!(&type3[off..off + len], to_utf16le("SEATTLE").as_slice());
     }
 
     #[test]
@@ -1648,6 +1724,7 @@ mod tests {
             &[0u8; 32],
             "HTTP/win01",
             Some([0xAA; 16]),
+            workstation(),
         )
         .unwrap();
         let ids: Vec<u16> = blob_av_pairs(&type3).iter().map(|(i, _)| *i).collect();
@@ -2088,6 +2165,7 @@ mod tests {
             &[0u8; 32],
             "HTTP/win01",
             None,
+            workstation(),
         )
         .unwrap();
         assert_eq!(

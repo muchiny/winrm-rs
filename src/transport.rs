@@ -534,6 +534,9 @@ pub(crate) struct TransportOptions {
     /// What NTLM and Kerberos do through a forwarding proxy that does not
     /// announce session-based authentication (see [`ProxySessionAuth`]).
     pub(crate) proxy_session_auth: ProxySessionAuth,
+    /// The NTLM `Workstation` field the caller set (UTF-16LE, reduced by
+    /// `ntlm::sanitize_workstation`); `None` sends the detected name.
+    pub(crate) workstation: Option<Vec<u8>>,
 }
 
 impl Default for TransportOptions {
@@ -542,6 +545,7 @@ impl Default for TransportOptions {
             use_env_proxy: true,
             tls: TlsOptions::default(),
             proxy_session_auth: ProxySessionAuth::default(),
+            workstation: None,
         }
     }
 }
@@ -1280,6 +1284,7 @@ impl HttpTransport {
             domain: self.credentials.domain.clone(),
             max_response_bytes: self.max_response_bytes(),
             proxy_gate: None,
+            workstation: self.options.workstation.clone(),
         }
     }
 

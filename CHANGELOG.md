@@ -216,6 +216,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   URL uses it), WS-Management action, kind and attempt number, for per-host
   quotas and kill switches. `before_send` is unchanged; the last of the two
   calls wins.
+- `WinrmClientBuilder::ntlm_workstation` sets the workstation name sent in the
+  NTLM `AUTHENTICATE` message, for accounts restricted to named workstations.
+  The name is reduced as the detected one is (first label, ASCII letters,
+  digits, `-` and `_`, upper-cased, 15 characters at most). It applies to
+  `AuthMethod::Ntlm`; without it, the detected name is sent as before.
 
 ### Fixed
 

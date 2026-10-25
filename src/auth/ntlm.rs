@@ -30,6 +30,9 @@ pub(crate) struct NtlmAuth {
     /// carries the challenge, before the Type 3. `None` when it does not
     /// apply (no forwarding proxy, HTTPS, or `Allow`).
     pub(crate) proxy_gate: Option<crate::transport::proxy::ProxyGate>,
+    /// The `Workstation` field the caller set (UTF-16LE, already reduced by
+    /// `ntlm::sanitize_workstation`); `None` sends the detected name.
+    pub(crate) workstation: Option<Vec<u8>>,
 }
 
 /// Length of an NTLM message signature (MS-NLMP 2.2.2.9.1).
@@ -262,6 +265,9 @@ impl NtlmAuth {
             &type2_raw,
             &target_name,
             channel_bindings,
+            self.workstation
+                .as_deref()
+                .unwrap_or_else(|| ntlm::workstation()),
         )
         .map_err(WinrmError::Ntlm)?;
         // Copy the exported session key to the heap before the awaits below

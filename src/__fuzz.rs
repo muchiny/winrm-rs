@@ -74,6 +74,7 @@ pub fn create_authenticate_message_http(
         type2,
         target_name,
         channel_bindings,
+        crate::ntlm::workstation(),
     )
     .map(|(msg, key)| (msg, *key))
 }
@@ -96,6 +97,7 @@ pub fn create_authenticate_message_with_cbt_and_key(
         Some(channel_bindings),
         None,
         None,
+        &[],
     )
     .map(|(msg, key)| (msg, *key))
 }

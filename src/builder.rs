@@ -453,6 +453,22 @@ impl WinrmClientBuilder<Ready> {
         self
     }
 
+    /// Set the workstation name the NTLM `AUTHENTICATE` message carries, for
+    /// accounts allowed to log on only from named workstations ("Log On To").
+    /// The name travels in clear text. It is reduced as the detected name is:
+    /// the first label (up to the first `.`), ASCII letters, digits, `-` and
+    /// `_` only (control characters and NUL are dropped with every other
+    /// character), upper-cased, at most 15 characters. A name that reduces to
+    /// nothing sends an empty field.
+    ///
+    /// It applies to [`AuthMethod::Ntlm`](crate::AuthMethod::Ntlm), sealed or
+    /// not; CredSSP and the Type 1 message are unchanged. Without this call,
+    /// the crate sends the detected name.
+    pub fn ntlm_workstation(mut self, name: impl Into<String>) -> Self {
+        self.options.workstation = Some(crate::ntlm::sanitize_workstation(&name.into()));
+        self
+    }
+
     /// Build the [`WinrmClient`].
     ///
     /// Returns [`WinrmError::Http`] if the underlying HTTP client cannot be
@@ -656,5 +672,120 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(client.endpoint("host"), "http://host:5985/wsman");
+    }
+    /// The Type 1 and Type 3 messages a client sent to `server`, in order of
+    /// type, after one request that runs the NTLM handshake.
+    async fn ntlm_messages_of(
+        server: &wiremock::MockServer,
+        builder: WinrmClientBuilder<Ready>,
+    ) -> Vec<Vec<u8>> {
+        use base64::Engine as _;
+        let client = builder.build().unwrap();
+        let _ = client
+            .create_shell(&server.address().ip().to_string())
+            .await; // the reply does not matter
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|r| {
+                r.headers
+                    .get("authorization")?
+                    .to_str()
+                    .ok()?
+                    .strip_prefix("Negotiate ")
+                    .map(str::to_string)
+            })
+            .map(|b64| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(b64)
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    fn workstation_field(type3: &[u8]) -> &[u8] {
+        let len = usize::from(u16::from_le_bytes([type3[44], type3[45]]));
+        let off = u32::from_le_bytes(type3[48..52].try_into().unwrap()) as usize;
+        &type3[off..off + len]
+    }
+
+    fn ntlm_builder(server: &wiremock::MockServer) -> WinrmClientBuilder<Ready> {
+        let config = WinrmConfig {
+            auth_method: crate::AuthMethod::Ntlm,
+            port: server.address().port(),
+            ..Default::default()
+        };
+        WinrmClient::builder(config).credentials(WinrmCredentials::new(
+            crate::test_ntlm_server::USER,
+            crate::test_ntlm_server::PASS,
+            "",
+        ))
+    }
+
+    /// `ntlm_workstation` reaches the Type 3 and not the Type 1.
+    #[tokio::test]
+    async fn ntlm_workstation_reaches_the_type3() {
+        let server = wiremock::MockServer::start().await;
+        let _fake = crate::test_ntlm_server::FakeNtlmServer::mount(&server).await;
+        let messages = ntlm_messages_of(
+            &server,
+            ntlm_builder(&server).ntlm_workstation("seattle.corp.example"),
+        )
+        .await;
+        let of_type = |n: u32| {
+            messages
+                .iter()
+                .find(|m| m[8..12] == n.to_le_bytes())
+                .expect("message sent")
+        };
+        let type1 = of_type(1);
+        assert_eq!(
+            u16::from_le_bytes([type1[24], type1[25]]),
+            0,
+            "Type 1 carries no workstation"
+        );
+        assert_eq!(
+            workstation_field(of_type(3)),
+            crate::ntlm::crypto::to_utf16le("SEATTLE").as_slice()
+        );
+    }
+
+    /// Without the call, the Type 3 carries the detected name.
+    #[tokio::test]
+    async fn ntlm_workstation_default_sends_the_detected_name() {
+        let server = wiremock::MockServer::start().await;
+        let _fake = crate::test_ntlm_server::FakeNtlmServer::mount(&server).await;
+        let messages = ntlm_messages_of(&server, ntlm_builder(&server)).await;
+        let type3 = messages
+            .iter()
+            .find(|m| m[8..12] == 3u32.to_le_bytes())
+            .expect("Type 3 sent");
+        assert_eq!(workstation_field(type3), crate::ntlm::workstation());
+    }
+
+    /// The name is stored reduced: first label, allowed characters, upper
+    /// case, 15 characters at most; control characters and NUL never survive.
+    #[test]
+    fn ntlm_workstation_is_stored_reduced() {
+        let stored = |name: &str| {
+            WinrmClientBuilder::new(WinrmConfig::default())
+                .credentials(WinrmCredentials::new("u", "p", ""))
+                .ntlm_workstation(name)
+                .options
+                .workstation
+        };
+        let utf16 = crate::ntlm::crypto::to_utf16le;
+        assert_eq!(stored("web-01.corp"), Some(utf16("WEB-01")));
+        assert_eq!(stored("a\r\nb\0c d"), Some(utf16("ABCD")));
+        assert_eq!(
+            stored("abcdefghijklmnopqrstuvwxyz"),
+            Some(utf16("ABCDEFGHIJKLMNO"))
+        );
+        assert_eq!(stored("\u{e9}\u{1F600}"), Some(Vec::new()));
+        let default = WinrmClientBuilder::new(WinrmConfig::default())
+            .credentials(WinrmCredentials::new("u", "p", ""));
+        assert_eq!(default.options.workstation, None);
     }
 }

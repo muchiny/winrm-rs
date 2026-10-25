@@ -707,13 +707,15 @@ impl WinrmClient {
     /// that audit process command lines (event 4688, Sysmon event 1) or log
     /// script blocks (event 4104) record its text. Do not embed secrets in it.
     ///
-    /// The host's PowerShell profile scripts run first, and a prompt waits for
-    /// input until the call is bounded or cancelled, unless the client was
-    /// built with
-    /// [`non_interactive_powershell(true)`](crate::WinrmClientBuilder::non_interactive_powershell),
-    /// which starts PowerShell with `-NoProfile -NonInteractive`;
+    /// PowerShell starts with `-NoProfile -NonInteractive` (the default since
+    /// 2.0): the host's profile scripts do not run and a prompt fails at once.
+    /// A client built with
+    /// [`non_interactive_powershell(false)`](crate::WinrmClientBuilder::non_interactive_powershell)
+    /// runs the profile scripts first, and a prompt waits for input until the
+    /// call is bounded or cancelled.
     /// [`upload_file`](crate::WinrmClient::upload_file) and
-    /// [`download_file`](crate::WinrmClient::download_file) always do.
+    /// [`download_file`](crate::WinrmClient::download_file) always use the
+    /// flags.
     #[tracing::instrument(
         level = "debug",
         skip(self, script, host),
@@ -749,9 +751,9 @@ impl WinrmClient {
     /// # use winrm_rs::{WinrmClient, WinrmConfig, WinrmCredentials, WinrmError};
     /// # async fn example() -> Result<(), WinrmError> {
     /// # let client = WinrmClient::new(WinrmConfig::default(), WinrmCredentials::new("u","p",""))?;
-    /// // `Read-Host` would block a plain `run_powershell` forever.
+    /// // A long wait would block a plain `run_powershell` until it ends.
     /// let err = client
-    ///     .run_powershell_with_timeout("server", "Read-Host", Duration::from_secs(10))
+    ///     .run_powershell_with_timeout("server", "Start-Sleep -Seconds 3600", Duration::from_secs(10))
     ///     .await
     ///     .unwrap_err();
     /// assert!(matches!(err, WinrmError::Timeout(10)));
@@ -5029,7 +5031,7 @@ mod tests {
         );
         assert!(
             client
-                .run_command_with_timeout(h, "cmd-SECRET-C", &["arg-SECRET-D"], t)
+                .run_command_with_timeout(h, "cmd-SECRET-C", &["arg-SECRET-D", "arg-SECRET-D2"], t)
                 .await
                 .is_err()
         );
@@ -5077,8 +5079,10 @@ mod tests {
         assert!(logs_contain("sending WinRM SOAP request"));
         assert!(logs_contain("args_len=1"));
         assert!(logs_contain("args_len=2"));
-        // Only `execute_command` above has three arguments.
+        // Only `execute_command` above has three arguments; the PowerShell
+        // calls have four (two flags and the encoded command).
         assert!(logs_contain("args_len=3"));
+        assert!(logs_contain("args_len=4"));
         assert!(logs_contain("script_len=23"));
         assert!(logs_contain("query_len=29"));
     }

@@ -495,7 +495,8 @@ impl WinrmClientBuilder<Ready> {
     /// Start PowerShell with `-NoProfile -NonInteractive` in `run_powershell`
     /// and `Shell::run_powershell`: the host's profile scripts do not run, and
     /// a prompt (`Read-Host`, a confirmation) fails at once instead of
-    /// waiting. Off by default in 1.x; on by default from 2.0.
+    /// waiting. On by default since 2.0; `false` restores the 1.x launch,
+    /// where profile scripts run and a prompt waits for input.
     ///
     /// It applies to `run_powershell`, `run_powershell_with_timeout` and
     /// `run_powershell_with_cancel` on the client, and to `run_powershell` and
@@ -642,40 +643,39 @@ mod tests {
         assert!(logs_contain("winrm_rs::wire"));
     }
 
-    /// `powershell_args` adds the non-interactive flags only when the option
-    /// is on, built from the constant, and the option is off by default.
+    /// `powershell_args` adds the non-interactive flags, built from the
+    /// constant, unless the option is turned off; they are on by default,
+    /// also through `WinrmClient::new`.
     #[test]
-    fn non_interactive_powershell_is_off_by_default_and_settable() {
+    fn non_interactive_powershell_is_on_by_default_and_can_be_turned_off() {
         let creds = || WinrmCredentials::new("u", "p", "");
+        let flags_on = [
+            &crate::command::NON_INTERACTIVE_FLAGS[..],
+            &["-EncodedCommand", "E"],
+        ]
+        .concat();
         let default = WinrmClient::builder(WinrmConfig::default())
             .credentials(creds())
             .build()
             .unwrap();
-        assert_eq!(default.powershell_args("E"), ["-EncodedCommand", "E"]);
+        assert_eq!(default.powershell_args("E"), flags_on);
 
-        let on = WinrmClient::builder(WinrmConfig::default())
+        let off = WinrmClient::builder(WinrmConfig::default())
             .credentials(creds())
-            .non_interactive_powershell(true)
-            .build()
-            .unwrap();
-        assert_eq!(
-            on.powershell_args("E"),
-            [
-                &crate::command::NON_INTERACTIVE_FLAGS[..],
-                &["-EncodedCommand", "E"]
-            ]
-            .concat()
-        );
-
-        let off_again = WinrmClient::builder(WinrmConfig::default())
-            .credentials(creds())
-            .non_interactive_powershell(true)
             .non_interactive_powershell(false)
             .build()
             .unwrap();
-        assert_eq!(off_again.powershell_args("E"), ["-EncodedCommand", "E"]);
+        assert_eq!(off.powershell_args("E"), ["-EncodedCommand", "E"]);
+
+        let on_again = WinrmClient::builder(WinrmConfig::default())
+            .credentials(creds())
+            .non_interactive_powershell(false)
+            .non_interactive_powershell(true)
+            .build()
+            .unwrap();
+        assert_eq!(on_again.powershell_args("E"), flags_on);
         let via_new = WinrmClient::new(WinrmConfig::default(), creds()).unwrap();
-        assert_eq!(via_new.powershell_args("E"), ["-EncodedCommand", "E"]);
+        assert_eq!(via_new.powershell_args("E"), flags_on);
     }
 
     /// `remote_path_policy` reaches the client; without the call, and

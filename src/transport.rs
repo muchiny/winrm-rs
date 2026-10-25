@@ -554,7 +554,7 @@ impl Default for TransportOptions {
             tls: TlsOptions::default(),
             proxy_session_auth: ProxySessionAuth::default(),
             workstation: None,
-            non_interactive_powershell: false,
+            non_interactive_powershell: true,
         }
     }
 }

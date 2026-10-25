@@ -267,7 +267,7 @@ println!("{}", String::from_utf8_lossy(&output.stdout));
 ### Bounding a call with a total timeout
 
 `run_command` and `run_powershell` wait as long as the command runs, so a
-script that hangs silently (`Read-Host`, `pause`) blocks them. The
+script that hangs silently (`pause`, a blocked process) blocks them. The
 `*_with_timeout` variants give up after a total time: the command is
 terminated, the remote shell is deleted, and the call returns
 `WinrmError::Timeout(secs)` (the timeout rounded up to whole seconds).

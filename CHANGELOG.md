@@ -233,6 +233,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   was the crate's internal NTLM sealing primitive; the client seals messages
   itself and no public API takes or returns it. Migration: none for
   `WinrmClient` users; code that drove it directly has no replacement.
+- `run_powershell` starts PowerShell with `-NoProfile -NonInteractive` by
+  default, so profile scripts do not run and a prompt fails at once. Scripts
+  that rely on a profile, or that prompt, call
+  `.non_interactive_powershell(false)` on the builder (builder only;
+  `WinrmClient::new` clients always use the flags).
 
 ### Added
 

@@ -717,7 +717,7 @@ mod stderr_decoder_tests {
 #[cfg(test)]
 mod tests {
     use crate::client::WinrmClient;
-    use crate::config::{AuthMethod, WinrmConfig, WinrmCredentials};
+    use crate::config::{AuthMethod, EncryptionMode, WinrmConfig, WinrmCredentials};
     use crate::error::WinrmError;
     use crate::shell::ShellKind;
     use wiremock::matchers::method;
@@ -731,6 +731,7 @@ mod tests {
         WinrmConfig {
             port,
             auth_method: AuthMethod::Basic,
+            encryption: EncryptionMode::Never,
             connect_timeout_secs: 5,
             operation_timeout_secs: 10,
             ..Default::default()
@@ -1124,6 +1125,7 @@ mod tests {
         let config = WinrmConfig {
             port,
             auth_method: AuthMethod::Basic,
+            encryption: EncryptionMode::Never,
             connect_timeout_secs: 30,
             operation_timeout_secs: 3, // * 2 = 6s timeout, + 2 = 5s
             ..Default::default()
@@ -1196,6 +1198,7 @@ mod tests {
         let config = WinrmConfig {
             port,
             auth_method: AuthMethod::Basic,
+            encryption: EncryptionMode::Never,
             connect_timeout_secs: 30,
             operation_timeout_secs: 1, // * 2 = 2s (ample), / 2 = 0s (instant timeout)
             ..Default::default()

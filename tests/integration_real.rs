@@ -68,6 +68,7 @@ fn test_client_with(tweak: impl FnOnce(&mut WinrmConfig)) -> Option<(WinrmClient
 
     let mut config = WinrmConfig {
         auth_method: AuthMethod::Basic,
+        encryption: EncryptionMode::Never,
         port,
         ..Default::default()
     };
@@ -655,6 +656,7 @@ async fn upload_failure_leaves_no_shell_behind() {
     let hook_sent = Arc::clone(&sent);
     let client = WinrmClient::builder(WinrmConfig {
         auth_method: AuthMethod::Basic,
+        encryption: EncryptionMode::Never,
         port,
         ..Default::default()
     })
@@ -1259,6 +1261,7 @@ async fn shell_with_working_directory() {
 
     let config = WinrmConfig {
         auth_method: AuthMethod::Basic,
+        encryption: EncryptionMode::Never,
         port,
         working_directory: Some("C:\\Windows".into()),
         ..Default::default()
@@ -1291,6 +1294,7 @@ async fn shell_with_env_vars() {
 
     let config = WinrmConfig {
         auth_method: AuthMethod::Basic,
+        encryption: EncryptionMode::Never,
         port,
         env_vars: vec![("WINRM_RS_TEST_VAR".into(), "hello_from_rust".into())],
         ..Default::default()
@@ -1362,6 +1366,7 @@ async fn retry_config_works_with_real_server() {
 
     let config = WinrmConfig {
         auth_method: AuthMethod::Basic,
+        encryption: EncryptionMode::Never,
         port,
         max_retries: 2,
         ..Default::default()
@@ -1416,6 +1421,7 @@ async fn cancel_long_running_command() {
 async fn connect_timeout_is_honoured() {
     let config = WinrmConfig {
         auth_method: AuthMethod::Basic,
+        encryption: EncryptionMode::Never,
         connect_timeout_secs: 2,
         max_retries: 0,
         ..Default::default()
@@ -1804,6 +1810,7 @@ async fn sealed_ntlm_client(
     let forwarder = RecordingForwarder::start(format!("{host}:{port}")).await;
     let (client, _) = test_client_with(|c| {
         c.auth_method = AuthMethod::Ntlm;
+        c.encryption = EncryptionMode::Auto; // the base config is Basic (Never)
         c.port = forwarder.addr.port();
         tweak(c);
     })
@@ -2260,6 +2267,7 @@ async fn shell_with_idle_timeout_works() {
 
     let config = WinrmConfig {
         auth_method: AuthMethod::Basic,
+        encryption: EncryptionMode::Never,
         port,
         idle_timeout_secs: Some(300),
         ..Default::default()
@@ -2287,6 +2295,7 @@ async fn custom_user_agent_does_not_break() {
 
     let config = WinrmConfig {
         auth_method: AuthMethod::Basic,
+        encryption: EncryptionMode::Never,
         port,
         user_agent: Some("winrm-rs-test/0.1".into()),
         ..Default::default()
@@ -2314,6 +2323,7 @@ async fn invalid_proxy_returns_http_error() {
 
     let config = WinrmConfig {
         auth_method: AuthMethod::Basic,
+        encryption: EncryptionMode::Never,
         port,
         proxy: Some("http://127.0.0.1:19999".into()),
         ..Default::default()
@@ -2531,6 +2541,7 @@ async fn http_proxy_carries_ntlm_over_http() {
     let proxy_url = format!("http://{}", proxy.addr);
     let (client, host) = test_client_with(|c| {
         c.auth_method = AuthMethod::Ntlm;
+        c.encryption = EncryptionMode::Auto; // the base config is Basic (Never)
         c.proxy = Some(proxy_url);
     })
     .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
@@ -2589,6 +2600,7 @@ async fn socks5_proxy_carries_ntlm() {
     let proxy_url = format!("socks5://{}", proxy.addr);
     let (client, host) = test_client_with(|c| {
         c.auth_method = AuthMethod::Ntlm;
+        c.encryption = EncryptionMode::Auto; // the base config is Basic (Never)
         c.proxy = Some(proxy_url);
     })
     .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
@@ -3214,6 +3226,7 @@ async fn small_max_envelope_size() {
 
     let config = WinrmConfig {
         auth_method: AuthMethod::Basic,
+        encryption: EncryptionMode::Never,
         port,
         max_envelope_size: 8192,
         ..Default::default()
@@ -3325,6 +3338,7 @@ async fn builder_pattern_works() {
 
     let config = WinrmConfig {
         auth_method: AuthMethod::Basic,
+        encryption: EncryptionMode::Never,
         port,
         ..Default::default()
     };
@@ -5210,6 +5224,7 @@ fn gated_client(
         .unwrap_or(5985);
     let mut config = WinrmConfig {
         auth_method: AuthMethod::Basic,
+        encryption: EncryptionMode::Never,
         port,
         ..Default::default()
     };
@@ -5304,6 +5319,7 @@ async fn before_send_refusal_leaves_a_sealed_ntlm_session_usable() {
     let forwarder = RecordingForwarder::start(format!("{host}:{port}")).await;
     let (client, _) = gated_client(&gate, |c| {
         c.auth_method = AuthMethod::Ntlm;
+        c.encryption = EncryptionMode::Auto; // the base config is Basic (Never)
         c.port = forwarder.addr.port();
     });
 
@@ -5336,6 +5352,7 @@ async fn before_send_refusal_leaves_an_ntlm_https_session_usable() {
     let gate = Gate::open();
     let (client, host) = gated_client(&gate, |c| {
         c.auth_method = AuthMethod::Ntlm;
+        c.encryption = EncryptionMode::Auto; // the base config is Basic (Never)
         c.use_tls = true;
         c.accept_invalid_certs = true;
         c.port = https_test_port();

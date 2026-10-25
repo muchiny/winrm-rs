@@ -25,7 +25,7 @@
 //!
 //! | Method | Enum variant | Notes |
 //! |--------|-------------|-------|
-//! | HTTP Basic | [`AuthMethod::Basic`] | Credentials sent base64-encoded per request. Use only over HTTPS. |
+//! | HTTP Basic | [`AuthMethod::Basic`] | Credentials sent base64-encoded per request. Use only over HTTPS; over plain HTTP the client is refused unless `encryption` is [`EncryptionMode::Never`]. |
 //! | `NTLMv2` | [`AuthMethod::Ntlm`] | Three-step handshake (negotiate / challenge / authenticate). Default. Authenticates the client only: over plain HTTP the handshake can be relayed, or recorded to guess the password offline (sealing protects the bodies, not the handshake); on untrusted networks use HTTPS with certificate validation (channel binding) or Kerberos. See [`WinrmConfig`] (Security). |
 //! | Kerberos | [`AuthMethod::Kerberos`] | Raw Kerberos GSS-API tokens (not SPNEGO) under the `Negotiate` HTTP scheme, via the system Kerberos library. Messages sealed with the Kerberos context over HTTP (see [`EncryptionMode`]); over HTTPS, channel binding to the probe's certificate, pinned for the connection's life. Requires `kerberos` feature + `kinit`. Windows clients: SSPI path built by the `kerberos-windows` CI job, not tested live; `EncryptionMode::Never` is the way back. |
 //! | Certificate | [`AuthMethod::Certificate`] | TLS client certificate; requires `use_tls = true` (building the client fails with `AuthFailed` otherwise). Set `client_cert_pem` and `client_key_pem` on config. |
@@ -50,9 +50,8 @@
 //! The crate logs through `tracing`. What each level records:
 //!
 //! - `warn`: settings that weaken security, at each client construction
-//!   (`accept_invalid_certs`, Basic or NTLM over plain HTTP,
-//!   `EncryptionMode::Always` with a method that cannot seal), and runtime
-//!   anomalies (a host string that had to be sanitised, a shell dropped
+//!   (`accept_invalid_certs`, Basic with `EncryptionMode::Never` or NTLM over
+//!   plain HTTP), and runtime anomalies (a host string that had to be sanitised, a shell dropped
 //!   without `close`, a retry). The NTLM one has its own target,
 //!   `winrm_rs::ntlm_over_http`, so a deliberate plain-HTTP deployment can
 //!   silence it alone.

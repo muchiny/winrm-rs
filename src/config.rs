@@ -256,6 +256,10 @@ pub struct WinrmConfig {
     ///
     /// Controls whether SOAP message bodies are sealed (encrypted and signed)
     /// with the NTLM session or the Kerberos context.
+    ///
+    /// Basic over plain HTTP needs [`EncryptionMode::Never`], and
+    /// [`EncryptionMode::Always`] with Basic, Certificate or CredSSP is
+    /// refused: building the client fails in both cases.
     pub encryption: EncryptionMode,
     /// Custom HTTP `User-Agent` header (default: `None` = `winrm-rs/<version>`).
     /// CredSSP sends it too.
@@ -481,24 +485,20 @@ pub enum EncryptionMode {
     Auto,
     /// Seal every SOAP body, over HTTPS too (inside TLS).
     ///
-    /// **Only NTLM and Kerberos can seal.** With Basic, Certificate or
-    /// CredSSP this setting protects nothing: for those methods the only
-    /// protection is TLS (HTTPS), and Basic over plain HTTP stays in
-    /// plaintext.
-    ///
-    /// NTLM and Kerberos only. With [`AuthMethod::Basic`],
-    /// [`AuthMethod::Certificate`] or [`AuthMethod::CredSsp`] it changes
-    /// nothing and refuses nothing: those methods never seal, so Basic over
-    /// plain HTTP still sends the credentials and every SOAP body in
-    /// plaintext. The client logs a WARN at construction in that case (and
-    /// one for any Basic over plain HTTP). Certificate and CredSSP require
-    /// HTTPS, whose TLS protects the bodies.
+    /// NTLM and Kerberos only: with Basic, Certificate or CredSSP, which
+    /// winrm-rs cannot seal, building the client fails with
+    /// [`WinrmError::AuthFailed`](crate::WinrmError::AuthFailed). For those
+    /// methods the protection is TLS (HTTPS): use [`Self::Auto`].
     Always,
     /// Never seal: over HTTP, SOAP bodies (commands, their output, file
     /// contents) cross the network in plaintext, and the server must allow
     /// unencrypted traffic (`AllowUnencrypted`; Windows answers otherwise
     /// with an HTTP 500 and an empty body, reported as such for Kerberos).
-    /// **Use only for debugging.**
+    ///
+    /// With [`AuthMethod::Basic`] over plain HTTP this is the required,
+    /// explicit consent that the password and every body travel in cleartext
+    /// (a WARN is still logged). With NTLM or Kerberos, use it only for
+    /// debugging or for an RC4-only Kerberos realm.
     Never,
 }
 
@@ -524,7 +524,10 @@ pub enum TlsProvider {
 #[derive(Debug, Clone)]
 pub enum AuthMethod {
     /// HTTP Basic authentication. Credentials are sent as a base64-encoded
-    /// `Authorization` header on every request. Only safe over HTTPS.
+    /// `Authorization` header on every request. Only safe over HTTPS. Over
+    /// plain HTTP, building the client fails unless [`EncryptionMode::Never`]
+    /// says plaintext is accepted. That includes a loopback endpoint reached
+    /// through an SSH or port-forward tunnel, which the client cannot see.
     Basic,
     /// NTLMv2 challenge/response authentication (default). When requests are
     /// sealed (see [`EncryptionMode`]), the three-step handshake (negotiate,

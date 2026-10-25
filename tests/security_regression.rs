@@ -11,7 +11,7 @@
 // the environment. These tests talk to a loopback mock server: if your shell
 // exports a proxy, make sure `NO_PROXY` covers `127.0.0.1`.
 
-use winrm_rs::{AuthMethod, WinrmClient, WinrmConfig, WinrmCredentials};
+use winrm_rs::{AuthMethod, EncryptionMode, WinrmClient, WinrmConfig, WinrmCredentials};
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -34,6 +34,7 @@ fn basic_client(uri: &str) -> (WinrmClient, String) {
         connect_timeout_secs: 5,
         operation_timeout_secs: 5,
         auth_method: AuthMethod::Basic,
+        encryption: EncryptionMode::Never,
         max_retries: 0,
         ..Default::default()
     };

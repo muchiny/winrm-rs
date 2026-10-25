@@ -1093,6 +1093,7 @@ mod tests {
         WinrmConfig {
             port,
             auth_method: AuthMethod::Basic,
+            encryption: EncryptionMode::Never,
             connect_timeout_secs: 5,
             operation_timeout_secs: 10,
             ..Default::default()
@@ -1931,6 +1932,7 @@ mod tests {
         WinrmConfig {
             port,
             auth_method: AuthMethod::Basic,
+            encryption: EncryptionMode::Never,
             connect_timeout_secs: 5,
             operation_timeout_secs: 10,
             max_retries,
@@ -3155,6 +3157,7 @@ mod tests {
         let config = WinrmConfig {
             port,
             auth_method: AuthMethod::Basic,
+            encryption: EncryptionMode::Never,
             connect_timeout_secs: 2,
             operation_timeout_secs: 5,
             max_retries: 3,
@@ -3412,6 +3415,7 @@ mod tests {
         let config = WinrmConfig {
             port,
             auth_method: AuthMethod::Basic,
+            encryption: EncryptionMode::Never,
             connect_timeout_secs: 2,
             operation_timeout_secs: 5,
             max_retries: 1,
@@ -3450,6 +3454,7 @@ mod tests {
         let config = WinrmConfig {
             port,
             auth_method: AuthMethod::Basic,
+            encryption: EncryptionMode::Never,
             connect_timeout_secs: 2,
             operation_timeout_secs: 5,
             max_retries: 0,
@@ -3508,6 +3513,7 @@ mod tests {
         let config = WinrmConfig {
             port,
             auth_method: AuthMethod::Basic,
+            encryption: EncryptionMode::Never,
             connect_timeout_secs: 30,
             operation_timeout_secs: 1,
             ..Default::default()
@@ -3667,6 +3673,7 @@ mod tests {
         let config = WinrmConfig {
             port,
             auth_method: AuthMethod::Basic,
+            encryption: EncryptionMode::Never,
             connect_timeout_secs: 2,
             operation_timeout_secs: 5,
             max_retries: 2,
@@ -4412,6 +4419,7 @@ mod tests {
             WinrmConfig {
                 port,
                 auth_method: AuthMethod::Basic,
+                encryption: EncryptionMode::Never,
                 connect_timeout_secs: 2,
                 max_retries: 0,
                 ..Default::default()

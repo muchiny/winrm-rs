@@ -29,7 +29,7 @@ async fn main() -> Result<(), winrm_rs::WinrmError> {
 ## Features
 
 - **NTLMv2 authentication** -- pure Rust, no OpenSSL or system SSPI required
-- **Basic authentication** -- for test environments or HTTPS-secured endpoints
+- **Basic authentication** -- over HTTPS; over plain HTTP only with `EncryptionMode::Never`, the explicit plaintext opt-in
 - **Kerberos authentication** -- via `cross-krb5`, feature-gated (`--features kerberos`); raw Kerberos GSS-API tokens under the `Negotiate` scheme, messages sealed with the Kerberos context over HTTP
 - **Certificate authentication** -- TLS client certificate auth
 - **PowerShell execution** -- scripts auto-encoded as UTF-16LE Base64 (`-EncodedCommand`)
@@ -60,7 +60,7 @@ cargo add winrm-rs --features kerberos
 | HTTPS + CredSSP, certificate validated or pinned (required) | yes (certificate) | inner TLS only | TLS | when the host must reach other machines with your credentials |
 | HTTP + Kerberos | yes (AP-REP) | no: a party on the path, or one controlling DNS, can relay the AP-REQ | sealed (`EncryptionMode::Auto`) | trusted networks |
 | HTTP + NTLM (the default) | no | no: the handshake can be relayed, or recorded to guess the password offline | sealed (`EncryptionMode::Auto`) | trusted networks only |
-| Basic | over HTTPS only | n/a | TLS; plaintext over HTTP (a WARN is logged) | HTTPS only |
+| Basic | over HTTPS only | n/a | TLS; over HTTP only with `EncryptionMode::Never`, in plaintext (a WARN is logged) | HTTPS only |
 | any method with `accept_invalid_certs` | no | channel binding stops a relay to the real WinRM server only; CredSSP refuses this flag | TLS to whoever answers | test environments |
 
 Sealing starts once the authentication is done: it protects this client's
@@ -104,6 +104,10 @@ let client = WinrmClient::new(
     WinrmCredentials::new("admin", "password", ""),
 )?;
 ```
+
+Over plain HTTP, building a Basic client fails unless `encryption` is
+`EncryptionMode::Never`, the explicit consent that the password and every
+body travel in cleartext.
 
 ### NTLM authentication (default)
 
@@ -338,7 +342,7 @@ line, which command-line auditing (event 4688) and script block logging
 | `client_cert_pem` | `None` | Path to client cert PEM (Certificate auth) |
 | `client_key_pem` | `None` | Path to client key PEM (Certificate auth) |
 | `proxy` | `None` | Proxy URL (e.g. `http://proxy:8080`); not used by CredSSP |
-| `encryption` | `Auto` | Message sealing for NTLM and Kerberos: `Auto` (over HTTP only), `Always`, `Never`. No effect with Basic, Certificate or CredSSP, `Always` included (Basic over HTTP stays plaintext; a WARN is logged) |
+| `encryption` | `Auto` | Message sealing for NTLM and Kerberos: `Auto` (over HTTP only), `Always`, `Never`. Basic over plain HTTP requires `Never`; `Always` with Basic, Certificate or CredSSP is refused |
 | `max_output_bytes` | `Some(64 MiB)` | Cap on a command's stdout+stderr; `None` removes it |
 
 ### Proxies

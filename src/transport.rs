@@ -779,6 +779,32 @@ impl HttpTransport {
         provider: Arc<CryptoProvider>,
     ) -> Result<Self, WinrmError> {
         debug!(tls_provider = ?opts.provider, "TLS crypto provider choice");
+
+        // Refused before anything else is read or built. Basic over plain
+        // HTTP puts the password and every body on the wire in cleartext, so
+        // `Never` is the caller's explicit consent to that.
+        if matches!(config.auth_method, AuthMethod::Basic)
+            && !config.use_tls
+            && config.encryption != EncryptionMode::Never
+        {
+            return Err(WinrmError::AuthFailed(
+                "Basic auth over HTTP sends the password and every SOAP body in cleartext: use \
+                 HTTPS (use_tls = true), or set encryption = EncryptionMode::Never to accept \
+                 plaintext"
+                    .into(),
+            ));
+        }
+        if config.encryption == EncryptionMode::Always
+            && !matches!(config.auth_method, AuthMethod::Ntlm | AuthMethod::Kerberos)
+        {
+            return Err(WinrmError::AuthFailed(format!(
+                "EncryptionMode::Always: winrm-rs seals SOAP bodies only with NTLM and \
+                 Kerberos and does not seal {}; use EncryptionMode::Auto, where HTTPS protects \
+                 the bodies",
+                method_name(&config.auth_method)
+            )));
+        }
+
         if config.accept_invalid_certs {
             tracing::warn!(
                 "TLS certificate verification disabled (accept_invalid_certs=true) — \
@@ -811,7 +837,8 @@ impl HttpTransport {
 
         if matches!(config.auth_method, AuthMethod::Basic) && !config.use_tls {
             tracing::warn!(
-                "Basic auth over HTTP transmits credentials in cleartext — use HTTPS in production"
+                "Basic auth over HTTP transmits credentials in cleartext (EncryptionMode::Never) — \
+                 use HTTPS in production"
             );
         }
 
@@ -823,17 +850,6 @@ impl HttpTransport {
                  not bound to the connection, so a party on the network path can relay it, \
                  or record it to guess the password offline; sealing protects only the SOAP \
                  bodies. Use HTTPS (use_tls = true, port = 5986) or Kerberos"
-            );
-        }
-
-        if config.encryption == EncryptionMode::Always
-            && !matches!(config.auth_method, AuthMethod::Ntlm | AuthMethod::Kerberos)
-        {
-            tracing::warn!(
-                auth_method = method_name(&config.auth_method),
-                use_tls = config.use_tls,
-                "EncryptionMode::Always has no effect with this auth method: only NTLM and \
-                 Kerberos seal SOAP bodies, so nothing is sealed"
             );
         }
 
@@ -1869,6 +1885,7 @@ mod tests {
             auth_method: AuthMethod::Basic,
             port,
             use_tls: false,
+            encryption: EncryptionMode::Never,
             ..Default::default()
         };
         let creds = WinrmCredentials::new("admin", "pass", "");
@@ -2155,6 +2172,7 @@ mod tests {
                 let config = WinrmConfig {
                     auth_method: auth_method.clone(),
                     use_tls,
+                    encryption: EncryptionMode::Never,
                     user_agent: Some(user_agent.into()),
                     ..Default::default()
                 };
@@ -2813,6 +2831,7 @@ mod tests {
             auth_method: AuthMethod::Basic,
             port: addr.port(),
             use_tls: false,
+            encryption: EncryptionMode::Never,
             max_retries: 3,
             ..Default::default()
         };
@@ -2838,6 +2857,7 @@ mod tests {
             auth_method: AuthMethod::Basic,
             port: addr.port(),
             use_tls: false,
+            encryption: EncryptionMode::Never,
             max_retries: 3,
             ..Default::default()
         };
@@ -2853,6 +2873,7 @@ mod tests {
         let config = WinrmConfig {
             auth_method: AuthMethod::Basic,
             use_tls: false,
+            encryption: EncryptionMode::Never,
             proxy: Some("http://proxy:8080".into()),
             ..Default::default()
         };
@@ -3080,23 +3101,65 @@ mod tests {
         }
     }
 
-    /// `Always` with a method that never seals is accepted (SemVer), but
-    /// says so at construction.
+    /// Basic over plain HTTP sends the password and every body in cleartext:
+    /// it is refused unless `Never` says so.
     #[tracing_test::traced_test]
     #[test]
-    fn always_with_a_method_that_never_seals_is_accepted_with_a_warning() {
-        let transport = HttpTransport::new(
-            WinrmConfig {
-                auth_method: AuthMethod::Basic,
+    fn basic_over_http_is_refused_unless_encryption_is_never() {
+        let basic = |use_tls: bool, encryption: EncryptionMode| {
+            HttpTransport::new(
+                WinrmConfig {
+                    auth_method: AuthMethod::Basic,
+                    use_tls,
+                    encryption,
+                    ..Default::default()
+                },
+                WinrmCredentials::new("admin", "pass", ""),
+            )
+        };
+        for mode in [EncryptionMode::Auto, EncryptionMode::Always] {
+            let err = basic(false, mode.clone()).err().expect("refused");
+            assert!(
+                matches!(&err, WinrmError::AuthFailed(m) if m.contains("EncryptionMode::Never") && m.contains("use_tls")),
+                "{mode:?}: {err:?}"
+            );
+        }
+        assert!(basic(false, EncryptionMode::Never).is_ok());
+        assert!(logs_contain("cleartext"));
+        assert!(basic(true, EncryptionMode::Auto).is_ok());
+    }
+
+    /// `Always` with a method that winrm-rs cannot seal is refused, before
+    /// any certificate file is read.
+    #[test]
+    fn always_with_a_method_that_never_seals_is_refused() {
+        let creds = || WinrmCredentials::new("admin", "pass", "");
+        for (method, name) in [
+            (AuthMethod::Basic, "Basic"),
+            (AuthMethod::Certificate, "Certificate"),
+            (AuthMethod::CredSsp, "CredSSP"),
+        ] {
+            let config = WinrmConfig {
+                auth_method: method,
+                use_tls: true,
+                port: 5986,
                 encryption: EncryptionMode::Always,
                 ..Default::default()
-            },
-            WinrmCredentials::new("admin", "pass", ""),
-        );
-        assert!(transport.is_ok());
-        assert!(!transport.unwrap().seals());
-        assert!(logs_contain("EncryptionMode::Always has no effect"));
-        assert!(logs_contain("auth_method=\"Basic\""));
+            };
+            let err = HttpTransport::new(config, creds()).err().expect("refused");
+            assert!(
+                matches!(&err, WinrmError::AuthFailed(m) if m.contains("EncryptionMode::Always") && m.contains(&format!("does not seal {name}"))),
+                "{err:?}"
+            );
+        }
+        let ntlm = WinrmConfig {
+            auth_method: AuthMethod::Ntlm,
+            use_tls: true,
+            port: 5986,
+            encryption: EncryptionMode::Always,
+            ..Default::default()
+        };
+        assert!(HttpTransport::new(ntlm, creds()).is_ok());
     }
 
     /// NTLM over plain HTTP is accepted (it is the default) but says at
@@ -3130,6 +3193,7 @@ mod tests {
         assert!(HttpTransport::new(https, creds()).is_ok());
         let basic = WinrmConfig {
             auth_method: AuthMethod::Basic,
+            encryption: EncryptionMode::Never,
             ..Default::default()
         };
         assert!(HttpTransport::new(basic, creds()).is_ok());
@@ -3168,6 +3232,7 @@ mod tests {
                 auth_method: AuthMethod::Basic,
                 port,
                 use_tls: false,
+                encryption: EncryptionMode::Never,
                 max_retries: 0,
                 connect_timeout_secs: 2,
                 ..Default::default()
@@ -3318,6 +3383,7 @@ mod tests {
             auth_method: AuthMethod::Basic,
             port,
             use_tls: false,
+            encryption: EncryptionMode::Never,
             max_retries,
             ..Default::default()
         };
@@ -3868,6 +3934,7 @@ mod tests {
         let config = WinrmConfig {
             auth_method: AuthMethod::Basic,
             port,
+            encryption: EncryptionMode::Never,
             max_retries: 2,
             ..Default::default()
         };
@@ -4666,6 +4733,7 @@ mod tests {
             let config = WinrmConfig {
                 auth_method: AuthMethod::Basic,
                 use_tls: false,
+                encryption: EncryptionMode::Never,
                 operation_timeout_secs: secs,
                 ..Default::default()
             };
@@ -4804,11 +4872,12 @@ mod tests {
                 https,
                 "{mode:?} Kerberos HTTPS"
             );
-            assert!(
-                !seals(AuthMethod::Basic, mode.clone(), false),
-                "{mode:?} Basic"
-            );
         }
+        // Basic never seals: over HTTP only `Never` builds, and over HTTPS
+        // only the modes that do not demand sealing.
+        assert!(!seals(AuthMethod::Basic, EncryptionMode::Never, false));
+        assert!(!seals(AuthMethod::Basic, EncryptionMode::Auto, true));
+        assert!(!seals(AuthMethod::Basic, EncryptionMode::Never, true));
     }
 
     // --- Bounded in-flight NTLM connections ---
@@ -5490,6 +5559,7 @@ mod tests {
         ));
         let config = WinrmConfig {
             use_tls: false,
+            encryption: EncryptionMode::Never,
             accept_invalid_certs,
             proxy: Some(format!("https://proxyuser:proxysecret@localhost:{p}")),
             ..tls_config(AuthMethod::Basic, 5985)
@@ -6155,6 +6225,7 @@ mod tests {
             ));
             let config = WinrmConfig {
                 use_tls: false,
+                encryption: EncryptionMode::Never,
                 proxy: Some(format!("https://localhost:{p}")),
                 ..tls_config(AuthMethod::Basic, 5985)
             };
@@ -6515,6 +6586,7 @@ mod tests {
     fn pin_without_tls_is_refused_at_build() {
         let config = WinrmConfig {
             use_tls: false,
+            encryption: EncryptionMode::Never,
             ..tls_config(AuthMethod::Basic, 5985)
         };
         assert_eq!(

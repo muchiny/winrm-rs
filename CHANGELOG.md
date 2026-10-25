@@ -99,6 +99,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   would use: short or octal IPv4 forms (`10.1`, `010.0.0.1`), fullwidth
   characters, an ideographic full stop, decomposed accents. Migration: pass
   the form in the error.
+- **Basic over plain HTTP needs `encryption: EncryptionMode::Never`**, the
+  explicit consent that the password and every SOAP body travel in cleartext.
+  Without it, building the client fails with `WinrmError::AuthFailed`.
+  Migration: set `encryption: EncryptionMode::Never` to keep Basic over HTTP,
+  or move to HTTPS.
+- **`EncryptionMode::Always` with Basic, Certificate or CredSSP is refused**
+  when the client is built. It sealed nothing before. Migration: use
+  `EncryptionMode::Auto`.
 
 ### Added
 

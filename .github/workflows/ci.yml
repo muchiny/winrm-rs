@@ -234,16 +234,13 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # SonarQube Cloud (CI-based analysis: Automatic Analysis skips Rust). Imports
-  # the llvm-cov coverage and a Clippy report; settings in
-  # sonar-project.properties. Dependabot and fork PRs get no SONAR_TOKEN, so
-  # the job is skipped for them. Third-party actions are pinned to full commit
-  # SHAs because this job handles a secret.
-  sonar:
-    name: SonarQube Cloud
+  # Clippy report for SonarQube Cloud. It runs here, in a job without secrets,
+  # because building runs dependency build scripts and proc-macros (and the
+  # branch's own code on a PR): none of that may share a VM with SONAR_TOKEN.
+  # Runs only when `sonar` runs.
+  clippy-report:
+    name: Clippy report (SonarQube)
     runs-on: ubuntu-latest
-    needs: coverage
-    # The scanner authenticates with SONAR_TOKEN, not with the GitHub token.
     permissions:
       contents: read
     if: >-
@@ -259,16 +256,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          # Full history: Sonar needs blame data to tell new code from old.
-          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-24
         with:
           toolchain: 1.98.0
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: coverage-cobertura
       - name: Clippy report (JSON)
         run: |
           cargo clippy --locked --all-targets --features credssp --message-format=json -- \
@@ -276,6 +268,45 @@ jobs:
             -W clippy::todo -W clippy::unimplemented -W clippy::indexing_slicing \
             -W clippy::arithmetic_side_effects -W clippy::as_conversions \
             > clippy-report.json
+      - name: Keep clippy-report.json for the sonar job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: clippy-report
+          path: clippy-report.json
+          if-no-files-found: error
+          retention-days: 1
+
+  # SonarQube Cloud (CI-based analysis: Automatic Analysis skips Rust). Imports
+  # the llvm-cov coverage and the Clippy report of the jobs above; settings in
+  # sonar-project.properties. The scanner only reads these reports: this job
+  # compiles nothing and runs no cargo. Dependabot and fork PRs get no
+  # SONAR_TOKEN, so the job is skipped for them. Third-party actions are pinned
+  # to full commit SHAs because this job handles a secret.
+  sonar:
+    name: SonarQube Cloud
+    runs-on: ubuntu-latest
+    needs: [coverage, clippy-report]
+    # The scanner authenticates with SONAR_TOKEN, not with the GitHub token.
+    permissions:
+      contents: read
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+      github.actor != 'dependabot[bot]')
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # Full history: Sonar needs blame data to tell new code from old.
+          fetch-depth: 0
+      # Each artifact holds one file, extracted at the repository root: the
+      # paths sonar-project.properties reads.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: coverage-cobertura
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: clippy-report
       - name: SonarQube scan
         uses: SonarSource/sonarqube-scan-action@d209202bc7d53ff1cc128f7f907dac145c9d6ae9 # v8.3.0
         env:

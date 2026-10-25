@@ -4957,10 +4957,19 @@ mod tests {
         let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
 
         let started = Instant::now();
-        let err = client
-            .run_wql_with_timeout("127.0.0.1", "SELECT * FROM X", None, Duration::from_secs(1))
-            .await
-            .unwrap_err();
+        // The outer limit makes a regression fail instead of hang.
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.run_wql_with_timeout(
+                "127.0.0.1",
+                "SELECT * FROM X",
+                None,
+                Duration::from_secs(1),
+            ),
+        )
+        .await
+        .expect("the call must end on its own")
+        .unwrap_err();
 
         assert!(matches!(err, WinrmError::Timeout(1)), "got {err:?}");
         let elapsed = started.elapsed();
@@ -5027,10 +5036,14 @@ mod tests {
         let token = tokio_util::sync::CancellationToken::new();
         let canceller = cancel_after(&token, Duration::from_millis(300));
 
-        let err = client
-            .run_wql_with_cancel("127.0.0.1", "SELECT * FROM X", None, token)
-            .await
-            .unwrap_err();
+        // The outer limit makes a regression fail instead of hang.
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.run_wql_with_cancel("127.0.0.1", "SELECT * FROM X", None, token),
+        )
+        .await
+        .expect("the call must end on its own")
+        .unwrap_err();
         canceller.await.unwrap();
 
         assert!(matches!(err, WinrmError::Cancelled), "got {err:?}");

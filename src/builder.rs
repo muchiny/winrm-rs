@@ -237,7 +237,9 @@ impl WinrmClientBuilder<Ready> {
     /// A refusal also blocks the stop and clean-up requests: the Signal sent by
     /// [`Shell::signal_ctrl_c`](crate::Shell::signal_ctrl_c) and
     /// [`WinrmClient::signal_terminate`](crate::WinrmClient::signal_terminate)
-    /// (the PSRP stop included), and the Delete sent by
+    /// (the PSRP stop included), the terminate that
+    /// [`Shell::run_command`](crate::Shell::run_command) sends when it finishes
+    /// or gives up, and the Delete sent by
     /// [`Shell::close`](crate::Shell::close),
     /// [`WinrmClient::delete_shell`](crate::WinrmClient::delete_shell) and the
     /// clean-up of `run_command*` and `run_powershell*`. The remote command or
@@ -409,8 +411,13 @@ impl WinrmClientBuilder<Ready> {
     /// ```
     ///
     /// - `Signal` carries [`Shell::signal_ctrl_c`](crate::Shell::signal_ctrl_c)
-    ///   (the PSRP stop included) and
-    ///   [`WinrmClient::signal_terminate`](crate::WinrmClient::signal_terminate).
+    ///   (the PSRP stop included),
+    ///   [`WinrmClient::signal_terminate`](crate::WinrmClient::signal_terminate)
+    ///   and the terminate [`Shell::run_command`](crate::Shell::run_command)
+    ///   (so `Shell::run_powershell` and `upload_file`) sends when its command
+    ///   finishes, passes `max_output_bytes` or reaches its deadline. Refused,
+    ///   that command keeps running in the shell; the call still returns its
+    ///   own result or error.
     /// - `Delete` carries [`Shell::close`](crate::Shell::close),
     ///   [`WinrmClient::delete_shell`](crate::WinrmClient::delete_shell) and the
     ///   clean-up of `run_command*` and `run_powershell*`. When the switch

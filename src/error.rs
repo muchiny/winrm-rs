@@ -29,8 +29,8 @@ pub enum WinrmError {
     /// seconds. The value depends on where it was raised:
     /// - `Shell::run_command` reports `2 * operation_timeout_secs` (its
     ///   total deadline; the product saturates at `u64::MAX`; the call itself
-    ///   can take up to `min(operation_timeout_secs, 10)` s more, the time to
-    ///   terminate the command);
+    ///   can take up to `min(operation_timeout_secs, 10)` s (at least 1 s)
+    ///   more, the time to terminate the command);
     /// - the `WinrmClient::*_with_timeout` methods report the caller's
     ///   `timeout` rounded up to whole seconds (at least 1);
     /// - a request that needs a dedicated connection (NTLM or Kerberos

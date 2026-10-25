@@ -441,13 +441,18 @@ ne figurent pas dans la matrice.
   reste jusqu'à l'idle timeout du serveur. `Shell::run_command` garde son
   délai total de `2 * operation_timeout_secs`. `run_wql` ne scrute pas
   Receive et n'est pas concerné.
-- **`Shell::run_command` n'arrête pas la commande quand il abandonne.** À son
-  délai total (`WinrmError::Timeout(2 * operation_timeout_secs)`) ou au
-  plafond `max_output_bytes` (`WinrmError::Transfer`), il rend l'erreur sans
-  envoyer de terminaison : la commande continue dans le shell, qui reste
-  ouvert jusqu'à `Shell::close` (ou l'idle timeout). Les méthodes de
-  `WinrmClient` (`run_command`, `*_with_timeout`, `*_with_cancel`), elles,
-  envoient la terminaison. Comportement antérieur à la campagne, inchangé.
+- **`Shell::run_command` termine la commande quand il abandonne (depuis
+  1.5.0).** Quand la commande se termine, atteint le plafond
+  `max_output_bytes` (`WinrmError::Transfer`) ou son délai total
+  (`WinrmError::Timeout(2 * operation_timeout_secs)`), il envoie une seule
+  terminaison, bornée (voie de nettoyage, `min(operation_timeout_secs, 10)` s,
+  au moins 1 s), puis rend son résultat ou son erreur ; le shell reste
+  ouvert. Un appel annulé (`run_command_with_cancel`), un Receive en échec ou
+  un hook qui refuse le Signal n'envoient aucune terminaison : la commande
+  continue alors dans le shell jusqu'à `Shell::close` (ou l'idle timeout).
+  Contrôle en direct : le test ignoré
+  `shell_run_command_terminates_on_cap_and_deadline` (banc à passer : à la
+  charge de l'utilisateur).
 - **Scellement NTLM et NTLM sur TLS : ce qui reste.** Les suites relevées
   par les audits sont traitées par `74578d2`, `9493f59` et `ad908b3` (repli
   en clair, Type 3 à corps vide, aucun renvoi d'une requête scellée, corps

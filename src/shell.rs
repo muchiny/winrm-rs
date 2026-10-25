@@ -132,8 +132,10 @@ impl<'a> Shell<'a> {
     /// much longer than the deadline. A command that must run longer belongs
     /// in [`start_command`](Self::start_command) and
     /// [`receive_next`](Self::receive_next).
-    /// [`run_command_with_cancel`](Self::run_command_with_cancel) sends no
-    /// signal: a dropped future cannot.
+    /// A *cancelled* [`run_command_with_cancel`](Self::run_command_with_cancel)
+    /// sends no signal: its future is dropped. If polling itself fails
+    /// (network error, or a hook refusing Receive), no signal is sent either
+    /// and the command keeps running until the shell is closed.
     ///
     /// See [`WinrmClient::run_command`](crate::WinrmClient::run_command) (Arguments) for
     /// how `args` reach the host.
@@ -1996,9 +1998,17 @@ mod tests {
             max_output_bytes: Some(4),
             ..basic_config(server.address().port())
         };
+        let refused = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&refused);
         let client = WinrmClient::builder(config)
             .credentials(test_creds())
-            .before_send_with(|req| req.kind() != crate::RequestKind::Signal)
+            .before_send_with(move |req| {
+                let signal = req.kind() == crate::RequestKind::Signal;
+                if signal {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                !signal
+            })
             .build()
             .unwrap();
         let shell = client.open_shell("127.0.0.1").await.unwrap();
@@ -2009,6 +2019,31 @@ mod tests {
             matches!(&err, WinrmError::Transfer(msg) if msg.contains("max_output_bytes (4)")),
             "got {err:?}"
         );
+        assert_eq!(terminate_count(&server).await, 0);
+        // One attempt: no retry and no second terminate.
+        assert_eq!(refused.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn shell_run_command_sends_no_terminate_when_polling_fails() {
+        let server = MockServer::start().await;
+        mount_open_shell_and_command(&server).await;
+        mount_receive_and_signal(
+            &server,
+            ResponseTemplate::new(500).set_body_string(
+                r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><s:Fault>
+                <s:Code><s:Value>s:Receiver</s:Value></s:Code>
+                <s:Reason><s:Text xml:lang="en-US">receive failed</s:Text></s:Reason>
+                </s:Fault></s:Body></s:Envelope>"#,
+            ),
+        )
+        .await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        let shell = client.open_shell("127.0.0.1").await.unwrap();
+
+        let err = shell.run_command("x", &[]).await.unwrap_err();
+
+        assert!(matches!(err, WinrmError::Soap(_)), "got {err:?}");
         assert_eq!(terminate_count(&server).await, 0);
     }
 

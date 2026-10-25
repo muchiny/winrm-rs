@@ -183,8 +183,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the command to terminate when it reaches `max_output_bytes` or its
   `2 * operation_timeout_secs` deadline, instead of leaving it running. The
   terminate sent after a completed command is bounded by
-  `min(operation_timeout_secs, 10)` s and no longer discards the output when
-  the deadline passes during it. Migration: a command that must outlive the
+  `min(operation_timeout_secs, 10)` s (at least 1 s) and no longer discards
+  the output when the deadline passes during it. Migration: a command that must outlive the
   deadline belongs in `Shell::start_command` and `Shell::receive_next`, which
   are not bounded.
 

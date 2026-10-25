@@ -1184,7 +1184,11 @@ async fn shell_run_command_terminates_on_cap_and_deadline() {
     let err = shell
         .run_command(
             "powershell.exe",
-            &["-NoProfile", "-Command", "1..1000000 | % { 'x' * 100 }"],
+            &[
+                "-NoProfile",
+                "-Command",
+                "foreach ($i in 1..1000000) { 'x' * 100 }",
+            ],
         )
         .await
         .unwrap_err();

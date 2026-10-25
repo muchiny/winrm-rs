@@ -158,9 +158,11 @@ jobs:
       - run: cargo clippy --locked --all-targets --features kerberos -- -D warnings
 
   kerberos-macos:
-    # macOS builds the Kerberos feature against Apple's GSS framework
-    # (libgssapi-sys); no Kerberos test runs here (no KDC), this checks that
-    # the code builds.
+    # The Kerberos feature seals with GSS-API IOV calls (`gss_wrap_iov`,
+    # cross-krb5's default `iov` feature), which Apple's GSS framework does
+    # not have. macOS builds it against MIT krb5 from Homebrew, selected with
+    # libgssapi-sys's documented LIBGSSAPI_IMPL and LIBGSSAPI_PREFIX. No
+    # Kerberos test runs here (no KDC), this checks that the code builds.
     name: Kerberos (macos, check)
     runs-on: macos-latest
     permissions:
@@ -173,7 +175,17 @@ jobs:
         with:
           toolchain: 1.98.0
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - run: cargo check --locked --all-targets --features kerberos
+      - name: Install MIT krb5
+        run: brew install krb5
+      - name: Check with MIT krb5
+        env:
+          LIBGSSAPI_IMPL: mit
+        run: |
+          LIBGSSAPI_PREFIX="$(brew --prefix krb5)"
+          [[ -f "$LIBGSSAPI_PREFIX/include/gssapi/gssapi_ext.h" ]] \
+            || { echo "::error::no MIT GSS-API headers under $LIBGSSAPI_PREFIX/include"; exit 1; }
+          export LIBGSSAPI_PREFIX
+          cargo check --locked --all-targets --features kerberos
 
   kerberos-kdc:
     # Kerberos end to end: a throwaway MIT KDC (scripts/ci-kdc.sh) and the

@@ -5,7 +5,11 @@ Thank you for your interest in contributing to winrm-rs! This document provides 
 ## Prerequisites
 
 - **Rust 1.98.0** or later
-- **libkrb5-dev** (Linux) or equivalent — only needed for the `kerberos` feature
+- **libkrb5-dev** (Linux) or equivalent — only needed for the `kerberos` feature.
+  On macOS that is MIT krb5 from Homebrew (`brew install krb5`, then
+  `LIBGSSAPI_IMPL=mit` and `LIBGSSAPI_PREFIX="$(brew --prefix krb5)"` in the
+  environment): the feature needs `gss_wrap_iov`, which Apple's GSS framework
+  does not have
 - **libssl-dev** and **pkg-config** (Linux) — needed for the `credssp` feature
 - **pwsh** (PowerShell 7) on `PATH` — needed for the PowerShell quoting test (`tests/pwsh_quote_oracle.rs`)
 

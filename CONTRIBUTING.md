@@ -43,6 +43,9 @@ scripts/fuzz.sh run fuzz_asn1_ts_request 900
 
 # Check what will be published to crates.io (fails on any file outside the allowlist)
 scripts/check-package.sh
+
+# Lint the GitHub workflows (any finding fails CI)
+uvx zizmor@1.31.1 .
 ```
 
 ## Pull Request guidelines

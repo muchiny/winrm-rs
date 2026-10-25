@@ -8,7 +8,6 @@ on:
 
 permissions:
   contents: read
-  checks: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -23,9 +22,12 @@ jobs:
     name: Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-24
+        with:
+          toolchain: nightly
           components: rustfmt
       - run: cargo fmt --all --check
       - name: Package contents
@@ -37,16 +39,19 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-24
+        with:
+          toolchain: 1.98.0
           components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets -- -D warnings
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo clippy --locked --all-targets -- -D warnings
       - name: Clippy (kerberos)
         run: |
           sudo apt-get update && sudo apt-get install -y libkrb5-dev
-          cargo clippy --all-targets --features kerberos -- -D warnings
+          cargo clippy --locked --all-targets --features kerberos -- -D warnings
 
   test:
     name: Test (${{ matrix.os }})
@@ -56,27 +61,39 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.0
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@nextest
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-24
+        with:
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: cargo-nextest@0.9.135
       - name: Run tests
-        run: cargo nextest run
+        run: cargo nextest run --locked
       - name: Run doc tests
-        run: cargo test --doc
+        run: cargo test --doc --locked
 
   test-kerberos:
     name: Test (kerberos)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.0
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@nextest
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-24
+        with:
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: cargo-nextest@0.9.135
       - name: Install libkrb5-dev
         run: sudo apt-get update && sudo apt-get install -y libkrb5-dev
-      - run: cargo nextest run --features kerberos
-      - run: cargo test --doc --features kerberos
+      - run: cargo nextest run --locked --features kerberos
+      - run: cargo test --doc --locked --features kerberos
 
   kerberos-windows:
     # The SSPI branch of cross-krb5 (and the `cfg(windows)` wrap code of
@@ -85,11 +102,14 @@ jobs:
     name: Kerberos (windows, check + clippy)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-24
+        with:
+          toolchain: 1.98.0
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo check --locked --all-targets --features kerberos
       - run: cargo clippy --locked --all-targets --features kerberos -- -D warnings
 
@@ -97,19 +117,19 @@ jobs:
     name: Coverage
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-24
+        with:
+          toolchain: 1.98.0
           components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@cargo-llvm-cov
-      - name: Generate coverage
-        run: cargo llvm-cov --locked --lcov --output-path lcov.info --fail-under-lines 95
-      - name: Upload to Codecov
-        uses: codecov/codecov-action@v4
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
-          files: lcov.info
-          fail_ci_if_error: false
+          tool: cargo-llvm-cov@0.8.7
+      - name: Generate coverage
+        run: cargo llvm-cov --locked --summary-only --fail-under-lines 95
       # Reuses the profile data of the run above: no rebuild.
       - name: Cobertura report for SonarQube Cloud
         run: cargo llvm-cov report --cobertura --output-path cobertura.xml
@@ -130,6 +150,9 @@ jobs:
     name: SonarQube Cloud
     runs-on: ubuntu-latest
     needs: coverage
+    # The scanner authenticates with SONAR_TOKEN, not with the GitHub token.
+    permissions:
+      contents: read
     if: >-
       github.event_name != 'pull_request' ||
       (github.event.pull_request.head.repo.full_name == github.repository &&
@@ -145,11 +168,11 @@ jobs:
           persist-credentials: false
           # Full history: Sonar needs blame data to tell new code from old.
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-24
         with:
           toolchain: 1.98.0
           components: clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: coverage-cobertura
@@ -171,14 +194,18 @@ jobs:
     env:
       RUSTDOCFLAGS: "-D warnings"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-24
+        with:
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # The `kerberos` feature pulls `cross-krb5` which needs krb5 dev
       # headers (gssapi.h) to build its `libgssapi-sys` bindings.
       - name: Install krb5 dev headers
         run: sudo apt-get update && sudo apt-get install -y libkrb5-dev
-      - run: cargo doc --no-deps --all-features
+      - run: cargo doc --locked --no-deps --all-features
 
   hardening:
     # Informatif : compte les violations des lints durcis (rust-hardening.md) et
@@ -188,14 +215,15 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-24
         with:
+          toolchain: 1.98.0
           components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-vet@0.10.2
       - name: Lints durcis (comptage)
@@ -215,45 +243,50 @@ jobs:
     name: MSRV (1.98.0)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.0
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo check --all-targets
-
-  audit:
-    name: Security audit
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-24
+        with:
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo check --locked --all-targets
 
   deny:
     name: Dependency check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          command: check
+          persist-credentials: false
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: cargo-deny@0.19.6
+      # Also checks the RustSec advisories (deny.toml `[advisories]`).
+      - run: cargo deny --all-features --locked check
 
   fuzz:
     name: Fuzz (smoke)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-24
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: fuzz
+          # The cargo-fuzz install below must run every time: a cached
+          # ~/.cargo/bin would satisfy it and the version pin would prove nothing.
+          cache-bin: "false"
       # NOT `taiki-e/install-action@cargo-fuzz`: that branch is an unmaintained
       # 2024-03 snapshot that resolves, exits in 19ms and installs nothing, and
       # cargo-fuzz is no longer in the action's tool manifest. `cargo install`
-      # is slower but cannot silently no-op; rust-cache keeps ~/.cargo/bin
-      # warm across runs.
+      # is slower but cannot silently no-op.
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        run: cargo install cargo-fuzz@0.13.1 --locked
       - name: Install OpenSSL headers (credssp feature)
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
       - name: Build every target
@@ -268,7 +301,7 @@ jobs:
         run: FUZZ_TIME=20 scripts/fuzz.sh run
       - name: Upload crash artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: fuzz-artifacts
           path: fuzz/artifacts/
@@ -279,14 +312,41 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@1.98.0
-      - uses: Swatinem/rust-cache@v2
-      - name: Install libkrb5-dev
-        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev
-      - uses: obi1kenobi/cargo-semver-checks-action@v2
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-24
+        with:
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # cargo-semver-checks builds the default feature group, which includes
+      # `credssp` (OpenSSL) and `kerberos` (krb5).
+      - name: Install krb5 and OpenSSL headers
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libssl-dev pkg-config
+      - uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2.9
+        with:
+          # Use the 1.98.0 toolchain installed above, not a floating stable.
+          rust-toolchain: manual
+
+  workflow-lint:
+    name: Workflow lint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: zizmor@1.31.1
+      # Online: the token enables the audits that query GitHub (impostor
+      # commits, ref confusion, actions with published advisories, ref/comment
+      # mismatch). Any finding fails the job.
+      - run: zizmor .
+        env:
+          GH_TOKEN: ${{ github.token }}
 
   # Gate job — add this to branch protection rules
   ci-pass:
@@ -301,30 +361,19 @@ jobs:
       - coverage
       - doc
       - msrv
-      - audit
       - deny
       - fuzz
+      - semver
+      - workflow-lint
     runs-on: ubuntu-latest
+    permissions: {}
     steps:
+      # Every job in `needs` must succeed; `semver` may be skipped (it runs on
+      # pull requests only). A job added to `needs` is covered with no edit here.
       - name: Verify all jobs passed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
         run: |
-          results=( \
-            "${{ needs.fmt.result }}" \
-            "${{ needs.clippy.result }}" \
-            "${{ needs.test.result }}" \
-            "${{ needs.test-kerberos.result }}" \
-            "${{ needs.kerberos-windows.result }}" \
-            "${{ needs.coverage.result }}" \
-            "${{ needs.doc.result }}" \
-            "${{ needs.msrv.result }}" \
-            "${{ needs.audit.result }}" \
-            "${{ needs.deny.result }}" \
-            "${{ needs.fuzz.result }}" \
-          )
-          for r in "${results[@]}"; do
-            if [[ "$r" != "success" ]]; then
-              echo "::error::One or more required jobs failed"
-              exit 1
-            fi
-          done
-          echo "All required jobs passed"
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$NEEDS"
+          jq -e 'to_entries | all(.value.result == "success" or (.key == "semver" and .value.result == "skipped"))' <<<"$NEEDS" >/dev/null \
+            || { echo "::error::One or more required jobs did not succeed"; exit 1; }

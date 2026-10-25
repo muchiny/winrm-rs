@@ -73,16 +73,23 @@ jobs:
             sanitizer: none
 
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-24
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: fuzz
+          # The cargo-fuzz install below must run every time: a cached
+          # ~/.cargo/bin would satisfy it and the version pin would prove nothing.
+          cache-bin: "false"
       # NOT `taiki-e/install-action@cargo-fuzz`: that branch is an unmaintained
       # 2024-03 snapshot that resolves, exits in 19ms and installs nothing, and
       # cargo-fuzz is no longer in the action's tool manifest.
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        run: cargo install cargo-fuzz@0.13.1 --locked
 
       - name: Install OpenSSL headers (credssp feature)
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
@@ -90,7 +97,7 @@ jobs:
       # A fresh key every run makes the cache write-only-once; the restore-keys
       # prefix still picks up the most recent corpus for this target.
       - name: Restore corpus
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ matrix.sanitizer }}-${{ github.run_id }}
@@ -122,7 +129,7 @@ jobs:
 
       - name: Upload crash artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: crash-${{ matrix.target }}-${{ matrix.sanitizer }}
           path: fuzz/artifacts/${{ matrix.target }}/
@@ -130,7 +137,7 @@ jobs:
 
       - name: Upload corpus
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: corpus-${{ matrix.target }}-${{ matrix.sanitizer }}
           path: fuzz/corpus/${{ matrix.target }}/

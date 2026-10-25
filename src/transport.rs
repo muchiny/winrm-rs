@@ -828,7 +828,9 @@ fn build_http_client(
         .tls_backend_preconfigured(tls_config)
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
-        .timeout(Duration::from_secs(config.operation_timeout_secs.saturating_add(10)))
+        .timeout(Duration::from_secs(
+            config.operation_timeout_secs.saturating_add(10),
+        ))
         .http1_only()
         // Exposes each response's TLS peer certificate: NTLM channel
         // binding is computed from the connection that carried the challenge.

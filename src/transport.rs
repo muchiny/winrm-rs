@@ -5160,6 +5160,87 @@ mod tests {
         );
     }
 
+    /// [`credssp_test_transport`] reading `HTTPS_PROXY=proxy` from the
+    /// environment, which `use_env_proxy` opts in or out of.
+    #[cfg(feature = "credssp")]
+    fn credssp_env_proxy_transport(port: u16, use_env_proxy: bool, proxy: String) -> HttpTransport {
+        HttpTransport::new_with_env(
+            credssp_test_config(port),
+            WinrmCredentials::new(USER, PASS, ""),
+            TransportOptions {
+                tls: TlsOptions {
+                    pins: vec![sha256_hex(crate::test_pki::EC_CERT_PEM)],
+                    ..Default::default()
+                },
+                use_env_proxy,
+                ..Default::default()
+            },
+            move |n: &str| (n == "HTTPS_PROXY").then(|| proxy.clone()),
+        )
+        .unwrap()
+    }
+
+    /// A client that opted in reaches the host through the environment's
+    /// proxy: the request computes its dial, so the proxy sees one CONNECT
+    /// for the host and the exchange completes through it.
+    #[cfg(feature = "credssp")]
+    #[tokio::test]
+    async fn credssp_request_goes_through_the_env_proxy_when_opted_in() {
+        use crate::auth::credssp::test_server::{self, Fault};
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
+        let (port, log) = test_server::spawn(Fault::Honest, EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let (pport, heads) = crate::test_proxy::spawn_connect_proxy_answering(
+            "HTTP/1.1 200 Connection established\r\n\r\n",
+        )
+        .await;
+        let t = credssp_env_proxy_transport(port, true, format!("http://127.0.0.1:{pport}"));
+        let reply = send_bounded(&t).await.unwrap();
+        assert_eq!(reply, test_server::MOCK_REPLY);
+        assert_eq!(test_server::delegations(&log.lock().unwrap()), 1);
+        let heads = heads.lock().unwrap().clone();
+        assert_eq!(heads.len(), 1, "{heads:?}");
+        assert!(
+            heads[0].starts_with(&format!("CONNECT 127.0.0.1:{port} HTTP/1.1")),
+            "{heads:?}"
+        );
+    }
+
+    /// An `https://` proxy in the environment is refused for the request,
+    /// before anything is sent, when the client opted in.
+    #[cfg(feature = "credssp")]
+    #[tokio::test]
+    async fn credssp_request_refuses_an_https_env_proxy_when_opted_in() {
+        let t = credssp_env_proxy_transport(5986, true, "https://proxy.test:3128".into());
+        let err = send_bounded(&t).await.unwrap_err();
+        assert!(
+            matches!(&err, WinrmError::AuthFailed(m)
+                if m.starts_with("CredSSP: an https:// proxy is not supported")),
+            "{err}"
+        );
+    }
+
+    /// Without the opt-in the environment's proxy is not used: the request
+    /// reaches the host directly and the proxy sees no connection.
+    #[cfg(feature = "credssp")]
+    #[tokio::test]
+    async fn credssp_request_ignores_the_env_proxy_unless_opted_in() {
+        use crate::auth::credssp::test_server::{self, Fault};
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
+        let (port, log) = test_server::spawn(Fault::Honest, EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let (pport, heads) = crate::test_proxy::spawn_connect_proxy_answering(
+            "HTTP/1.1 200 Connection established\r\n\r\n",
+        )
+        .await;
+        let t = credssp_env_proxy_transport(port, false, format!("http://127.0.0.1:{pport}"));
+        let reply = send_bounded(&t).await.unwrap();
+        assert_eq!(reply, test_server::MOCK_REPLY);
+        assert_eq!(test_server::delegations(&log.lock().unwrap()), 1);
+        assert!(
+            heads.lock().unwrap().is_empty(),
+            "the proxy saw a connection"
+        );
+    }
+
     #[cfg(feature = "credssp")]
     #[test]
     fn credssp_refuses_an_https_proxy_at_construction() {

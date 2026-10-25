@@ -481,8 +481,8 @@ pub(crate) struct HttpTransport {
     /// not read: through the proxy of [`WinrmConfig::proxy`], else directly.
     /// Resolved at construction ([`proxy::ProxyRoute::credssp_dial`]), so an
     /// explicit proxy CredSSP cannot use fails there. With
-    /// [`TransportOptions::use_env_proxy`], each request computes its own
-    /// dial instead ([`Self::credssp_dial_for`]).
+    /// [`TransportOptions::use_env_proxy`] and no explicit proxy, each
+    /// request computes its own dial instead ([`Self::credssp_dial_for`]).
     /// [`proxy::CredSspDial::Direct`] for the other methods.
     #[cfg(feature = "credssp")]
     credssp_dial: Arc<proxy::CredSspDial>,
@@ -1090,8 +1090,9 @@ impl HttpTransport {
         // refused here. That proxy serves every host, so the placeholder
         // host of the URL named here does not change the result. The
         // environment is not read here (`use_env` false): its proxy depends
-        // on the host through `NO_PROXY`, so with `use_env_proxy` each
-        // request computes its own dial (`credssp_dial_for`).
+        // on the host through `NO_PROXY`, so with `use_env_proxy` and no
+        // explicit proxy each request computes its own dial
+        // (`credssp_dial_for`).
         #[cfg(feature = "credssp")]
         let credssp_dial = Arc::new(if matches!(config.auth_method, AuthMethod::CredSsp) {
             route.credssp_dial(
@@ -1307,7 +1308,7 @@ impl HttpTransport {
                         WinrmError::AuthFailed("CredSSP requires HTTPS (set use_tls = true)".into())
                     })?),
                     opts: CredSspConnOptions::from_config(&self.config),
-                    dial: Arc::new(self.credssp_dial_for(&url)?),
+                    dial: self.credssp_dial_for(&url)?,
                 };
                 auth.send_authenticated(&self.http, &url, body).await?
             }
@@ -1334,18 +1335,26 @@ impl HttpTransport {
     }
 
     /// How CredSSP reaches the endpoint `url`: the dial resolved at
-    /// construction when the environment is not read, else the route's dial
-    /// for this URL ([`proxy::ProxyRoute::credssp_dial`] with `use_env`):
-    /// [`WinrmConfig::proxy`] when set, otherwise the environment's proxy for
-    /// `https://` endpoints, subject to `NO_PROXY` for the URL's host. An
-    /// `https://` or `socks4://` proxy from the environment is refused here
-    /// ([`WinrmError::AuthFailed`]), before anything is sent.
+    /// construction when the route does not depend on the URL (the
+    /// environment is not read, or [`WinrmConfig::proxy`] is set, which
+    /// serves every endpoint and leaves the environment unread), else the
+    /// route's dial for this URL ([`proxy::ProxyRoute::credssp_dial`] with
+    /// `use_env`): the environment's proxy for `https://` endpoints, subject
+    /// to `NO_PROXY` for the URL's host. An `https://` or `socks4://` proxy
+    /// from the environment is refused here ([`WinrmError::AuthFailed`]),
+    /// before anything is sent.
+    ///
+    /// The stored dial is shared, not copied, so the proxy credentials it
+    /// may hold are not duplicated per request.
     #[cfg(feature = "credssp")]
-    pub(crate) fn credssp_dial_for(&self, url: &str) -> Result<proxy::CredSspDial, WinrmError> {
-        if !self.options.use_env_proxy {
-            return Ok((*self.credssp_dial).clone());
+    pub(crate) fn credssp_dial_for(
+        &self,
+        url: &str,
+    ) -> Result<Arc<proxy::CredSspDial>, WinrmError> {
+        if !self.options.use_env_proxy || self.config.proxy.is_some() {
+            return Ok(Arc::clone(&self.credssp_dial));
         }
-        self.route.credssp_dial(url, true)
+        self.route.credssp_dial(url, true).map(Arc::new)
     }
 
     /// The CredSSP TLS contexts and dial of this transport, for the tests of
@@ -7122,19 +7131,22 @@ mod tests {
 
         let t = build(true, "http://10.0.0.1:3128");
         assert!(t.options().use_env_proxy);
-        match t.credssp_dial_for(h).unwrap() {
+        match &*t.credssp_dial_for(h).unwrap() {
             proxy::CredSspDial::HttpConnect { proxy, .. } => assert_eq!(proxy, "10.0.0.1:3128"),
             other => panic!("expected HttpConnect, got {other:?}"),
         }
         assert!(matches!(
-            t.credssp_dial_for(excluded).unwrap(),
+            *t.credssp_dial_for(excluded).unwrap(),
             proxy::CredSspDial::Direct
         ));
 
         let t = build(false, "http://10.0.0.1:3128");
         for url in [h, excluded] {
             assert!(
-                matches!(t.credssp_dial_for(url).unwrap(), proxy::CredSspDial::Direct),
+                matches!(
+                    *t.credssp_dial_for(url).unwrap(),
+                    proxy::CredSspDial::Direct
+                ),
                 "{url}"
             );
         }
@@ -7152,9 +7164,32 @@ mod tests {
             other => panic!("expected AuthFailed, got {other:?}"),
         }
         assert!(matches!(
-            t.credssp_dial_for(excluded).unwrap(),
+            *t.credssp_dial_for(excluded).unwrap(),
             proxy::CredSspDial::Direct
         ));
+
+        // `WinrmConfig::proxy` serves every endpoint, even when opted in:
+        // every request shares the dial resolved at construction.
+        let t = HttpTransport::new_with_env(
+            WinrmConfig {
+                proxy: Some(SecretString::from("http://user:pw@10.0.0.2:3128")),
+                ..tls_config(AuthMethod::CredSsp, 5986)
+            },
+            WinrmCredentials::new(USER, PASS, ""),
+            TransportOptions {
+                use_env_proxy: true,
+                ..Default::default()
+            },
+            |_: &str| -> Option<String> { panic!("the environment was read") },
+        )
+        .unwrap();
+        let first = t.credssp_dial_for(h).unwrap();
+        let second = t.credssp_dial_for(excluded).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        match &*first {
+            proxy::CredSspDial::HttpConnect { proxy, .. } => assert_eq!(proxy, "10.0.0.2:3128"),
+            other => panic!("expected HttpConnect, got {other:?}"),
+        }
     }
 
     // --- `Proxy-Support: Session-Based-Authentication` (RFC 4559 section 6) ---

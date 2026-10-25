@@ -1,5 +1,8 @@
 // The proxy route of a client: `WinrmConfig::proxy`, else the proxy
-// environment variables, resolved once when the client is built.
+// environment variables, resolved once when the client is built. The
+// CredSSP dial of a client that opted in to the environment's proxies (and
+// sets no `WinrmConfig::proxy`) follows the URL of each request, as
+// `NO_PROXY` may exclude its host.
 //
 // `reqwest::Proxy::all` retries a value it cannot parse as `http://{value}`,
 // so `socks5h:/proxy.corp:1080` (a lost slash) would become an HTTP proxy on a

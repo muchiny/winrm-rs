@@ -14,7 +14,7 @@ use winrm_rs::{WinrmClient, WinrmConfig, WinrmCredentials};
 #[tokio::main]
 async fn main() -> Result<(), winrm_rs::WinrmError> {
     let client = WinrmClient::new(
-        WinrmConfig::default(), // NTLM over plain HTTP: read "Choosing a transport"
+        WinrmConfig::https(), // HTTPS on 5986, certificate validated
         WinrmCredentials::new("administrator", "secret", ""),
     )?;
 
@@ -25,6 +25,11 @@ async fn main() -> Result<(), winrm_rs::WinrmError> {
     Ok(())
 }
 ```
+
+A listener whose certificate comes from an internal CA: build the client with
+`WinrmClient::builder(WinrmConfig::https()).credentials(..).add_root_certificates_pem("ca.pem").build()`.
+Plain HTTP on 5985 (`WinrmConfig::http()`) does not authenticate the server:
+see [Choosing a transport](#choosing-a-transport).
 
 ## Features
 
@@ -59,7 +64,7 @@ cargo add winrm-rs --features kerberos
 | HTTPS + Certificate | yes (certificate) | yes (client certificate in the TLS handshake) | TLS | certificate-mapped accounts |
 | HTTPS + CredSSP, certificate validated or pinned (required) | yes (certificate) | inner TLS only | TLS | when the host must reach other machines with your credentials |
 | HTTP + Kerberos | yes (AP-REP) | no: a party on the path, or one controlling DNS, can relay the AP-REQ | sealed (`EncryptionMode::Auto`) | trusted networks |
-| HTTP + NTLM (the default) | no | no: the handshake can be relayed, or recorded to guess the password offline | sealed (`EncryptionMode::Auto`) | trusted networks only |
+| HTTP + NTLM (`WinrmConfig::http()`, today's default) | no | no: the handshake can be relayed, or recorded to guess the password offline | sealed (`EncryptionMode::Auto`) | trusted networks only |
 | Basic | over HTTPS only | n/a | TLS; over HTTP only with `EncryptionMode::Never`, in plaintext (a WARN is logged) | HTTPS only |
 | any method with `accept_invalid_certs` | no | channel binding stops a relay to the real WinRM server only; CredSSP refuses this flag | TLS to whoever answers | test environments |
 
@@ -114,14 +119,14 @@ body travel in cleartext.
 ```rust
 // Plain HTTP on 5985 (the default): see "Choosing a transport".
 let client = WinrmClient::new(
-    WinrmConfig::default(),
+    WinrmConfig::http(),
     WinrmCredentials::new("admin", "password", "MYDOMAIN"),
 )?;
 
 // HTTPS on 5986: the certificate authenticates the server, and NTLM
 // carries a channel binding to it.
 let client = WinrmClient::new(
-    WinrmConfig { use_tls: true, port: 5986, ..WinrmConfig::default() },
+    WinrmConfig::https(),
     WinrmCredentials::new("admin", "password", "MYDOMAIN"),
 )?;
 ```

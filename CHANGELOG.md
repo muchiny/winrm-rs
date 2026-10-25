@@ -383,6 +383,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Documentation
 
+- The README quick start and `examples/basic.rs` now use HTTPS (`WinrmConfig::https()`).
 - The `AuthMethod::CredSsp` documentation, `Shell::disconnect`,
   `idle_timeout_secs`, the `credssp` feature description and the README now
   say that the target receives the delegated password, and what to do to

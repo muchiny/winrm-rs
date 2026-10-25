@@ -251,9 +251,8 @@ jobs:
       - run: cargo doc --locked --no-deps --all-features
 
   hardening:
-    # Informatif : compte les violations des lints durcis (rust-hardening.md) et
-    # vérifie la baseline cargo-vet. Ne bloque jamais ; à rendre bloquant
-    # quand les compteurs sont à zéro.
+    # Informatif : compte les violations des lints durcis (rust-hardening.md).
+    # Ne bloque jamais ; à rendre bloquant quand les compteurs sont à zéro.
     name: Hardening (informatif)
     runs-on: ubuntu-latest
     continue-on-error: true
@@ -266,9 +265,6 @@ jobs:
           toolchain: 1.98.0
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
-        with:
-          tool: cargo-vet@0.10.2
       - name: Lints durcis (comptage)
         run: |
           cargo clippy --locked --message-format=short -- \
@@ -279,8 +275,20 @@ jobs:
             sed -nE 's/^[^ ]+ (warning|error): //p' hardening.txt | sort | uniq -c | sort -rn
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-      - name: cargo vet (baseline d'exemptions)
-        run: cargo vet --locked
+
+  vet:
+    name: cargo vet
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: cargo-vet@0.10.2
+      - run: cargo vet --locked
 
   msrv:
     name: MSRV (1.98.0)
@@ -412,6 +420,7 @@ jobs:
       - fuzz
       - semver
       - workflow-lint
+      - vet
     runs-on: ubuntu-latest
     permissions: {}
     steps:

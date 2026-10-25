@@ -268,8 +268,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   build it with `SecretString::from(url)`. The copy held by `WinrmConfig`
   and by the proxy route is wiped on drop.
 - `RemotePathPolicy::LocalDrive` also refuses DOS device names (`CON`,
-  `NUL`, `COM1`, `LPT1`, ...) as the last path component, with or without
-  an extension. Migration: `RemotePathPolicy::Any` accepts them.
+  `NUL`, `COM1`, `LPT1`, ...) as the last path component after resolving
+  `.` and `..`, with or without an extension. Migration:
+  `RemotePathPolicy::Any` accepts them.
 - `EncryptionMode::Auto` seals NTLM and Kerberos messages over HTTPS when
   `accept_invalid_certs` is set, as it does over plain HTTP, so an
   unverified server never receives a request body in clear. Migration: none

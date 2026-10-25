@@ -328,17 +328,17 @@ let bytes = client.download_file("win-server", "C:\\remote\\file.bin", Path::new
 only drive-absolute remote paths (`C:\...`) and refuses UNC, WebDAV and
 device paths, `\\?\` long paths and relative paths before anything is sent
 (`RemotePathPolicy::LocalDrive`, the default). It also refuses a path whose
-last component is a DOS device name (`CON`, `NUL`, `COM1`, `LPT1`, ...):
-Windows opens the device instead of a file, and a printer port may be
-redirected to a network printer. With the `Any` policy, a path may name a
-UNC share or a device path, and under CredSSP or Basic a UNC path
-is reached with your credentials: never pass an untrusted path. On the host,
-blocking outbound SMB (445) and WebDAV, the "Network security: Restrict NTLM:
-Outgoing NTLM traffic to remote servers" policy, a disabled WebClient service
-and Kerberos constrained delegation instead of CredSSP all limit what such a
-path can reach. Uploads put the file content on the remote `powershell.exe`
-command line, which command-line auditing (event 4688) and script block
-logging (event 4104) record.
+last component, after resolving `.` and `..`, is a DOS device name (`CON`,
+`NUL`, `COM1`, `LPT1`, ...): Windows opens the device instead of a file, and
+a printer port may be redirected to a network printer. With the `Any`
+policy, a path may name a UNC share or a device path, and under CredSSP or
+Basic a UNC path is reached with your credentials: never pass an untrusted
+path. On the host, blocking outbound SMB (445) and WebDAV, the "Network
+security: Restrict NTLM: Outgoing NTLM traffic to remote servers" policy, a
+disabled WebClient service and Kerberos constrained delegation instead of
+CredSSP all limit what such a path can reach. Uploads put the file content
+on the remote `powershell.exe` command line, which command-line auditing
+(event 4688) and script block logging (event 4104) record.
 
 To reach shares on purpose, typically a CredSSP double-hop, build the client
 with `RemotePathPolicy::Any`. Only the builder chooses the policy:

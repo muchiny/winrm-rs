@@ -73,12 +73,13 @@ pub(crate) fn validate_remote_path(path: &str) -> Result<(), WinrmError> {
 /// WebDAV shares and device paths: CredSSP double-hop users need it to reach
 /// `\\fileserver\share`.
 ///
-/// `LocalDrive` also refuses a drive-absolute path whose last component is a
-/// DOS device name (`CON`, `PRN`, `AUX`, `NUL`, `CONIN$`, `CONOUT$`,
-/// `COM0`-`COM9`, `LPT0`-`LPT9`, in any case, with or without an extension):
-/// Windows opens the device instead of a file, and a printer port can be
-/// redirected to a network printer. `C:\x\LPT1` and `C:\x\nul.txt` are
-/// refused; `C:\con\file.txt` and `C:\x\com10` are not.
+/// `LocalDrive` also refuses a drive-absolute path whose last component,
+/// after resolving `.` and `..`, is a DOS device name (`CON`, `PRN`, `AUX`,
+/// `NUL`, `CONIN$`, `CONOUT$`, `COM0`-`COM9`, `LPT0`-`LPT9`, in any case,
+/// with or without an extension): Windows opens the device instead of a
+/// file, and a printer port can be redirected to a network printer.
+/// `C:\x\LPT1`, `C:\x\nul.txt` and `C:\x\LPT1\.` are refused;
+/// `C:\con\file.txt`, `C:\x\LPT1\..\file.txt` and `C:\x\com10` are not.
 ///
 /// This is a lexical check. A symbolic link, junction, `subst` drive or
 /// mapped network drive on the host can still lead a drive-absolute path to
@@ -94,15 +95,16 @@ pub enum RemotePathPolicy {
     /// characters): the behaviour of every release before 2.0.
     Any,
     /// Accept only drive-absolute remote paths: a letter, `:`, then `\` or
-    /// `/`, whose last component is not a DOS device name. The default since
-    /// 2.0.
+    /// `/`, whose last component, after resolving `.` and `..`, is not a DOS
+    /// device name. The default since 2.0.
     #[default]
     LocalDrive,
 }
 
 /// [`validate_remote_path`], then the restriction `policy` adds: under
 /// [`RemotePathPolicy::LocalDrive`], a drive-absolute path whose last
-/// component is not a DOS device name ([`names_dos_device`]).
+/// component, after resolving `.` and `..`, is not a DOS device name
+/// ([`names_dos_device`]).
 pub(crate) fn validate_remote_path_for(
     path: &str,
     policy: RemotePathPolicy,
@@ -126,16 +128,37 @@ pub(crate) fn validate_remote_path_for(
     }
 }
 
-/// Whether the last component of `path` is a name that legacy Win32 path
-/// rules map to a DOS device wherever it appears: `CON`, `PRN`, `AUX`,
-/// `NUL`, `CONIN$`, `CONOUT$`, `COM0`-`COM9`, `LPT0`-`LPT9` and `COM¹`,
-/// `COM²`, `COM³`, `LPT¹`, `LPT²`, `LPT³`, in any case. Trailing dots and
-/// spaces are dropped first, and the name is cut at its first `.` or `:`
-/// with the spaces before that cut dropped too, so `nul.`, `COM1.txt`,
-/// `con .txt` and `LPT1:` all count. Earlier components are not checked:
-/// a directory named `con` is not opened as a device.
+/// Whether the last component of the drive-absolute `path`, once `.` and
+/// `..` are resolved, is a name that legacy Win32 path rules map to a DOS
+/// device wherever it appears: `CON`, `PRN`, `AUX`, `NUL`, `CONIN$`,
+/// `CONOUT$`, `COM0`-`COM9`, `LPT0`-`LPT9` and `COM¹`, `COM²`, `COM³`,
+/// `LPT¹`, `LPT²`, `LPT³`, in any case.
+///
+/// The components after the drive are resolved the way Windows resolves
+/// them before it opens the path: empty and `.` components are skipped, and
+/// `..` drops the component before it, never going above the drive root.
+/// So `C:\x\LPT1\.` and `C:\x\LPT1\a\..` both name `LPT1`. A trailing
+/// separator is skipped too, which also refuses `C:\x\LPT1\` (a directory
+/// path, so nothing is lost).
+///
+/// Trailing dots and spaces are then dropped from that component, and the
+/// name is cut at its first `.` or `:` with the spaces before that cut
+/// dropped too, so `nul.`, `COM1.txt`, `con .txt` and `LPT1:` all count.
+/// Earlier components are not checked: a directory named `con` is not
+/// opened as a device.
 fn names_dos_device(path: &str) -> bool {
-    let last = path.rsplit(['\\', '/']).next().unwrap_or(path);
+    // The caller checked the `C:` prefix; the components start after it.
+    let mut resolved: Vec<&str> = Vec::new();
+    for component in path.get(2..).unwrap_or(path).split(['\\', '/']) {
+        match component {
+            "" | "." => {}
+            ".." => {
+                resolved.pop();
+            }
+            name => resolved.push(name),
+        }
+    }
+    let last = resolved.last().copied().unwrap_or_default();
     let trimmed = last.trim_end_matches([' ', '.']);
     let stem = trimmed
         .split(['.', ':'])
@@ -1081,6 +1104,39 @@ mod tests {
             assert!(
                 validate_remote_path_for(p, RemotePathPolicy::Any).is_ok(),
                 "{p:?} refused under Any"
+            );
+        }
+    }
+
+    /// `.` and `..` are resolved before the last component is read, as
+    /// Windows does when it opens the path: `C:\x\LPT1\.` names `LPT1`.
+    #[test]
+    fn local_drive_policy_resolves_dot_segments_before_the_device_check() {
+        for p in [
+            r"C:\x\LPT1\.",
+            r"C:\x\LPT1\a\..",
+            r"C:\x\NUL\.\.",
+            "C:/x/com1/.",
+            r"C:\a\..\CON",
+            r"C:\..\..\aux",
+            r"C:\x\LPT1.\a\..",
+            r"C:\x\LPT1\",
+        ] {
+            match validate_remote_path_for(p, RemotePathPolicy::LocalDrive) {
+                Err(WinrmError::Transfer(m)) => assert!(m.contains("DOS device"), "{p:?}: {m}"),
+                other => panic!("{p:?}: expected Transfer, got {other:?}"),
+            }
+        }
+        for p in [
+            r"C:\x\LPT1\..\file.txt",
+            r"C:\x\..\ok.txt",
+            r"C:\x\.\console.txt",
+            r"C:\CON\..",
+            r"C:\x\NUL\...",
+        ] {
+            assert!(
+                validate_remote_path_for(p, RemotePathPolicy::LocalDrive).is_ok(),
+                "{p:?}"
             );
         }
     }

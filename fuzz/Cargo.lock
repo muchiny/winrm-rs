@@ -1611,6 +1611,7 @@ dependencies = [
  "rand",
  "reqwest",
  "rustls",
+ "rustls-platform-verifier",
  "secrecy",
  "sha2",
  "subtle",

@@ -207,6 +207,23 @@ it reads; the decoded key it hands to `rustls`, and the copies made while
 decoding it, are not wiped. Protect core dumps, swap and hibernation files on
 hosts that hold the key.
 
+### Trusting an internal CA
+
+By default the HTTPS listener must chain to the built-in Mozilla roots. For a
+private CA, add its certificate; `platform_roots(true)` trusts the operating
+system's certificate store instead.
+
+```rust
+let client = WinrmClient::builder(WinrmConfig { use_tls: true, port: 5986, ..Default::default() })
+    .add_root_certificates_pem("/etc/winrm/corp-ca.pem")
+    .credentials(WinrmCredentials::new("admin", "pass", ""))
+    .build()?;
+```
+
+The listener certificate must still name the host in its Subject Alternative
+Name, and an intermediate CA the listener does not send must be added too; see
+the rustdoc of `WinrmClientBuilder::add_root_certificates_pem`.
+
 ### PowerShell execution
 
 ```rust

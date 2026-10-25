@@ -59,6 +59,11 @@ pub struct WinrmConfig {
     /// it **only** in test environments. The constructor logs a
     /// `tracing::warn` when this flag is enabled.
     ///
+    /// For an internal CA or a self-signed listener, use
+    /// [`WinrmClientBuilder::add_root_certificates_pem`](crate::WinrmClientBuilder::add_root_certificates_pem)
+    /// or [`WinrmClientBuilder::platform_roots`](crate::WinrmClientBuilder::platform_roots)
+    /// instead.
+    ///
     /// Since 1.4.1 the WinRM server must still prove, in the TLS handshake,
     /// that it holds the private key of the certificate it presents. NTLM and
     /// Kerberos channel binding are computed from that certificate, and

@@ -86,6 +86,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the application installed and fails to build when there is none. Without
   it, building a client still installs ring process-wide when no provider is
   installed yet; 2.0 stops doing that.
+- **`WinrmClientBuilder::add_root_certificates_pem` and `platform_roots`**:
+  trust an internal CA, or the operating system's certificate store, for the
+  HTTPS listener, the CredSSP outer TLS and an `https://` proxy, without
+  `accept_invalid_certs`.
 
 ### Fixed
 

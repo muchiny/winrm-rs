@@ -5492,3 +5492,63 @@ async fn poll_pacing_bench_zero_operation_timeout() {
         Err(e) => panic!("unexpected error: {e}"),
     }
 }
+
+/// HTTPS to a listener whose certificate chains to a custom CA, with
+/// `accept_invalid_certs = false` and `add_root_certificates_pem`.
+///
+/// Needs `WINRM_TEST_CA_PEM` (path of the CA certificate, or of the listener
+/// certificate when it is not a CA certificate) and `WINRM_TEST_CA_HOST` (a
+/// host name present in the listener certificate's SAN, resolvable from the
+/// client, for example through `/etc/hosts`), plus the usual
+/// `WINRM_TEST_USER` / `WINRM_TEST_PASS`. The port is `https_test_port()`.
+/// When `WINRM_TEST_HOST` is an IP address, the same client must refuse it:
+/// the host name is still checked.
+#[tokio::test]
+#[ignore]
+async fn custom_ca_https_listener_authenticates() {
+    let (Ok(ca_pem), Ok(ca_host)) = (
+        std::env::var("WINRM_TEST_CA_PEM"),
+        std::env::var("WINRM_TEST_CA_HOST"),
+    ) else {
+        eprintln!(
+            "SKIP custom_ca_https_listener_authenticates: set WINRM_TEST_CA_PEM and WINRM_TEST_CA_HOST"
+        );
+        return;
+    };
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    let pass = std::env::var("WINRM_TEST_PASS").expect("WINRM_TEST_PASS");
+
+    #[cfg(feature = "credssp")]
+    let methods = [AuthMethod::Basic, AuthMethod::Ntlm, AuthMethod::CredSsp];
+    #[cfg(not(feature = "credssp"))]
+    let methods = [AuthMethod::Basic, AuthMethod::Ntlm];
+
+    for method in methods {
+        let label = format!("{method:?}");
+        let config = WinrmConfig {
+            auth_method: method,
+            use_tls: true,
+            accept_invalid_certs: false,
+            port: https_test_port(),
+            ..Default::default()
+        };
+        let client = WinrmClient::builder(config)
+            .add_root_certificates_pem(&ca_pem)
+            .credentials(WinrmCredentials::new(user.clone(), pass.clone(), ""))
+            .build()
+            .unwrap_or_else(|e| panic!("{label}: build: {e}"));
+        let output = client
+            .run_command(&ca_host, "whoami", &[])
+            .await
+            .unwrap_or_else(|e| panic!("{label}: run_command on {ca_host}: {e}"));
+        assert_eq!(output.exit_code, 0, "{label}");
+
+        // The name check still applies: an IP address is not in the SAN.
+        if let Ok(ip_host) = std::env::var("WINRM_TEST_HOST")
+            && ip_host.parse::<std::net::IpAddr>().is_ok()
+        {
+            let refused = client.run_command(&ip_host, "whoami", &[]).await;
+            assert!(refused.is_err(), "{label}: {ip_host} must be refused");
+        }
+    }
+}

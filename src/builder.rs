@@ -57,6 +57,52 @@ impl<S> WinrmClientBuilder<S> {
         self.tls.provider = Some(provider);
         self
     }
+
+    /// Trust the CA certificates in the PEM file at `path`, in addition to the
+    /// built-in Mozilla roots (`webpki-roots`), for the WinRM server's HTTPS
+    /// listener (shared and per-connection clients, CredSSP outer TLS) and for
+    /// an `https://` proxy. May be called several times.
+    ///
+    /// The file must be a regular file of at most 1 MiB holding at least one
+    /// `CERTIFICATE` section; other sections are ignored. It is read by
+    /// [`build`](WinrmClientBuilder::build), which fails with
+    /// [`WinrmError::AuthFailed`] naming the file when it cannot be read or a
+    /// certificate is not a usable trust anchor.
+    ///
+    /// The usual checks still apply. The listener certificate must name the
+    /// host you connect with in its Subject Alternative Name (`DNS:` for a
+    /// name, `IP:` for an address; the Common Name is not used, RFC 9525),
+    /// must be valid now, and must chain to one of these roots. If the
+    /// listener does not send its intermediate certificates, add the issuing
+    /// CA too (`openssl s_client -connect <host>:5986 -servername <host>
+    /// -showcerts` shows what it sends). A self-signed listener certificate
+    /// can be its own root only if it is not a CA certificate (`openssl x509
+    /// -noout -ext basicConstraints` shows no `CA:TRUE`).
+    ///
+    /// With `use_tls = false` these roots apply to an `https://` proxy only.
+    pub fn add_root_certificates_pem(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.tls.root_files.push(path.into());
+        self
+    }
+
+    /// Also trust the operating system's certificate store (the Windows
+    /// certificate store, the macOS keychain, or the system CA bundle on
+    /// Linux, through `rustls-platform-verifier`), for the WinRM server's
+    /// HTTPS listener and for an `https://` proxy. Roots added with
+    /// [`add_root_certificates_pem`](WinrmClientBuilder::add_root_certificates_pem)
+    /// are trusted too; the built-in Mozilla roots are not used in this mode.
+    /// Default: `false`.
+    ///
+    /// On Windows the OS verifier also checks revocation where it can, and a
+    /// revocation server it cannot reach can add up to 10 s to the first
+    /// handshake of each new chain on an air-gapped host. On Linux,
+    /// [`build`](WinrmClientBuilder::build) fails with
+    /// [`WinrmError::AuthFailed`] when the system store holds no certificate
+    /// and no root file was added.
+    pub fn platform_roots(mut self, enabled: bool) -> Self {
+        self.tls.platform_roots = enabled;
+        self
+    }
 }
 
 impl WinrmClientBuilder<NeedsCredentials> {
@@ -243,6 +289,26 @@ mod tests {
         assert_eq!(after.tls.provider, Some(TlsProvider::ProcessDefault));
         let default = WinrmClientBuilder::new(WinrmConfig::default()).credentials(creds());
         assert_eq!(default.tls.provider, None);
+    }
+
+    /// The root options survive the typestate transition, and their errors
+    /// surface from `build`.
+    #[test]
+    fn tls_options_are_kept_across_credentials() {
+        let result = WinrmClientBuilder::new(WinrmConfig {
+            use_tls: true,
+            port: 5986,
+            ..Default::default()
+        })
+        .add_root_certificates_pem("/nonexistent/winrm-rs/ca.pem")
+        .credentials(WinrmCredentials::new("u", "p", ""))
+        .build();
+        match result {
+            Err(WinrmError::AuthFailed(m)) => {
+                assert!(m.contains("/nonexistent/winrm-rs/ca.pem"), "{m}");
+            }
+            other => panic!("expected AuthFailed, got {:?}", other.map(|_| ())),
+        }
     }
 
     /// `TlsProvider::Ring` reaches the transport: its TLS configuration

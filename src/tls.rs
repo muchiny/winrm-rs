@@ -6,6 +6,7 @@
 // server certificate hash is injected into the NTLM Type 3 message to bind
 // authentication to the TLS channel, preventing relay attacks.
 
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use rustls::client::WebPkiServerVerifier;
@@ -350,6 +351,11 @@ pub(crate) struct TlsOptions {
     /// The rustls crypto provider; `None` keeps the 1.x behaviour (see
     /// [`crypto_provider`]).
     pub(crate) provider: Option<TlsProvider>,
+    /// PEM files of extra trust anchors, in the order they were added.
+    pub(crate) root_files: Vec<std::path::PathBuf>,
+    /// Whether the operating system's certificate store is trusted instead of
+    /// the built-in Mozilla roots.
+    pub(crate) platform_roots: bool,
 }
 
 /// Error message when [`TlsProvider::ProcessDefault`] finds no process-wide
@@ -404,6 +410,25 @@ pub(crate) fn client_config_builder(
         })
 }
 
+/// A WebPKI verifier on the built-in Mozilla roots plus `extra`, on
+/// `provider`.
+fn webpki_with_extra(
+    extra: &[CertificateDer<'static>],
+    provider: &Arc<CryptoProvider>,
+) -> Result<Arc<dyn ServerCertVerifier>, WinrmError> {
+    let mut roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    for cert in extra {
+        roots
+            .add(cert.clone())
+            .map_err(|e| WinrmError::AuthFailed(format!("TLS: root certificate rejected: {e}")))?;
+    }
+    let verifier =
+        WebPkiServerVerifier::builder_with_provider(Arc::new(roots), Arc::clone(provider))
+            .build()
+            .map_err(|e| WinrmError::AuthFailed(format!("TLS verifier error: {e}")))?;
+    Ok(verifier)
+}
+
 /// The operating system's verifier when it could be built, else a WebPKI
 /// verifier on the built-in Mozilla roots plus `extra`, on `provider`.
 ///
@@ -421,20 +446,117 @@ pub(crate) fn platform_or_webpki(
                 error = %e,
                 "OS certificate store unusable; using the built-in Mozilla roots"
             );
-            let mut roots =
-                RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            for cert in extra {
-                roots.add(cert.clone()).map_err(|e| {
-                    WinrmError::AuthFailed(format!("TLS: root certificate rejected: {e}"))
-                })?;
-            }
-            let verifier =
-                WebPkiServerVerifier::builder_with_provider(Arc::new(roots), Arc::clone(provider))
-                    .build()
-                    .map_err(|e| WinrmError::AuthFailed(format!("TLS verifier error: {e}")))?;
-            Ok(verifier)
+            webpki_with_extra(extra, provider)
         }
     }
+}
+
+/// The operating system's verifier, for a caller that asked for it
+/// (`platform_roots(true)`): an unusable store is an error, with no fallback
+/// to other roots.
+pub(crate) fn platform_verifier(
+    result: Result<rustls_platform_verifier::Verifier, Error>,
+) -> Result<Arc<dyn ServerCertVerifier>, WinrmError> {
+    match result {
+        Ok(verifier) => Ok(Arc::new(verifier)),
+        Err(e) => Err(WinrmError::AuthFailed(format!(
+            "platform_roots(true): the operating system's certificate store could not be used: {e}"
+        ))),
+    }
+}
+
+/// The certificates of the PEM file at `path`, each checked to be usable as a
+/// trust anchor. Other PEM sections are ignored.
+fn load_root_certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>, WinrmError> {
+    let pem = read_pem_file(path, "root certificates")?;
+    let lossy = path.to_string_lossy();
+    let shown = shown_path(&lossy);
+    let certs = CertificateDer::pem_slice_iter(&pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| {
+            WinrmError::AuthFailed(format!(
+                "invalid PEM in root certificates {shown}: {}",
+                describe_pem_error(&e)
+            ))
+        })?;
+    if certs.is_empty() {
+        return Err(WinrmError::AuthFailed(format!(
+            "root certificates {shown} contain no certificate (expected a CERTIFICATE PEM section)"
+        )));
+    }
+    for (index, cert) in certs.iter().enumerate() {
+        RootCertStore::empty().add(cert.clone()).map_err(|e| {
+            WinrmError::AuthFailed(format!(
+                "root certificate {} in {shown} is not a usable trust anchor: {e}",
+                index.saturating_add(1)
+            ))
+        })?;
+    }
+    Ok(certs)
+}
+
+/// The server verifiers of a client, built once so that the shared client,
+/// the per-connection clients and CredSSP all verify alike.
+pub(crate) struct ServerVerifiers {
+    /// Verifies the WinRM server (HTTPS transport, CredSSP outer TLS).
+    pub(crate) origin: Arc<dyn ServerCertVerifier>,
+    /// Verifies the certificate of an `https://` proxy.
+    #[expect(
+        dead_code,
+        reason = "the leg to an https proxy still verifies with `origin`"
+    )]
+    pub(crate) proxy: Arc<dyn ServerCertVerifier>,
+}
+
+/// Build the verifiers for `opts`.
+///
+/// The strict verifier trusts:
+/// - with `opts.platform_roots`: the operating system's store plus the root
+///   files, and nothing else;
+/// - else with `use_tls`: the built-in Mozilla roots plus the root files;
+/// - else (plain HTTP, an `https://` proxy leg only): the operating system's
+///   store plus the root files, or, when the store is unusable, the built-in
+///   Mozilla roots plus the root files.
+///
+/// `origin` is a verifier that accepts any certificate under
+/// `accept_invalid_certs`, else the strict one; `proxy` is always the strict
+/// one.
+pub(crate) fn server_verifiers(
+    opts: &TlsOptions,
+    use_tls: bool,
+    accept_invalid_certs: bool,
+    provider: &Arc<CryptoProvider>,
+) -> Result<ServerVerifiers, WinrmError> {
+    let mut extra = Vec::new();
+    for file in &opts.root_files {
+        extra.extend(load_root_certificates(file)?);
+    }
+    let strict = if opts.platform_roots {
+        platform_verifier(rustls_platform_verifier::Verifier::new_with_extra_roots(
+            extra,
+            Arc::clone(provider),
+        ))?
+    } else if use_tls {
+        webpki_with_extra(&extra, provider)?
+    } else {
+        platform_or_webpki(
+            rustls_platform_verifier::Verifier::new_with_extra_roots(
+                extra.clone(),
+                Arc::clone(provider),
+            ),
+            &extra,
+            provider,
+        )?
+    };
+    let origin: Arc<dyn ServerCertVerifier> = if accept_invalid_certs {
+        Arc::new(NoVerifier::new(provider))
+    } else {
+        Arc::clone(&strict)
+    };
+    Ok(ServerVerifiers {
+        origin,
+        proxy: strict,
+    })
 }
 
 /// The TLS configuration of a plain-HTTP client, used only on the leg to an
@@ -493,8 +615,8 @@ pub(crate) fn load_client_auth_cert(
     let cert_shown = shown_path(cert_path);
     let key_shown = shown_path(key_path);
     // A combined cert+key file may be passed as `cert_path`: wipe both.
-    let cert_pem = read_pem_file(cert_path, "client cert")?;
-    let key_pem = read_pem_file(key_path, "client key")?;
+    let cert_pem = read_pem_file(Path::new(cert_path), "client cert")?;
+    let key_pem = read_pem_file(Path::new(key_path), "client key")?;
 
     let chain = CertificateDer::pem_slice_iter(&cert_pem)
         .collect::<Result<Vec<_>, _>>()
@@ -536,13 +658,15 @@ pub(crate) fn load_client_auth_cert(
     Ok(ClientAuthCert { chain, key })
 }
 
-/// Read a PEM file for Certificate auth: regular files only, at most
-/// [`MAX_PEM_FILE_BYTES`], into a buffer wiped on drop. `what` names the file
-/// in errors ("client cert" / "client key"); errors never quote its content.
-fn read_pem_file(path: &str, what: &str) -> Result<Zeroizing<Vec<u8>>, WinrmError> {
+/// Read a PEM file (Certificate auth, extra roots): regular files only, at
+/// most [`MAX_PEM_FILE_BYTES`], into a buffer wiped on drop. `what` names the
+/// file in errors ("client cert", "client key", "root certificates"); errors
+/// never quote its content.
+fn read_pem_file(path: &Path, what: &str) -> Result<Zeroizing<Vec<u8>>, WinrmError> {
     use std::io::Read;
 
-    let shown = shown_path(path);
+    let lossy = path.to_string_lossy();
+    let shown = shown_path(&lossy);
     let read_err =
         |e: std::io::Error| WinrmError::AuthFailed(format!("failed to read {what} {shown}: {e}"));
     let not_regular = || WinrmError::AuthFailed(format!("{what} {shown} is not a regular file"));
@@ -948,6 +1072,17 @@ mod tests {
             NoVerifier::new(&p).supported_verify_schemes(),
             p.signature_verification_algorithms.supported_schemes()
         );
+    }
+
+    /// Asking for the OS store and not getting it is an error, not a
+    /// fallback to other roots.
+    #[test]
+    fn platform_roots_error_names_the_option() {
+        let e = rustls::Error::General("No CA certificates were loaded from the system".into());
+        match platform_verifier(Err(e)) {
+            Err(WinrmError::AuthFailed(m)) => assert!(m.contains("platform_roots(true)"), "{m}"),
+            other => panic!("expected AuthFailed, got {:?}", other.map(|_| ())),
+        }
     }
 
     #[test]

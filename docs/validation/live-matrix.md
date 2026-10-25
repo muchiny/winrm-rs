@@ -422,8 +422,7 @@ ne figurent pas dans la matrice.
   les identifiants appartiennent au client.
 - **Un proxy `https://` partage la configuration d'authentification cliente** du
   transport.
-- **Le crate ne fait confiance qu'aux racines webpki.** Il n'existe pas d'option
-  pour une CA privée ; les CA internes poussent donc à `accept_invalid_certs`.
+- **Racines de confiance.** Par défaut, seules les racines webpki (Mozilla) sont reconnues. Depuis 1.5.0, `WinrmClientBuilder::add_root_certificates_pem` et `platform_roots` couvrent les CA internes ; le certificat de l'écouteur doit porter le nom d'hôte dans son SAN.
 - **`WinrmClient::run_command`, `run_powershell` et `download_file` n'ont
   pas de délai total.** `operation_timeout_secs` borne chaque Receive, pas la
   commande. Depuis le correctif de D1, une commande bloquée et muette

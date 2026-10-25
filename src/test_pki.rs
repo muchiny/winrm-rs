@@ -16,6 +16,22 @@
 //   openssl ec -in ec-sec1.key -aes128 -passout pass:throwaway -out ec-sec1-enc.key
 //   openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256   # impostor key
 //
+// Trust-anchor fixtures (CA, a CA-issued leaf, a non-CA self-signed leaf), made
+// with OpenSSL 3.5 and equally throwaway:
+//
+//   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout ca.key \
+//       -out ca.pem -days 36500 -subj "/CN=winrm-rs throwaway test CA"   # default v3_ca: CA:TRUE
+//   printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:localhost\n' > leaf.ext
+//   openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout leaf.key \
+//       -out leaf.csr -subj "/CN=winrm-rs throwaway CA-issued leaf"
+//   openssl x509 -req -in leaf.csr -CA ca.pem -CAkey ca.key -set_serial 2 -days 36500 \
+//       -extfile leaf.ext -out leaf.pem
+//   openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout ss.key \
+//       -out ss.csr -subj "/CN=winrm-rs throwaway non-CA self-signed"
+//   openssl x509 -req -in ss.csr -key ss.key -set_serial 3 -days 36500 -extfile leaf.ext -out ss.pem
+//
+// Check with `openssl x509 -noout -ext basicConstraints,subjectAltName -in <file>`.
+//
 // One EC key in two encodings (SEC1, PKCS#8) and one RSA key in PKCS#1 cover
 // the three private-key formats Certificate auth accepts. The impostor key is
 // unrelated to any certificate here.
@@ -505,6 +521,71 @@ pub(crate) const IMPOSTOR_EC_KEY_PKCS8_PEM: &str = "\
 MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgo3vpmJqQd+dRjJ1A
 e8wB5ZKXW454BkvTzdUxB3SxLTihRANCAASMHHL9ze51gTZXP39HeGt0VYT5EoIL
 TZkzaJG8kyjjXD9Hm+4XvQoYWD7qDvK1xYymIr+F28TE4IV/nKG5Axfi
+-----END PRIVATE KEY-----
+";
+
+/// Throwaway P-256 CA (`CN=winrm-rs throwaway test CA`, `CA:TRUE`); it issued [`CA_LEAF_PEM`].
+pub(crate) const TEST_CA_PEM: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIBoTCCAUegAwIBAgIUUFwHMwwgXImKMIMdRG/DbhF3a80wCgYIKoZIzj0EAwIw
+JTEjMCEGA1UEAwwad2lucm0tcnMgdGhyb3dhd2F5IHRlc3QgQ0EwIBcNMjYxMDI1
+MDA1NTE5WhgPMjEyNjEwMDEwMDU1MTlaMCUxIzAhBgNVBAMMGndpbnJtLXJzIHRo
+cm93YXdheSB0ZXN0IENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE4huGQcE4
+Z73m9e946pA4Y98uJIdolSHqlz7mDSft5pFjbKLeIUqpIYll06deGjUU4CPQMk23
+mjTt43hlzf9/QKNTMFEwHQYDVR0OBBYEFPTwETCVzdw1CASJRkzrMAZ8W1LhMB8G
+A1UdIwQYMBaAFPTwETCVzdw1CASJRkzrMAZ8W1LhMA8GA1UdEwEB/wQFMAMBAf8w
+CgYIKoZIzj0EAwIDSAAwRQIgOKOHuw8q3VCCQw47qbYXlUEdUWyS/L5SA2m3a0Ld
+Q9gCIQCRJbfABdEhBBjXR4n0iHsQjlFXRtTYunYfeny23AHKOA==
+-----END CERTIFICATE-----
+";
+
+/// P-256 listener certificate issued by [`TEST_CA_PEM`]: `CA:FALSE`, `serverAuth`, SAN `DNS:localhost`.
+pub(crate) const CA_LEAF_PEM: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIB0DCCAXWgAwIBAgIBAjAKBggqhkjOPQQDAjAlMSMwIQYDVQQDDBp3aW5ybS1y
+cyB0aHJvd2F3YXkgdGVzdCBDQTAgFw0yNjEwMjUwMDU1MTlaGA8yMTI2MTAwMTAw
+NTUxOVowLDEqMCgGA1UEAwwhd2lucm0tcnMgdGhyb3dhd2F5IENBLWlzc3VlZCBs
+ZWFmMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEv+C/7q8/0QRGgELNJ87xUEu1
+UObYe0fI6m6Ay54jrct+NJbE2Od/4hq/RQBMQY08G1HyDZ9ghd8JTvV2Lv4HT6OB
+jDCBiTAMBgNVHRMBAf8EAjAAMA4GA1UdDwEB/wQEAwIHgDATBgNVHSUEDDAKBggr
+BgEFBQcDATAUBgNVHREEDTALgglsb2NhbGhvc3QwHQYDVR0OBBYEFG9P1EjVHlKq
+Ee6XqitUghpW1dMbMB8GA1UdIwQYMBaAFPTwETCVzdw1CASJRkzrMAZ8W1LhMAoG
+CCqGSM49BAMCA0kAMEYCIQD1tBuoonZiLYdN5VA4TAgyvol/hNgAJbHCvG7gQx5l
+UgIhAJ8caRvuzb58cSw83SpUQuefW+XRhfpbo2aHA+WAsBda
+-----END CERTIFICATE-----
+";
+
+/// Key of [`CA_LEAF_PEM`], PKCS#8 (`PRIVATE KEY`).
+pub(crate) const CA_LEAF_KEY_PEM: &str = "\
+-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgsXq/yism2esy250x
+kiHHs5JOMZcMVs+g7T4A4oRkkBihRANCAAS/4L/urz/RBEaAQs0nzvFQS7VQ5th7
+R8jqboDLniOty340lsTY53/iGr9FAExBjTwbUfINn2CF3wlO9XYu/gdP
+-----END PRIVATE KEY-----
+";
+
+/// Self-signed P-256 certificate that is not a CA: `CA:FALSE`, `serverAuth`, SAN `DNS:localhost`.
+pub(crate) const NON_CA_SELF_SIGNED_PEM: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIBuzCCAWGgAwIBAgIBAzAKBggqhkjOPQQDAjAwMS4wLAYDVQQDDCV3aW5ybS1y
+cyB0aHJvd2F3YXkgbm9uLUNBIHNlbGYtc2lnbmVkMCAXDTI2MTAyNTAwNTUxOVoY
+DzIxMjYxMDAxMDA1NTE5WjAwMS4wLAYDVQQDDCV3aW5ybS1ycyB0aHJvd2F3YXkg
+bm9uLUNBIHNlbGYtc2lnbmVkMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEfvSH
+H5kZbJ9Mx7bahe8es5czIx0+e7mKLZRs3o0wOwY520JhPDy69fvipIffEn/C5J5z
+y9XbsBgy/j1uU7A3NaNqMGgwDAYDVR0TAQH/BAIwADAOBgNVHQ8BAf8EBAMCB4Aw
+EwYDVR0lBAwwCgYIKwYBBQUHAwEwFAYDVR0RBA0wC4IJbG9jYWxob3N0MB0GA1Ud
+DgQWBBRRWfhbsNNIxoQcgrw0Ppv0nRRlFjAKBggqhkjOPQQDAgNIADBFAiBMDUge
+67lJPpN70bxW1XJXIDAQXn9EADnLmQPb3qB2jAIhAMkLcX/ye+I58dBWGhf6szTA
+sBIpF5KMbj5lLMqNmt32
+-----END CERTIFICATE-----
+";
+
+/// Key of [`NON_CA_SELF_SIGNED_PEM`], PKCS#8 (`PRIVATE KEY`).
+pub(crate) const NON_CA_SELF_SIGNED_KEY_PEM: &str = "\
+-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQge4qqz64WFk3lnmiZ
+I3cho+VUxn+vtRjYUqXiNY+aLlahRANCAAR+9IcfmRlsn0zHttqF7x6zlzMjHT57
+uYotlGzejTA7BjnbQmE8PLr1++Kkh98Sf8LknnPL1duwGDL+PW5TsDc1
 -----END PRIVATE KEY-----
 ";
 

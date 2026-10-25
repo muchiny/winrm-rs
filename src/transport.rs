@@ -32,7 +32,7 @@ use crate::config::{AuthMethod, EncryptionMode, WinrmConfig, WinrmCredentials};
 use crate::error::{SoapError, WinrmError};
 use crate::ntlm::NtlmSession;
 use crate::soap;
-use crate::tls::{CertHandle, ClientAuthCert, NoVerifier, TlsOptions};
+use crate::tls::{CertHandle, ClientAuthCert, TlsOptions};
 use rustls::client::danger::ServerCertVerifier;
 use rustls::crypto::CryptoProvider;
 
@@ -765,23 +765,17 @@ impl HttpTransport {
         // NTLM channel binding takes the server certificate of the connection
         // that carried the challenge: from the response (`tls_info`), or from
         // the verifier of a dedicated single-connection client (see `AuthConn`).
+        let origin = crate::tls::server_verifiers(
+            opts,
+            config.use_tls,
+            config.accept_invalid_certs,
+            &provider,
+        )?
+        .origin;
         let (client_tls, server_verifier) = if config.use_tls {
-            let verifier: Arc<dyn ServerCertVerifier> = if config.accept_invalid_certs {
-                Arc::new(NoVerifier::new(&provider))
-            } else {
-                let roots = rustls::RootCertStore::from_iter(
-                    webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
-                );
-                rustls::client::WebPkiServerVerifier::builder_with_provider(
-                    Arc::new(roots),
-                    Arc::clone(&provider),
-                )
-                .build()
-                .map_err(|e| WinrmError::AuthFailed(format!("TLS verifier error: {e}")))?
-            };
             let tls_builder = crate::tls::client_config_builder(&provider)?
                 .dangerous()
-                .with_custom_certificate_verifier(Arc::clone(&verifier));
+                .with_custom_certificate_verifier(Arc::clone(&origin));
             let client_tls = match client_auth {
                 Some(ClientAuthCert { chain, key }) => {
                     tls_builder.with_client_auth_cert(chain, key).map_err(|e| {
@@ -790,21 +784,10 @@ impl HttpTransport {
                 }
                 None => tls_builder.with_no_client_auth(),
             };
-            (client_tls, Some(verifier))
+            (client_tls, Some(origin))
         } else {
-            // Plain HTTP: TLS only on the leg to an `https://` proxy, verified
-            // as `reqwest` would (the OS store), with the built-in roots when
-            // the OS store is unusable.
-            let verifier: Arc<dyn ServerCertVerifier> = if config.accept_invalid_certs {
-                Arc::new(NoVerifier::new(&provider))
-            } else {
-                crate::tls::platform_or_webpki(
-                    rustls_platform_verifier::Verifier::new(Arc::clone(&provider)),
-                    &[],
-                    &provider,
-                )?
-            };
-            (crate::tls::plain_http_config(verifier, &provider)?, None)
+            // Plain HTTP: TLS only on the leg to an `https://` proxy.
+            (crate::tls::plain_http_config(origin, &provider)?, None)
         };
 
         #[cfg(feature = "credssp")]
@@ -1776,6 +1759,7 @@ pub(crate) fn capture_logs() -> (LogBuf, tracing::subscriber::DefaultGuard) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tls::NoVerifier;
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -5487,5 +5471,290 @@ mod tests {
             fake.log()
         );
         assert_eq!(accepts.load(Ordering::SeqCst), 2);
+    }
+
+    // --- Extra trust anchors ---
+
+    /// HTTPS config with strict verification, aimed at loopback `port`.
+    fn tls_config(auth_method: AuthMethod, port: u16) -> WinrmConfig {
+        WinrmConfig {
+            auth_method,
+            use_tls: true,
+            accept_invalid_certs: false,
+            port,
+            max_retries: 0,
+            connect_timeout_secs: 5,
+            operation_timeout_secs: 5,
+            ..Default::default()
+        }
+    }
+
+    fn transport_with(config: WinrmConfig, opts: &TlsOptions) -> Result<HttpTransport, WinrmError> {
+        HttpTransport::with_tls(config, WinrmCredentials::new(USER, PASS, ""), opts)
+    }
+
+    /// A temp directory holding `pem` as the certificate file.
+    fn root_file(tag: &str, pem: &str) -> PemFiles {
+        pem_files(tag, pem, "")
+    }
+
+    /// Options trusting the certificate file of every entry of `files`.
+    fn roots(files: &[&PemFiles]) -> TlsOptions {
+        TlsOptions {
+            root_files: files
+                .iter()
+                .map(|f| std::path::PathBuf::from(&f.cert))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    async fn send_basic(t: &HttpTransport, host: &str) -> Result<String, WinrmError> {
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            t.send_soap_with_retry(host, "<soap/>".into()),
+        )
+        .await
+        .expect("did not finish in 20 s")
+    }
+
+    /// Every `to_string()` down the `source()` chain.
+    fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
+        let mut parts = vec![e.to_string()];
+        let mut source = e.source();
+        while let Some(s) = source {
+            parts.push(s.to_string());
+            source = s.source();
+        }
+        parts.join(": ")
+    }
+
+    /// Basic over HTTPS to a sink presenting `cert`/`key`, with `opts`, at `host`.
+    /// Returns the result and the application bytes the sink read.
+    async fn basic_against_sink(
+        opts: &TlsOptions,
+        cert: &str,
+        key: &str,
+        host: &str,
+    ) -> (Result<String, WinrmError>, usize) {
+        let (port, read) =
+            crate::test_pki::spawn_tls_sink(crate::test_pki::server_config(cert, key));
+        let t = transport_with(tls_config(AuthMethod::Basic, port), opts).unwrap();
+        let result = send_basic(&t, host).await;
+        (result, read.load(Ordering::SeqCst))
+    }
+
+    fn http_error_chain(result: Result<String, WinrmError>) -> String {
+        match result {
+            Err(WinrmError::Http(e)) => error_chain(&e),
+            other => panic!("expected WinrmError::Http, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn extra_root_accepts_a_listener_it_issued() {
+        use crate::test_pki::{CA_LEAF_KEY_PEM, CA_LEAF_PEM, TEST_CA_PEM};
+        let ca = root_file("ca", TEST_CA_PEM);
+        let (_, read) =
+            basic_against_sink(&roots(&[&ca]), CA_LEAF_PEM, CA_LEAF_KEY_PEM, "localhost").await;
+        assert!(read > 0, "the listener must be trusted");
+    }
+
+    #[tokio::test]
+    async fn extra_root_refuses_a_listener_from_another_ca() {
+        use crate::test_pki::{CA_LEAF_KEY_PEM, CA_LEAF_PEM, RSA_CERT_PEM};
+        let other = root_file("other-ca", RSA_CERT_PEM);
+        let (result, read) =
+            basic_against_sink(&roots(&[&other]), CA_LEAF_PEM, CA_LEAF_KEY_PEM, "localhost").await;
+        let chain = http_error_chain(result);
+        assert!(chain.contains("UnknownIssuer"), "{chain}");
+        assert_eq!(read, 0);
+    }
+
+    #[tokio::test]
+    async fn extra_root_still_checks_the_host_name() {
+        use crate::test_pki::{CA_LEAF_KEY_PEM, CA_LEAF_PEM, TEST_CA_PEM};
+        let ca = root_file("ca-name", TEST_CA_PEM);
+        let (result, read) =
+            basic_against_sink(&roots(&[&ca]), CA_LEAF_PEM, CA_LEAF_KEY_PEM, "127.0.0.1").await;
+        let chain = http_error_chain(result);
+        assert!(chain.contains("not valid for name"), "{chain}");
+        assert_eq!(read, 0);
+    }
+
+    #[tokio::test]
+    async fn extra_root_accepts_a_non_ca_self_signed_listener() {
+        use crate::test_pki::{NON_CA_SELF_SIGNED_KEY_PEM, NON_CA_SELF_SIGNED_PEM};
+        let own = root_file("non-ca", NON_CA_SELF_SIGNED_PEM);
+        let (_, read) = basic_against_sink(
+            &roots(&[&own]),
+            NON_CA_SELF_SIGNED_PEM,
+            NON_CA_SELF_SIGNED_KEY_PEM,
+            "localhost",
+        )
+        .await;
+        assert!(
+            read > 0,
+            "a non-CA self-signed listener can be its own root"
+        );
+    }
+
+    #[tokio::test]
+    async fn extra_root_refuses_a_ca_self_signed_listener() {
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
+        let own = root_file("ca-self", EC_CERT_PEM);
+        let (result, read) =
+            basic_against_sink(&roots(&[&own]), EC_CERT_PEM, EC_KEY_PKCS8_PEM, "localhost").await;
+        let chain = http_error_chain(result);
+        assert!(chain.contains("CaUsedAsEndEntity"), "{chain}");
+        assert_eq!(read, 0);
+    }
+
+    /// The per-connection clients (NTLM over HTTPS through a proxy) verify
+    /// with the extra root too, and the channel binding follows.
+    #[tokio::test]
+    async fn extra_root_applies_to_the_dedicated_leg() {
+        use crate::test_pki::{CA_LEAF_KEY_PEM, CA_LEAF_PEM, TEST_CA_PEM};
+        let ca = root_file("ca-dedicated", TEST_CA_PEM);
+        let proxy = Some(format!("http://127.0.0.1:{}", spawn_connect_proxy()));
+        let (port, seen) = spawn_ntlm_tls_server(CA_LEAF_PEM, CA_LEAF_KEY_PEM);
+        let url = format!("https://localhost:{port}/wsman");
+        let config = || WinrmConfig {
+            proxy: proxy.clone(),
+            ..tls_config(AuthMethod::Ntlm, port)
+        };
+
+        let trusting = transport_with(config(), &roots(&[&ca])).unwrap();
+        let reply = tokio::time::timeout(
+            Duration::from_secs(20),
+            trusting.send_ntlm_over_tls("localhost", &url, "<soap/>", Lane::Data),
+        )
+        .await
+        .expect("did not finish in 20 s")
+        .unwrap();
+        assert_eq!(reply, "<ok/>");
+        let recorded = seen.lock().unwrap().clone();
+        assert_eq!(
+            type3_channel_bindings(&recorded[0]),
+            Some(cbt_of(CA_LEAF_PEM))
+        );
+
+        seen.lock().unwrap().clear();
+        let plain = transport_with(config(), &TlsOptions::default()).unwrap();
+        let refused = tokio::time::timeout(
+            Duration::from_secs(20),
+            plain.send_ntlm_over_tls("localhost", &url, "<soap/>", Lane::Data),
+        )
+        .await
+        .expect("did not finish in 20 s");
+        assert!(refused.is_err(), "{refused:?}");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "no Type 3 without the root"
+        );
+    }
+
+    /// `platform_roots(true)` keeps the extra roots: the OS verifier trusts
+    /// them next to the system store.
+    #[tokio::test]
+    async fn platform_roots_trust_the_extra_root_too() {
+        use crate::test_pki::{CA_LEAF_KEY_PEM, CA_LEAF_PEM, TEST_CA_PEM};
+        let ca = root_file("ca-platform", TEST_CA_PEM);
+        let opts = TlsOptions {
+            platform_roots: true,
+            ..roots(&[&ca])
+        };
+        let (_, read) = basic_against_sink(&opts, CA_LEAF_PEM, CA_LEAF_KEY_PEM, "localhost").await;
+        assert!(read > 0, "the listener must be trusted");
+    }
+
+    /// The options apply to an `https://` proxy over plain HTTP.
+    #[tokio::test]
+    async fn extra_root_applies_to_the_https_proxy_leg_over_plain_http() {
+        use crate::test_pki::{CA_LEAF_KEY_PEM, CA_LEAF_PEM, TEST_CA_PEM};
+        let ca = root_file("ca-proxy", TEST_CA_PEM);
+        for (opts, trusted) in [(roots(&[&ca]), true), (TlsOptions::default(), false)] {
+            let (p, read) = crate::test_pki::spawn_tls_sink(crate::test_pki::server_config(
+                CA_LEAF_PEM,
+                CA_LEAF_KEY_PEM,
+            ));
+            let config = WinrmConfig {
+                use_tls: false,
+                proxy: Some(format!("https://localhost:{p}")),
+                ..tls_config(AuthMethod::Basic, 5985)
+            };
+            let t = transport_with(config, &opts).unwrap();
+            let _ = send_basic(&t, "127.0.0.1").await;
+            let read = read.load(Ordering::SeqCst);
+            if trusted {
+                assert!(read > 0, "the proxy certificate must be trusted");
+            } else {
+                assert_eq!(read, 0, "without the root the proxy is refused");
+            }
+        }
+    }
+
+    /// CredSSP's outer TLS uses the same verifier.
+    #[cfg(feature = "credssp")]
+    #[tokio::test]
+    async fn credssp_tls_outer_uses_the_extra_root() {
+        use crate::test_pki::{CA_LEAF_KEY_PEM, CA_LEAF_PEM, TEST_CA_PEM};
+        let ca = root_file("ca-credssp", TEST_CA_PEM);
+
+        let (port, read) = crate::test_pki::spawn_tls_sink(crate::test_pki::server_config(
+            CA_LEAF_PEM,
+            CA_LEAF_KEY_PEM,
+        ));
+        let t = transport_with(tls_config(AuthMethod::CredSsp, port), &roots(&[&ca])).unwrap();
+        let _ = send_basic(&t, "localhost").await;
+        assert!(
+            read.load(Ordering::SeqCst) > 0,
+            "the outer TLS must be trusted"
+        );
+
+        let (port, read) = crate::test_pki::spawn_tls_sink(crate::test_pki::server_config(
+            CA_LEAF_PEM,
+            CA_LEAF_KEY_PEM,
+        ));
+        let t = transport_with(
+            tls_config(AuthMethod::CredSsp, port),
+            &TlsOptions::default(),
+        )
+        .unwrap();
+        match send_basic(&t, "localhost").await {
+            Err(WinrmError::AuthFailed(m)) => {
+                assert!(m.starts_with("CredSSP outer TLS:"), "{m}");
+            }
+            other => panic!("expected AuthFailed, got {other:?}"),
+        }
+        assert_eq!(read.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn root_file_without_a_certificate_is_a_clear_error() {
+        use crate::test_pki::EC_KEY_PKCS8_PEM;
+        let keys = root_file("no-cert", EC_KEY_PKCS8_PEM);
+        match transport_with(tls_config(AuthMethod::Basic, 5986), &roots(&[&keys])) {
+            Err(WinrmError::AuthFailed(m)) => {
+                assert!(m.contains(&keys.cert), "{m}");
+                assert!(m.contains("no certificate"), "{m}");
+                assert!(!m.contains("IvSE2eFVFQPSvWUFhXFxIaP6"), "{m}");
+            }
+            other => panic!("expected AuthFailed, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
+    fn missing_root_file_is_a_clear_error() {
+        let opts = TlsOptions {
+            root_files: vec!["/nonexistent/winrm-rs/ca.pem".into()],
+            ..Default::default()
+        };
+        match transport_with(tls_config(AuthMethod::Basic, 5986), &opts) {
+            Err(WinrmError::AuthFailed(m)) => {
+                assert!(m.contains("/nonexistent/winrm-rs/ca.pem"), "{m}");
+            }
+            other => panic!("expected AuthFailed, got {:?}", other.map(|_| ())),
+        }
     }
 }

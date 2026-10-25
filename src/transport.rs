@@ -223,6 +223,12 @@ const MAX_KDC_IN_FLIGHT: usize = 32;
 /// [`MAX_CONNS_PER_HOST`]).
 const MAX_CONNS_IN_FLIGHT_TOTAL: usize = 128;
 
+/// The construction error of a CredSSP client with `accept_invalid_certs`.
+const CREDSSP_UNAUTHENTICATED_TLS: &str = "CredSSP refuses accept_invalid_certs = true. Set it \
+     to false and either pin the listener certificate with pin_server_certificate_sha256 or \
+     trust its CA with add_root_certificates_pem: the delegated password and every SOAP body \
+     would otherwise cross an unauthenticated HTTPS connection";
+
 /// Which slots an exchange on a dedicated connection takes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Lane {
@@ -712,8 +718,9 @@ impl HttpTransport {
     /// Builds the underlying HTTP client with the configured timeouts and TLS
     /// settings. Returns [`WinrmError::Http`] if the HTTP client cannot be
     /// constructed, and [`WinrmError::AuthFailed`] if the authentication
-    /// method cannot be set up: Certificate or CredSSP without HTTPS,
-    /// Certificate auth without a usable certificate and key, a crypto
+    /// method cannot be set up: Certificate or CredSSP without HTTPS, CredSSP
+    /// with `accept_invalid_certs`, Certificate auth without a usable
+    /// certificate and key, a crypto
     /// provider, TLS verifier or client certificate that rustls rejects, or,
     /// with the `credssp` feature, the CredSSP TLS contexts.
     #[tracing::instrument(level = "debug", skip_all)]
@@ -799,6 +806,12 @@ impl HttpTransport {
             &proxy_names,
             &provider,
         )?;
+        // CredSSP has no channel binding on the outer TLS (MS-CSSP), so it
+        // runs only behind a verifier that authenticates the server.
+        let outer_authenticated = !config.accept_invalid_certs;
+        if matches!(config.auth_method, AuthMethod::CredSsp) && !outer_authenticated {
+            return Err(WinrmError::AuthFailed(CREDSSP_UNAUTHENTICATED_TLS.into()));
+        }
         // The names whose handshakes do not get the endpoint's own
         // verification (see `ProxyRoutingVerifier`): a host with one of them
         // is refused where that would weaken the endpoint's verification.
@@ -828,13 +841,6 @@ impl HttpTransport {
 
         #[cfg(feature = "credssp")]
         let credssp_tls = if matches!(config.auth_method, AuthMethod::CredSsp) && config.use_tls {
-            if config.accept_invalid_certs {
-                tracing::warn!(
-                    "CredSSP outer TLS verification disabled (accept_invalid_certs=true): the \
-                     server is not authenticated and the delegated credentials are not \
-                     protected; do not use in production"
-                );
-            }
             Some(Arc::new(CredSspTls::new(&client_tls)?))
         } else {
             None
@@ -2045,7 +2051,6 @@ mod tests {
                 let config = WinrmConfig {
                     auth_method: auth_method.clone(),
                     use_tls,
-                    accept_invalid_certs: use_tls,
                     user_agent: Some(user_agent.into()),
                     ..Default::default()
                 };
@@ -3915,7 +3920,7 @@ mod tests {
         WinrmConfig {
             auth_method: AuthMethod::CredSsp,
             use_tls: true,
-            accept_invalid_certs: true,
+            accept_invalid_certs: false,
             port,
             connect_timeout_secs: 1,
             operation_timeout_secs: 5,
@@ -3923,12 +3928,17 @@ mod tests {
         }
     }
 
-    /// CredSSP transport aimed at a loopback test server on `port`.
+    /// CredSSP transport aimed at a loopback test server on `port`, with the
+    /// certificate of the test servers (`EC_CERT_PEM`) pinned.
     #[cfg(feature = "credssp")]
     fn credssp_test_transport(port: u16) -> HttpTransport {
-        HttpTransport::new(
+        HttpTransport::with_tls(
             credssp_test_config(port),
             WinrmCredentials::new(USER, PASS, ""),
+            &TlsOptions {
+                pins: vec![sha256_hex(crate::test_pki::EC_CERT_PEM)],
+                ..Default::default()
+            },
         )
         .unwrap()
     }
@@ -3994,6 +4004,129 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("CredSSP outer TLS"), "{err}");
         assert!(accepted.join().unwrap(), "no TCP connection reached [::1]");
+    }
+
+    #[cfg(feature = "credssp")]
+    fn creds() -> WinrmCredentials {
+        WinrmCredentials::new(USER, PASS, "")
+    }
+
+    /// One request through the retry loop, bounded at 20 s.
+    #[cfg(feature = "credssp")]
+    async fn send_bounded(t: &HttpTransport) -> Result<String, WinrmError> {
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            t.send_soap_with_retry("127.0.0.1", "<s:Envelope/>".into()),
+        )
+        .await
+        .expect("bounded")
+    }
+
+    /// CredSSP has no channel binding on the outer TLS: a client that does
+    /// not verify the server is refused when it is built.
+    #[cfg(feature = "credssp")]
+    #[test]
+    fn credssp_with_accept_invalid_certs_is_refused() {
+        let config = WinrmConfig {
+            accept_invalid_certs: true,
+            ..credssp_test_config(5986)
+        };
+        let err = HttpTransport::new(config, creds())
+            .err()
+            .expect("must refuse");
+        assert!(
+            matches!(&err, WinrmError::AuthFailed(m) if m == CREDSSP_UNAUTHENTICATED_TLS),
+            "{err}"
+        );
+    }
+
+    /// The pinned listener completes the exchange and receives the password.
+    #[cfg(feature = "credssp")]
+    #[tokio::test]
+    async fn credssp_pin_accepts_pinned_listener() {
+        use crate::auth::credssp::test_server::{self, Fault};
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
+        let (port, log) = test_server::spawn(Fault::Honest, EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let t = credssp_test_transport(port);
+        let reply = send_bounded(&t).await.unwrap();
+        assert_eq!(reply, test_server::MOCK_REPLY);
+        assert_eq!(test_server::delegations(&log.lock().unwrap()), 1);
+    }
+
+    /// A relay presenting another certificate in front of the real server is
+    /// refused at the outer TLS handshake, before any request reaches it.
+    #[cfg(feature = "credssp")]
+    #[tokio::test]
+    async fn credssp_pin_refuses_a_listener_with_another_certificate() {
+        use crate::auth::credssp::test_server::{self, Fault};
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM, RSA_CERT_PEM, RSA_KEY_PKCS1_PEM};
+        let (port, log) = test_server::spawn(Fault::Honest, EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let relay = test_server::spawn_tls_relay(port, RSA_CERT_PEM, RSA_KEY_PKCS1_PEM);
+        let t = credssp_test_transport(relay);
+        let err = send_bounded(&t).await.unwrap_err();
+        assert!(
+            matches!(&err, WinrmError::AuthFailed(m) if m.starts_with("CredSSP outer TLS")),
+            "{err}"
+        );
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "the real server saw a request"
+        );
+    }
+
+    /// The relay forwards a whole exchange when the client pins the relay's
+    /// own certificate, so the refusal above comes from the pin alone.
+    #[cfg(feature = "credssp")]
+    #[tokio::test]
+    async fn credssp_tls_relay_forwards_the_exchange() {
+        use crate::auth::credssp::test_server::{self, Fault};
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM, RSA_CERT_PEM, RSA_KEY_PKCS1_PEM};
+        let (port, log) = test_server::spawn(Fault::Honest, EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let relay = test_server::spawn_tls_relay(port, RSA_CERT_PEM, RSA_KEY_PKCS1_PEM);
+        let t = HttpTransport::with_tls(
+            credssp_test_config(relay),
+            creds(),
+            &TlsOptions {
+                pins: vec![sha256_hex(RSA_CERT_PEM)],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let reply = send_bounded(&t).await.unwrap();
+        assert_eq!(reply, test_server::MOCK_REPLY);
+        assert_eq!(test_server::delegations(&log.lock().unwrap()), 1);
+    }
+
+    /// Without a pin or an extra root, the default verifier (the built-in
+    /// Mozilla roots) refuses the self-signed test listener.
+    #[cfg(feature = "credssp")]
+    #[tokio::test]
+    async fn credssp_default_verifier_refuses_untrusted_listener() {
+        use crate::auth::credssp::test_server::{self, Fault};
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
+        let (port, log) = test_server::spawn(Fault::Honest, EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let t = HttpTransport::new(credssp_test_config(port), creds()).unwrap();
+        let err = send_bounded(&t).await.unwrap_err();
+        assert!(
+            matches!(&err, WinrmError::AuthFailed(m) if m.starts_with("CredSSP outer TLS")),
+            "{err}"
+        );
+        assert!(log.lock().unwrap().is_empty(), "the server saw a request");
+    }
+
+    /// The CredSSP outer TLS offers no ALPN protocol.
+    #[cfg(feature = "credssp")]
+    #[test]
+    fn credssp_tls_outer_offers_no_alpn() {
+        let t = credssp_test_transport(5986);
+        assert!(
+            t.credssp_tls
+                .as_ref()
+                .unwrap()
+                .outer
+                .alpn_protocols
+                .is_empty()
+        );
     }
 
     #[test]

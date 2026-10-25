@@ -2232,12 +2232,16 @@ async fn silent_command_completes_over_credssp() {
     let config = WinrmConfig {
         auth_method: AuthMethod::CredSsp,
         use_tls: true,
-        accept_invalid_certs: true,
+        accept_invalid_certs: false,
         port: https_test_port(),
         operation_timeout_secs: SILENT_OP_SECS,
         ..Default::default()
     };
-    let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
+    let client = WinrmClient::builder(config)
+        .pin_server_certificate_sha256(&bench_https_pin().expect("WINRM_TEST_HTTPS_CERT_SHA256"))
+        .credentials(WinrmCredentials::new(user, pass, ""))
+        .build()
+        .unwrap();
     assert_silent_command_completes(&client, &host).await;
 }
 
@@ -2860,11 +2864,15 @@ async fn credssp_run_command_whoami() {
     let config = WinrmConfig {
         auth_method: AuthMethod::CredSsp,
         use_tls: true,
-        accept_invalid_certs: true,
+        accept_invalid_certs: false,
         port,
         ..Default::default()
     };
-    let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
+    let client = WinrmClient::builder(config)
+        .pin_server_certificate_sha256(&bench_https_pin().expect("WINRM_TEST_HTTPS_CERT_SHA256"))
+        .credentials(WinrmCredentials::new(user, pass, ""))
+        .build()
+        .unwrap();
     let output = client
         .run_command(&host, "whoami", &[])
         .await
@@ -2893,11 +2901,15 @@ async fn credssp_reads_a_large_framed_response() {
     let config = WinrmConfig {
         auth_method: AuthMethod::CredSsp,
         use_tls: true,
-        accept_invalid_certs: true,
+        accept_invalid_certs: false,
         port: https_test_port(),
         ..Default::default()
     };
-    let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
+    let client = WinrmClient::builder(config)
+        .pin_server_certificate_sha256(&bench_https_pin().expect("WINRM_TEST_HTTPS_CERT_SHA256"))
+        .credentials(WinrmCredentials::new(user, pass, ""))
+        .build()
+        .unwrap();
     let output = client
         .run_powershell(&host, "'x' * 300000")
         .await
@@ -5341,13 +5353,23 @@ async fn before_send_refusal_leaves_a_credssp_session_usable() {
         );
         return;
     }
+    let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    let pass = std::env::var("WINRM_TEST_PASS").expect("WINRM_TEST_PASS");
     let gate = Gate::open();
-    let (client, host) = gated_client(&gate, |c| {
-        c.auth_method = AuthMethod::CredSsp;
-        c.use_tls = true;
-        c.accept_invalid_certs = true;
-        c.port = https_test_port();
-    });
+    let hook = std::sync::Arc::clone(&gate);
+    let client = WinrmClient::builder(WinrmConfig {
+        auth_method: AuthMethod::CredSsp,
+        use_tls: true,
+        accept_invalid_certs: false,
+        port: https_test_port(),
+        ..Default::default()
+    })
+    .pin_server_certificate_sha256(&bench_https_pin().expect("WINRM_TEST_HTTPS_CERT_SHA256"))
+    .credentials(WinrmCredentials::new(user, pass, ""))
+    .before_send(move || hook.check())
+    .build()
+    .expect("build the gated CredSSP client");
     assert_refusal_leaves_session_usable(&client, &host, &gate).await;
 }
 

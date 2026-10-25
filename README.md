@@ -57,11 +57,11 @@ cargo add winrm-rs --features kerberos
 | HTTPS + NTLM, certificate validated | yes (certificate) | yes (channel binding) | TLS | untrusted networks, hosts outside a domain |
 | HTTPS + Kerberos, certificate validated | yes (certificate, AP-REP) | yes (channel binding, certificate pin) | TLS | domain members, connected to by name |
 | HTTPS + Certificate | yes (certificate) | yes (client certificate in the TLS handshake) | TLS | certificate-mapped accounts |
-| HTTPS + CredSSP, certificate validated | yes (certificate) | inner TLS only | TLS | when the host must reach other machines with your credentials |
+| HTTPS + CredSSP, certificate validated or pinned (required) | yes (certificate) | inner TLS only | TLS | when the host must reach other machines with your credentials |
 | HTTP + Kerberos | yes (AP-REP) | no: a party on the path, or one controlling DNS, can relay the AP-REQ | sealed (`EncryptionMode::Auto`) | trusted networks |
 | HTTP + NTLM (the default) | no | no: the handshake can be relayed, or recorded to guess the password offline | sealed (`EncryptionMode::Auto`) | trusted networks only |
 | Basic | over HTTPS only | n/a | TLS; plaintext over HTTP (a WARN is logged) | HTTPS only |
-| any method with `accept_invalid_certs` | no | channel binding stops a relay to the real WinRM server only; CredSSP not at all | TLS to whoever answers | test environments |
+| any method with `accept_invalid_certs` | no | channel binding stops a relay to the real WinRM server only; CredSSP refuses this flag | TLS to whoever answers | test environments |
 
 Sealing starts once the authentication is done: it protects this client's
 SOAP bodies, not the authentication. Two server-side settings matter as
@@ -79,7 +79,7 @@ much as the client's:
   validation no other party can write on the connection. With
   `accept_invalid_certs` it can: with NTLM and Kerberos unless the
   server checks channel binding (`CbtHardeningLevel = Relaxed` or
-  `Strict`), and with CredSSP always.
+  `Strict`); CredSSP refuses `accept_invalid_certs`.
 - Signing and channel-binding enforcement on the network's other
   services (SMB signing, LDAP channel binding, Extended Protection on
   AD CS web enrollment) decide where a relayed NTLM handshake is
@@ -436,7 +436,7 @@ cargo test --test integration_real -- --ignored
 |---|---|---|
 | *(default)* | stable | NTLMv2, Basic, Certificate auth; no optional deps |
 | `kerberos` | stable | Pulls `cross-krb5`; requires a working `kinit` |
-| `credssp` | **experimental** | Double-hop delegation. Validated end-to-end against Windows Server 2025 (live `credssp_run_command_whoami`); not yet exercised on other host generations. Up to 1.4.1 it ignored `proxy`, `max_retries`, `connect_timeout_secs`, `operation_timeout_secs` and `user_agent`; since 1.4.2 it applies both timeouts and `user_agent`, and still ignores `proxy` and `max_retries` (see `AuthMethod::CredSsp`). Delegates your cleartext password to the target: use it only toward hosts you trust as much as the account. Links the host OpenSSL; see below. |
+| `credssp` | **experimental** | Double-hop delegation. CredSSP refuses `accept_invalid_certs = true`: set it to false and either pin the listener certificate with `pin_server_certificate_sha256` or trust its CA with `add_root_certificates_pem`. Validated end-to-end against Windows Server 2025 (live `credssp_run_command_whoami`); not yet exercised on other host generations. Up to 1.4.1 it ignored `proxy`, `max_retries`, `connect_timeout_secs`, `operation_timeout_secs` and `user_agent`; since 1.4.2 it applies both timeouts and `user_agent`, and still ignores `proxy` and `max_retries` (see `AuthMethod::CredSsp`). Delegates your cleartext password to the target: use it only toward hosts you trust as much as the account. Links the host OpenSSL; see below. |
 
 ### `credssp` and the host OpenSSL
 

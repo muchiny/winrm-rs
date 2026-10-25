@@ -105,6 +105,82 @@ pub(crate) fn spawn_with(fault: Fault, outer: Arc<rustls::ServerConfig>) -> (u16
     (port, log)
 }
 
+/// Start a TLS relay that presents `cert_pem` with its key `key_pem` and
+/// forwards to the server on `upstream_port`, over a TLS connection of its own
+/// that checks no certificate. Returns its port. It serves one connection, and
+/// exits after 20 s without one. It connects upstream only once the client's
+/// handshake is done and its first request has arrived, then forwards one
+/// request and then one response at a time (CredSSP is strictly
+/// request/response).
+pub(crate) fn spawn_tls_relay(
+    upstream_port: u16,
+    cert_pem: &'static str,
+    key_pem: &'static str,
+) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    let outer = crate::test_pki::server_config(cert_pem, key_pem);
+    std::thread::spawn(move || {
+        if let Some(tcp) = accept(&listener) {
+            // A failure on either side simply ends both connections.
+            let _ = relay(outer, tcp, upstream_port);
+        }
+    });
+    port
+}
+
+fn relay(
+    outer: Arc<rustls::ServerConfig>,
+    tcp: TcpStream,
+    upstream_port: u16,
+) -> Result<(), String> {
+    set_deadlines(&tcp)?;
+    let conn = rustls::ServerConnection::new(outer).map_err(|e| e.to_string())?;
+    let mut client = rustls::StreamOwned::new(conn, tcp);
+    let Some(mut request) = read_request(&mut client)? else {
+        return Ok(());
+    };
+    let mut upstream = connect_upstream(upstream_port)?;
+    loop {
+        forward(&mut upstream, &request)?;
+        let Some(response) = read_request(&mut upstream)? else {
+            return Ok(());
+        };
+        forward(&mut client, &response)?;
+        match read_request(&mut client)? {
+            Some(next) => request = next,
+            None => return Ok(()),
+        }
+    }
+}
+
+/// A TLS client connection to `127.0.0.1:port` that checks no certificate.
+fn connect_upstream(
+    port: u16,
+) -> Result<rustls::StreamOwned<rustls::ClientConnection, TcpStream>, String> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = crate::tls::client_config_builder(&provider)
+        .map_err(|e| e.to_string())?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(crate::tls::NoVerifier::new(&provider)))
+        .with_no_client_auth();
+    let tcp = TcpStream::connect(("127.0.0.1", port)).map_err(|e| e.to_string())?;
+    set_deadlines(&tcp)?;
+    let name = rustls::pki_types::ServerName::try_from("127.0.0.1").map_err(|e| e.to_string())?;
+    let conn = rustls::ClientConnection::new(Arc::new(config), name).map_err(|e| e.to_string())?;
+    Ok(rustls::StreamOwned::new(conn, tcp))
+}
+
+/// Write one message read by [`read_request`]: its head, then its body.
+fn forward(to: &mut impl Write, (head, body): &(String, Vec<u8>)) -> Result<(), String> {
+    send(to, head.as_bytes())?;
+    if !body.is_empty() {
+        send(to, body)?;
+    }
+    Ok(())
+}
+
 /// How many times a password was delegated.
 pub(crate) fn delegations(log: &[Event]) -> usize {
     log.iter()
@@ -141,11 +217,18 @@ fn accept(listener: &TcpListener) -> Option<TcpStream> {
     }
 }
 
-type Tls = rustls::StreamOwned<rustls::ServerConnection, TcpStream>;
+/// The read and write deadlines of every test connection.
+fn set_deadlines(tcp: &TcpStream) -> Result<(), String> {
+    tcp.set_nonblocking(false).map_err(|e| e.to_string())?;
+    tcp.set_read_timeout(Some(DEADLINE))
+        .map_err(|e| e.to_string())?;
+    tcp.set_write_timeout(Some(DEADLINE))
+        .map_err(|e| e.to_string())
+}
 
-/// One HTTP request: its head and its `Content-Length` body. `None` on EOF
-/// before a request starts.
-fn read_request(tls: &mut Tls) -> Result<Option<(String, Vec<u8>)>, String> {
+/// One HTTP message (a request, or a response for the relay): its head and
+/// its `Content-Length` body. `None` on EOF before a message starts.
+fn read_request(tls: &mut impl Read) -> Result<Option<(String, Vec<u8>)>, String> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     let head_end = loop {
@@ -187,7 +270,7 @@ fn header(head: &str, name: &str) -> Option<String> {
     })
 }
 
-fn send(tls: &mut Tls, bytes: &[u8]) -> Result<(), String> {
+fn send(tls: &mut impl Write, bytes: &[u8]) -> Result<(), String> {
     tls.write_all(bytes).map_err(|e| e.to_string())?;
     tls.flush().map_err(|e| e.to_string())
 }
@@ -304,11 +387,7 @@ fn serve(
     tcp: TcpStream,
     log: &Log,
 ) -> Result<(), String> {
-    tcp.set_nonblocking(false).map_err(|e| e.to_string())?;
-    tcp.set_read_timeout(Some(DEADLINE))
-        .map_err(|e| e.to_string())?;
-    tcp.set_write_timeout(Some(DEADLINE))
-        .map_err(|e| e.to_string())?;
+    set_deadlines(&tcp)?;
     let conn = rustls::ServerConnection::new(outer).map_err(|e| e.to_string())?;
     let mut tls = rustls::StreamOwned::new(conn, tcp);
     let record = |event: Event| log.lock().unwrap().push(event);

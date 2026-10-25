@@ -271,8 +271,8 @@ fn inner_openssl_connector() -> Result<openssl::ssl::SslConnector, WinrmError> {
     // NTLM session key. It does not identify the server, and it binds
     // nothing to the outer HTTPS connection, which carries the SOAP bodies.
     // Server identity and body integrity come only from the outer TLS
-    // verifier (`CredSspTls::outer`); under `accept_invalid_certs` there is
-    // none.
+    // verifier (`CredSspTls::outer`); the transport refuses CredSSP under
+    // `accept_invalid_certs`.
     builder.set_verify(SslVerifyMode::NONE);
     // Force TLS 1.2 to match what Microsoft CredSSP server expects.
     builder
@@ -385,6 +385,8 @@ impl CredSspConnection {
     /// The outer TLS leg uses `tls.outer`, which carries the verifier of the
     /// client. Nothing inside CredSSP replaces it: the inner TLS is not
     /// verified (MS-CSSP 1.3) and `pubKeyAuth` binds only the inner TLS key.
+    /// The outer TLS verifier is the transport's; CredSSP is refused under
+    /// `accept_invalid_certs`.
     async fn connect(
         endpoint: &CredSspEndpoint,
         tls: &CredSspTls,
@@ -1004,9 +1006,9 @@ pub(crate) struct CredSspAuth {
     pub(crate) username: String,
     pub(crate) password: Zeroizing<String>,
     pub(crate) domain: String,
-    /// The TLS contexts of the client. With `accept_invalid_certs` the outer
-    /// channel skips chain validation, and nothing in CredSSP authenticates
-    /// the server instead (`pubKeyAuth` binds only the inner TLS key).
+    /// The TLS contexts of the client. Only the outer verifier authenticates
+    /// the server (`pubKeyAuth` binds only the inner TLS key), so the
+    /// transport refuses CredSSP under `accept_invalid_certs`.
     pub(crate) tls: Arc<CredSspTls>,
     /// Response size and timeout limits of the connection.
     pub(crate) opts: CredSspConnOptions,
@@ -2083,8 +2085,9 @@ mod tests {
         CredSspTls::new(&base).unwrap()
     }
 
-    /// The TLS contexts of an `accept_invalid_certs` client: no outer
-    /// certificate verification (handshake signatures are still checked).
+    /// TLS contexts with no outer certificate verification (handshake
+    /// signatures are still checked). The transport refuses CredSSP under
+    /// `accept_invalid_certs`; these tests build `CredSspAuth` directly.
     fn no_verify() -> CredSspTls {
         test_tls_with(|provider| Arc::new(crate::tls::NoVerifier::new(provider)))
     }

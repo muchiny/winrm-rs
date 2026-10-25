@@ -81,6 +81,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `WinrmClientBuilder::danger_accept_invalid_proxy_certs(true)`. With
   `use_tls = true`, a proxy that reqwest takes from system settings is still
   verified like the WinRM server.
+- **CredSSP needs an authenticated HTTPS server.** CredSSP refuses
+  `accept_invalid_certs = true`: building a client with `AuthMethod::CredSsp`
+  and that flag now fails with `WinrmError::AuthFailed`. CredSSP delegates
+  your password and carries no channel binding to the HTTPS connection.
+  Migration: set `accept_invalid_certs = false` and either pin the listener
+  certificate with `pin_server_certificate_sha256` or trust its CA with
+  `add_root_certificates_pem`. The CredSSP connection now uses the client's
+  TLS verifier, custom CA and pin included, instead of its own.
 
 ### Added
 

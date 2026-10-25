@@ -54,9 +54,9 @@ pub struct WinrmConfig {
     /// # Security
     ///
     /// Setting this to `true` stops checking the server certificate's chain,
-    /// validity dates and host name: on the HTTPS transport and on the
-    /// CredSSP outer TLS leg, not on the leg to an `https://` proxy (see
-    /// below). Use it **only** in test environments. The constructor logs a
+    /// validity dates and host name on the HTTPS transport, not on the leg to
+    /// an `https://` proxy (see below); CredSSP refuses it (see below). Use
+    /// it **only** in test environments. The constructor logs a
     /// `tracing::warn` when this flag is enabled.
     ///
     /// For an internal CA or a self-signed listener, use
@@ -94,13 +94,14 @@ pub struct WinrmConfig {
     /// the WinRM server is, that is not at all under this flag: a proxy that
     /// `reqwest` takes from system settings, which the client cannot name.
     ///
-    /// **CredSSP is the exception.** Its HTTPS connection carries no channel
-    /// binding, and nothing inside CredSSP identifies the server. With this
-    /// flag, a party on the network path who presents a certificate of its
-    /// own can relay the CredSSP exchange, read and rewrite every SOAP body
-    /// and its output, and so run commands in a session that holds your
-    /// delegated credentials. Do not combine CredSSP with this flag outside
-    /// an isolated test network.
+    /// With [`AuthMethod::CredSsp`], building the client fails with
+    /// `AuthFailed`: CredSSP refuses `accept_invalid_certs = true`. Set it to
+    /// false and either pin the listener certificate with
+    /// [`pin_server_certificate_sha256`](crate::WinrmClientBuilder::pin_server_certificate_sha256)
+    /// or trust its CA with
+    /// [`add_root_certificates_pem`](crate::WinrmClientBuilder::add_root_certificates_pem).
+    /// CredSSP has no channel binding, so it needs an authenticated HTTPS
+    /// connection.
     pub accept_invalid_certs: bool,
     /// TCP connect timeout in seconds (default: 30).
     ///
@@ -627,14 +628,13 @@ pub enum AuthMethod {
     /// CredSSP sends your cleartext password to the server. Only the HTTPS
     /// certificate identifies that server: for a domain account, any
     /// domain-joined computer can complete the NTLM exchange inside CredSSP
-    /// through a domain controller. With
-    /// [`WinrmConfig::accept_invalid_certs`] nothing identifies the server
-    /// (see that field). Until a listener certificate can be pinned, keep
-    /// `accept_invalid_certs = false` with a certificate the default roots
-    /// trust, or use [`AuthMethod::Ntlm`] or [`AuthMethod::Kerberos`], whose
-    /// channel binding keeps the authentication from being used on the real
-    /// server even in that mode; it does not protect the traffic (see that
-    /// field).
+    /// through a domain controller. CredSSP refuses `accept_invalid_certs =
+    /// true`: building the client fails with
+    /// [`WinrmError::AuthFailed`](crate::WinrmError::AuthFailed). Set it to
+    /// false and either pin the listener certificate with
+    /// `pin_server_certificate_sha256` or trust its CA with
+    /// `add_root_certificates_pem`. The CredSSP connection uses the same
+    /// verifier as the rest of the client.
     ///
     /// Anyone who controls the target, now or while your logon session lives
     /// there, can read the delegated password. Use CredSSP only toward hosts

@@ -269,6 +269,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `RemotePathPolicy::LocalDrive` also refuses DOS device names (`CON`,
   `NUL`, `COM1`, `LPT1`, ...) as the last path component, with or without
   an extension. Migration: `RemotePathPolicy::Any` accepts them.
+- `EncryptionMode::Auto` seals NTLM and Kerberos messages over HTTPS when
+  `accept_invalid_certs` is set, as it does over plain HTTP, so an
+  unverified server never receives a request body in clear. Migration: none
+  needed; to rely on TLS alone, pin the listener certificate or trust its
+  CA and leave `accept_invalid_certs` false.
 
 ### Added
 

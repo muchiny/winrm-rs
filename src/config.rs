@@ -76,9 +76,11 @@ pub struct WinrmConfig {
     /// certificate. That is all this mode keeps. Someone in the middle who
     /// presents a certificate of its own is accepted. It receives, and can
     /// change, what TLS was meant to protect: Basic credentials, SOAP bodies
-    /// and their output (over HTTPS, [`EncryptionMode::Auto`] does not seal
-    /// them), and the NTLMv2 response, which it can relay to a service that
-    /// ignores channel binding or use to guess the password offline.
+    /// and their output unless they are sealed (with this flag,
+    /// [`EncryptionMode::Auto`] seals NTLM and Kerberos messages over HTTPS
+    /// too, since 2.0; [`EncryptionMode::Never`] does not), and the NTLMv2
+    /// response, which it can relay to a service that ignores channel binding
+    /// or use to guess the password offline.
     ///
     /// Certificates the verifier cannot use are refused even in this mode:
     /// X.509 v1 and v2, a certificate with an unknown critical extension, RSA
@@ -512,7 +514,9 @@ impl std::fmt::Debug for EnvVarNames<'_> {
 /// session (RC4, NTLM signatures), or with the Kerberos context (GSS-API wrap
 /// with confidentiality; only RFC 4121 "CFX" wrap tokens are accepted, so AES
 /// session keys: an RC4-only realm cannot seal and needs [`Self::Never`]).
-/// When using HTTPS, the TLS layer provides that, making sealing redundant.
+/// When using HTTPS with a verified certificate, the TLS layer provides that,
+/// making sealing redundant. With `accept_invalid_certs` it does not, since
+/// the server is not authenticated, so [`Self::Auto`] seals over HTTPS too.
 /// Sealing starts once the authentication is done: it protects the SOAP
 /// bodies, not the authentication itself (see the Security section of
 /// [`WinrmConfig`]).
@@ -578,9 +582,17 @@ impl std::fmt::Debug for EnvVarNames<'_> {
 /// way back if that fails.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub enum EncryptionMode {
-    /// Seal every SOAP body over HTTP (NTLM and Kerberos); over HTTPS rely on
-    /// TLS and send them unsealed (default). Basic, Certificate and CredSSP
-    /// never seal: they rely on TLS.
+    /// Seal every SOAP body over HTTP (NTLM and Kerberos), and over HTTPS
+    /// when [`WinrmConfig::accept_invalid_certs`] is set; over HTTPS with a
+    /// verified certificate rely on TLS and send them unsealed (default).
+    /// Basic, Certificate and CredSSP never seal: they rely on TLS.
+    ///
+    /// Without certificate verification whoever answers on the HTTPS port
+    /// completes the TLS handshake, so an unsealed body would reach it in
+    /// clear (with NTLM, the first one rides in the request that completes
+    /// the authentication). Sealing keeps it unreadable to a server that
+    /// does not hold the session key. 1.x, whose default was plain HTTP,
+    /// sealed this case only over HTTP.
     #[default]
     Auto,
     /// Seal every SOAP body, over HTTPS too (inside TLS).
@@ -716,8 +728,8 @@ pub enum AuthMethod {
     /// the AP-REP proves that the real server took part in the exchange, not
     /// that this client's connection reaches it: a relay passes the AP-REP
     /// through. Message confidentiality and integrity come from HTTPS, or from
-    /// Kerberos sealing ([`EncryptionMode::Auto`] over HTTP, or
-    /// [`EncryptionMode::Always`]). Both run on dedicated connections
+    /// Kerberos sealing ([`EncryptionMode::Auto`] over HTTP or with
+    /// `accept_invalid_certs`, or [`EncryptionMode::Always`]). Both run on dedicated connections
     /// authenticated once, and require the AP-REP. Over HTTPS the AP-REQ
     /// carries a channel binding (RFC 5929 `tls-server-end-point`) computed for
     /// the certificate learnt on an unauthenticated probe request; that
@@ -733,8 +745,9 @@ pub enum AuthMethod {
     /// middle from using the authentication on the real server's HTTPS listener
     /// (since 1.4.1 the server must prove it holds the pinned certificate's
     /// key); they do not stop a party with a certificate of its own from
-    /// reading the traffic or relaying the token to a service that ignores
-    /// channel binding. A certificate whose signature algorithm defines no
+    /// reading unsealed traffic ([`EncryptionMode::Auto`] seals in this mode,
+    /// [`EncryptionMode::Never`] does not) or relaying the token to a service
+    /// that ignores channel binding. A certificate whose signature algorithm defines no
     /// binding hash (Ed25519, unknown) is refused. With
     /// [`EncryptionMode::Never`] over HTTP, each request authenticates with a
     /// fresh context, the AP-REP is checked only when the answer carries one,

@@ -4540,9 +4540,10 @@ fn kerberos_https_client_from_env(tweak: impl FnOnce(&mut WinrmConfig)) -> (Winr
     })
 }
 
-/// `AuthMethod::Kerberos` over HTTPS: TLS protects the messages, the
-/// Kerberos token authenticates the request (SPN `HTTP/dc.winrm.test`, the
-/// same as over HTTP).
+/// `AuthMethod::Kerberos` over HTTPS: the Kerberos token authenticates the
+/// request (SPN `HTTP/dc.winrm.test`, the same as over HTTP). The listener
+/// certificate is not verified here, so `EncryptionMode::Auto` also seals
+/// the messages inside TLS.
 #[cfg(feature = "kerberos")]
 #[tokio::test]
 #[ignore]
@@ -5271,8 +5272,9 @@ async fn kerberos_channel_binding_split_relay_fails_at_the_handshake() {
 
 /// With `CbtHardeningLevel = None` the DC ignores channel bindings, so the
 /// relay can watch the traffic inside TLS: `EncryptionMode::Always` sends
-/// every SOAP body sealed (Kerberos and NTLM), `Auto` sends them as is
-/// (TLS only), which shows the relay would see plaintext.
+/// every SOAP body sealed (Kerberos and NTLM), and so does `Auto` here, since
+/// the certificate is not verified (`accept_invalid_certs`); `Never` sends
+/// them as is (TLS only), which shows the relay would see plaintext.
 #[cfg(feature = "kerberos")]
 #[tokio::test]
 #[ignore]
@@ -5302,32 +5304,49 @@ async fn always_seals_inside_tls_seen_by_a_relay_with_dc_cbt_none() {
             .expect("Kerberos Auto through the relay");
         let (with_body, sealed) = relay.bodies();
         assert!(with_body >= 4, "expected the command's requests");
-        assert_eq!(sealed, 0, "Kerberos Auto over HTTPS does not seal");
+        assert_eq!(
+            sealed, with_body,
+            "Kerberos Auto without certificate verification: a body went unsealed"
+        );
 
         let relay = TlsRecordingRelay::start(https_port);
-        let config = WinrmConfig {
-            auth_method: AuthMethod::Ntlm,
-            encryption: EncryptionMode::Always,
-            use_tls: true,
-            accept_invalid_certs: true,
-            port: Some(relay.port),
-            ..Default::default()
-        };
-        let ntlm = WinrmClient::new(config, WinrmCredentials::new("vagrant", "vagrant", "WINRM"))
-            .expect("NTLM client");
-        let host = std::env::var("WINRM_TEST_KRB_HOST").expect("WINRM_TEST_KRB_HOST");
-        ntlm.run_command(&host, "whoami", &[])
+        let (client, host) = kerberos_client_through_relay(&relay, EncryptionMode::Never);
+        client
+            .run_command(&host, "whoami", &[])
             .await
-            .expect("NTLM Always through the relay");
+            .expect("Kerberos Never through the relay");
         let (with_body, sealed) = relay.bodies();
         assert!(with_body >= 4, "expected the command's requests");
-        assert_eq!(sealed, with_body, "NTLM Always: a body went unsealed");
+        assert_eq!(sealed, 0, "Kerberos Never over HTTPS does not seal");
+
+        let host = std::env::var("WINRM_TEST_KRB_HOST").expect("WINRM_TEST_KRB_HOST");
+        for mode in [EncryptionMode::Always, EncryptionMode::Auto] {
+            let relay = TlsRecordingRelay::start(https_port);
+            let config = WinrmConfig {
+                auth_method: AuthMethod::Ntlm,
+                encryption: mode.clone(),
+                use_tls: true,
+                accept_invalid_certs: true,
+                port: Some(relay.port),
+                ..Default::default()
+            };
+            let ntlm =
+                WinrmClient::new(config, WinrmCredentials::new("vagrant", "vagrant", "WINRM"))
+                    .expect("NTLM client");
+            ntlm.run_command(&host, "whoami", &[])
+                .await
+                .unwrap_or_else(|e| panic!("NTLM {mode:?} through the relay: {e}"));
+            let (with_body, sealed) = relay.bodies();
+            assert!(with_body >= 4, "expected the command's requests");
+            assert_eq!(sealed, with_body, "NTLM {mode:?}: a body went unsealed");
+        }
     })
     .await;
 }
 
 /// `CbtHardeningLevel = Strict` requires channel bindings: Kerberos over
-/// HTTPS still works, unsealed (`Auto`) and sealed (`Always`), since the
+/// HTTPS still works, unsealed (`Never`) and sealed (`Auto` without
+/// certificate verification, `Always`), since the
 /// AP-REQ carries them; through the relay it is refused, and the split relay
 /// fails at the handshake as under `Relaxed`.
 #[cfg(feature = "kerberos")]
@@ -5335,7 +5354,11 @@ async fn always_seals_inside_tls_seen_by_a_relay_with_dc_cbt_none() {
 #[ignore]
 async fn kerberos_over_https_with_dc_cbt_strict() {
     with_dc_cbt_hardening("Strict", || async {
-        for mode in [EncryptionMode::Auto, EncryptionMode::Always] {
+        for mode in [
+            EncryptionMode::Never,
+            EncryptionMode::Auto,
+            EncryptionMode::Always,
+        ] {
             let (client, host) = kerberos_https_client_from_env(|c| c.encryption = mode.clone());
             let out = client
                 .run_command(&host, "whoami", &[])

@@ -246,14 +246,17 @@ impl WinrmClientBuilder<Ready> {
     ///
     /// - Basic, Certificate, and Kerberos over HTTP with
     ///   [`EncryptionMode::Never`](crate::EncryptionMode::Never): 1.
-    /// - NTLM over HTTPS, and NTLM over HTTP with `EncryptionMode::Never`: 2 for
-    ///   every message (Negotiate, then the Authenticate that carries the message).
-    /// - Sealed NTLM or Kerberos, and Kerberos over HTTPS: 1 on a pooled
-    ///   authenticated connection. A new connection is first authenticated by a
-    ///   handshake with no body (NTLM: Negotiate and Authenticate; Kerberos: the
-    ///   AP-REQ, after an unauthenticated probe over HTTPS). That handshake runs
-    ///   once more if the server closes the connection after authenticating, so
-    ///   up to 5 requests in all.
+    /// - NTLM over HTTPS unsealed (a verified certificate under
+    ///   `EncryptionMode::Auto`, or `Never`), and NTLM over HTTP with `Never`:
+    ///   2 for every message (Negotiate, then the Authenticate that carries the
+    ///   message).
+    /// - Sealed NTLM or Kerberos (over HTTP, over HTTPS with
+    ///   `accept_invalid_certs` under `Auto`, or with `Always`), and Kerberos
+    ///   over HTTPS: 1 on a pooled authenticated connection. A new connection
+    ///   is first authenticated by a handshake with no body (NTLM: Negotiate
+    ///   and Authenticate; Kerberos: the AP-REQ, after an unauthenticated probe
+    ///   over HTTPS). That handshake runs once more if the server closes the
+    ///   connection after authenticating, so up to 5 requests in all.
     /// - CredSSP: a new TLS connection and the whole CredSSP exchange for every
     ///   message, each leg carrying the message. Usually 5 requests, at most 13.
     ///

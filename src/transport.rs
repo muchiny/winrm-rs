@@ -327,14 +327,16 @@ impl Route {
 }
 
 /// Whether requests under `config` are sealed (NTLM and Kerberos only):
-/// `EncryptionMode::Auto` seals over plain HTTP only, `Always` over HTTPS
-/// too, `Never` never.
+/// `EncryptionMode::Auto` seals over plain HTTP, and over HTTPS when the
+/// certificate is not verified (`accept_invalid_certs`: the server is not
+/// authenticated, so TLS alone does not keep the bodies from whoever
+/// answers); `Always` seals over HTTPS too, `Never` never.
 fn seals_for(config: &WinrmConfig) -> bool {
     matches!(config.auth_method, AuthMethod::Ntlm | AuthMethod::Kerberos)
         && match config.encryption {
             EncryptionMode::Always => true,
             EncryptionMode::Never => false,
-            EncryptionMode::Auto => !config.use_tls,
+            EncryptionMode::Auto => !config.use_tls || config.accept_invalid_certs,
         }
 }
 
@@ -6104,6 +6106,87 @@ mod tests {
         assert!(!seals(AuthMethod::Basic, EncryptionMode::Never, true));
     }
 
+    /// Over HTTPS without certificate verification the server is not
+    /// authenticated, so `Auto` seals NTLM and Kerberos as over plain HTTP:
+    /// whoever answers never receives a body in clear. `Never` still does
+    /// not seal, and the methods that never seal are unchanged.
+    #[test]
+    fn auto_seals_over_https_when_the_certificate_is_not_verified() {
+        let config = |auth_method, encryption, use_tls, accept_invalid_certs| WinrmConfig {
+            auth_method,
+            encryption,
+            use_tls,
+            accept_invalid_certs,
+            ..Default::default()
+        };
+        let seals = |auth_method, encryption, use_tls, accept_invalid_certs| {
+            HttpTransport::new(
+                config(auth_method, encryption, use_tls, accept_invalid_certs),
+                WinrmCredentials::new("u", "p", ""),
+            )
+            .unwrap()
+            .seals()
+        };
+        for method in [AuthMethod::Ntlm, AuthMethod::Kerberos] {
+            let name = format!("{method:?}");
+            // HTTPS, certificate not verified: sealed under Auto and Always.
+            assert!(
+                seals(method.clone(), EncryptionMode::Auto, true, true),
+                "{name}"
+            );
+            assert!(
+                seals(method.clone(), EncryptionMode::Always, true, true),
+                "{name}"
+            );
+            // HTTPS, certificate verified: TLS alone under Auto.
+            assert!(
+                !seals(method.clone(), EncryptionMode::Auto, true, false),
+                "{name}"
+            );
+            // Plain HTTP: sealed under Auto, with or without the flag.
+            assert!(
+                seals(method.clone(), EncryptionMode::Auto, false, true),
+                "{name}"
+            );
+            assert!(
+                seals(method.clone(), EncryptionMode::Auto, false, false),
+                "{name}"
+            );
+            // `Never` is still accepted over HTTPS without verification, and
+            // still does not seal.
+            assert!(
+                !seals(method.clone(), EncryptionMode::Never, true, true),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            Route::for_config(&config(AuthMethod::Ntlm, EncryptionMode::Auto, true, true)),
+            Route::Sealed
+        );
+        assert_eq!(
+            Route::for_config(&config(AuthMethod::Ntlm, EncryptionMode::Auto, true, false)),
+            Route::NtlmOverTls
+        );
+        if cfg!(feature = "kerberos") {
+            assert_eq!(
+                Route::for_config(&config(
+                    AuthMethod::Kerberos,
+                    EncryptionMode::Auto,
+                    true,
+                    true
+                )),
+                Route::Sealed
+            );
+        }
+        // Certificate auth never seals, verified or not.
+        assert!(!seals_for(&config(
+            AuthMethod::Certificate,
+            EncryptionMode::Auto,
+            true,
+            true
+        )));
+    }
+
     // --- Bounded in-flight NTLM connections ---
 
     #[tokio::test]
@@ -6677,6 +6760,9 @@ mod tests {
             auth_method: AuthMethod::Ntlm,
             use_tls: true,
             accept_invalid_certs: true,
+            // The unsealed route over HTTPS, which this server speaks: `Auto`
+            // seals when the certificate is not verified.
+            encryption: EncryptionMode::Never,
             port: Some(port),
             connect_timeout_secs: 5,
             operation_timeout_secs: 5,
@@ -6740,6 +6826,10 @@ mod tests {
                     auth_method,
                     use_tls: true,
                     accept_invalid_certs: !basic,
+                    // The unsealed NTLM route over HTTPS, which this server
+                    // speaks: `Auto` seals when the certificate is not
+                    // verified.
+                    encryption: EncryptionMode::Never,
                     port: Some(port),
                     proxy,
                     connect_timeout_secs: 5,

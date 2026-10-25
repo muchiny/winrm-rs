@@ -1,35 +1,78 @@
 name: Release
 
+# A `v*` tag publishes the crate. A manual run (`gh workflow run release.yml
+# --ref main`) is a dry run: `verify` and `package` only. CONTRIBUTING.md,
+# "Releasing (maintainers)", gives the procedure.
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
 
 permissions: {}
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+# No cache anywhere in this workflow: a tag run could restore a cache written
+# by another ref.
 jobs:
-  test:
-    name: Pre-release tests
+  verify:
+    name: Verify the commit
     runs-on: ubuntu-latest
+    # The CI status check waits up to an hour for the push-to-main run.
+    timeout-minutes: 75
     permissions:
       contents: read
+      actions: read # list the CI runs of the commit
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # Full history and every branch: step "On main" needs origin/main.
+          fetch-depth: 0
           persist-credentials: false
-      # No rust-cache: a tag run could restore a cache written by another ref.
       - name: Install Rust 1.98.0
-        run: rustup toolchain install 1.98.0 --profile minimal --component clippy --no-self-update && rustup default 1.98.0
+        run: rustup toolchain install 1.98.0 --profile minimal --no-self-update && rustup default 1.98.0
+      # cargo-semver-checks builds the default feature group, which includes
+      # `credssp` (OpenSSL) and `kerberos` (krb5).
+      - name: Install krb5 and OpenSSL headers
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libssl-dev pkg-config
+      - name: On main
+        run: |
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main \
+            || { echo "::error::$GITHUB_SHA is not on main"; exit 1; }
+      - name: Tag matches the Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 --locked \
+            | jq -r '.packages[] | select(.name == "winrm-rs") | .version')
+          test "$GITHUB_REF_NAME" = "v$version" \
+            || { echo "::error::tag $GITHUB_REF_NAME does not match the Cargo.toml version $version"; exit 1; }
+      # The push-to-main run of ci.yml, not a check run named `CI passed`:
+      # a pull request can produce a check run of that name on any commit.
+      - name: CI succeeded on the push to main
+        run: scripts/release-ci-status.sh "$GITHUB_SHA"
+        env:
+          GH_TOKEN: ${{ github.token }}
       - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
-          tool: cargo-nextest@0.9.135
-      - run: cargo nextest run --locked
-      - run: cargo test --doc --locked
-      - run: cargo clippy --locked --all-targets -- -D warnings
+          tool: cargo-deny@0.19.6
+      - name: RustSec advisories
+        run: cargo deny --all-features --locked check advisories
+      # On a tag run, the newest version on crates.io is the previous release:
+      # that is the baseline.
+      - uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2.9
+        with:
+          # Use the 1.98.0 toolchain installed above, not a floating stable.
+          rust-toolchain: manual
 
-  publish:
-    name: Publish to crates.io
-    needs: test
+  package:
+    name: Package
+    needs: verify
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -39,15 +82,46 @@ jobs:
           persist-credentials: false
       - name: Install Rust 1.98.0
         run: rustup toolchain install 1.98.0 --profile minimal --no-self-update && rustup default 1.98.0
+      - name: Package contents
+        run: scripts/check-package.sh
+      # Builds the packaged sources, without any secret in the job. `publish`
+      # then uploads the same tree with `--no-verify`.
+      - name: Build the package
+        run: cargo package --locked
+
+  publish:
+    name: Publish to crates.io
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    # Waits for a maintainer's approval. The crates.io Trusted Publisher names
+    # this workflow file and this environment.
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write # crates.io Trusted Publishing (OIDC)
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust 1.98.0
+        run: rustup toolchain install 1.98.0 --profile minimal --no-self-update && rustup default 1.98.0
+      # Exchanges the OIDC token for a short-lived crates.io token; its post
+      # step revokes that token when the job ends.
+      - uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+        id: auth
+      # `--no-verify`: no dependency build script or proc-macro runs while the
+      # token exists. `package` built the same commit.
       - name: Publish
-        run: cargo publish --locked
+        run: cargo publish --locked --no-verify
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
   github-release:
     name: GitHub Release
     # No GitHub release for a version that did not reach crates.io.
     needs: publish
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write # create the GitHub release

@@ -9,9 +9,12 @@ on:
 permissions:
   contents: read
 
+# A newer push cancels a pull request run. Push runs on main are never
+# cancelled: the release workflow needs the complete result of every merge
+# commit (scripts/release-ci-status.sh).
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -34,6 +37,8 @@ jobs:
         run: scripts/check-package.sh
       - name: fuzz.sh argument checks
         run: scripts/test-fuzz-args.sh
+      - name: release-ci-status.sh checks
+        run: scripts/test-release-ci-status.sh
 
   clippy:
     name: Clippy

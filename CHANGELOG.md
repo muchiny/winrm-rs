@@ -457,6 +457,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   reqwest loaded the operating system's roots for plain-HTTP clients (they
   are used only for an `https://` proxy) and failed to build when that store
   was empty. The client now falls back to the built-in Mozilla roots.
+- Decoding PowerShell CLIXML on stderr now finds the document when raw stderr
+  text arrives between the `#< CLIXML` marker and `<Objs`; error records were
+  returned as raw XML.
 
 ### Documentation
 

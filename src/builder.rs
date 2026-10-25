@@ -718,12 +718,22 @@ mod tests {
     #[test]
     fn builder_sets_the_remote_path_policy() {
         let creds = || WinrmCredentials::new("u", "p", "");
-        let client = WinrmClient::builder(WinrmConfig::default())
+        // `Any` differs from the default, so this leg fails if the setter
+        // does nothing.
+        let any = WinrmClient::builder(WinrmConfig::default())
             .credentials(creds())
+            .remote_path_policy(RemotePathPolicy::Any)
+            .build()
+            .unwrap();
+        assert_eq!(any.remote_path_policy, RemotePathPolicy::Any);
+        // The last call wins: `LocalDrive` after `Any`.
+        let local = WinrmClient::builder(WinrmConfig::default())
+            .credentials(creds())
+            .remote_path_policy(RemotePathPolicy::Any)
             .remote_path_policy(RemotePathPolicy::LocalDrive)
             .build()
             .unwrap();
-        assert_eq!(client.remote_path_policy, RemotePathPolicy::LocalDrive);
+        assert_eq!(local.remote_path_policy, RemotePathPolicy::LocalDrive);
         let default = WinrmClient::builder(WinrmConfig::default())
             .credentials(creds())
             .build()

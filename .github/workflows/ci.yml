@@ -229,10 +229,11 @@ jobs:
       # FFI glue is exercised by the kerberos-kdc job, not counted here.
       - name: Generate coverage
         run: cargo llvm-cov --locked --features credssp --summary-only --fail-under-lines 95
-      # Reuses the profile data of the run above: no rebuild. The feature list
-      # must match that run, or the report would come from a different build.
+      # Reuses the profile data and the objects of the run above (built with
+      # `credssp`): no rebuild. `cargo llvm-cov report` takes no feature
+      # flags; it reads whatever that run left in the target directory.
       - name: Cobertura report for SonarQube Cloud
-        run: cargo llvm-cov report --features credssp --cobertura --output-path cobertura.xml
+        run: cargo llvm-cov report --cobertura --output-path cobertura.xml
       - name: Keep cobertura.xml for the sonar job
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

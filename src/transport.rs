@@ -1223,6 +1223,15 @@ impl HttpTransport {
         Route::for_config(&self.config)
     }
 
+    /// The CredSSP TLS contexts and dial of this transport, for the tests of
+    /// `auth::credssp` that drive a connection themselves.
+    #[cfg(all(test, feature = "credssp"))]
+    pub(crate) fn credssp_tls_and_dial(
+        &self,
+    ) -> (Option<&Arc<CredSspTls>>, &Arc<proxy::CredSspDial>) {
+        (self.credssp_tls.as_ref(), &self.credssp_dial)
+    }
+
     /// [`seals_for`] this transport's configuration.
     #[cfg(test)]
     fn seals(&self) -> bool {

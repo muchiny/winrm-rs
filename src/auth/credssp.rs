@@ -1323,335 +1323,13 @@ impl AuthTransport for CredSspAuth {
         // Microsoft HTTPAPI on the WSMAN listener expects). The same body is
         // re-sent during the auth handshake AND on the final TSCredentials
         // delivery.
-        let body_for_auth: &str = &body;
-
-        let encode_auth = |bytes: &[u8]| format!("CredSSP {}", B64.encode(bytes));
-
-        // === Step 1: Initialize the INNER TLS connection (memory-only) ===
-        // Use OpenSSL via in-memory BIO — pyspnego does the same and rustls
-        // produces a TLS state Microsoft's CredSSP server silently rejects.
-        let mut inner_tls = build_inner_openssl_tls(&self.tls.inner)?;
-        // Drive the TLS handshake one step to produce ClientHello.
-        inner_tls.handshake_step()?;
-
-        // === Step 3: Drive the TLS handshake through HTTP rounds ===
-        // Each round:
-        //   1. Drain outgoing TLS bytes (ClientHello, then key exchange...)
-        //   2. POST to server with these bytes in Authorization header
-        //   3. Receive server response (ServerHello, etc.) in WWW-Authenticate
-        //   4. Feed back into rustls
-        //   5. Repeat until !is_handshaking()
-        let mut round = 0;
-        loop {
-            round += 1;
-            if round > 10 {
-                return Err(WinrmError::AuthFailed(
-                    "CredSSP: TLS handshake did not complete in 10 rounds".into(),
-                ));
-            }
-
-            let outgoing = inner_tls.drain_outgoing();
-            if outgoing.is_empty() {
-                if inner_tls.handshake_step()? {
-                    break;
-                }
-                continue;
-            }
-
-            let resp = conn
-                .post(Some(&encode_auth(&outgoing)), body_for_auth)
-                .await?;
-            if resp.status != 401 {
-                return Err(WinrmError::AuthFailed(format!(
-                    "CredSSP: TLS handshake round {round}: expected 401, got {}",
-                    resp.status
-                )));
-            }
-            let server_token = resp
-                .head
-                .header("www-authenticate")
-                .as_deref()
-                .and_then(extract_credssp_token_str)
-                .ok_or_else(|| {
-                    WinrmError::AuthFailed(format!(
-                        "CredSSP: TLS handshake round {round}: no CredSSP token in response"
-                    ))
-                })?;
-            handshake_round_ok(&resp, &format!("TLS handshake round {round}"))?;
-            let server_bytes = B64.decode(server_token.trim_ascii()).map_err(|e| {
-                WinrmError::AuthFailed(format!("CredSSP: bad base64 in handshake: {e}"))
-            })?;
-            inner_tls.feed_incoming(&server_bytes);
-            if inner_tls.handshake_step()? {
-                break;
-            }
-        }
-
-        // === Extract SubjectPublicKey from the INNER TLS server cert ===
-        let inner_cert_der = inner_tls.peer_cert_der()?;
-        let inner_cert_der: &[u8] = &inner_cert_der;
-        let subject_public_key = {
-            use x509_cert::der::Decode;
-            let cert = x509_cert::Certificate::from_der(inner_cert_der)
-                .map_err(|e| WinrmError::AuthFailed(format!("CredSSP cert parse: {e}")))?;
-            // Per MS-CSSP 2.2.2.5, pubKeyAuth is computed over the bit string
-            // contents of subjectPublicKey (PKCS#1 RSAPublicKey for RSA certs).
-            cert.tbs_certificate()
-                .subject_public_key_info()
-                .subject_public_key
-                .raw_bytes()
-                .to_vec()
-        };
-
-        // === Step 4: Inner TLS established. Build NTLM Type 1 in TSRequest ===
-        // Use the CredSSP-specific Type 1 with KEY_EXCH/SEAL/SIGN flags required
-        // for the sealing of pubKeyAuth and TSCredentials.
-        let type1 = ntlm::create_negotiate_message_credssp();
-        let spnego_init = asn1::encode_spnego_init(&type1);
-        let ts_req1 =
-            asn1::encode_ts_request(CREDSSP_VERSION, Some(&spnego_init), None, None, None);
-        inner_tls.write_plaintext(&ts_req1)?;
-        let outgoing = Ok::<_, WinrmError>(inner_tls.drain_outgoing())?;
-
-        // Send through HTTP
-        let resp = conn
-            .post(Some(&encode_auth(&outgoing)), body_for_auth)
-            .await?;
-        if resp.status != 401 {
-            return Err(WinrmError::AuthFailed(format!(
-                "CredSSP: NTLM negotiate: expected 401, got {}",
-                resp.status
-            )));
-        }
-        let server_token = resp
-            .head
-            .header("www-authenticate")
-            .as_deref()
-            .and_then(extract_credssp_token_str)
-            .ok_or_else(|| WinrmError::AuthFailed("CredSSP: NTLM nego: no CredSSP token".into()))?;
-        handshake_round_ok(&resp, "NTLM negotiate")?;
-        let server_bytes = B64
-            .decode(server_token.trim_ascii())
-            .map_err(|e| WinrmError::AuthFailed(format!("CredSSP: bad b64 NTLM nego: {e}")))?;
-        {
-            inner_tls.feed_incoming(&server_bytes);
-            Ok::<_, WinrmError>(())
-        }?;
-        let plaintext = inner_tls.read_plaintext()?;
-
-        // === Step 5: Decode TSRequest containing NTLM Type 2 ===
-        let ts_resp = asn1::decode_ts_request(&plaintext).map_err(WinrmError::CredSsp)?;
-        let negotiated_version = std::cmp::min(ts_resp.version, CREDSSP_VERSION);
-        tracing::debug!(
-            server_version = ts_resp.version,
-            negotiated = negotiated_version,
-            "CredSSP version negotiation"
-        );
-        if let Some(code) = ts_resp.error_code {
-            return Err(WinrmError::CredSsp(CredSspError::ServerError(code)));
-        }
-        let spnego_resp = ts_resp
-            .nego_token
-            .ok_or_else(|| WinrmError::AuthFailed("CredSSP: no negoToken from server".into()))?;
-        let type2 = asn1::decode_spnego_token(&spnego_resp).map_err(WinrmError::CredSsp)?;
-        let challenge = ntlm::parse_challenge(&type2).map_err(WinrmError::Ntlm)?;
-
-        // === Step 6: Build NTLM Type 3 + pubKeyAuth + clientNonce ===
-        // CONFIRMED via forensic hash analysis: pywinrm uses username.upper()+empty
-        // for NTOWFv2 (NTProofStr matches when computed this way). Empty domain.
-        let domain = self.domain.clone();
-        // SPN from the endpoint host (punycode, lowercase, IPv6 without brackets).
-        let spn = endpoint.spn();
-
-        // No `.await` inside this block: the exported session key never becomes
-        // part of the future's state, and `Zeroizing` wipes it when the block
-        // ends. Keep awaits out of it.
-        let (type3, mut ntlm_session) = {
-            let (type3, session_key) = ntlm::create_authenticate_message_credssp(
-                &challenge,
-                &self.username,
-                &self.password,
-                &domain,
-                &spn,
-                &type1,
-                &type2,
-            )
-            .map_err(WinrmError::Ntlm)?;
-            (type3, NtlmSession::boxed_from_auth(&session_key))
-        };
-        // Compute mechListMIC over the SPNEGO mech_type_list. This MUST happen
-        // before sealing pubKeyAuth so that the latter uses seq=1 (matches
-        // pyspnego/Windows expectations). Without mechListMIC the server
-        // returns STATUS_LOGON_FAILURE. `sign_mech_list_mic` also resets the
-        // RC4 sealing handle afterwards, as Windows SPNEGO does — the
-        // pubKeyAuth below must be sealed at keystream offset 0.
-        let mech_list_mic = ntlm_session.sign_mech_list_mic(asn1::MECH_TYPE_LIST_NTLM);
-
-        // Compute pubKeyAuth (v6): SHA256(magic + nonce + SubjectPublicKey).
-        //
-        // CREDSSP_FIXED_NONCE pins the v6 nonce for deterministic tests. It is
-        // honoured only in debug builds with the internal `__internal` feature;
-        // every other build draws from the CSPRNG.
-        #[cfg(all(debug_assertions, feature = "__internal"))]
-        let nonce: [u8; 32] = std::env::var("CREDSSP_FIXED_NONCE")
-            .ok()
-            .and_then(|s| crate::ntlm::crypto::parse_fixed_hex::<32>(&s))
-            .unwrap_or_else(rand::random);
-        #[cfg(not(all(debug_assertions, feature = "__internal")))]
-        let nonce: [u8; 32] = rand::random();
-        let client_hash = {
-            let mut hasher = Sha256::new();
-            hasher.update(b"CredSSP Client-To-Server Binding Hash\0");
-            hasher.update(nonce);
-            hasher.update(&subject_public_key);
-            hasher.finalize().to_vec()
-        };
-        let encrypted_pub_key_auth = ntlm_session.seal(&client_hash);
-
-        let spnego_authenticate = asn1::encode_spnego_response(&type3, Some(&mech_list_mic));
-        let ts_req3 = asn1::encode_ts_request(
-            CREDSSP_VERSION,
-            Some(&spnego_authenticate),
-            Some(&encrypted_pub_key_auth),
-            None,
-            Some(&nonce),
-        );
-        // CREDSSP_DUMP dumps every secret (nonce, public key bind, sealed
-        // pubKeyAuth) to stderr. It is compiled in only for debug builds with
-        // the internal `__internal` feature.
-        #[cfg(all(debug_assertions, feature = "__internal"))]
-        if std::env::var("CREDSSP_DUMP").is_ok() {
-            let h = |b: &[u8]| b.iter().map(|x| format!("{:02x}", x)).collect::<String>();
-            eprintln!(
-                "[CREDSSP_DUMP] ts_req3 ({}B): {}",
-                ts_req3.len(),
-                h(&ts_req3)
-            );
-            eprintln!("[CREDSSP_DUMP] nonce: {}", h(&nonce));
-            eprintln!("[CREDSSP_DUMP] inner_cert_der: {}", h(inner_cert_der));
-            eprintln!("[CREDSSP_DUMP] type1: {}", h(&type1));
-            eprintln!("[CREDSSP_DUMP] spnego_init: {}", h(&spnego_init));
-            eprintln!("[CREDSSP_DUMP] type2: {}", h(&type2));
-            eprintln!("[CREDSSP_DUMP] type3: {}", h(&type3));
-            eprintln!("[CREDSSP_DUMP] mech_list_mic: {}", h(&mech_list_mic));
-            eprintln!("[CREDSSP_DUMP] spn: {spn}");
-            eprintln!(
-                "[CREDSSP_DUMP] subject_public_key: {}",
-                h(&subject_public_key)
-            );
-            eprintln!("[CREDSSP_DUMP] client_hash: {}", h(&client_hash));
-            eprintln!(
-                "[CREDSSP_DUMP] sealed_pub_key_auth: {}",
-                h(&encrypted_pub_key_auth)
-            );
-        }
-        inner_tls.write_plaintext(&ts_req3)?;
-        let outgoing = Ok::<_, WinrmError>(inner_tls.drain_outgoing())?;
-
-        let resp = conn
-            .post(Some(&encode_auth(&outgoing)), body_for_auth)
-            .await?;
-        if resp.status != 401 {
-            return Err(WinrmError::AuthFailed(format!(
-                "CredSSP: NTLM authenticate: expected 401, got {}",
-                resp.status
-            )));
-        }
-        #[cfg(all(debug_assertions, feature = "__internal"))]
-        if std::env::var("CREDSSP_DUMP").is_ok() {
-            eprintln!(
-                "[CREDSSP_DUMP] step6 response status={} headers={:?}",
-                resp.status, resp.head.headers
-            );
-        }
-        let server_token = resp
-            .head
-            .header("www-authenticate")
-            .as_deref()
-            .and_then(extract_credssp_token_str)
-            .ok_or_else(|| {
-                WinrmError::AuthFailed(
-                    "CredSSP: server dropped the context after NTLM AUTHENTICATE + pubKeyAuth \
-                     (401 without a CredSSP token is how Windows reports a rejected pubKeyAuth)"
-                        .into(),
-                )
-            })?;
-        handshake_round_ok(&resp, "NTLM authenticate")?;
-        let server_bytes = B64
-            .decode(server_token.trim_ascii())
-            .map_err(|e| WinrmError::AuthFailed(format!("CredSSP: bad b64 auth: {e}")))?;
-        {
-            inner_tls.feed_incoming(&server_bytes);
-            Ok::<_, WinrmError>(())
-        }?;
-        let plaintext = inner_tls.read_plaintext()?;
-
-        // === Step 7: Verify server pubKeyAuth ===
-        let ts_resp = asn1::decode_ts_request(&plaintext).map_err(WinrmError::CredSsp)?;
-        if let Some(code) = ts_resp.error_code {
-            return Err(WinrmError::CredSsp(CredSspError::ServerError(code)));
-        }
-        // The client sent a mechListMIC with its last SPNEGO token, so RFC 4178
-        // §5 c) case I requires the server's final token to answer with its own
-        // and with accept-completed. MS-SPNG <8> makes the mechListMIC
-        // mandatory on every Windows version after Server 2003 / XP. A token
-        // that cannot be parsed surfaces as `Asn1Decode`, not as "omitted".
-        // An absent negState stays allowed (RFC 4178 §4.2.2).
-        // Verifying the MIC (GSS_VerifyMIC at server seq 0) also re-initialises
-        // the server RC4 handle, so the pubKeyAuth below unseals at seq 1,
-        // keystream offset 0 — the same reset Windows applies on its side.
-        let nego = ts_resp.nego_token.as_deref().ok_or_else(|| {
-            WinrmError::AuthFailed("CredSSP: server sent no final SPNEGO token".into())
-        })?;
-        let (state, mic) = asn1::decode_spnego_final(nego).map_err(WinrmError::CredSsp)?;
-        if let Some(s) = state
-            && s != asn1::NEG_STATE_ACCEPT_COMPLETED
-        {
-            return Err(WinrmError::AuthFailed(format!(
-                "CredSSP: server final SPNEGO state {s} is not accept-completed"
-            )));
-        }
-        let mic = mic.ok_or_else(|| {
-            WinrmError::AuthFailed("CredSSP: server omitted mechListMIC (RFC 4178 §5)".into())
-        })?;
-        ntlm_session
-            .verify_mech_list_mic(asn1::MECH_TYPE_LIST_NTLM, &mic)
-            .map_err(WinrmError::Ntlm)?;
-        let server_pub_key_auth = ts_resp
-            .pub_key_auth
-            .ok_or_else(|| WinrmError::AuthFailed("CredSSP: no pubKeyAuth from server".into()))?;
-        let decrypted_server_hash = ntlm_session
-            .unseal(&server_pub_key_auth)
-            .map_err(WinrmError::Ntlm)?;
-        let expected_server_hash = {
-            let mut hasher = Sha256::new();
-            hasher.update(b"CredSSP Server-To-Client Binding Hash\0");
-            hasher.update(nonce);
-            hasher.update(&subject_public_key);
-            hasher.finalize().to_vec()
-        };
-        if decrypted_server_hash != expected_server_hash {
-            return Err(WinrmError::CredSsp(CredSspError::PublicKeyMismatch));
-        }
-
-        // === Step 8: Send encrypted TSCredentials ===
-        // Same rule: the cleartext TSCredentials are wiped before the final
-        // POST, which can last as long as the WS-Man operation
-        // (`operation_timeout_secs`). No `.await` inside this block.
-        let encrypted_creds = {
-            let ts_creds = asn1::encode_ts_credentials(&domain, &self.username, &self.password);
-            ntlm_session.seal(&ts_creds)
-        };
-        let ts_req5 =
-            asn1::encode_ts_request(CREDSSP_VERSION, None, None, Some(&encrypted_creds), None);
-        inner_tls.write_plaintext(&ts_req5)?;
-        let outgoing = Ok::<_, WinrmError>(inner_tls.drain_outgoing())?;
+        let round5 = authenticate(&mut conn, self, &endpoint, &body).await?;
 
         let HttpResponse {
             status,
             body: resp_body,
             ..
-        } = conn.post(Some(&encode_auth(&outgoing)), &body).await?;
+        } = conn.post(Some(&round5), &body).await?;
         if status == 401 {
             return Err(WinrmError::AuthFailed(
                 "CredSSP: credentials rejected after delegation".into(),
@@ -1668,6 +1346,343 @@ impl AuthTransport for CredSspAuth {
         }
         Ok(String::from_utf8_lossy(&resp_body).into_owned())
     }
+}
+
+/// Run the CredSSP handshake on `conn` up to the delegation: the inner TLS
+/// handshake, NTLM negotiate, then NTLM authenticate with `pubKeyAuth`, whose
+/// answer must carry the server's final SPNEGO token and `pubKeyAuth`. Each
+/// round posts `body_for_auth`. Returns the `Authorization` value of the
+/// delegation round (the TSRequest with the sealed TSCredentials in
+/// `authInfo`), which the caller posts with the request body.
+#[cfg(feature = "credssp")]
+async fn authenticate(
+    conn: &mut CredSspConnection,
+    auth: &CredSspAuth,
+    endpoint: &CredSspEndpoint,
+    body_for_auth: &str,
+) -> Result<String, WinrmError> {
+    let encode_auth = |bytes: &[u8]| format!("CredSSP {}", B64.encode(bytes));
+
+    // === Step 1: Initialize the INNER TLS connection (memory-only) ===
+    // Use OpenSSL via in-memory BIO — pyspnego does the same and rustls
+    // produces a TLS state Microsoft's CredSSP server silently rejects.
+    let mut inner_tls = build_inner_openssl_tls(&auth.tls.inner)?;
+    // Drive the TLS handshake one step to produce ClientHello.
+    inner_tls.handshake_step()?;
+
+    // === Step 3: Drive the TLS handshake through HTTP rounds ===
+    // Each round:
+    //   1. Drain outgoing TLS bytes (ClientHello, then key exchange...)
+    //   2. POST to server with these bytes in Authorization header
+    //   3. Receive server response (ServerHello, etc.) in WWW-Authenticate
+    //   4. Feed back into rustls
+    //   5. Repeat until !is_handshaking()
+    let mut round = 0;
+    loop {
+        round += 1;
+        if round > 10 {
+            return Err(WinrmError::AuthFailed(
+                "CredSSP: TLS handshake did not complete in 10 rounds".into(),
+            ));
+        }
+
+        let outgoing = inner_tls.drain_outgoing();
+        if outgoing.is_empty() {
+            if inner_tls.handshake_step()? {
+                break;
+            }
+            continue;
+        }
+
+        let resp = conn
+            .post(Some(&encode_auth(&outgoing)), body_for_auth)
+            .await?;
+        if resp.status != 401 {
+            return Err(WinrmError::AuthFailed(format!(
+                "CredSSP: TLS handshake round {round}: expected 401, got {}",
+                resp.status
+            )));
+        }
+        let server_token = resp
+            .head
+            .header("www-authenticate")
+            .as_deref()
+            .and_then(extract_credssp_token_str)
+            .ok_or_else(|| {
+                WinrmError::AuthFailed(format!(
+                    "CredSSP: TLS handshake round {round}: no CredSSP token in response"
+                ))
+            })?;
+        handshake_round_ok(&resp, &format!("TLS handshake round {round}"))?;
+        let server_bytes = B64.decode(server_token.trim_ascii()).map_err(|e| {
+            WinrmError::AuthFailed(format!("CredSSP: bad base64 in handshake: {e}"))
+        })?;
+        inner_tls.feed_incoming(&server_bytes);
+        if inner_tls.handshake_step()? {
+            break;
+        }
+    }
+
+    // === Extract SubjectPublicKey from the INNER TLS server cert ===
+    let inner_cert_der = inner_tls.peer_cert_der()?;
+    let inner_cert_der: &[u8] = &inner_cert_der;
+    let subject_public_key = {
+        use x509_cert::der::Decode;
+        let cert = x509_cert::Certificate::from_der(inner_cert_der)
+            .map_err(|e| WinrmError::AuthFailed(format!("CredSSP cert parse: {e}")))?;
+        // Per MS-CSSP 2.2.2.5, pubKeyAuth is computed over the bit string
+        // contents of subjectPublicKey (PKCS#1 RSAPublicKey for RSA certs).
+        cert.tbs_certificate()
+            .subject_public_key_info()
+            .subject_public_key
+            .raw_bytes()
+            .to_vec()
+    };
+
+    // === Step 4: Inner TLS established. Build NTLM Type 1 in TSRequest ===
+    // Use the CredSSP-specific Type 1 with KEY_EXCH/SEAL/SIGN flags required
+    // for the sealing of pubKeyAuth and TSCredentials.
+    let type1 = ntlm::create_negotiate_message_credssp();
+    let spnego_init = asn1::encode_spnego_init(&type1);
+    let ts_req1 = asn1::encode_ts_request(CREDSSP_VERSION, Some(&spnego_init), None, None, None);
+    inner_tls.write_plaintext(&ts_req1)?;
+    let outgoing = Ok::<_, WinrmError>(inner_tls.drain_outgoing())?;
+
+    // Send through HTTP
+    let resp = conn
+        .post(Some(&encode_auth(&outgoing)), body_for_auth)
+        .await?;
+    if resp.status != 401 {
+        return Err(WinrmError::AuthFailed(format!(
+            "CredSSP: NTLM negotiate: expected 401, got {}",
+            resp.status
+        )));
+    }
+    let server_token = resp
+        .head
+        .header("www-authenticate")
+        .as_deref()
+        .and_then(extract_credssp_token_str)
+        .ok_or_else(|| WinrmError::AuthFailed("CredSSP: NTLM nego: no CredSSP token".into()))?;
+    handshake_round_ok(&resp, "NTLM negotiate")?;
+    let server_bytes = B64
+        .decode(server_token.trim_ascii())
+        .map_err(|e| WinrmError::AuthFailed(format!("CredSSP: bad b64 NTLM nego: {e}")))?;
+    {
+        inner_tls.feed_incoming(&server_bytes);
+        Ok::<_, WinrmError>(())
+    }?;
+    let plaintext = inner_tls.read_plaintext()?;
+
+    // === Step 5: Decode TSRequest containing NTLM Type 2 ===
+    let ts_resp = asn1::decode_ts_request(&plaintext).map_err(WinrmError::CredSsp)?;
+    let negotiated_version = std::cmp::min(ts_resp.version, CREDSSP_VERSION);
+    tracing::debug!(
+        server_version = ts_resp.version,
+        negotiated = negotiated_version,
+        "CredSSP version negotiation"
+    );
+    if let Some(code) = ts_resp.error_code {
+        return Err(WinrmError::CredSsp(CredSspError::ServerError(code)));
+    }
+    let spnego_resp = ts_resp
+        .nego_token
+        .ok_or_else(|| WinrmError::AuthFailed("CredSSP: no negoToken from server".into()))?;
+    let type2 = asn1::decode_spnego_token(&spnego_resp).map_err(WinrmError::CredSsp)?;
+    let challenge = ntlm::parse_challenge(&type2).map_err(WinrmError::Ntlm)?;
+
+    // === Step 6: Build NTLM Type 3 + pubKeyAuth + clientNonce ===
+    // CONFIRMED via forensic hash analysis: pywinrm uses username.upper()+empty
+    // for NTOWFv2 (NTProofStr matches when computed this way). Empty domain.
+    let domain = auth.domain.clone();
+    // SPN from the endpoint host (punycode, lowercase, IPv6 without brackets).
+    let spn = endpoint.spn();
+
+    // No `.await` inside this block: the exported session key never becomes
+    // part of the future's state, and `Zeroizing` wipes it when the block
+    // ends. Keep awaits out of it.
+    let (type3, mut ntlm_session) = {
+        let (type3, session_key) = ntlm::create_authenticate_message_credssp(
+            &challenge,
+            &auth.username,
+            &auth.password,
+            &domain,
+            &spn,
+            &type1,
+            &type2,
+        )
+        .map_err(WinrmError::Ntlm)?;
+        (type3, NtlmSession::boxed_from_auth(&session_key))
+    };
+    // Compute mechListMIC over the SPNEGO mech_type_list. This MUST happen
+    // before sealing pubKeyAuth so that the latter uses seq=1 (matches
+    // pyspnego/Windows expectations). Without mechListMIC the server
+    // returns STATUS_LOGON_FAILURE. `sign_mech_list_mic` also resets the
+    // RC4 sealing handle afterwards, as Windows SPNEGO does — the
+    // pubKeyAuth below must be sealed at keystream offset 0.
+    let mech_list_mic = ntlm_session.sign_mech_list_mic(asn1::MECH_TYPE_LIST_NTLM);
+
+    // Compute pubKeyAuth (v6): SHA256(magic + nonce + SubjectPublicKey).
+    //
+    // CREDSSP_FIXED_NONCE pins the v6 nonce for deterministic tests. It is
+    // honoured only in debug builds with the internal `__internal` feature;
+    // every other build draws from the CSPRNG.
+    #[cfg(all(debug_assertions, feature = "__internal"))]
+    let nonce: [u8; 32] = std::env::var("CREDSSP_FIXED_NONCE")
+        .ok()
+        .and_then(|s| crate::ntlm::crypto::parse_fixed_hex::<32>(&s))
+        .unwrap_or_else(rand::random);
+    #[cfg(not(all(debug_assertions, feature = "__internal")))]
+    let nonce: [u8; 32] = rand::random();
+    let client_hash = {
+        let mut hasher = Sha256::new();
+        hasher.update(b"CredSSP Client-To-Server Binding Hash\0");
+        hasher.update(nonce);
+        hasher.update(&subject_public_key);
+        hasher.finalize().to_vec()
+    };
+    let encrypted_pub_key_auth = ntlm_session.seal(&client_hash);
+
+    let spnego_authenticate = asn1::encode_spnego_response(&type3, Some(&mech_list_mic));
+    let ts_req3 = asn1::encode_ts_request(
+        CREDSSP_VERSION,
+        Some(&spnego_authenticate),
+        Some(&encrypted_pub_key_auth),
+        None,
+        Some(&nonce),
+    );
+    // CREDSSP_DUMP dumps every secret (nonce, public key bind, sealed
+    // pubKeyAuth) to stderr. It is compiled in only for debug builds with
+    // the internal `__internal` feature.
+    #[cfg(all(debug_assertions, feature = "__internal"))]
+    if std::env::var("CREDSSP_DUMP").is_ok() {
+        let h = |b: &[u8]| b.iter().map(|x| format!("{:02x}", x)).collect::<String>();
+        eprintln!(
+            "[CREDSSP_DUMP] ts_req3 ({}B): {}",
+            ts_req3.len(),
+            h(&ts_req3)
+        );
+        eprintln!("[CREDSSP_DUMP] nonce: {}", h(&nonce));
+        eprintln!("[CREDSSP_DUMP] inner_cert_der: {}", h(inner_cert_der));
+        eprintln!("[CREDSSP_DUMP] type1: {}", h(&type1));
+        eprintln!("[CREDSSP_DUMP] spnego_init: {}", h(&spnego_init));
+        eprintln!("[CREDSSP_DUMP] type2: {}", h(&type2));
+        eprintln!("[CREDSSP_DUMP] type3: {}", h(&type3));
+        eprintln!("[CREDSSP_DUMP] mech_list_mic: {}", h(&mech_list_mic));
+        eprintln!("[CREDSSP_DUMP] spn: {spn}");
+        eprintln!(
+            "[CREDSSP_DUMP] subject_public_key: {}",
+            h(&subject_public_key)
+        );
+        eprintln!("[CREDSSP_DUMP] client_hash: {}", h(&client_hash));
+        eprintln!(
+            "[CREDSSP_DUMP] sealed_pub_key_auth: {}",
+            h(&encrypted_pub_key_auth)
+        );
+    }
+    inner_tls.write_plaintext(&ts_req3)?;
+    let outgoing = Ok::<_, WinrmError>(inner_tls.drain_outgoing())?;
+
+    let resp = conn
+        .post(Some(&encode_auth(&outgoing)), body_for_auth)
+        .await?;
+    if resp.status != 401 {
+        return Err(WinrmError::AuthFailed(format!(
+            "CredSSP: NTLM authenticate: expected 401, got {}",
+            resp.status
+        )));
+    }
+    #[cfg(all(debug_assertions, feature = "__internal"))]
+    if std::env::var("CREDSSP_DUMP").is_ok() {
+        eprintln!(
+            "[CREDSSP_DUMP] step6 response status={} headers={:?}",
+            resp.status, resp.head.headers
+        );
+    }
+    let server_token = resp
+        .head
+        .header("www-authenticate")
+        .as_deref()
+        .and_then(extract_credssp_token_str)
+        .ok_or_else(|| {
+            WinrmError::AuthFailed(
+                "CredSSP: server dropped the context after NTLM AUTHENTICATE + pubKeyAuth \
+                     (401 without a CredSSP token is how Windows reports a rejected pubKeyAuth)"
+                    .into(),
+            )
+        })?;
+    handshake_round_ok(&resp, "NTLM authenticate")?;
+    let server_bytes = B64
+        .decode(server_token.trim_ascii())
+        .map_err(|e| WinrmError::AuthFailed(format!("CredSSP: bad b64 auth: {e}")))?;
+    {
+        inner_tls.feed_incoming(&server_bytes);
+        Ok::<_, WinrmError>(())
+    }?;
+    let plaintext = inner_tls.read_plaintext()?;
+
+    // === Step 7: Verify server pubKeyAuth ===
+    let ts_resp = asn1::decode_ts_request(&plaintext).map_err(WinrmError::CredSsp)?;
+    if let Some(code) = ts_resp.error_code {
+        return Err(WinrmError::CredSsp(CredSspError::ServerError(code)));
+    }
+    // The client sent a mechListMIC with its last SPNEGO token, so RFC 4178
+    // §5 c) case I requires the server's final token to answer with its own
+    // and with accept-completed. MS-SPNG <8> makes the mechListMIC
+    // mandatory on every Windows version after Server 2003 / XP. A token
+    // that cannot be parsed surfaces as `Asn1Decode`, not as "omitted".
+    // An absent negState stays allowed (RFC 4178 §4.2.2).
+    // Verifying the MIC (GSS_VerifyMIC at server seq 0) also re-initialises
+    // the server RC4 handle, so the pubKeyAuth below unseals at seq 1,
+    // keystream offset 0 — the same reset Windows applies on its side.
+    let nego = ts_resp.nego_token.as_deref().ok_or_else(|| {
+        WinrmError::AuthFailed("CredSSP: server sent no final SPNEGO token".into())
+    })?;
+    let (state, mic) = asn1::decode_spnego_final(nego).map_err(WinrmError::CredSsp)?;
+    if let Some(s) = state
+        && s != asn1::NEG_STATE_ACCEPT_COMPLETED
+    {
+        return Err(WinrmError::AuthFailed(format!(
+            "CredSSP: server final SPNEGO state {s} is not accept-completed"
+        )));
+    }
+    let mic = mic.ok_or_else(|| {
+        WinrmError::AuthFailed("CredSSP: server omitted mechListMIC (RFC 4178 §5)".into())
+    })?;
+    ntlm_session
+        .verify_mech_list_mic(asn1::MECH_TYPE_LIST_NTLM, &mic)
+        .map_err(WinrmError::Ntlm)?;
+    let server_pub_key_auth = ts_resp
+        .pub_key_auth
+        .ok_or_else(|| WinrmError::AuthFailed("CredSSP: no pubKeyAuth from server".into()))?;
+    let decrypted_server_hash = ntlm_session
+        .unseal(&server_pub_key_auth)
+        .map_err(WinrmError::Ntlm)?;
+    let expected_server_hash = {
+        let mut hasher = Sha256::new();
+        hasher.update(b"CredSSP Server-To-Client Binding Hash\0");
+        hasher.update(nonce);
+        hasher.update(&subject_public_key);
+        hasher.finalize().to_vec()
+    };
+    if decrypted_server_hash != expected_server_hash {
+        return Err(WinrmError::CredSsp(CredSspError::PublicKeyMismatch));
+    }
+
+    // === Step 8: Send encrypted TSCredentials ===
+    // Same rule: the cleartext TSCredentials are wiped before the final
+    // POST, which can last as long as the WS-Man operation
+    // (`operation_timeout_secs`). No `.await` inside this block.
+    let encrypted_creds = {
+        let ts_creds = asn1::encode_ts_credentials(&domain, &auth.username, &auth.password);
+        ntlm_session.seal(&ts_creds)
+    };
+    let ts_req5 =
+        asn1::encode_ts_request(CREDSSP_VERSION, None, None, Some(&encrypted_creds), None);
+    inner_tls.write_plaintext(&ts_req5)?;
+    let outgoing = Ok::<_, WinrmError>(inner_tls.drain_outgoing())?;
+
+    Ok(encode_auth(&outgoing))
 }
 
 #[cfg(not(feature = "credssp"))]
@@ -3059,6 +3074,133 @@ mod tests {
             1
         );
         assert!(log.contains(&Event::Executed { body: BODY.into() }));
+    }
+
+    /// Each request runs its own session on its own connection: the inner TLS
+    /// handshake, NTLM negotiate, NTLM authenticate, then the delegation that
+    /// carries the request. Every round posts the request body.
+    #[tokio::test]
+    async fn send_authenticated_is_one_session_per_request() {
+        let auth = mock_auth(no_verify(), 1 << 20);
+        let mut want = vec![(BODY.len(), false); 4];
+        want.push((BODY.len(), true));
+        for _ in 0..2 {
+            let (port, log) = test_server::spawn(Fault::Honest, EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+            let out = run(&auth, port, BODY).await.unwrap();
+            assert_eq!(out, test_server::MOCK_REPLY);
+            let log = log.lock().unwrap().clone();
+            assert_eq!(rounds(&log), want);
+            assert_eq!(delegations(&log), 1);
+            assert_eq!(
+                log.iter()
+                    .filter(|e| **e == Event::Executed { body: BODY.into() })
+                    .count(),
+                1
+            );
+        }
+    }
+
+    /// Whether a live host keeps the CredSSP context of a connection after
+    /// the delegation: a shell is created with the delegation round, then
+    /// deleted on the same connection with no `Authorization` header. Run on
+    /// an HTTPS listener without message encryption, its certificate pinned,
+    /// with the variables of `tests/integration_real.rs`:
+    /// `cargo test --lib --features credssp -- --ignored --nocapture credssp_live_connection_keeps_the_context`
+    #[tokio::test]
+    #[ignore = "needs a live host: WINRM_TEST_HOST, WINRM_TEST_USER, WINRM_TEST_PASS, WINRM_TEST_HTTPS_CERT_SHA256"]
+    async fn credssp_live_connection_keeps_the_context() {
+        use crate::config::{AuthMethod, WinrmCredentials};
+        use crate::soap::namespaces::RESOURCE_URI_CMD;
+        use crate::tls::TlsOptions;
+        use crate::transport::{HttpTransport, TransportOptions};
+
+        let (Ok(host), Ok(user), Ok(pass)) = (
+            std::env::var("WINRM_TEST_HOST"),
+            std::env::var("WINRM_TEST_USER"),
+            std::env::var("WINRM_TEST_PASS"),
+        ) else {
+            eprintln!(
+                "SKIP credssp_live_connection_keeps_the_context: set WINRM_TEST_HOST, \
+                 WINRM_TEST_USER and WINRM_TEST_PASS"
+            );
+            return;
+        };
+        let port: u16 = std::env::var("WINRM_TEST_HTTPS_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(55986);
+        let Some(pin) = std::env::var("WINRM_TEST_HTTPS_CERT_SHA256")
+            .ok()
+            .filter(|pin| !pin.trim().is_empty())
+        else {
+            eprintln!(
+                "SKIP credssp_live_connection_keeps_the_context: set WINRM_TEST_HTTPS_CERT_SHA256"
+            );
+            return;
+        };
+
+        let config = WinrmConfig {
+            auth_method: AuthMethod::CredSsp,
+            use_tls: true,
+            accept_invalid_certs: false,
+            port,
+            ..Default::default()
+        };
+        let t = HttpTransport::new_with(
+            config.clone(),
+            WinrmCredentials::new(user.clone(), pass.clone(), ""),
+            TransportOptions {
+                tls: TlsOptions {
+                    pins: vec![pin],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (tls, dial) = t.credssp_tls_and_dial();
+        let tls = tls.unwrap();
+        let url = t.endpoint(&host);
+        let endpoint = CredSspEndpoint::parse(&url).unwrap();
+        let opts = CredSspConnOptions::from_config(&config);
+        let auth = CredSspAuth {
+            username: user,
+            password: Zeroizing::new(pass),
+            domain: String::new(),
+            tls: Arc::clone(tls),
+            opts: opts.clone(),
+            dial: Arc::clone(dial),
+        };
+
+        let mut conn = CredSspConnection::connect(&endpoint, tls, dial, opts)
+            .await
+            .unwrap();
+        let create = crate::soap::create_shell_request(&url, &config);
+        let round5 = authenticate(&mut conn, &auth, &endpoint, &create)
+            .await
+            .unwrap();
+        let resp = conn.post(Some(&round5), &create).await.unwrap();
+        let body = String::from_utf8_lossy(&resp.body).into_owned();
+        assert_eq!(resp.status, 200, "create: {body}");
+        eprintln!(
+            "create: status {}, closing {}, leftover {}",
+            resp.status, resp.closing, resp.leftover
+        );
+        let shell_id = crate::soap::parse_shell_id(&body).unwrap();
+
+        let delete =
+            crate::soap::delete_shell_request_for(&url, &shell_id, RESOURCE_URI_CMD, 60, 153_600);
+        let resp = match conn.post(None, &delete).await {
+            Ok(resp) => resp,
+            Err(e) => panic!("delete without Authorization on the same connection: {e}"),
+        };
+        let body = String::from_utf8_lossy(&resp.body).into_owned();
+        eprintln!(
+            "delete without Authorization: status {}, closing {}, leftover {}",
+            resp.status, resp.closing, resp.leftover
+        );
+        assert_eq!(resp.status, 200, "delete: {body}");
+        assert!(!body.contains("s:Fault"), "delete: {body}");
     }
 
     #[tokio::test]

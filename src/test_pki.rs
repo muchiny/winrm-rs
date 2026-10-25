@@ -508,12 +508,23 @@ TZkzaJG8kyjjXD9Hm+4XvQoYWD7qDvK1xYymIr+F28TE4IV/nKG5Axfi
 -----END PRIVATE KEY-----
 ";
 
+/// Install `ring` as the process-wide rustls provider, if none is installed
+/// yet. Test servers (`ServerConfig::builder`) and `reqwest` clients built
+/// without a preconfigured TLS configuration read it.
+pub(crate) fn install_test_provider() {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test servers and reqwest test clients need a process provider"
+    )]
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 /// A TLS server config presenting `cert_pem` with its own key `key_pem`.
 pub(crate) fn server_config(cert_pem: &str, key_pem: &str) -> Arc<rustls::ServerConfig> {
     use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    install_test_provider();
     let chain = vec![CertificateDer::from_pem_slice(cert_pem.as_bytes()).unwrap()];
     let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).unwrap();
     Arc::new(
@@ -543,7 +554,7 @@ pub(crate) fn impostor_server_config(
         }
     }
 
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    install_test_provider();
     let cert = CertificateDer::from_pem_slice(EC_CERT_PEM.as_bytes()).unwrap();
     let key = PrivateKeyDer::from_pem_slice(IMPOSTOR_EC_KEY_PKCS8_PEM.as_bytes()).unwrap();
     let signing_key = rustls::crypto::ring::sign::any_ecdsa_type(&key).unwrap();

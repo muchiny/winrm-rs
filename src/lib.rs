@@ -133,7 +133,7 @@ mod transport;
 pub use builder::{NeedsCredentials, Ready, WinrmClientBuilder};
 pub use client::WinrmClient;
 pub use command::{CommandOutput, encode_powershell_command};
-pub use config::{AuthMethod, EncryptionMode, WinrmConfig, WinrmCredentials};
+pub use config::{AuthMethod, EncryptionMode, TlsProvider, WinrmConfig, WinrmCredentials};
 pub use error::{CredSspError, NtlmError, SoapError, WinrmError};
 pub use ntlm::NtlmSession;
 pub use secrecy::{ExposeSecret, SecretString};

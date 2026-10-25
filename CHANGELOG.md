@@ -70,12 +70,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   transfer scripts are affected; they never relied on a profile. A profile
   that customises the remote session no longer applies to `upload_file` or
   `download_file`.
+- With `use_tls = false` and `accept_invalid_certs`, an `https://` proxy must
+  now prove it holds its certificate's key, as the WinRM server must since
+  1.4.1. The plain-HTTP TLS configuration is now built by the crate rather
+  than by reqwest.
 
 ### Added
 
 - CredSSP logs the OpenSSL version used for its inner TLS at `debug` level
   (target `winrm_rs::credssp`); the README documents the host OpenSSL
   dependency.
+- **`WinrmClientBuilder::tls_provider`** chooses the rustls crypto provider.
+  `TlsProvider::Ring` uses a private ring provider and never reads or installs
+  the process-wide default. `TlsProvider::ProcessDefault` uses the provider
+  the application installed and fails to build when there is none. Without
+  it, building a client still installs ring process-wide when no provider is
+  installed yet; 2.0 stops doing that.
 
 ### Fixed
 
@@ -185,6 +195,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `http://` proxy on a host named after the scheme. It is now refused, with an
   error that does not repeat the credentials. A scheme that no proxy supports
   (`ftp://`) still goes direct, now with a WARN. 1.5.0 will refuse it.
+- **A plain-HTTP client builds on a host without a system CA bundle.**
+  reqwest loaded the operating system's roots for plain-HTTP clients (they
+  are used only for an `https://` proxy) and failed to build when that store
+  was empty. The client now falls back to the built-in Mozilla roots.
 
 ### Documentation
 

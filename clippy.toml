@@ -5,4 +5,8 @@ allow-panic-in-tests = true
 allow-indexing-slicing-in-tests = true
 disallowed-methods = [
     { path = "std::process::Command::new", reason = "no subprocess on the authentication path" },
+    { path = "rustls::ClientConfig::builder", reason = "reads the process-wide provider; use tls::client_config_builder" },
+    { path = "rustls::ClientConfig::builder_with_protocol_versions", reason = "reads the process-wide provider; use tls::client_config_builder" },
+    { path = "rustls::client::WebPkiServerVerifier::builder", reason = "reads the process-wide provider; use builder_with_provider" },
+    { path = "rustls::crypto::CryptoProvider::install_default", reason = "process-global; only tls::crypto_provider's legacy branch and test_pki::install_test_provider" },
 ]

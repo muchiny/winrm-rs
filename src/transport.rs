@@ -32,8 +32,9 @@ use crate::config::{AuthMethod, EncryptionMode, WinrmConfig, WinrmCredentials};
 use crate::error::{SoapError, WinrmError};
 use crate::ntlm::NtlmSession;
 use crate::soap;
-use crate::tls::{CertHandle, ClientAuthCert};
+use crate::tls::{CertHandle, ClientAuthCert, NoVerifier, TlsOptions};
 use rustls::client::danger::ServerCertVerifier;
+use rustls::crypto::CryptoProvider;
 
 /// A dedicated connection: a `reqwest` client that keeps at most one TCP
 /// connection, the certificate handle of its own TLS verifier (HTTPS), and,
@@ -365,10 +366,14 @@ pub(crate) struct HttpTransport {
     http: reqwest::Client,
     config: WinrmConfig,
     credentials: WinrmCredentials,
-    /// rustls configuration of [`Self::http`] and its server certificate
-    /// verifier (HTTPS only), the base of the dedicated clients.
-    tls_config: Option<(rustls::ClientConfig, Arc<dyn ServerCertVerifier>)>,
-    /// CredSSP TLS contexts, built once from [`Self::tls_config`]. `Some` only
+    /// rustls configuration of [`Self::http`] (HTTPS, or plain HTTP, where
+    /// it serves only the leg to an `https://` proxy), on the client's crypto
+    /// provider: the base of the dedicated clients.
+    client_tls: rustls::ClientConfig,
+    /// Server certificate verifier of [`Self::client_tls`], `Some` only over
+    /// HTTPS: the base of each dedicated client's capturing verifier.
+    server_verifier: Option<Arc<dyn ServerCertVerifier>>,
+    /// CredSSP TLS contexts, built once from [`Self::client_tls`]. `Some` only
     /// for [`AuthMethod::CredSsp`].
     #[cfg(feature = "credssp")]
     credssp_tls: Option<Arc<CredSspTls>>,
@@ -583,8 +588,9 @@ pub(crate) fn validate_host(host: &str) -> Result<(), WinrmError> {
 }
 
 /// Build the `reqwest` client for `config`: timeouts, redirects off, user
-/// agent, proxy, TLS details on responses and, over HTTPS, the prepared
-/// rustls configuration. At most `max_idle_per_host` idle connections are
+/// agent, proxy, TLS details on responses and the prepared rustls
+/// configuration `tls_config` (HTTPS, or the plain-HTTP one that serves an
+/// `https://` proxy). At most `max_idle_per_host` idle connections are
 /// kept per host: 10 for the transport's shared client, 1 for the client of
 /// a dedicated connection (sealed, Kerberos over TLS, or NTLM over TLS).
 ///
@@ -595,7 +601,7 @@ pub(crate) fn validate_host(host: &str) -> Result<(), WinrmError> {
 /// connection, so its requests stay on the authenticated one.
 fn build_http_client(
     config: &WinrmConfig,
-    tls_config: Option<rustls::ClientConfig>,
+    tls_config: rustls::ClientConfig,
     max_idle_per_host: usize,
     gate: Option<Arc<ConnGate>>,
 ) -> Result<reqwest::Client, WinrmError> {
@@ -604,7 +610,8 @@ fn build_http_client(
     // would risk forwarding the Authorization header. Disable redirects
     // entirely.
     let mut builder = reqwest::Client::builder()
-        .danger_accept_invalid_certs(config.accept_invalid_certs)
+        // Every TLS setting (verifier, provider) lives in `tls_config`.
+        .tls_backend_preconfigured(tls_config)
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
         .timeout(Duration::from_secs(config.operation_timeout_secs.saturating_add(10)))
@@ -639,9 +646,6 @@ fn build_http_client(
         // (see `WinrmConfig::proxy`).
         builder = builder.no_proxy();
     }
-    if let Some(tls_config) = tls_config {
-        builder = builder.tls_backend_preconfigured(tls_config);
-    }
     if let Some(gate) = gate {
         builder = builder.connector_layer(ConnGateLayer(gate));
     }
@@ -649,31 +653,57 @@ fn build_http_client(
 }
 
 impl HttpTransport {
-    /// Create a new HTTP transport from the given configuration and credentials.
+    /// Create a new HTTP transport from the given configuration and
+    /// credentials, with the default TLS options: [`Self::with_tls`]. The
+    /// client goes through [`Self::with_tls`] directly; the tests use this.
+    #[cfg(test)]
+    pub(crate) fn new(
+        config: WinrmConfig,
+        credentials: WinrmCredentials,
+    ) -> Result<Self, WinrmError> {
+        Self::with_tls(config, credentials, &TlsOptions::default())
+    }
+
+    /// Create a new HTTP transport from the given configuration, credentials
+    /// and TLS options: [`Self::with_provider`] on the crypto provider
+    /// `opts.provider` selects ([`crate::tls::crypto_provider`]).
+    pub(crate) fn with_tls(
+        config: WinrmConfig,
+        credentials: WinrmCredentials,
+        opts: &TlsOptions,
+    ) -> Result<Self, WinrmError> {
+        Self::with_provider(
+            config,
+            credentials,
+            opts,
+            crate::tls::crypto_provider(opts.provider)?,
+        )
+    }
+
+    /// Create a new HTTP transport whose every TLS configuration (the shared
+    /// client, the dedicated clients, the CredSSP outer TLS) uses `provider`.
     ///
     /// Builds the underlying HTTP client with the configured timeouts and TLS
     /// settings. Returns [`WinrmError::Http`] if the HTTP client cannot be
     /// constructed, and [`WinrmError::AuthFailed`] if the authentication
     /// method cannot be set up: Certificate or CredSSP without HTTPS,
-    /// Certificate auth without a usable certificate and key, a TLS verifier
-    /// or client certificate that rustls rejects, or, with the `credssp`
-    /// feature, the CredSSP TLS contexts.
-    #[tracing::instrument(level = "debug", skip(config, credentials))]
-    pub(crate) fn new(
+    /// Certificate auth without a usable certificate and key, a crypto
+    /// provider, TLS verifier or client certificate that rustls rejects, or,
+    /// with the `credssp` feature, the CredSSP TLS contexts.
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub(crate) fn with_provider(
         config: WinrmConfig,
         credentials: WinrmCredentials,
+        opts: &TlsOptions,
+        provider: Arc<CryptoProvider>,
     ) -> Result<Self, WinrmError> {
+        debug!(tls_provider = ?opts.provider, "TLS crypto provider choice");
         if config.accept_invalid_certs {
             tracing::warn!(
                 "TLS certificate verification disabled (accept_invalid_certs=true) — \
                  TEST USE ONLY, do not use in production"
             );
         }
-
-        // `reqwest` is built with `rustls-no-provider`, so a provider must be
-        // installed before ANY client is built, plain HTTP included
-        // (idempotent: an already-installed provider is kept).
-        let _ = rustls::crypto::ring::default_provider().install_default();
 
         // Load the client certificate for Certificate auth here, so a bad path
         // or PEM fails at construction. It is presented through the rustls
@@ -735,21 +765,24 @@ impl HttpTransport {
         // NTLM channel binding takes the server certificate of the connection
         // that carried the challenge: from the response (`tls_info`), or from
         // the verifier of a dedicated single-connection client (see `AuthConn`).
-        let tls_config = if config.use_tls {
-            let root_store =
-                rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            let inner_verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
-                if config.accept_invalid_certs {
-                    Arc::new(crate::tls::NoVerifier)
-                } else {
-                    rustls::client::WebPkiServerVerifier::builder(Arc::new(root_store))
-                        .build()
-                        .map_err(|e| WinrmError::AuthFailed(format!("TLS verifier error: {e}")))?
-                };
-            let tls_builder = rustls::ClientConfig::builder()
+        let (client_tls, server_verifier) = if config.use_tls {
+            let verifier: Arc<dyn ServerCertVerifier> = if config.accept_invalid_certs {
+                Arc::new(NoVerifier::new(&provider))
+            } else {
+                let roots = rustls::RootCertStore::from_iter(
+                    webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
+                );
+                rustls::client::WebPkiServerVerifier::builder_with_provider(
+                    Arc::new(roots),
+                    Arc::clone(&provider),
+                )
+                .build()
+                .map_err(|e| WinrmError::AuthFailed(format!("TLS verifier error: {e}")))?
+            };
+            let tls_builder = crate::tls::client_config_builder(&provider)?
                 .dangerous()
-                .with_custom_certificate_verifier(Arc::clone(&inner_verifier));
-            let tls_config = match client_auth {
+                .with_custom_certificate_verifier(Arc::clone(&verifier));
+            let client_tls = match client_auth {
                 Some(ClientAuthCert { chain, key }) => {
                     tls_builder.with_client_auth_cert(chain, key).map_err(|e| {
                         WinrmError::AuthFailed(format!("client certificate and key rejected: {e}"))
@@ -757,13 +790,25 @@ impl HttpTransport {
                 }
                 None => tls_builder.with_no_client_auth(),
             };
-            Some((tls_config, inner_verifier))
+            (client_tls, Some(verifier))
         } else {
-            None
+            // Plain HTTP: TLS only on the leg to an `https://` proxy, verified
+            // as `reqwest` would (the OS store), with the built-in roots when
+            // the OS store is unusable.
+            let verifier: Arc<dyn ServerCertVerifier> = if config.accept_invalid_certs {
+                Arc::new(NoVerifier::new(&provider))
+            } else {
+                crate::tls::platform_or_webpki(
+                    rustls_platform_verifier::Verifier::new(Arc::clone(&provider)),
+                    &[],
+                    &provider,
+                )?
+            };
+            (crate::tls::plain_http_config(verifier, &provider)?, None)
         };
 
         #[cfg(feature = "credssp")]
-        let credssp_tls = if matches!(config.auth_method, AuthMethod::CredSsp) {
+        let credssp_tls = if matches!(config.auth_method, AuthMethod::CredSsp) && config.use_tls {
             if config.accept_invalid_certs {
                 tracing::warn!(
                     "CredSSP outer TLS verification disabled (accept_invalid_certs=true): the \
@@ -771,26 +816,19 @@ impl HttpTransport {
                      protected; do not use in production"
                 );
             }
-            tls_config
-                .as_ref()
-                .map(|(base, _)| CredSspTls::new(base).map(Arc::new))
-                .transpose()?
+            Some(Arc::new(CredSspTls::new(&client_tls)?))
         } else {
             None
         };
 
-        let http = build_http_client(
-            &config,
-            tls_config.as_ref().map(|(c, _)| c.clone()),
-            10,
-            None,
-        )?;
+        let http = build_http_client(&config, client_tls.clone(), 10, None)?;
 
         Ok(Self {
             http,
             config,
             credentials,
-            tls_config,
+            client_tls,
+            server_verifier,
             #[cfg(feature = "credssp")]
             credssp_tls,
             conn_pool: Mutex::new(Vec::new()),
@@ -805,6 +843,12 @@ impl HttpTransport {
     /// Install the gate checked before every request attempt.
     pub(crate) fn set_before_send(&mut self, hook: BeforeSend) {
         self.before_send = Some(hook);
+    }
+
+    /// The rustls configuration of the shared client, for tests.
+    #[cfg(test)]
+    pub(crate) fn client_tls(&self) -> &rustls::ClientConfig {
+        &self.client_tls
     }
 
     /// Build the WinRM endpoint URL for a given host.
@@ -1148,8 +1192,9 @@ impl HttpTransport {
     /// one connection behind an open [`ConnGate`], and over HTTPS its own
     /// capturing verifier with TLS session resumption off.
     fn new_conn(&self, host: &str) -> Result<Box<AuthConn>, WinrmError> {
-        let (tls, cert) = match &self.tls_config {
-            Some((base, verifier)) => {
+        let mut tls = self.client_tls.clone();
+        let cert = match &self.server_verifier {
+            Some(verifier) => {
                 let capturing = crate::tls::CertCapturingVerifier::new(
                     Arc::clone(verifier),
                     url_server_name(&self.endpoint(host)),
@@ -1163,14 +1208,12 @@ impl HttpTransport {
                     }
                 }));
                 let handle = capturing.cert_handle();
-                let mut config = base.clone();
-                config
-                    .dangerous()
+                tls.dangerous()
                     .set_certificate_verifier(Arc::new(capturing));
-                config.resumption = rustls::client::Resumption::disabled();
-                (Some(config), Some(handle))
+                tls.resumption = rustls::client::Resumption::disabled();
+                Some(handle)
             }
-            None => (None, None),
+            None => None,
         };
         let gate = Arc::new(ConnGate::new(&self.config));
         Ok(Box::new(AuthConn {
@@ -1672,7 +1715,7 @@ fn retry_delay(attempt: u32) -> Duration {
 /// `rustls-no-provider` panics at build time unless a provider is installed.
 #[cfg(test)]
 pub(crate) fn test_http_client() -> reqwest::Client {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    crate::test_pki::install_test_provider();
     // No proxy from the environment: the tests talk to loopback servers.
     reqwest::Client::builder().no_proxy().build().unwrap()
 }
@@ -2423,7 +2466,7 @@ mod tests {
         use rustls::pki_types::{CertificateDer, PrivateKeyDer};
         use std::io::{Read, Write};
 
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        crate::test_pki::install_test_provider();
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let chain =
             vec![CertificateDer::from_pem_slice(crate::test_pki::EC_CERT_PEM.as_bytes()).unwrap()];
@@ -2680,7 +2723,7 @@ mod tests {
         };
         let creds = WinrmCredentials::new("admin", "pass", "");
         let transport = HttpTransport::new(config, creds).unwrap();
-        assert!(transport.tls_config.is_some());
+        assert!(transport.server_verifier.is_some());
     }
 
     #[test]
@@ -2693,13 +2736,70 @@ mod tests {
         };
         let creds = WinrmCredentials::new("admin", "pass", "");
         let transport = HttpTransport::new(config, creds).unwrap();
-        assert!(transport.tls_config.is_some());
+        assert!(transport.server_verifier.is_some());
     }
 
     #[test]
     fn no_tls_has_no_tls_config() {
         let transport = basic_transport(5985);
-        assert!(transport.tls_config.is_none());
+        assert!(transport.server_verifier.is_none());
+    }
+
+    /// A plain-HTTP client builds on a host whose OS certificate store is empty.
+    /// Meaningful when run with `SSL_CERT_FILE=/nonexistent` on Linux.
+    #[test]
+    fn plain_http_client_builds_without_system_roots() {
+        let result = HttpTransport::new(
+            WinrmConfig::default(),
+            WinrmCredentials::new(USER, PASS, ""),
+        );
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    /// Every TLS configuration of a transport (shared client, dedicated
+    /// clients' base, CredSSP outer TLS) uses the provider it was given.
+    #[test]
+    fn every_tls_config_uses_the_chosen_provider() {
+        let p = Arc::new(rustls::crypto::ring::default_provider());
+        for (use_tls, accept_invalid_certs) in
+            [(true, true), (true, false), (false, true), (false, false)]
+        {
+            let t = HttpTransport::with_provider(
+                WinrmConfig {
+                    use_tls,
+                    accept_invalid_certs,
+                    port: 5986,
+                    ..Default::default()
+                },
+                WinrmCredentials::new(USER, PASS, ""),
+                &TlsOptions::default(),
+                Arc::clone(&p),
+            )
+            .unwrap();
+            assert!(
+                Arc::ptr_eq(t.client_tls.crypto_provider(), &p),
+                "{use_tls} {accept_invalid_certs}"
+            );
+            assert_eq!(t.server_verifier.is_some(), use_tls);
+        }
+        #[cfg(feature = "credssp")]
+        {
+            let t = HttpTransport::with_provider(
+                WinrmConfig {
+                    auth_method: AuthMethod::CredSsp,
+                    use_tls: true,
+                    port: 5986,
+                    ..Default::default()
+                },
+                WinrmCredentials::new(USER, PASS, ""),
+                &TlsOptions::default(),
+                Arc::clone(&p),
+            )
+            .unwrap();
+            let o = &t.credssp_tls.as_ref().unwrap().outer;
+            assert!(Arc::ptr_eq(o.crypto_provider(), &p));
+            assert!(o.alpn_protocols.is_empty());
+        }
     }
 
     #[test]
@@ -3098,7 +3198,7 @@ mod tests {
 
     #[tokio::test]
     async fn before_send_runs_before_every_attempt() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        crate::test_pki::install_test_provider();
         let (_socket, port) = refused_port();
         let mut transport = basic_transport_retrying(port, 2);
         let (hook, calls) = counting_hook(usize::MAX);
@@ -3112,7 +3212,7 @@ mod tests {
 
     #[tokio::test]
     async fn before_send_refusal_stops_the_retries() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        crate::test_pki::install_test_provider();
         let (_socket, port) = refused_port();
         let mut transport = basic_transport_retrying(port, 2);
         let (hook, calls) = counting_hook(1);
@@ -3503,7 +3603,7 @@ mod tests {
     /// error (here a timeout) is not retried, whatever the auth method.
     #[tokio::test]
     async fn requests_are_retried_only_on_connection_errors() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        crate::test_pki::install_test_provider();
         let refused = {
             // Bound but not listening: refused, and the port stays ours.
             let socket = tokio::net::TcpSocket::new_v4().unwrap();
@@ -3994,10 +4094,14 @@ mod tests {
         let proxy = spawn_connect_proxy();
         let transport = ntlm_tls_transport(port, proxy);
         // A client that does not report TLS details on its responses.
-        let tls = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(crate::tls::NoVerifier))
-            .with_no_client_auth();
+        let tls =
+            crate::tls::client_config_builder(&Arc::new(rustls::crypto::ring::default_provider()))
+                .unwrap()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(crate::tls::NoVerifier::new(
+                    &rustls::crypto::ring::default_provider(),
+                )))
+                .with_no_client_auth();
         let http = reqwest::Client::builder()
             .proxy(reqwest::Proxy::all(format!("http://127.0.0.1:{proxy}")).unwrap())
             .tls_backend_preconfigured(tls)
@@ -4026,10 +4130,14 @@ mod tests {
         use crate::test_pki::{RSA_CERT_PEM, RSA_KEY_PKCS1_PEM};
         let (port, seen) = spawn_ntlm_tls_server(RSA_CERT_PEM, RSA_KEY_PKCS1_PEM);
         let transport = ntlm_tls_transport(port, spawn_connect_proxy());
-        let tls = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(crate::tls::NoVerifier))
-            .with_no_client_auth();
+        let tls =
+            crate::tls::client_config_builder(&Arc::new(rustls::crypto::ring::default_provider()))
+                .unwrap()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(crate::tls::NoVerifier::new(
+                    &rustls::crypto::ring::default_provider(),
+                )))
+                .with_no_client_auth();
         let http = reqwest::Client::builder()
             .no_proxy()
             .tls_info(true)
@@ -4071,10 +4179,15 @@ mod tests {
                     .await
             } else {
                 // Direct, as in `ntlm_cbt_comes_from_the_response_tls_details`.
-                let tls = rustls::ClientConfig::builder()
-                    .dangerous()
-                    .with_custom_certificate_verifier(Arc::new(crate::tls::NoVerifier))
-                    .with_no_client_auth();
+                let tls = crate::tls::client_config_builder(&Arc::new(
+                    rustls::crypto::ring::default_provider(),
+                ))
+                .unwrap()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(crate::tls::NoVerifier::new(
+                    &rustls::crypto::ring::default_provider(),
+                )))
+                .with_no_client_auth();
                 let http = reqwest::Client::builder()
                     .no_proxy()
                     .tls_info(true)
@@ -4725,10 +4838,14 @@ mod tests {
         use rustls::pki_types::pem::PemObject;
         let (port, seen) = spawn_ntlm_tls_server(EC_CERT_PEM, EC_KEY_PKCS8_PEM);
         let transport = ntlm_tls_transport(port, spawn_connect_proxy());
-        let tls = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(crate::tls::NoVerifier))
-            .with_no_client_auth();
+        let tls =
+            crate::tls::client_config_builder(&Arc::new(rustls::crypto::ring::default_provider()))
+                .unwrap()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(crate::tls::NoVerifier::new(
+                    &rustls::crypto::ring::default_provider(),
+                )))
+                .with_no_client_auth();
         let http = reqwest::Client::builder()
             .no_proxy()
             .tls_info(true)
@@ -4790,6 +4907,94 @@ mod tests {
         );
     }
 
+    /// The transport's provider, not the process-wide one, runs every
+    /// handshake. The server offers one TLS 1.3 suite: a client provider
+    /// limited to another suite fails on every client before any Type 3, one
+    /// limited to the server's suite succeeds.
+    #[tokio::test]
+    async fn explicit_provider_is_used_for_every_handshake() {
+        use rustls::crypto::ring::cipher_suite::{
+            TLS13_AES_128_GCM_SHA256, TLS13_CHACHA20_POLY1305_SHA256,
+        };
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+        let only = |s| {
+            Arc::new(CryptoProvider {
+                cipher_suites: vec![s],
+                ..rustls::crypto::ring::default_provider()
+            })
+        };
+        let chain =
+            vec![CertificateDer::from_pem_slice(crate::test_pki::EC_CERT_PEM.as_bytes()).unwrap()];
+        let key =
+            PrivateKeyDer::from_pem_slice(crate::test_pki::EC_KEY_PKCS8_PEM.as_bytes()).unwrap();
+        let (port, seen) = spawn_ntlm_tls_server_with(Arc::new(
+            rustls::ServerConfig::builder_with_provider(only(TLS13_AES_128_GCM_SHA256))
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(chain, key)
+                .unwrap(),
+        ));
+        let url = format!("https://127.0.0.1:{port}/wsman");
+        let transport = |auth_method: AuthMethod, proxy: Option<String>, suite| {
+            HttpTransport::with_provider(
+                WinrmConfig {
+                    auth_method,
+                    use_tls: true,
+                    accept_invalid_certs: true,
+                    port,
+                    proxy,
+                    connect_timeout_secs: 5,
+                    operation_timeout_secs: 5,
+                    ..Default::default()
+                },
+                WinrmCredentials::new(USER, PASS, ""),
+                &TlsOptions::default(),
+                only(suite),
+            )
+            .unwrap()
+        };
+        for (suite, handshakes) in [
+            (TLS13_CHACHA20_POLY1305_SHA256, false),
+            (TLS13_AES_128_GCM_SHA256, true),
+        ] {
+            let direct = transport(AuthMethod::Ntlm, None, suite);
+            let proxied = transport(
+                AuthMethod::Ntlm,
+                Some(format!("http://127.0.0.1:{}", spawn_connect_proxy())),
+                suite,
+            );
+            let results = [
+                direct
+                    .send_soap_with_retry("127.0.0.1", "<soap/>".into())
+                    .await,
+                proxied
+                    .send_ntlm_over_tls("127.0.0.1", &url, "<soap/>", Lane::Data)
+                    .await,
+            ];
+            // Basic goes through the transport's shared client: the server
+            // answers it 400 once TLS is up.
+            let shared = transport(AuthMethod::Basic, None, suite)
+                .send_soap_with_retry("127.0.0.1", "<soap/>".into())
+                .await;
+            let tls_failed = matches!(&shared, Err(WinrmError::Http(e)) if e.is_connect());
+            if handshakes {
+                for result in results {
+                    assert_eq!(result.unwrap(), "<ok/>");
+                }
+                assert!(!tls_failed, "shared client: {shared:?}");
+            } else {
+                for result in results {
+                    assert!(result.is_err(), "{result:?}");
+                }
+                assert!(tls_failed, "shared client: {shared:?}");
+                assert!(seen.lock().unwrap().is_empty(), "no Type 3 may be sent");
+            }
+        }
+    }
+
     /// An answer carrying `Connection: close` ends that connection: the
     /// connection is not kept, so the next request authenticates a new one
     /// instead of failing with a 401 on a socket without a session.
@@ -4824,7 +5029,7 @@ mod tests {
         use rustls::pki_types::{CertificateDer, PrivateKeyDer};
         use std::io::{ErrorKind, Read, Write};
 
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        crate::test_pki::install_test_provider();
         let chain = vec![CertificateDer::from_pem_slice(cert_pem.as_bytes()).unwrap()];
         let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).unwrap();
         let config = Arc::new(
@@ -5166,7 +5371,7 @@ mod tests {
     /// connector then.
     #[tokio::test]
     async fn locked_gate_refuses_after_handshake_but_not_before() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        crate::test_pki::install_test_provider();
         let (port, accepts) = spawn_closing_http_server();
         let config = WinrmConfig {
             connect_timeout_secs: 5,
@@ -5176,7 +5381,10 @@ mod tests {
             locked: AtomicBool::new(false),
             wait: Duration::from_millis(50),
         });
-        let client = build_http_client(&config, None, 1, Some(Arc::clone(&gate))).unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let tls =
+            crate::tls::plain_http_config(Arc::new(NoVerifier::new(&provider)), &provider).unwrap();
+        let client = build_http_client(&config, tls, 1, Some(Arc::clone(&gate))).unwrap();
         let url = format!("http://127.0.0.1:{port}/wsman");
         for _ in 0..2 {
             assert_eq!(client.get(&url).send().await.unwrap().status(), 200);

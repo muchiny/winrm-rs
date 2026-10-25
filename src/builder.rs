@@ -6,8 +6,9 @@
 use std::panic::AssertUnwindSafe;
 
 use crate::client::WinrmClient;
-use crate::config::{WinrmConfig, WinrmCredentials};
+use crate::config::{TlsProvider, WinrmConfig, WinrmCredentials};
 use crate::error::WinrmError;
+use crate::tls::TlsOptions;
 
 /// Typestate marker: credentials have not yet been provided.
 pub struct NeedsCredentials;
@@ -33,7 +34,29 @@ pub struct WinrmClientBuilder<S = NeedsCredentials> {
     // `AssertUnwindSafe` keeps the builder `UnwindSafe` and `RefUnwindSafe`
     // as it was before the hook existed; the hook is never called here.
     before_send: Option<AssertUnwindSafe<crate::transport::BeforeSend>>,
+    /// TLS settings (plain data).
+    tls: TlsOptions,
     _state: std::marker::PhantomData<S>,
+}
+
+impl<S> WinrmClientBuilder<S> {
+    /// Choose the rustls crypto provider for every TLS connection of this
+    /// client: the HTTPS transport, the CredSSP outer TLS and the leg to an
+    /// `https://` proxy. Both choices offer TLS 1.3 and 1.2.
+    ///
+    /// Without this call, the client keeps the 1.x behaviour: building it
+    /// installs `ring` as the process-wide default when no provider is
+    /// installed yet, so a later `install_default` in the application returns
+    /// `Err`, and then it uses the process-wide provider. 2.0 stops installing
+    /// it.
+    ///
+    /// A missing process provider with [`TlsProvider::ProcessDefault`] is
+    /// reported as [`WinrmError::AuthFailed`], like the other TLS setup
+    /// errors, since `WinrmError` has no dedicated variant.
+    pub fn tls_provider(mut self, provider: TlsProvider) -> Self {
+        self.tls.provider = Some(provider);
+        self
+    }
 }
 
 impl WinrmClientBuilder<NeedsCredentials> {
@@ -43,6 +66,7 @@ impl WinrmClientBuilder<NeedsCredentials> {
             config,
             credentials: None,
             before_send: None,
+            tls: TlsOptions::default(),
             _state: std::marker::PhantomData,
         }
     }
@@ -53,6 +77,7 @@ impl WinrmClientBuilder<NeedsCredentials> {
             config: self.config,
             credentials: Some(creds),
             before_send: self.before_send,
+            tls: self.tls,
             _state: std::marker::PhantomData,
         }
     }
@@ -177,10 +202,11 @@ impl WinrmClientBuilder<Ready> {
     pub fn build(self) -> Result<WinrmClient, WinrmError> {
         // SAFETY: The typestate pattern guarantees that `credentials` is
         // `Some` when `build()` is callable (state = Ready).
-        let mut client = WinrmClient::new(
+        let mut client = WinrmClient::with_options(
             self.config,
             self.credentials
                 .expect("typestate guarantees credentials are set"),
+            &self.tls,
         )?;
         if let Some(hook) = self.before_send {
             client.transport.set_before_send(hook.0);
@@ -200,6 +226,40 @@ mod tests {
         fn assert_unwind_safe<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
         assert_unwind_safe::<WinrmClientBuilder<NeedsCredentials>>();
         assert_unwind_safe::<WinrmClientBuilder<Ready>>();
+    }
+
+    /// The provider choice survives the typestate transition, made before or
+    /// after the credentials.
+    #[test]
+    fn tls_provider_is_carried_over_by_credentials() {
+        let creds = || WinrmCredentials::new("admin", "pass", "");
+        let before = WinrmClientBuilder::new(WinrmConfig::default())
+            .tls_provider(TlsProvider::Ring)
+            .credentials(creds());
+        assert_eq!(before.tls.provider, Some(TlsProvider::Ring));
+        let after = WinrmClientBuilder::new(WinrmConfig::default())
+            .credentials(creds())
+            .tls_provider(TlsProvider::ProcessDefault);
+        assert_eq!(after.tls.provider, Some(TlsProvider::ProcessDefault));
+        let default = WinrmClientBuilder::new(WinrmConfig::default()).credentials(creds());
+        assert_eq!(default.tls.provider, None);
+    }
+
+    /// `TlsProvider::Ring` reaches the transport: its TLS configuration
+    /// uses a provider of its own, not the process-wide one.
+    #[test]
+    fn tls_provider_ring_reaches_the_transport() {
+        crate::test_pki::install_test_provider();
+        let client = WinrmClient::builder(WinrmConfig::default())
+            .tls_provider(TlsProvider::Ring)
+            .credentials(WinrmCredentials::new("admin", "pass", ""))
+            .build()
+            .unwrap();
+        let process = rustls::crypto::CryptoProvider::get_default().unwrap();
+        assert!(!std::sync::Arc::ptr_eq(
+            client.transport.client_tls().crypto_provider(),
+            process
+        ));
     }
 
     #[test]

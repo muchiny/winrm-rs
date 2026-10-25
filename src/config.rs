@@ -498,6 +498,24 @@ pub enum EncryptionMode {
     Never,
 }
 
+/// The rustls crypto provider of a client's TLS connections, chosen with
+/// [`WinrmClientBuilder::tls_provider`](crate::WinrmClientBuilder::tls_provider).
+///
+/// Both choices offer TLS 1.3 and TLS 1.2.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TlsProvider {
+    /// A `ring` provider private to this client: the process-wide default is
+    /// neither read nor installed.
+    Ring,
+    /// The provider the application installed with
+    /// `rustls::crypto::CryptoProvider::install_default` (for example
+    /// aws-lc-rs in FIPS mode). Building fails with
+    /// [`WinrmError::AuthFailed`](crate::WinrmError::AuthFailed) when none is
+    /// installed.
+    ProcessDefault,
+}
+
 /// Authentication method for the WinRM HTTP transport.
 #[derive(Debug, Clone)]
 pub enum AuthMethod {

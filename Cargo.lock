@@ -2406,6 +2406,7 @@ dependencies = [
  "rand",
  "reqwest",
  "rustls",
+ "rustls-platform-verifier",
  "secrecy",
  "serde_json",
  "sha2",

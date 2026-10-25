@@ -61,6 +61,7 @@ tracing = "0.1"
 zeroize = { version = "1.8", features = ["derive"] }
 tokio-util = { version = "0.7.18", features = ["rt"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-platform-verifier = { version = "0.7", default-features = false }
 sha2 = "0.11"
 subtle = "2.6"
 webpki-roots = "1.0.6"

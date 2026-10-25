@@ -4650,7 +4650,7 @@ impl TlsRecordingRelay {
         use std::io::Write;
         use std::sync::{Arc, Mutex};
 
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
@@ -4681,16 +4681,21 @@ impl TlsRecordingRelay {
         let _ = std::fs::remove_dir_all(&dir);
 
         let server_config = Arc::new(
-            rustls::ServerConfig::builder()
+            rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
+                .with_safe_default_protocol_versions()
+                .expect("relay server protocol versions")
                 .with_no_client_auth()
                 .with_single_cert(vec![cert], key)
                 .expect("relay server config"),
         );
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
         let client_config = Arc::new(
-            rustls::ClientConfig::builder()
+            rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+                .with_safe_default_protocol_versions()
+                .expect("relay client protocol versions")
                 .dangerous()
-                .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert(provider)))
+                .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert(Arc::clone(
+                    &provider,
+                ))))
                 .with_no_client_auth(),
         );
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind relay");

@@ -225,7 +225,8 @@ impl OpenSslMemTls {
 /// and not for every request.
 #[cfg(feature = "credssp")]
 pub(crate) struct CredSspTls {
-    /// Outer HTTPS leg (rustls).
+    /// The transport's TLS configuration for the outer HTTPS connection,
+    /// without ALPN and session resumption.
     pub(crate) outer: Arc<rustls::ClientConfig>,
     /// Inner TLS leg that carries the `TSRequest` messages (OpenSSL).
     pub(crate) inner: openssl::ssl::SslConnector,
@@ -373,8 +374,9 @@ impl CredSspConnOptions {
 
 #[cfg(feature = "credssp")]
 impl CredSspConnection {
-    /// Open a TCP+TLS connection to `endpoint`. The returned object owns
-    /// the underlying socket; drop to close.
+    /// Open a TCP+TLS connection to the endpoint with `tls.outer`, the
+    /// transport's own TLS configuration (its verifier, provider and trust
+    /// settings). The returned object owns the socket; drop to close.
     ///
     /// The TCP connect and the outer TLS handshake share one deadline,
     /// `opts.connect_timeout`; its expiry is [`WinrmError::Timeout`].
@@ -2008,14 +2010,14 @@ mod tests {
 
     #[test]
     fn openssl_inner_tls_peer_cert_before_handshake_errors() {
-        let tls = build_inner_openssl_tls(&test_tls().inner).expect("build inner tls");
+        let tls = build_inner_openssl_tls(&no_verify().inner).expect("build inner tls");
         // No handshake completed → no peer cert available
         assert!(tls.peer_cert_der().is_err());
     }
 
     #[test]
     fn openssl_inner_tls_feed_incoming_then_drain_clears_outgoing() {
-        let mut tls = build_inner_openssl_tls(&test_tls().inner).expect("build inner tls");
+        let mut tls = build_inner_openssl_tls(&no_verify().inner).expect("build inner tls");
         let _ = tls.handshake_step();
         let first = tls.drain_outgoing();
         assert!(!first.is_empty());
@@ -2027,7 +2029,7 @@ mod tests {
 
     #[test]
     fn openssl_inner_tls_handshake_starts() {
-        let mut tls = build_inner_openssl_tls(&test_tls().inner).expect("build inner tls");
+        let mut tls = build_inner_openssl_tls(&no_verify().inner).expect("build inner tls");
         let _ = tls.handshake_step();
         let bytes = tls.drain_outgoing();
         assert!(!bytes.is_empty(), "should produce ClientHello bytes");
@@ -2045,7 +2047,7 @@ mod tests {
                 crate::test_pki::spawn_tls_sink(crate::test_pki::impostor_server_config(versions));
             let endpoint =
                 CredSspEndpoint::parse(&format!("https://127.0.0.1:{port}/wsman")).unwrap();
-            match CredSspConnection::connect(&endpoint, &test_tls(), test_opts()).await {
+            match CredSspConnection::connect(&endpoint, &no_verify(), test_opts()).await {
                 Err(WinrmError::AuthFailed(m)) => {
                     assert!(m.starts_with("CredSSP outer TLS:"), "{label}: {m}");
                 }
@@ -2064,35 +2066,46 @@ mod tests {
 
     const BODY: &str = "<s:Envelope>mock request</s:Envelope>";
 
-    /// The TLS contexts of a client: no outer verification when
-    /// `accept_invalid_certs`, the `webpki_roots` verifier otherwise.
-    fn test_tls_with(accept_invalid_certs: bool) -> CredSspTls {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> = if accept_invalid_certs
-        {
-            Arc::new(crate::tls::NoVerifier)
-        } else {
-            let roots =
-                rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
-                .build()
-                .unwrap()
-        };
-        let base = rustls::ClientConfig::builder()
+    /// The TLS contexts of a client on a private `ring` provider, whose
+    /// outer TLS uses `verifier`.
+    fn test_tls_with(
+        verifier: impl FnOnce(
+            &Arc<rustls::crypto::CryptoProvider>,
+        ) -> Arc<dyn rustls::client::danger::ServerCertVerifier>,
+    ) -> CredSspTls {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let base = crate::tls::client_config_builder(&provider)
+            .unwrap()
             .dangerous()
-            .with_custom_certificate_verifier(verifier)
+            .with_custom_certificate_verifier(verifier(&provider))
             .with_no_client_auth();
         CredSspTls::new(&base).unwrap()
     }
 
-    fn test_tls() -> CredSspTls {
-        test_tls_with(true)
+    /// The TLS contexts of an `accept_invalid_certs` client: no outer
+    /// certificate verification (handshake signatures are still checked).
+    fn no_verify() -> CredSspTls {
+        test_tls_with(|provider| Arc::new(crate::tls::NoVerifier::new(provider)))
+    }
+
+    /// The TLS contexts of a verifying client: the `webpki_roots` verifier.
+    fn webpki() -> CredSspTls {
+        test_tls_with(|provider| {
+            let roots =
+                rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            rustls::client::WebPkiServerVerifier::builder_with_provider(
+                Arc::new(roots),
+                Arc::clone(provider),
+            )
+            .build()
+            .unwrap()
+        })
     }
 
     #[test]
     #[tracing_test::traced_test]
     fn inner_tls_logs_the_runtime_openssl_version() {
-        let _tls = build_inner_openssl_tls(&test_tls().inner).expect("inner TLS builds");
+        let _tls = build_inner_openssl_tls(&no_verify().inner).expect("inner TLS builds");
         assert!(logs_contain("CredSSP inner TLS backend"));
         assert!(logs_contain(openssl::version::version()));
         assert!(logs_contain(&format!(
@@ -2111,7 +2124,7 @@ mod tests {
         use rustls::pki_types::{CertificateDer, PrivateKeyDer};
         use std::io::{Read, Write};
 
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        crate::test_pki::install_test_provider();
         let chain = vec![CertificateDer::from_pem_slice(EC_CERT_PEM.as_bytes()).unwrap()];
         let key = PrivateKeyDer::from_pem_slice(EC_KEY_PKCS8_PEM.as_bytes()).unwrap();
         let mut config = rustls::ServerConfig::builder_with_protocol_versions(versions)
@@ -2225,7 +2238,7 @@ mod tests {
 
     #[test]
     fn inner_ssl_comes_from_the_cached_context() {
-        let tls = test_tls();
+        let tls = no_verify();
         let a = build_inner_openssl_tls(&tls.inner).unwrap();
         let b = build_inner_openssl_tls(&tls.inner).unwrap();
         assert!(std::ptr::eq(a.ssl.ssl().ssl_context(), tls.inner.context()));
@@ -2236,7 +2249,7 @@ mod tests {
     async fn credssp_outer_tls_never_resumes() {
         for (label, versions) in [("TLS 1.3", TLS13_ONLY), ("TLS 1.2", TLS12_ONLY)] {
             let port = spawn_tls_401_server(versions);
-            let tls = test_tls();
+            let tls = no_verify();
             let endpoint =
                 CredSspEndpoint::parse(&format!("https://127.0.0.1:{port}/wsman")).unwrap();
             let mut first = CredSspConnection::connect(&endpoint, &tls, test_opts())
@@ -2258,17 +2271,18 @@ mod tests {
 
     #[tokio::test]
     async fn credssp_outer_client_hello_extensions_unchanged() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
         // What `connect` built for every request before the contexts were cached.
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
         let today = Arc::new(
-            rustls::ClientConfig::builder()
+            crate::tls::client_config_builder(&provider)
+                .unwrap()
                 .dangerous()
-                .with_custom_certificate_verifier(Arc::new(crate::tls::NoVerifier))
+                .with_custom_certificate_verifier(Arc::new(crate::tls::NoVerifier::new(&provider)))
                 .with_no_client_auth(),
         );
         let want = client_hello_extension_types(&captured_client_hello(today).await);
         let got = client_hello_extension_types(
-            &captured_client_hello(Arc::clone(&test_tls().outer)).await,
+            &captured_client_hello(Arc::clone(&no_verify().outer)).await,
         );
         assert_eq!(got, want);
         assert!(
@@ -2278,12 +2292,12 @@ mod tests {
     }
 
     /// The client the acceptor knows: `USER` / `PASS`, empty domain.
-    fn mock_auth(accept_invalid_certs: bool, max_response_bytes: usize) -> CredSspAuth {
+    fn mock_auth(tls: CredSspTls, max_response_bytes: usize) -> CredSspAuth {
         CredSspAuth {
             username: USER.into(),
             password: Zeroizing::new(PASS.into()),
             domain: String::new(),
-            tls: Arc::new(test_tls_with(accept_invalid_certs)),
+            tls: Arc::new(tls),
             opts: CredSspConnOptions {
                 max_response_bytes,
                 connect_timeout: Duration::from_secs(20),
@@ -2407,7 +2421,7 @@ mod tests {
 
     #[tokio::test]
     async fn credssp_connect_times_out_when_the_server_never_sends_server_hello() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        crate::test_pki::install_test_provider();
         // Never accepted: the kernel completes the TCP handshake and nobody
         // answers the ClientHello.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2420,7 +2434,7 @@ mod tests {
         let start = std::time::Instant::now();
         let res = tokio::time::timeout(
             Duration::from_secs(10),
-            CredSspConnection::connect(&endpoint, &test_tls(), opts),
+            CredSspConnection::connect(&endpoint, &no_verify(), opts),
         )
         .await
         .expect("connect is not bounded");
@@ -2432,7 +2446,7 @@ mod tests {
 
     /// One CredSSP exchange posting `body` to the acceptor on `port`.
     async fn run(auth: &CredSspAuth, port: u16, body: &str) -> Result<String, WinrmError> {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        crate::test_pki::install_test_provider();
         let http = reqwest::Client::builder().build().unwrap();
         let url = format!("https://127.0.0.1:{port}/wsman");
         tokio::time::timeout(
@@ -2447,7 +2461,9 @@ mod tests {
     /// is delegated. Returns the error and the acceptor's log.
     async fn refused(fault: Fault, max: usize) -> (WinrmError, Vec<Event>) {
         let (port, log) = test_server::spawn(fault, EC_CERT_PEM, EC_KEY_PKCS8_PEM);
-        let err = run(&mock_auth(true, max), port, BODY).await.unwrap_err();
+        let err = run(&mock_auth(no_verify(), max), port, BODY)
+            .await
+            .unwrap_err();
         let log = log.lock().unwrap().clone();
         assert_eq!(delegations(&log), 0, "password delegated despite {err:?}");
         (err, log)
@@ -2456,7 +2472,9 @@ mod tests {
     #[tokio::test]
     async fn mock_happy_path_delegates_once() {
         let (port, log) = test_server::spawn(Fault::Honest, EC_CERT_PEM, EC_KEY_PKCS8_PEM);
-        let out = run(&mock_auth(true, 1 << 20), port, BODY).await.unwrap();
+        let out = run(&mock_auth(no_verify(), 1 << 20), port, BODY)
+            .await
+            .unwrap();
         assert_eq!(out, test_server::MOCK_REPLY);
         let log = log.lock().unwrap().clone();
         assert_eq!(
@@ -2570,7 +2588,7 @@ mod tests {
     async fn body_of_exactly_the_cap_is_accepted() {
         let (port, _) = test_server::spawn(Fault::Honest, EC_CERT_PEM, EC_KEY_PKCS8_PEM);
         let max = test_server::MOCK_REPLY.len();
-        let out = run(&mock_auth(true, max), port, BODY).await.unwrap();
+        let out = run(&mock_auth(no_verify(), max), port, BODY).await.unwrap();
         assert_eq!(out, test_server::MOCK_REPLY);
     }
 
@@ -2586,7 +2604,7 @@ mod tests {
     #[tokio::test]
     async fn untrusted_outer_cert_is_refused_by_default() {
         let (port, log) = test_server::spawn(Fault::Honest, EC_CERT_PEM, EC_KEY_PKCS8_PEM);
-        let err = run(&mock_auth(false, 1 << 20), port, BODY)
+        let err = run(&mock_auth(webpki(), 1 << 20), port, BODY)
             .await
             .unwrap_err();
         assert!(
@@ -2603,7 +2621,7 @@ mod tests {
             Fault::Honest,
             crate::test_pki::impostor_server_config(versions),
         );
-        let err = run(&mock_auth(true, 1 << 20), port, BODY)
+        let err = run(&mock_auth(no_verify(), 1 << 20), port, BODY)
             .await
             .unwrap_err();
         assert!(
@@ -2634,7 +2652,7 @@ mod tests {
                 .enable_all()
                 .build()
                 .unwrap();
-            let _ = tx.send(rt.block_on(run(&mock_auth(true, 1 << 20), port, BODY)));
+            let _ = tx.send(rt.block_on(run(&mock_auth(no_verify(), 1 << 20), port, BODY)));
         });
         let out = rx
             .recv_timeout(Duration::from_secs(10))

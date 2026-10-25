@@ -8,12 +8,15 @@
 
 use std::sync::{Arc, Mutex};
 
+use rustls::client::WebPkiServerVerifier;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms};
 use rustls::pki_types::pem::{self, PemObject};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
-use rustls::{DigitallySignedStruct, Error, SignatureScheme};
+use rustls::{DigitallySignedStruct, Error, RootCertStore, SignatureScheme};
 use zeroize::Zeroizing;
 
+use crate::config::TlsProvider;
 use crate::error::WinrmError;
 
 /// A [`ServerCertVerifier`] wrapper that records every distinct end-entity
@@ -290,7 +293,19 @@ impl CertHandle {
 /// certificate, would match the real server and the authentication could be
 /// relayed to it.
 #[derive(Debug)]
-pub(crate) struct NoVerifier;
+pub(crate) struct NoVerifier {
+    /// The signature algorithms of the client's crypto provider.
+    algs: WebPkiSupportedAlgorithms,
+}
+
+impl NoVerifier {
+    /// A verifier checking handshake signatures with `provider`'s algorithms.
+    pub(crate) fn new(provider: &CryptoProvider) -> Self {
+        Self {
+            algs: provider.signature_verification_algorithms,
+        }
+    }
+}
 
 impl ServerCertVerifier for NoVerifier {
     fn verify_server_cert(
@@ -310,12 +325,7 @@ impl ServerCertVerifier for NoVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
-        )
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algs)
     }
 
     fn verify_tls13_signature(
@@ -324,19 +334,122 @@ impl ServerCertVerifier for NoVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
-        )
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algs)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        rustls::crypto::ring::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
+        self.algs.supported_schemes()
     }
+}
+
+/// TLS settings chosen through [`crate::WinrmClientBuilder`]. Plain data
+/// only, so the builder keeps its auto traits (`UnwindSafe`,
+/// `RefUnwindSafe`).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TlsOptions {
+    /// The rustls crypto provider; `None` keeps the 1.x behaviour (see
+    /// [`crypto_provider`]).
+    pub(crate) provider: Option<TlsProvider>,
+}
+
+/// Error message when [`TlsProvider::ProcessDefault`] finds no process-wide
+/// provider.
+const NO_PROCESS_PROVIDER: &str = "no process-wide rustls CryptoProvider is installed \
+     (TlsProvider::ProcessDefault): install one with CryptoProvider::install_default before \
+     building the client, or choose TlsProvider::Ring";
+
+/// The crypto provider of every TLS configuration of a client.
+///
+/// - `None` (no choice, the 1.x behaviour): installs `ring` as the
+///   process-wide default when none is installed yet, then uses the
+///   process-wide default.
+/// - [`TlsProvider::Ring`]: a `ring` provider private to the client; the
+///   process-wide default is neither read nor installed.
+/// - [`TlsProvider::ProcessDefault`]: the process-wide default, or
+///   [`WinrmError::AuthFailed`] when none is installed.
+pub(crate) fn crypto_provider(
+    choice: Option<TlsProvider>,
+) -> Result<Arc<CryptoProvider>, WinrmError> {
+    let process_default = || {
+        CryptoProvider::get_default()
+            .cloned()
+            .ok_or_else(|| WinrmError::AuthFailed(NO_PROCESS_PROVIDER.into()))
+    };
+    match choice {
+        None => {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "1.x installs ring process-wide for callers that choose no provider; \
+                          removed in 2.0"
+            )]
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            process_default()
+        }
+        Some(TlsProvider::Ring) => Ok(Arc::new(rustls::crypto::ring::default_provider())),
+        Some(TlsProvider::ProcessDefault) => process_default(),
+    }
+}
+
+/// A rustls client configuration builder on `provider`, offering TLS 1.3
+/// and TLS 1.2, as rustls's own default does.
+pub(crate) fn client_config_builder(
+    provider: &Arc<CryptoProvider>,
+) -> Result<rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier>, WinrmError> {
+    rustls::ClientConfig::builder_with_provider(Arc::clone(provider))
+        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+        .map_err(|e| {
+            WinrmError::AuthFailed(format!(
+                "TLS: the crypto provider supports neither TLS 1.3 nor TLS 1.2: {e}"
+            ))
+        })
+}
+
+/// The operating system's verifier when it could be built, else a WebPKI
+/// verifier on the built-in Mozilla roots plus `extra`, on `provider`.
+///
+/// Building the OS verifier fails when the OS certificate store is empty (a
+/// minimal or offline image without a CA bundle).
+pub(crate) fn platform_or_webpki(
+    platform: Result<rustls_platform_verifier::Verifier, Error>,
+    extra: &[CertificateDer<'static>],
+    provider: &Arc<CryptoProvider>,
+) -> Result<Arc<dyn ServerCertVerifier>, WinrmError> {
+    match platform {
+        Ok(verifier) => Ok(Arc::new(verifier)),
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                "OS certificate store unusable; using the built-in Mozilla roots"
+            );
+            let mut roots =
+                RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            for cert in extra {
+                roots.add(cert.clone()).map_err(|e| {
+                    WinrmError::AuthFailed(format!("TLS: root certificate rejected: {e}"))
+                })?;
+            }
+            let verifier =
+                WebPkiServerVerifier::builder_with_provider(Arc::new(roots), Arc::clone(provider))
+                    .build()
+                    .map_err(|e| WinrmError::AuthFailed(format!("TLS verifier error: {e}")))?;
+            Ok(verifier)
+        }
+    }
+}
+
+/// The TLS configuration of a plain-HTTP client, used only on the leg to an
+/// `https://` proxy: `verifier` on `provider`, no client certificate, and the
+/// `http/1.1` ALPN protocol, as `reqwest` sets it for an HTTP/1-only client.
+pub(crate) fn plain_http_config(
+    verifier: Arc<dyn ServerCertVerifier>,
+    provider: &Arc<CryptoProvider>,
+) -> Result<rustls::ClientConfig, WinrmError> {
+    let mut config = client_config_builder(provider)?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(config)
 }
 
 /// Client certificate chain and private key for `AuthMethod::Certificate`,
@@ -823,9 +936,39 @@ mod tests {
         assert_eq!(handle1.captured(), handle2.captured());
     }
 
+    /// A [`NoVerifier`] on a private `ring` provider.
+    fn ring_no_verifier() -> NoVerifier {
+        NoVerifier::new(&rustls::crypto::ring::default_provider())
+    }
+
+    #[test]
+    fn no_verifier_uses_the_provider_algorithms() {
+        let p = rustls::crypto::ring::default_provider();
+        assert_eq!(
+            NoVerifier::new(&p).supported_verify_schemes(),
+            p.signature_verification_algorithms.supported_schemes()
+        );
+    }
+
+    #[test]
+    fn platform_error_falls_back_to_webpki_roots() {
+        let p = Arc::new(rustls::crypto::ring::default_provider());
+        let e = rustls::Error::General("No CA certificates were loaded from the system".into());
+        let v = platform_or_webpki(Err(e), &[], &p).unwrap();
+        assert!(format!("{v:?}").contains("WebPkiServerVerifier"), "{v:?}");
+    }
+
+    #[test]
+    fn plain_http_config_offers_http11_alpn() {
+        let p = Arc::new(rustls::crypto::ring::default_provider());
+        let c = plain_http_config(Arc::new(NoVerifier::new(&p)), &p).unwrap();
+        assert_eq!(c.alpn_protocols, vec![b"http/1.1".to_vec()]);
+        assert!(Arc::ptr_eq(c.crypto_provider(), &p));
+    }
+
     #[test]
     fn no_verifier_accepts_any_cert() {
-        let verifier = NoVerifier;
+        let verifier = ring_no_verifier();
         let cert = CertificateDer::from(vec![0xFF; 100]);
         let name = ServerName::try_from("any.host").unwrap();
         assert!(
@@ -837,7 +980,7 @@ mod tests {
 
     #[test]
     fn no_verifier_supported_schemes_not_empty() {
-        let verifier = NoVerifier;
+        let verifier = ring_no_verifier();
         assert!(!verifier.supported_verify_schemes().is_empty());
     }
 
@@ -902,12 +1045,12 @@ mod tests {
     fn no_verifier_accepts_a_valid_handshake_signature() {
         let (cert, dss) = ec_signed(b"handshake transcript");
         assert!(
-            NoVerifier
+            ring_no_verifier()
                 .verify_tls12_signature(b"handshake transcript", &cert, &dss)
                 .is_ok()
         );
         assert!(
-            NoVerifier
+            ring_no_verifier()
                 .verify_tls13_signature(b"handshake transcript", &cert, &dss)
                 .is_ok()
         );
@@ -919,12 +1062,12 @@ mod tests {
     fn no_verifier_refuses_a_signature_over_another_message() {
         let (cert, dss) = ec_signed(b"handshake transcript");
         assert!(
-            NoVerifier
+            ring_no_verifier()
                 .verify_tls12_signature(b"another transcript", &cert, &dss)
                 .is_err()
         );
         assert!(
-            NoVerifier
+            ring_no_verifier()
                 .verify_tls13_signature(b"another transcript", &cert, &dss)
                 .is_err()
         );
@@ -935,12 +1078,12 @@ mod tests {
         let cert = CertificateDer::from_pem_slice(crate::test_pki::EC_CERT_PEM.as_bytes()).unwrap();
         let dss = make_dss();
         assert!(
-            NoVerifier
+            ring_no_verifier()
                 .verify_tls12_signature(b"message", &cert, &dss)
                 .is_err()
         );
         assert!(
-            NoVerifier
+            ring_no_verifier()
                 .verify_tls13_signature(b"message", &cert, &dss)
                 .is_err()
         );

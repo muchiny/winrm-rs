@@ -77,8 +77,8 @@ impl WinrmClient {
     ///
     /// [`WinrmError::Http`] if the HTTP client cannot be constructed.
     /// [`WinrmError::AuthFailed`] for a configuration refused before anything
-    /// is sent: Basic over plain HTTP without `EncryptionMode::Never`,
-    /// `EncryptionMode::Always` with a method that does not seal, Certificate
+    /// is sent: Basic over plain HTTP without `EncryptionMode::Never`, Basic
+    /// over HTTPS with `accept_invalid_certs`, `EncryptionMode::Always` with a method that does not seal, Certificate
     /// or CredSSP without `use_tls`, CredSSP with `accept_invalid_certs` or
     /// with a proxy it cannot tunnel through, an invalid
     /// [`WinrmConfig::proxy`], an unusable certificate and key, or a TLS

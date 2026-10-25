@@ -236,6 +236,12 @@ const CREDSSP_UNAUTHENTICATED_TLS: &str = "CredSSP refuses accept_invalid_certs 
      trust its CA with add_root_certificates_pem: the delegated password and every SOAP body \
      would otherwise cross an unauthenticated HTTPS connection";
 
+/// The construction error of a Basic client over HTTPS with
+/// `accept_invalid_certs`.
+const BASIC_UNVERIFIED_TLS: &str = "Basic sends the password to a server whose certificate is not \
+     verified: set accept_invalid_certs = false and pin the certificate with \
+     pin_server_certificate_sha256 or add a root with add_root_certificates_pem";
+
 /// Which slots an exchange on a dedicated connection takes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Lane {
@@ -848,8 +854,7 @@ fn build_http_client(
 }
 
 /// The construction WARNs for a certificate that is not verified: the
-/// server's (`accept_invalid_certs`, once more for Basic, which then sends
-/// the password to that server), and an `https://` proxy's
+/// server's (`accept_invalid_certs`), and an `https://` proxy's
 /// (`danger_accept_invalid_proxy_certs`) when the route has such a proxy for
 /// the endpoints' scheme.
 fn warn_unverified_tls(config: &WinrmConfig, opts: &TransportOptions, route: &proxy::ProxyRoute) {
@@ -858,13 +863,6 @@ fn warn_unverified_tls(config: &WinrmConfig, opts: &TransportOptions, route: &pr
             "TLS certificate verification disabled (accept_invalid_certs=true) — \
              TEST USE ONLY, do not use in production"
         );
-        if config.use_tls && matches!(config.auth_method, AuthMethod::Basic) {
-            tracing::warn!(
-                "Basic sends the password to a server whose certificate is not verified \
-                 (accept_invalid_certs=true); pin the certificate \
-                 (pin_server_certificate_sha256) or add a root (add_root_certificates_pem)"
-            );
-        }
     }
     if opts.tls.accept_invalid_proxy_certs
         && let Some(proxy) = route.tls_proxy(config.use_tls)
@@ -1043,6 +1041,15 @@ impl HttpTransport {
         let outer_authenticated = !config.accept_invalid_certs;
         if matches!(config.auth_method, AuthMethod::CredSsp) && !outer_authenticated {
             return Err(WinrmError::AuthFailed(CREDSSP_UNAUTHENTICATED_TLS.into()));
+        }
+        // Basic sends the password itself: over HTTPS it goes only to a
+        // server whose certificate is verified. Over plain HTTP the
+        // encryption rule above applies unchanged.
+        if matches!(config.auth_method, AuthMethod::Basic)
+            && config.use_tls
+            && config.accept_invalid_certs
+        {
+            return Err(WinrmError::AuthFailed(BASIC_UNVERIFIED_TLS.into()));
         }
         // The names whose handshakes do not get the endpoint's own
         // verification (see `ProxyRoutingVerifier`): a host with one of them
@@ -4818,8 +4825,6 @@ mod tests {
     }
 
     const UNVERIFIED_SERVER_WARN: &str = "TLS certificate verification disabled";
-    const UNVERIFIED_BASIC_WARN: &str =
-        "Basic sends the password to a server whose certificate is not verified";
     const UNVERIFIED_PROXY_WARN: &str = "https:// proxy certificate verification disabled";
 
     /// Build a transport reading the proxy environment `env` (opted in).
@@ -4844,37 +4849,43 @@ mod tests {
         )
     }
 
-    /// Basic over HTTPS to a server whose certificate is not verified is
-    /// built with its own WARN on top of the general one.
+    /// Basic over HTTPS sends the password to the server: a client that does
+    /// not verify that server is refused when it is built.
     #[test]
-    #[tracing_test::traced_test]
-    fn basic_with_accept_invalid_certs_warns_about_the_password() {
+    fn basic_with_accept_invalid_certs_is_refused() {
         let config = WinrmConfig {
             accept_invalid_certs: true,
             ..tls_config(AuthMethod::Basic, 5986)
         };
-        transport_in_env(config, TlsOptions::default(), &[]).unwrap();
-        assert!(logs_contain(UNVERIFIED_SERVER_WARN));
-        assert!(logs_contain(UNVERIFIED_BASIC_WARN));
-        assert!(logs_contain("pin_server_certificate_sha256"));
+        let err = HttpTransport::new(config, WinrmCredentials::new(USER, PASS, ""))
+            .err()
+            .expect("must refuse");
+        assert!(
+            matches!(&err, WinrmError::AuthFailed(m) if m == BASIC_UNVERIFIED_TLS),
+            "{err}"
+        );
     }
 
-    /// The Basic WARN needs both Basic and an unverified server.
+    /// The refusal needs both Basic over HTTPS and an unverified server: a
+    /// verified Basic client, and NTLM or Basic over plain HTTP with
+    /// `accept_invalid_certs`, are built.
     #[test]
-    #[tracing_test::traced_test]
-    fn no_basic_warn_without_basic_or_with_a_verified_server() {
+    fn basic_is_refused_only_over_https_without_verification() {
         let verified = tls_config(AuthMethod::Basic, 5986);
-        transport_in_env(verified, TlsOptions::default(), &[]).unwrap();
+        HttpTransport::new(verified, WinrmCredentials::new(USER, PASS, "")).unwrap();
         let ntlm = WinrmConfig {
             accept_invalid_certs: true,
             ..tls_config(AuthMethod::Ntlm, 5986)
         };
-        transport_in_env(ntlm, TlsOptions::default(), &[]).unwrap();
-        assert!(
-            logs_contain(UNVERIFIED_SERVER_WARN),
-            "NTLM gets the general one"
-        );
-        assert!(!logs_contain(UNVERIFIED_BASIC_WARN));
+        HttpTransport::new(ntlm, WinrmCredentials::new(USER, PASS, "")).unwrap();
+        // Plain HTTP: the encryption rule decides, not this one.
+        let plain = WinrmConfig {
+            accept_invalid_certs: true,
+            use_tls: false,
+            encryption: EncryptionMode::Never,
+            ..tls_config(AuthMethod::Basic, 5985)
+        };
+        HttpTransport::new(plain, WinrmCredentials::new(USER, PASS, "")).unwrap();
     }
 
     /// A build refused for CredSSP with `accept_invalid_certs` logs no
@@ -5540,7 +5551,9 @@ mod tests {
     /// The production shared client (`WinrmClient::with_options` →
     /// `HttpTransport::with_provider`: `build_http_client`
     /// with the preconfigured rustls config, no proxy) refuses the impostor
-    /// before any HTTP byte, so no Basic `Authorization` header leaves.
+    /// before any HTTP byte, so no Basic `Authorization` header leaves. The
+    /// impostor presents the pinned certificate (Basic refuses
+    /// `accept_invalid_certs`) and signs with another key.
     #[tokio::test]
     async fn impostor_is_refused_basic_shared_client() {
         for (label, versions) in [
@@ -5549,18 +5562,12 @@ mod tests {
         ] {
             let (port, read) =
                 crate::test_pki::spawn_tls_sink(crate::test_pki::impostor_server_config(versions));
-            let config = WinrmConfig {
-                auth_method: AuthMethod::Basic,
-                use_tls: true,
-                accept_invalid_certs: true,
-                port,
-                max_retries: 0,
-                connect_timeout_secs: 5,
-                operation_timeout_secs: 5,
-                ..Default::default()
-            };
-            let transport =
-                HttpTransport::new(config, WinrmCredentials::new(USER, PASS, "")).unwrap();
+            let config = tls_config(AuthMethod::Basic, port);
+            let transport = transport_with(
+                config,
+                &pinned(&[&sha256_hex(crate::test_pki::EC_CERT_PEM)]),
+            )
+            .unwrap();
             let result = tokio::time::timeout(
                 Duration::from_secs(20),
                 transport.send_soap_with_retry("127.0.0.1", "<soap/>".into()),
@@ -6418,11 +6425,13 @@ mod tests {
         ));
         let url = format!("https://127.0.0.1:{port}/wsman");
         let transport = |auth_method: AuthMethod, proxy: Option<String>, suite| {
+            // Basic refuses `accept_invalid_certs`: it pins the certificate.
+            let basic = matches!(auth_method, AuthMethod::Basic);
             HttpTransport::with_provider(
                 WinrmConfig {
                     auth_method,
                     use_tls: true,
-                    accept_invalid_certs: true,
+                    accept_invalid_certs: !basic,
                     port,
                     proxy,
                     connect_timeout_secs: 5,
@@ -6430,7 +6439,14 @@ mod tests {
                     ..Default::default()
                 },
                 WinrmCredentials::new(USER, PASS, ""),
-                TransportOptions::default(),
+                TransportOptions {
+                    tls: if basic {
+                        pinned(&[&sha256_hex(crate::test_pki::EC_CERT_PEM)])
+                    } else {
+                        TlsOptions::default()
+                    },
+                    ..Default::default()
+                },
                 only(suite),
                 proxy::env_var,
             )
@@ -7514,6 +7530,13 @@ mod tests {
             CA_LEAF_KEY_PEM, CA_LEAF_PEM, NON_CA_SELF_SIGNED_KEY_PEM, NON_CA_SELF_SIGNED_PEM,
         };
         let ca = root_file("ca-invalid-certs-name", TEST_CA_PEM);
+        // Certificate auth: Basic refuses `accept_invalid_certs`, and this
+        // one also goes through the shared client.
+        let client_files = pem_files(
+            "invalid-certs-name",
+            crate::test_pki::EC_CERT_PEM,
+            crate::test_pki::EC_KEY_PKCS8_PEM,
+        );
         let p = spawn_https_connect_proxy(CA_LEAF_PEM, CA_LEAF_KEY_PEM);
         for (host, accepted) in [("localhost", false), ("127.0.0.1", true)] {
             // The listener's certificate is self-signed and not trusted.
@@ -7524,7 +7547,14 @@ mod tests {
             let config = WinrmConfig {
                 accept_invalid_certs: true,
                 proxy: Some(format!("https://localhost:{p}")),
-                ..tls_config(AuthMethod::Basic, port)
+                ..cert_tls_config(&client_files)
+            };
+            let config = WinrmConfig {
+                port,
+                max_retries: 0,
+                connect_timeout_secs: 5,
+                operation_timeout_secs: 5,
+                ..config
             };
             let t = transport_with(config, &roots(&[&ca])).unwrap();
             let result = send_basic(&t, host).await;

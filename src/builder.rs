@@ -559,7 +559,8 @@ impl WinrmClientBuilder<Ready> {
     /// refused before anything is sent:
     ///
     /// - `AuthMethod::Basic` over plain HTTP, unless `encryption` is
-    ///   `EncryptionMode::Never`;
+    ///   `EncryptionMode::Never`, or over HTTPS with
+    ///   `accept_invalid_certs = true`;
     /// - `EncryptionMode::Always` with a method other than NTLM or Kerberos;
     /// - `AuthMethod::Certificate` or `AuthMethod::CredSsp` without
     ///   `use_tls = true`, or Certificate without a usable certificate and

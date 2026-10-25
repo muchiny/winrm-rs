@@ -250,6 +250,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   too (`http://` and `socks5://` only). `ignore_env_proxy` is deprecated;
   `ignore_env_proxy(false)` still turns them on. Migration: call
   `use_env_proxy(true)` to keep the 1.x behaviour.
+- Basic over HTTPS with `accept_invalid_certs = true` is refused when the
+  client is built (it logged a WARN in 1.5). Migration: pin the listener
+  certificate (`pin_server_certificate_sha256`) or trust its CA
+  (`add_root_certificates_pem`) and set `accept_invalid_certs = false`.
 
 ### Added
 

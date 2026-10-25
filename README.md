@@ -67,8 +67,8 @@ cargo add winrm-rs --features kerberos
 | HTTPS + CredSSP, certificate validated or pinned (required) | yes (certificate) | inner TLS only | TLS | when the host must reach other machines with your credentials |
 | HTTP + Kerberos | yes (AP-REP) | no: a party on the path, or one controlling DNS, can relay the AP-REQ | sealed (`EncryptionMode::Auto`) | trusted networks |
 | HTTP + NTLM (`WinrmConfig::http()`, today's default) | no | no: the handshake can be relayed, or recorded to guess the password offline | sealed (`EncryptionMode::Auto`) | trusted networks only |
-| Basic | over HTTPS only | n/a | TLS; over HTTP only with `EncryptionMode::Never`, in plaintext (a WARN is logged) | HTTPS only |
-| any method with `accept_invalid_certs` | no | channel binding stops a relay to the real WinRM server only; CredSSP refuses this flag | TLS to whoever answers | test environments |
+| Basic | over HTTPS only, certificate verified (`accept_invalid_certs` is refused) | n/a | TLS; over HTTP only with `EncryptionMode::Never`, in plaintext (a WARN is logged) | HTTPS only |
+| any method with `accept_invalid_certs` | no | channel binding stops a relay to the real WinRM server only; CredSSP and Basic over HTTPS refuse this flag | TLS to whoever answers | test environments |
 
 Sealing starts once the authentication is done: it protects this client's
 SOAP bodies, not the authentication. Two server-side settings matter as
@@ -86,7 +86,7 @@ much as the client's:
   validation no other party can write on the connection. With
   `accept_invalid_certs` it can: with NTLM and Kerberos unless the
   server checks channel binding (`CbtHardeningLevel = Relaxed` or
-  `Strict`); CredSSP refuses `accept_invalid_certs`.
+  `Strict`); CredSSP and Basic over HTTPS refuse `accept_invalid_certs`.
 - Signing and channel-binding enforcement on the network's other
   services (SMB signing, LDAP channel binding, Extended Protection on
   AD CS web enrollment) decide where a relayed NTLM handshake is

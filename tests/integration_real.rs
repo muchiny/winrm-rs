@@ -2758,14 +2758,24 @@ async fn http_proxy_connect_carries_https() {
     }
     let proxy = TestProxy::http().await;
     let proxy_url = format!("http://{}", proxy.addr);
-    let (client, host) = test_client_with(|c| {
-        c.auth_method = AuthMethod::Basic;
-        c.use_tls = true;
-        c.accept_invalid_certs = true; // self-signed cert
-        c.port = https_test_port();
-        c.proxy = Some(proxy_url);
-    })
-    .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    let pass = std::env::var("WINRM_TEST_PASS").expect("WINRM_TEST_PASS");
+    // Basic sends the password: the self-signed listener certificate is
+    // pinned, since `accept_invalid_certs = true` is refused for it.
+    let config = WinrmConfig {
+        auth_method: AuthMethod::Basic,
+        use_tls: true,
+        accept_invalid_certs: false,
+        port: https_test_port(),
+        proxy: Some(proxy_url),
+        ..Default::default()
+    };
+    let client = WinrmClient::builder(config)
+        .pin_server_certificate_sha256(&bench_https_pin().expect("WINRM_TEST_HTTPS_CERT_SHA256"))
+        .credentials(WinrmCredentials::new(user, pass, ""))
+        .build()
+        .unwrap();
 
     let out = client
         .run_command(&host, "cmd.exe", &["/c", "echo via-proxy"])
@@ -3020,11 +3030,17 @@ async fn basic_over_https_works() {
     let config = WinrmConfig {
         auth_method: AuthMethod::Basic,
         use_tls: true,
-        accept_invalid_certs: true,
+        accept_invalid_certs: false,
         port,
         ..Default::default()
     };
-    let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
+    // Basic sends the password: the listener certificate is pinned, since
+    // `accept_invalid_certs = true` is refused for it.
+    let client = WinrmClient::builder(config)
+        .pin_server_certificate_sha256(&bench_https_pin().expect("WINRM_TEST_HTTPS_CERT_SHA256"))
+        .credentials(WinrmCredentials::new(user, pass, ""))
+        .build()
+        .unwrap();
     let output = client
         .run_command(&host, "whoami", &[])
         .await

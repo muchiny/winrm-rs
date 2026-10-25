@@ -52,9 +52,8 @@
 //! The crate logs through `tracing`. What each level records:
 //!
 //! - `warn`: at each client construction, settings that weaken security
-//!   (`accept_invalid_certs`, once more for Basic over HTTPS with it,
-//!   `danger_accept_invalid_proxy_certs` when an `https://` proxy applies,
-//!   Basic over plain HTTP (`EncryptionMode::Never`) or NTLM over plain
+//!   (`accept_invalid_certs`, `danger_accept_invalid_proxy_certs` when an
+//!   `https://` proxy applies, Basic over plain HTTP (`EncryptionMode::Never`) or NTLM over plain
 //!   HTTP) and proxy settings that may surprise (a plain-HTTP client that may
 //!   follow a proxy from the environment, an environment variable that is
 //!   not a usable proxy URL, which is ignored). At run time: a proxy that

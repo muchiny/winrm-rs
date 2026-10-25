@@ -104,10 +104,10 @@ pub struct WinrmConfig {
     /// CredSSP has no channel binding, so it needs an authenticated HTTPS
     /// connection.
     ///
-    /// With [`AuthMethod::Basic`] over HTTPS, the client is built with a
-    /// second WARN: Basic sends the password to a server whose certificate is
-    /// not verified. Pin the certificate or add a root instead. 1.x warns;
-    /// 2.0 will refuse this combination as it refuses CredSSP.
+    /// With [`AuthMethod::Basic`] over HTTPS, building the client fails with
+    /// `AuthFailed`: Basic sends the password to a server whose certificate
+    /// is not verified. Pin the certificate or add a root instead, as for
+    /// CredSSP. Since 2.0; 1.x only logged a WARN.
     pub accept_invalid_certs: bool,
     /// TCP connect timeout in seconds (default: 30).
     ///
@@ -655,12 +655,12 @@ pub enum AuthMethod {
     /// through an SSH or port-forward tunnel, which the client cannot see.
     ///
     /// Over HTTPS with [`WinrmConfig::accept_invalid_certs`], building the
-    /// client logs a WARN: the password goes to a server whose certificate
-    /// is not verified. Pin the certificate
+    /// client fails with `AuthFailed`: the password would go to a server
+    /// whose certificate is not verified. Pin the certificate
     /// ([`pin_server_certificate_sha256`](crate::WinrmClientBuilder::pin_server_certificate_sha256))
     /// or add a root
     /// ([`add_root_certificates_pem`](crate::WinrmClientBuilder::add_root_certificates_pem)).
-    /// 1.x warns; 2.0 will refuse this combination.
+    /// Since 2.0; 1.x only logged a WARN.
     Basic,
     /// NTLMv2 challenge/response authentication (default). When requests are
     /// sealed (see [`EncryptionMode`]), the three-step handshake (negotiate,

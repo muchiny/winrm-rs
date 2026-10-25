@@ -2745,15 +2745,52 @@ mod tests {
         assert!(transport.server_verifier.is_none());
     }
 
-    /// A plain-HTTP client builds on a host whose OS certificate store is empty.
-    /// Meaningful when run with `SSL_CERT_FILE=/nonexistent` on Linux.
+    /// A plain-HTTP client builds on a host whose OS certificate store is
+    /// empty. Run by [`plain_http_client_builds_without_system_roots`] in a
+    /// child process whose environment empties that store; on its own it
+    /// checks nothing more than any plain-HTTP construction.
     #[test]
-    fn plain_http_client_builds_without_system_roots() {
+    #[ignore = "run in a child process by plain_http_client_builds_without_system_roots"]
+    fn plain_http_client_builds_without_system_roots_inner() {
         let result = HttpTransport::new(
             WinrmConfig::default(),
             WinrmCredentials::new(USER, PASS, ""),
         );
         assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    /// Runs [`plain_http_client_builds_without_system_roots_inner`] in a child
+    /// copy of this test binary with `SSL_CERT_DIR` removed and
+    /// `SSL_CERT_FILE=/nonexistent`, so the OS store (read by
+    /// rustls-native-certs from those variables when set) is empty. It runs in
+    /// a child because `cargo test` itself sets both variables to the system
+    /// bundle in the environment of the tests it starts.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn plain_http_client_builds_without_system_roots() {
+        let exe = std::env::current_exe().unwrap();
+        #[expect(clippy::disallowed_methods, reason = "test-only subprocess")]
+        let output = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "transport::tests::plain_http_client_builds_without_system_roots_inner",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env_remove("SSL_CERT_DIR")
+            .env("SSL_CERT_FILE", "/nonexistent")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "child failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "the inner test did not run:\n{stdout}"
+        );
     }
 
     /// Every TLS configuration of a transport (shared client, dedicated
@@ -4230,7 +4267,8 @@ mod tests {
         assert_impostor_refused(&[&rustls::version::TLS12], false).await;
     }
 
-    /// The production shared client (`HttpTransport::new`: `build_http_client`
+    /// The production shared client (`WinrmClient::with_options` →
+    /// `HttpTransport::with_provider`: `build_http_client`
     /// with the preconfigured rustls config, no proxy) refuses the impostor
     /// before any HTTP byte, so no Basic `Authorization` header leaves.
     #[tokio::test]
@@ -4871,7 +4909,8 @@ mod tests {
         assert_eq!(type3_channel_bindings(&seen[0]), Some(cbt_of(EC_CERT_PEM)));
     }
 
-    /// End to end through `HttpTransport::new` on a direct connection, with
+    /// End to end through the transport (`HttpTransport::new`, the default
+    /// options of `WinrmClient::with_options`) on a direct connection, with
     /// a P-384 certificate signed with ECDSA-SHA384: the CBT hashes the
     /// certificate with SHA-384 (known answer computed with Python
     /// `cryptography`, see `test_pki.rs`).
@@ -4979,17 +5018,22 @@ mod tests {
             let shared = transport(AuthMethod::Basic, None, suite)
                 .send_soap_with_retry("127.0.0.1", "<soap/>".into())
                 .await;
-            let tls_failed = matches!(&shared, Err(WinrmError::Http(e)) if e.is_connect());
             if handshakes {
                 for result in results {
                     assert_eq!(result.unwrap(), "<ok/>");
                 }
-                assert!(!tls_failed, "shared client: {shared:?}");
+                assert!(
+                    matches!(&shared, Err(WinrmError::AuthFailed(m)) if m.starts_with("HTTP 400")),
+                    "shared client: {shared:?}"
+                );
             } else {
                 for result in results {
                     assert!(result.is_err(), "{result:?}");
                 }
-                assert!(tls_failed, "shared client: {shared:?}");
+                assert!(
+                    matches!(&shared, Err(WinrmError::Http(e)) if e.is_connect()),
+                    "shared client: {shared:?}"
+                );
                 assert!(seen.lock().unwrap().is_empty(), "no Type 3 may be sent");
             }
         }

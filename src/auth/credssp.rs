@@ -221,8 +221,9 @@ impl OpenSslMemTls {
 
 /// The TLS contexts every CredSSP connection of a client uses.
 ///
-/// Built once when the client is built, so the system CA bundle is read once
-/// and not for every request.
+/// Built once when the client is built, not for every request: the outer
+/// configuration is a clone of the client's TLS configuration (see
+/// [`CredSspTls::new`]).
 #[cfg(feature = "credssp")]
 pub(crate) struct CredSspTls {
     /// The transport's TLS configuration for the outer HTTPS connection,

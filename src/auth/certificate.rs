@@ -18,7 +18,8 @@ const MUTUAL_TLS_SECPROFILE: &str =
 ///
 /// The TLS client certificate itself is presented by the `reqwest::Client`,
 /// whose rustls config is built with it at construction time
-/// (`HttpTransport::with_provider`, reached from `WinrmClient::with_options`).
+/// (`HttpTransport::with_provider`, reached from `WinrmClient::with_options`
+/// through `HttpTransport::new_with`).
 /// Each request carries the mutual security profile
 /// in its `Authorization` header so the server uses that certificate.
 pub(crate) struct CertificateAuth {

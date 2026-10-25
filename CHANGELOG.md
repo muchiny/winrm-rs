@@ -78,9 +78,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   proxy's certificate.** The proxy leg is verified with the trusted roots,
   including those added with `add_root_certificates_pem` and `platform_roots`.
   For the old behaviour use
-  `WinrmClientBuilder::danger_accept_invalid_proxy_certs(true)`. With
-  `use_tls = true`, a proxy that reqwest takes from system settings is still
-  verified like the WinRM server.
+  `WinrmClientBuilder::danger_accept_invalid_proxy_certs(true)`.
 - **CredSSP needs an authenticated HTTPS server.** CredSSP refuses
   `accept_invalid_certs = true`: building a client with `AuthMethod::CredSsp`
   and that flag now fails with `WinrmError::AuthFailed`. CredSSP delegates
@@ -107,6 +105,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **`EncryptionMode::Always` with Basic, Certificate or CredSSP is refused**
   when the client is built. It sealed nothing before. Migration: use
   `EncryptionMode::Auto`.
+- **The operating system's proxy settings (Windows registry, macOS
+  configuration) are never read**, whatever features other crates enable in
+  `reqwest` or `hyper-util`. Environment proxies keep working, as before.
+  Migration: if your requests reached WinRM only through the OS proxy, set
+  `WinrmConfig::proxy` or `HTTP_PROXY` / `HTTPS_PROXY`.
+- **`WinrmConfig::proxy` with a scheme that no proxy supports (`ftp://`) is
+  refused** when the client is built, with `WinrmError::AuthFailed`. It used
+  to go direct. Migration: use an `http://`, `https://`, `socks4://`,
+  `socks4a://`, `socks5://` or `socks5h://` proxy URL, or leave
+  `WinrmConfig::proxy` unset to connect directly.
+- A proxy environment variable whose value is not a usable proxy URL is
+  ignored with a WARN. Migration: none; fix or unset the variable to silence
+  the WARN.
 
 ### Added
 

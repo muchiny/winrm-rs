@@ -159,9 +159,8 @@ that certificate is then pinned in the connection's verifier, so the
 AP-REQ's connection, and every later one, presents that same certificate or
 fails at its TLS handshake (any other server name than the endpoint's, the
 `https://` proxy's own leg aside, is refused too: the proxy of
-`WinrmConfig::proxy`, else any `https://` proxy in `HTTPS_PROXY` /
-`ALL_PROXY`; a proxy from system settings, which reqwest only reads when a
-crate in the build enables its `system-proxy` feature, is refused; a host that is no valid
+`WinrmConfig::proxy`, or else the `https://` proxy the environment gives for
+`https://` endpoints; the operating system's proxy is never used; a host that is no valid
 TLS server name once the URL is parsed is refused before the AP-REQ). Accepted by `CbtHardeningLevel = Strict`; a
 server certificate with no binding hash (Ed25519, unknown algorithm) is
 refused. `EncryptionMode::Never` over plain HTTP has none of this.
@@ -347,8 +346,8 @@ line, which command-line auditing (event 4688) and script block logging
 
 ### Proxies
 
-- `proxy` takes `http://`, `https://`, `socks4://`, `socks4a://`, `socks5://` or `socks5h://` URLs; one without a scheme is taken as `http://`. CredSSP never uses a proxy: it always connects directly.
-- With `proxy` unset, `reqwest` reads `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` (and their lower-case forms). It also reads the operating system's proxy settings (Windows registry, macOS configuration) whenever a crate in your build enables `hyper-util/client-proxy-system`, as the default features of `reqwest` 0.13 do. Set `proxy`, or `NO_PROXY`, to choose the route yourself.
+- `proxy` takes `http://`, `https://`, `socks4://`, `socks4a://`, `socks5://` or `socks5h://` URLs; one without a scheme is taken as `http://`, and any other scheme is refused when the client is built. CredSSP never uses a proxy: it always connects directly.
+- With `proxy` unset, the environment applies: `HTTP_PROXY` for `http://` endpoints, `HTTPS_PROXY` for `https://` endpoints, `ALL_PROXY` for both when the specific one is unset or unusable, and `NO_PROXY` for exclusions (names, domain suffixes, IP addresses, CIDR ranges, and `*` for every host name but no IP address). Upper case is read before lower case, and a set but empty value counts as set; none applies when `REQUEST_METHOD` is set (CGI). A value that is not a usable proxy URL is ignored with a WARN. The operating system's proxy settings are never read.
 - Over plain HTTP, an `http://` or `https://` proxy forwards each request and keeps the server connection that NTLM or Kerberos authenticated; WinRM then sends sealed requests on it without credentials. A proxy that shares those server connections between its clients (RFC 4559 section 6 forbids it) lets its other users send requests that run as you, whenever the server accepts unencrypted messages. Keep `AllowUnencrypted = false` on the server, and prefer HTTPS or a SOCKS proxy. See [Choosing a transport](#choosing-a-transport).
 - Credentials in a proxy URL reach `http://` and `socks5://` proxies in cleartext (`socks4://` ignores them); an `https://` proxy receives them inside TLS.
 

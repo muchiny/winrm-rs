@@ -34,7 +34,7 @@ kerberos = ["dep:cross-krb5"]
 # Microsoft CredSSP server silently drops the context after Type3 +
 # pubKeyAuth. See the comment block in `src/auth/credssp.rs` around the
 # `build_inner_openssl_tls` function for the full background.
-credssp = ["dep:hyper", "dep:hyper-util", "dep:tokio-rustls", "dep:http-body-util", "dep:bytes", "dep:http", "dep:x509-cert", "dep:openssl"]
+credssp = ["dep:hyper", "dep:tokio-rustls", "dep:http-body-util", "dep:bytes", "dep:x509-cert", "dep:openssl"]
 # Internal-only. Re-exports crate internals needed by `fuzz/` targets.
 # NOT part of the public API. Do not enable from downstream code — any
 # item gated by this feature may change or disappear without a SemVer
@@ -68,11 +68,11 @@ webpki-roots = "1.0.6"
 tower-layer = "0.3"
 tower-service = "0.3"
 hyper = { version = "1", features = ["client", "http1"], optional = true }
-hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+hyper-util = { version = "0.1.21", features = ["tokio", "client-proxy"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"], optional = true }
 http-body-util = { version = "0.1", optional = true }
 bytes = { version = "1", optional = true }
-http = { version = "1", optional = true }
+http = "1.5"
 x509-cert = { version = "0.3", optional = true }
 openssl = { version = "0.10", optional = true }
 idna = "1.1"

@@ -407,13 +407,38 @@ pub(crate) struct HttpTransport {
     before_send: Option<BeforeSend>,
     /// With `pin_server_certificate_sha256` or
     /// `danger_accept_invalid_proxy_certs` over HTTPS, the server names of
-    /// the `https://` proxies ([`proxy_server_names`]): their handshakes get
-    /// the proxy's verification, not the endpoint's (see
+    /// the `https://` proxy of [`Self::route`]
+    /// ([`proxy::ProxyRoute::https_proxy_server_names`]): their handshakes
+    /// get the proxy's verification, not the endpoint's (see
     /// [`crate::tls::ProxyRoutingVerifier`]), so a host with one of these
     /// names is refused (see [`Self::checked_endpoint`]). Empty otherwise.
     shared_proxy_names: Vec<rustls::pki_types::ServerName<'static>>,
-    /// Whether a pin is set, which picks the wording of that refusal.
-    shared_proxy_names_pinned: bool,
+    /// The proxy route of every client of this transport, resolved once at
+    /// construction.
+    route: proxy::ProxyRoute,
+    /// The options this transport was built with.
+    options: TransportOptions,
+}
+
+/// Transport settings chosen through [`crate::WinrmClientBuilder`], beside
+/// [`WinrmConfig`]. Plain data only, so the builder keeps its auto traits
+/// (`UnwindSafe`, `RefUnwindSafe`).
+#[derive(Clone, Debug)]
+pub(crate) struct TransportOptions {
+    /// Whether the proxy environment variables are read when
+    /// [`WinrmConfig::proxy`] is `None` (see [`proxy::ProxyRoute::resolve`]).
+    pub(crate) use_env_proxy: bool,
+    /// TLS settings.
+    pub(crate) tls: TlsOptions,
+}
+
+impl Default for TransportOptions {
+    fn default() -> Self {
+        Self {
+            use_env_proxy: true,
+            tls: TlsOptions::default(),
+        }
+    }
 }
 
 /// Largest response body read from the server: four times the envelope size
@@ -445,64 +470,6 @@ pub(crate) fn url_host(url: &str) -> Option<String> {
 /// the URL has no host that is a valid TLS server name.
 pub(crate) fn url_server_name(url: &str) -> Option<rustls::pki_types::ServerName<'static>> {
     rustls::pki_types::ServerName::try_from(url_host(url)?).ok()
-}
-
-/// The environment variable `name`, for [`proxy_server_names`]: `None` in
-/// unit tests, whose clients are built without environment proxies.
-fn proxy_env(name: &str) -> Option<String> {
-    if cfg!(test) {
-        None
-    } else {
-        std::env::var(name).ok()
-    }
-}
-
-/// Server names of the `https://` proxies a client built from `config` may
-/// do a TLS handshake with, for the proxy exception of the pinned verifiers
-/// (the Kerberos certificate pin, `pin_server_certificate_sha256`). When
-/// [`WinrmConfig::proxy`] is set, reqwest ignores the environment: its name
-/// if it is an `https://` proxy, else none. Otherwise every `https://` proxy
-/// in `HTTPS_PROXY`, `https_proxy`, `ALL_PROXY` or `all_proxy`, read through
-/// `var`.
-///
-/// For the environment this is a superset of what reqwest uses (it takes
-/// the first of each pair, prefers `HTTPS_PROXY` over `ALL_PROXY` for an
-/// `https://` endpoint, and skips the proxy for hosts in `NO_PROXY`): a
-/// name listed here that reqwest does not use is never the name of a
-/// handshake, since the dedicated client only connects to the endpoint (no
-/// redirects) and to its proxy, so the extra exception is inert. A WinRM
-/// host with one of these names is refused while a
-/// `pin_server_certificate_sha256` pin is set
-/// ([`HttpTransport::checked_endpoint`]), since its handshake would not be
-/// pinned. `http://`,
-/// scheme-less (taken as `http://`) and SOCKS proxies only relay bytes and
-/// do no TLS of their own. A proxy from system settings
-/// (`hyper-util/client-proxy-system`, which another crate in the build may
-/// enable through `reqwest`'s default features) is not covered: the pin
-/// refuses its handshake.
-fn proxy_server_names(
-    config: &WinrmConfig,
-    var: impl Fn(&str) -> Option<String>,
-) -> Vec<rustls::pki_types::ServerName<'static>> {
-    if let Some(proxy) = config.proxy.as_deref() {
-        return proxy::parse_proxy_url(proxy)
-            .ok()
-            .filter(|url| url.scheme() == "https")
-            .and_then(|url| url_server_name(url.as_str()))
-            .into_iter()
-            .collect();
-    }
-    ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]
-        .into_iter()
-        .filter_map(var)
-        .filter(|value| {
-            value
-                .trim()
-                .get(..8)
-                .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
-        })
-        .filter_map(|value| url_server_name(value.trim()))
-        .collect()
 }
 
 /// Strip scheme, userinfo, port, and path from a host string.
@@ -668,9 +635,10 @@ fn check_parser_keeps_host(host: &str) -> Result<(), WinrmError> {
 }
 
 /// Build the `reqwest` client for `config`: timeouts, redirects off, user
-/// agent, proxy, TLS details on responses and the prepared rustls
-/// configuration `tls_config` (HTTPS, or the plain-HTTP one that serves an
-/// `https://` proxy). At most `max_idle_per_host` idle connections are
+/// agent, the proxies of `route` and no other (the operating system's proxy
+/// settings are never read), TLS details on responses and the prepared
+/// rustls configuration `tls_config` (HTTPS, or the plain-HTTP one that
+/// serves an `https://` proxy). At most `max_idle_per_host` idle connections are
 /// kept per host: 10 for the transport's shared client, 1 for the client of
 /// a dedicated connection (sealed, Kerberos over TLS, or NTLM over TLS).
 ///
@@ -681,6 +649,7 @@ fn check_parser_keeps_host(host: &str) -> Result<(), WinrmError> {
 /// connection, so its requests stay on the authenticated one.
 fn build_http_client(
     config: &WinrmConfig,
+    route: &proxy::ProxyRoute,
     tls_config: rustls::ClientConfig,
     max_idle_per_host: usize,
     gate: Option<Arc<ConnGate>>,
@@ -707,24 +676,13 @@ fn build_http_client(
                 .user_agent
                 .as_deref()
                 .unwrap_or(concat!("winrm-rs/", env!("CARGO_PKG_VERSION"))),
-        );
-    if let Some(ref proxy_url) = config.proxy {
-        let url = proxy::parse_proxy_url(proxy_url)?;
-        if !proxy::PROXY_SCHEMES.contains(&url.scheme()) {
-            tracing::warn!(
-                scheme = url.scheme(),
-                "WinrmConfig::proxy has a scheme no proxy supports: requests go direct, as \
-                 before; winrm-rs 1.5.0 refuses it"
-            );
-        }
-        let proxy = reqwest::Proxy::all(url).map_err(|e| WinrmError::Http(e.without_url()))?;
+        )
+        // Drops `reqwest`'s own proxy lookup (the environment and, when a
+        // crate in the build enables it, the operating system's settings):
+        // the route is the only source of proxies.
+        .no_proxy();
+    for proxy in route.reqwest_proxies()? {
         builder = builder.proxy(proxy);
-    } else if cfg!(test) {
-        // Unit tests talk to loopback servers: keep `HTTP(S)_PROXY` from the
-        // environment out of them. Builds outside tests keep `reqwest`'s
-        // environment proxies and, when the build enables it, the OS proxy
-        // (see `WinrmConfig::proxy`).
-        builder = builder.no_proxy();
     }
     if let Some(gate) = gate {
         builder = builder.connector_layer(ConnGateLayer(gate));
@@ -734,34 +692,44 @@ fn build_http_client(
 
 impl HttpTransport {
     /// Create a new HTTP transport from the given configuration and
-    /// credentials, with the default TLS options: [`Self::with_tls`]. The
-    /// client goes through [`Self::with_tls`] directly; the tests use this.
+    /// credentials, with the default options: [`Self::new_with`]. The client
+    /// goes through [`Self::new_with`] directly; the tests use this.
     #[cfg(test)]
     pub(crate) fn new(
         config: WinrmConfig,
         credentials: WinrmCredentials,
     ) -> Result<Self, WinrmError> {
-        Self::with_tls(config, credentials, &TlsOptions::default())
+        Self::new_with(config, credentials, TransportOptions::default())
     }
 
     /// Create a new HTTP transport from the given configuration, credentials
-    /// and TLS options: [`Self::with_provider`] on the crypto provider
-    /// `opts.provider` selects ([`crate::tls::crypto_provider`]).
-    pub(crate) fn with_tls(
+    /// and options, reading the proxy environment of the process
+    /// ([`proxy::env_var`]): [`Self::new_with_env`].
+    pub(crate) fn new_with(
         config: WinrmConfig,
         credentials: WinrmCredentials,
-        opts: &TlsOptions,
+        opts: TransportOptions,
     ) -> Result<Self, WinrmError> {
-        Self::with_provider(
-            config,
-            credentials,
-            opts,
-            crate::tls::crypto_provider(opts.provider)?,
-        )
+        Self::new_with_env(config, credentials, opts, proxy::env_var)
+    }
+
+    /// Create a new HTTP transport whose proxy environment is read through
+    /// `var`: [`Self::with_provider`] on the crypto provider
+    /// `opts.tls.provider` selects ([`crate::tls::crypto_provider`]).
+    pub(crate) fn new_with_env(
+        config: WinrmConfig,
+        credentials: WinrmCredentials,
+        opts: TransportOptions,
+        var: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self, WinrmError> {
+        let provider = crate::tls::crypto_provider(opts.tls.provider)?;
+        Self::with_provider(config, credentials, opts, provider, var)
     }
 
     /// Create a new HTTP transport whose every TLS configuration (the shared
-    /// client, the dedicated clients, the CredSSP outer TLS) uses `provider`.
+    /// client, the dedicated clients, the CredSSP outer TLS) uses `provider`,
+    /// and whose proxy route ([`proxy::ProxyRoute::resolve`]) reads the
+    /// environment through `var`.
     ///
     /// Builds the underlying HTTP client with the configured timeouts and TLS
     /// settings. Returns [`WinrmError::Http`] if the HTTP client cannot be
@@ -769,16 +737,18 @@ impl HttpTransport {
     /// method cannot be set up: Certificate or CredSSP without HTTPS, CredSSP
     /// with `accept_invalid_certs`, Certificate auth without a usable
     /// certificate and key, a crypto
-    /// provider, TLS verifier or client certificate that rustls rejects, or,
-    /// with the `credssp` feature, the CredSSP TLS contexts.
+    /// provider, TLS verifier or client certificate that rustls rejects, an
+    /// invalid [`WinrmConfig::proxy`], or, with the `credssp` feature, the
+    /// CredSSP TLS contexts.
     #[tracing::instrument(level = "debug", skip_all)]
-    pub(crate) fn with_provider(
+    fn with_provider(
         config: WinrmConfig,
         credentials: WinrmCredentials,
-        opts: &TlsOptions,
+        opts: TransportOptions,
         provider: Arc<CryptoProvider>,
+        var: impl Fn(&str) -> Option<String>,
     ) -> Result<Self, WinrmError> {
-        debug!(tls_provider = ?opts.provider, "TLS crypto provider choice");
+        debug!(tls_provider = ?opts.tls.provider, "TLS crypto provider choice");
 
         // Refused before anything else is read or built. Basic over plain
         // HTTP puts the password and every body on the wire in cleartext, so
@@ -862,9 +832,11 @@ impl HttpTransport {
         // NTLM channel binding takes the server certificate of the connection
         // that carried the challenge: from the response (`tls_info`), or from
         // the verifier of a dedicated single-connection client (see `AuthConn`).
-        let proxy_names = proxy_server_names(&config, proxy_env);
+        let route = proxy::ProxyRoute::resolve(&config, opts.use_env_proxy, var)?;
+        debug!(route = ?route, "proxy route");
+        let proxy_names = route.https_proxy_server_names();
         let crate::tls::ServerVerifiers { origin, proxy } = crate::tls::server_verifiers(
-            opts,
+            &opts.tls,
             config.use_tls,
             config.accept_invalid_certs,
             &proxy_names,
@@ -879,12 +851,13 @@ impl HttpTransport {
         // The names whose handshakes do not get the endpoint's own
         // verification (see `ProxyRoutingVerifier`): a host with one of them
         // is refused where that would weaken the endpoint's verification.
-        let pinned = !opts.pins.is_empty();
-        let shared_proxy_names = if config.use_tls && (pinned || opts.accept_invalid_proxy_certs) {
-            proxy_names
-        } else {
-            Vec::new()
-        };
+        let pinned = !opts.tls.pins.is_empty();
+        let shared_proxy_names =
+            if config.use_tls && (pinned || opts.tls.accept_invalid_proxy_certs) {
+                proxy_names
+            } else {
+                Vec::new()
+            };
         let (client_tls, server_verifier) = if config.use_tls {
             let tls_builder = crate::tls::client_config_builder(&provider)?
                 .dangerous()
@@ -910,7 +883,7 @@ impl HttpTransport {
             None
         };
 
-        let http = build_http_client(&config, client_tls.clone(), 10, None)?;
+        let http = build_http_client(&config, &route, client_tls.clone(), 10, None)?;
 
         Ok(Self {
             http,
@@ -927,8 +900,15 @@ impl HttpTransport {
             session_id: format!("uuid:{}", uuid::Uuid::new_v4().to_string().to_uppercase()),
             before_send: None,
             shared_proxy_names,
-            shared_proxy_names_pinned: pinned,
+            route,
+            options: opts,
         })
+    }
+
+    /// The proxy route of this transport, for tests.
+    #[cfg(test)]
+    fn proxy_route(&self) -> &proxy::ProxyRoute {
+        &self.route
     }
 
     /// Install the gate checked before every request attempt.
@@ -972,7 +952,8 @@ impl HttpTransport {
             && url_server_name(&url).is_some_and(|name| self.shared_proxy_names.contains(&name))
         {
             let host = log_host(host);
-            return Err(WinrmError::AuthFailed(if self.shared_proxy_names_pinned {
+            let pinned = !self.options.tls.pins.is_empty();
+            return Err(WinrmError::AuthFailed(if pinned {
                 format!(
                     "pin_server_certificate_sha256: host {host} has the name of an https:// \
                      proxy; the pin cannot be applied to it, refusing"
@@ -1305,7 +1286,7 @@ impl HttpTransport {
                     Arc::clone(verifier),
                     url_server_name(&self.endpoint(host)),
                 )
-                .with_proxies(proxy_server_names(&self.config, proxy_env));
+                .with_proxies(self.route.https_proxy_server_names());
                 let handle = capturing.cert_handle();
                 tls.dangerous()
                     .set_certificate_verifier(Arc::new(capturing));
@@ -1317,7 +1298,7 @@ impl HttpTransport {
         let gate = Arc::new(ConnGate::new(&self.config));
         Ok(Box::new(AuthConn {
             host: host_key(host),
-            http: build_http_client(&self.config, tls, 1, Some(Arc::clone(&gate)))?,
+            http: build_http_client(&self.config, &self.route, tls, 1, Some(Arc::clone(&gate)))?,
             cert,
             gate: Some(gate),
             session: None,
@@ -2983,8 +2964,9 @@ mod tests {
                     ..Default::default()
                 },
                 WinrmCredentials::new(USER, PASS, ""),
-                &TlsOptions::default(),
+                TransportOptions::default(),
                 Arc::clone(&p),
+                proxy::env_var,
             )
             .unwrap();
             assert!(
@@ -3003,8 +2985,9 @@ mod tests {
                     ..Default::default()
                 },
                 WinrmCredentials::new(USER, PASS, ""),
-                &TlsOptions::default(),
+                TransportOptions::default(),
                 Arc::clone(&p),
+                proxy::env_var,
             )
             .unwrap();
             let o = &t.credssp_tls.as_ref().unwrap().outer;
@@ -3015,28 +2998,20 @@ mod tests {
 
     #[test]
     fn proxy_named_after_its_scheme_is_refused_at_construction() {
-        let config = WinrmConfig {
-            proxy: Some("socks5h:/proxy.corp:1080".into()),
-            ..Default::default()
-        };
-        let err = HttpTransport::new(config, WinrmCredentials::new("u", "p", ""))
-            .err()
-            .expect("refused");
-        assert!(
-            matches!(&err, WinrmError::AuthFailed(m) if m.contains("invalid proxy URL")),
-            "{err:?}"
-        );
-    }
-
-    #[tracing_test::traced_test]
-    #[test]
-    fn unsupported_proxy_scheme_warns_and_goes_direct() {
-        let config = WinrmConfig {
-            proxy: Some("ftp://proxy:21".into()),
-            ..Default::default()
-        };
-        assert!(HttpTransport::new(config, WinrmCredentials::new("u", "p", "")).is_ok());
-        assert!(logs_contain("scheme no proxy supports"));
+        // The second has a scheme no proxy supports.
+        for proxy in ["socks5h:/proxy.corp:1080", "ftp://proxy:21"] {
+            let config = WinrmConfig {
+                proxy: Some(proxy.into()),
+                ..Default::default()
+            };
+            let err = HttpTransport::new(config, WinrmCredentials::new("u", "p", ""))
+                .err()
+                .expect("refused");
+            assert!(
+                matches!(&err, WinrmError::AuthFailed(m) if m.contains("invalid proxy URL")),
+                "{proxy}: {err:?}"
+            );
+        }
     }
 
     #[test]
@@ -3048,62 +3023,6 @@ mod tests {
         let creds = WinrmCredentials::new("u", "p", "");
         let result = HttpTransport::new(config, creds);
         assert!(result.is_err(), "expected error for invalid proxy URL");
-    }
-
-    /// The pinned verifier's proxy exception covers the configured proxy,
-    /// else the `https://` proxies of the environment (reqwest uses them
-    /// when `WinrmConfig::proxy` is `None`); proxies without TLS of their
-    /// own add nothing.
-    #[test]
-    fn proxy_server_names_cover_the_configured_or_environment_https_proxies() {
-        use rustls::pki_types::ServerName;
-        let name = |n: &str| ServerName::try_from(n.to_string()).unwrap();
-        let env = |vars: &'static [(&'static str, &'static str)]| {
-            move |key: &str| {
-                vars.iter()
-                    .find(|(k, _)| *k == key)
-                    .map(|(_, v)| (*v).to_string())
-            }
-        };
-        let none = WinrmConfig::default();
-        assert_eq!(
-            proxy_server_names(
-                &none,
-                env(&[
-                    ("HTTPS_PROXY", "https://user:pw@proxy.corp:3128"),
-                    ("all_proxy", " HTTPS://All.Corp/ "),
-                    ("https_proxy", "http://plain.corp:3128"),
-                    ("ALL_PROXY", "socks5://socks.corp:1080"),
-                ])
-            ),
-            vec![name("proxy.corp"), name("all.corp")]
-        );
-        assert!(proxy_server_names(&none, env(&[("HTTPS_PROXY", "proxy.corp:3128")])).is_empty());
-        assert!(proxy_server_names(&none, env(&[])).is_empty());
-        let explicit = |proxy: &str| WinrmConfig {
-            proxy: Some(proxy.into()),
-            ..Default::default()
-        };
-        assert_eq!(
-            proxy_server_names(
-                &explicit("HTTPS://explicit.corp:8443"),
-                env(&[("HTTPS_PROXY", "https://proxy.corp")])
-            ),
-            vec![name("explicit.corp")],
-            "an explicit proxy makes reqwest ignore the environment"
-        );
-        // An explicit proxy that does no TLS of its own gets no exception,
-        // and the environment is still ignored.
-        for plain in ["http://explicit.corp:8080", "explicit.corp:8080"] {
-            assert!(
-                proxy_server_names(
-                    &explicit(plain),
-                    env(&[("HTTPS_PROXY", "https://proxy.corp")])
-                )
-                .is_empty(),
-                "{plain}"
-            );
-        }
     }
 
     /// Basic over plain HTTP sends the password and every body in cleartext:
@@ -3963,11 +3882,19 @@ mod tests {
     /// the requested `127.0.0.1` port. Pointing the transport at it as an
     /// explicit proxy keeps `HTTP(S)_PROXY` from the environment out.
     fn spawn_connect_proxy() -> u16 {
+        spawn_connect_proxy_counting().0
+    }
+
+    /// [`spawn_connect_proxy`], with the number of `CONNECT`s it served.
+    fn spawn_connect_proxy_counting() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
         use std::io::Write;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
+        let connects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let served = Arc::clone(&connects);
         std::thread::spawn(move || {
             while let Ok(mut client) = accept_with_deadline(&listener) {
+                let served = Arc::clone(&served);
                 std::thread::spawn(move || -> Result<(), String> {
                     let (head, _) = read_http_head(&mut client)?;
                     let target = head
@@ -3977,6 +3904,7 @@ mod tests {
                         .to_string();
                     let upstream =
                         std::net::TcpStream::connect(&target).map_err(|e| e.to_string())?;
+                    served.fetch_add(1, Ordering::SeqCst);
                     client
                         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                         .map_err(|e| e.to_string())?;
@@ -3991,7 +3919,7 @@ mod tests {
                 });
             }
         });
-        port
+        (port, connects)
     }
 
     /// An HTTPS endpoint presenting `cert_pem` that answers NTLM: a Type 1
@@ -4111,11 +4039,14 @@ mod tests {
     /// certificate of the test servers (`EC_CERT_PEM`) pinned.
     #[cfg(feature = "credssp")]
     fn credssp_test_transport(port: u16) -> HttpTransport {
-        HttpTransport::with_tls(
+        HttpTransport::new_with(
             credssp_test_config(port),
             WinrmCredentials::new(USER, PASS, ""),
-            &TlsOptions {
-                pins: vec![sha256_hex(crate::test_pki::EC_CERT_PEM)],
+            TransportOptions {
+                tls: TlsOptions {
+                    pins: vec![sha256_hex(crate::test_pki::EC_CERT_PEM)],
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         )
@@ -4262,11 +4193,14 @@ mod tests {
         use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM, RSA_CERT_PEM, RSA_KEY_PKCS1_PEM};
         let (port, log) = test_server::spawn(Fault::Honest, EC_CERT_PEM, EC_KEY_PKCS8_PEM);
         let relay = test_server::spawn_tls_relay(port, RSA_CERT_PEM, RSA_KEY_PKCS1_PEM);
-        let t = HttpTransport::with_tls(
+        let t = HttpTransport::new_with(
             credssp_test_config(relay),
             creds(),
-            &TlsOptions {
-                pins: vec![sha256_hex(RSA_CERT_PEM)],
+            TransportOptions {
+                tls: TlsOptions {
+                    pins: vec![sha256_hex(RSA_CERT_PEM)],
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         )
@@ -5358,8 +5292,9 @@ mod tests {
                     ..Default::default()
                 },
                 WinrmCredentials::new(USER, PASS, ""),
-                &TlsOptions::default(),
+                TransportOptions::default(),
                 only(suite),
+                proxy::env_var,
             )
             .unwrap()
         };
@@ -5547,6 +5482,52 @@ mod tests {
         assert_eq!(reply, "<ok/>");
         let seen = seen.lock().unwrap().clone();
         assert_eq!(type3_channel_bindings(&seen[0]), Some(cbt_of(EC_CERT_PEM)));
+    }
+
+    /// An https endpoint reached through an HTTPS_PROXY from the environment:
+    /// reqwest's real proxy selection tunnels it, and the Type 3 still binds
+    /// the endpoint's certificate.
+    #[tokio::test]
+    async fn env_https_proxy_tunnel_keeps_ntlm_cbt() {
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
+        let (port, seen) = spawn_ntlm_tls_server(EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let (proxy_port, connects) = spawn_connect_proxy_counting();
+        let config = WinrmConfig {
+            auth_method: AuthMethod::Ntlm,
+            use_tls: true,
+            accept_invalid_certs: true,
+            port,
+            connect_timeout_secs: 5,
+            operation_timeout_secs: 5,
+            ..Default::default()
+        };
+        let env =
+            move |n: &str| (n == "HTTPS_PROXY").then(|| format!("http://127.0.0.1:{proxy_port}"));
+        let transport = HttpTransport::new_with_env(
+            config,
+            WinrmCredentials::new(USER, PASS, ""),
+            TransportOptions::default(),
+            env,
+        )
+        .unwrap();
+        let url = format!("https://127.0.0.1:{port}/wsman");
+        assert_eq!(
+            transport.proxy_route().proxy_for(&url).map(|u| u.port()),
+            Some(Some(proxy_port))
+        );
+        let reply = transport
+            .send_ntlm_over_tls("127.0.0.1", &url, "<soap/>", Lane::Data)
+            .await
+            .unwrap();
+        assert_eq!(reply, "<ok/>");
+        assert!(
+            connects.load(Ordering::SeqCst) >= 1,
+            "the environment proxy was not used"
+        );
+        assert_eq!(
+            type3_channel_bindings(&seen.lock().unwrap()[0]),
+            Some(cbt_of(EC_CERT_PEM))
+        );
     }
 
     /// Basic over plain HTTP through an `https://` proxy on loopback whose
@@ -5962,7 +5943,8 @@ mod tests {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let tls =
             crate::tls::plain_http_config(Arc::new(NoVerifier::new(&provider)), &provider).unwrap();
-        let client = build_http_client(&config, tls, 1, Some(Arc::clone(&gate))).unwrap();
+        let route = proxy::ProxyRoute::resolve(&config, false, |_: &str| None).unwrap();
+        let client = build_http_client(&config, &route, tls, 1, Some(Arc::clone(&gate))).unwrap();
         let url = format!("http://127.0.0.1:{port}/wsman");
         for _ in 0..2 {
             assert_eq!(client.get(&url).send().await.unwrap().status(), 200);
@@ -6040,7 +6022,14 @@ mod tests {
     }
 
     fn transport_with(config: WinrmConfig, opts: &TlsOptions) -> Result<HttpTransport, WinrmError> {
-        HttpTransport::with_tls(config, WinrmCredentials::new(USER, PASS, ""), opts)
+        HttpTransport::new_with(
+            config,
+            WinrmCredentials::new(USER, PASS, ""),
+            TransportOptions {
+                tls: opts.clone(),
+                ..Default::default()
+            },
+        )
     }
 
     /// A temp directory holding `pem` as the certificate file.

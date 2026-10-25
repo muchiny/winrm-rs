@@ -90,9 +90,7 @@ pub struct WinrmConfig {
     /// the built-in Mozilla roots for `use_tls = true`, the operating
     /// system's store for `use_tls = false`).
     /// [`WinrmClientBuilder::danger_accept_invalid_proxy_certs`](crate::WinrmClientBuilder::danger_accept_invalid_proxy_certs)
-    /// turns that off. With `use_tls = true`, one proxy is still verified as
-    /// the WinRM server is, that is not at all under this flag: a proxy that
-    /// `reqwest` takes from system settings, which the client cannot name.
+    /// turns that off.
     ///
     /// With [`AuthMethod::CredSsp`], building the client fails with
     /// `AuthFailed`: CredSSP refuses `accept_invalid_certs = true`. Set it to
@@ -185,9 +183,8 @@ pub struct WinrmConfig {
     /// only a proxy the client trusts can request the chain. `http://`
     /// (CONNECT) and SOCKS5 proxies only
     /// relay bytes: TLS, and the certificate, stay end-to-end with the WinRM
-    /// host. The same applies to a proxy taken from the `HTTPS_PROXY` /
-    /// `ALL_PROXY` environment variables, which `reqwest` uses when this field
-    /// is `None`, or from system settings.
+    /// host. The same applies to a proxy taken from the environment when this
+    /// field is `None` (see below).
     ///
     /// Credentials in the URL (`http://user:password@proxy:8080`) are the
     /// proxy account's, never the WinRM credentials. They reach `http://`
@@ -198,22 +195,26 @@ pub struct WinrmConfig {
     /// See [`accept_invalid_certs`](Self::accept_invalid_certs) for how the
     /// proxy's certificate is verified.
     ///
-    /// With this field `None`, `reqwest` reads `HTTP_PROXY`, `HTTPS_PROXY`,
-    /// `ALL_PROXY` and `NO_PROXY` (and their lower-case forms) from the
-    /// environment. It also reads the operating system's proxy settings
-    /// (Windows registry, macOS configuration) whenever any crate in the build
-    /// enables `hyper-util/client-proxy-system`, as the default features of
-    /// `reqwest` 0.13 do (its `system-proxy` feature). Set this field, or
-    /// `NO_PROXY`, to choose the route.
+    /// A URL whose scheme is not `http`, `https`, `socks4`, `socks4a`,
+    /// `socks5` or `socks5h` (`ftp://`, for one) is refused when the client
+    /// is built.
+    ///
+    /// With this field `None`, the environment applies: `HTTP_PROXY` for
+    /// `http://` endpoints, `HTTPS_PROXY` for `https://` endpoints,
+    /// `ALL_PROXY` for both when the specific one is unset or unusable, and
+    /// `NO_PROXY` for exclusions (names, domain suffixes, IP addresses, CIDR
+    /// ranges, and `*`, which matches every name but no IP address; `<local>`
+    /// has no meaning). Each upper-case name is read before its lower-case
+    /// form, and a set but empty value counts as set. None applies when
+    /// `REQUEST_METHOD` is set (CGI). A value that is not a usable proxy URL
+    /// is ignored with a WARN. The operating system's proxy settings are
+    /// never read.
     ///
     /// Kerberos over HTTPS pins the server certificate in the connection's
     /// verifier and refuses a TLS handshake for any other server name than
-    /// the endpoint's, except an `https://` proxy's own: this one, else any
-    /// `https://` proxy named in `HTTPS_PROXY`, `https_proxy`, `ALL_PROXY` or
-    /// `all_proxy`. A proxy that `reqwest` takes from system settings (only
-    /// when a crate in the build enables its `system-proxy` feature: Windows
-    /// registry, macOS configuration) is refused with an error naming that
-    /// cause; set it here instead.
+    /// the endpoint's, except an `https://` proxy's own leg: this one, or
+    /// else the `https://` proxy the environment gives for `https://`
+    /// endpoints. The operating system's proxy is never used.
     pub proxy: Option<String>,
     /// Console output code page (default: 65001 = UTF-8).
     ///

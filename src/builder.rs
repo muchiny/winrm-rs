@@ -8,7 +8,7 @@ use std::panic::AssertUnwindSafe;
 use crate::client::WinrmClient;
 use crate::config::{TlsProvider, WinrmConfig, WinrmCredentials};
 use crate::error::WinrmError;
-use crate::tls::TlsOptions;
+use crate::transport::TransportOptions;
 
 /// Typestate marker: credentials have not yet been provided.
 pub struct NeedsCredentials;
@@ -34,8 +34,8 @@ pub struct WinrmClientBuilder<S = NeedsCredentials> {
     // `AssertUnwindSafe` keeps the builder `UnwindSafe` and `RefUnwindSafe`
     // as it was before the hook existed; the hook is never called here.
     before_send: Option<AssertUnwindSafe<crate::transport::BeforeSend>>,
-    /// TLS settings (plain data).
-    tls: TlsOptions,
+    /// Transport settings: TLS and proxy (plain data).
+    options: TransportOptions,
     _state: std::marker::PhantomData<S>,
 }
 
@@ -54,7 +54,7 @@ impl<S> WinrmClientBuilder<S> {
     /// reported as [`WinrmError::AuthFailed`], like the other TLS setup
     /// errors, since `WinrmError` has no dedicated variant.
     pub fn tls_provider(mut self, provider: TlsProvider) -> Self {
-        self.tls.provider = Some(provider);
+        self.options.tls.provider = Some(provider);
         self
     }
 
@@ -81,7 +81,7 @@ impl<S> WinrmClientBuilder<S> {
     ///
     /// With `use_tls = false` these roots apply to an `https://` proxy only.
     pub fn add_root_certificates_pem(mut self, path: impl Into<std::path::PathBuf>) -> Self {
-        self.tls.root_files.push(path.into());
+        self.options.tls.root_files.push(path.into());
         self
     }
 
@@ -100,7 +100,7 @@ impl<S> WinrmClientBuilder<S> {
     /// [`WinrmError::AuthFailed`] when the system store holds no certificate
     /// and no root file was added.
     pub fn platform_roots(mut self, enabled: bool) -> Self {
-        self.tls.platform_roots = enabled;
+        self.options.tls.platform_roots = enabled;
         self
     }
 
@@ -120,8 +120,9 @@ impl<S> WinrmClientBuilder<S> {
     /// roots ([`add_root_certificates_pem`](Self::add_root_certificates_pem),
     /// [`platform_roots`](Self::platform_roots)). A WinRM host that has the
     /// name of such a proxy is refused while a pin is set, since its
-    /// handshake could not be told from the proxy's. An `https://` proxy that
-    /// `reqwest` takes from system settings is refused while a pin is set.
+    /// handshake could not be told from the proxy's. The proxy is the one of
+    /// [`WinrmConfig::proxy`], else the `https://` proxy the environment gives
+    /// for `https://` endpoints; the operating system's proxy is never used.
     ///
     /// [`build`](WinrmClientBuilder::build) fails with
     /// [`WinrmError::AuthFailed`] for a malformed fingerprint, with
@@ -139,7 +140,7 @@ impl<S> WinrmClientBuilder<S> {
     /// From a client: `openssl s_client -connect <host>:5986 -servername <host>
     /// </dev/null | openssl x509 -noout -fingerprint -sha256`.
     pub fn pin_server_certificate_sha256(mut self, fingerprint: &str) -> Self {
-        self.tls.pins.push(fingerprint.to_string());
+        self.options.tls.pins.push(fingerprint.to_string());
         self
     }
 
@@ -155,7 +156,7 @@ impl<S> WinrmClientBuilder<S> {
     /// host that has the name of the `https://` proxy is refused, since its
     /// handshake could not be told from the proxy's. Default: `false`.
     pub fn danger_accept_invalid_proxy_certs(mut self, accept: bool) -> Self {
-        self.tls.accept_invalid_proxy_certs = accept;
+        self.options.tls.accept_invalid_proxy_certs = accept;
         self
     }
 }
@@ -167,7 +168,7 @@ impl WinrmClientBuilder<NeedsCredentials> {
             config,
             credentials: None,
             before_send: None,
-            tls: TlsOptions::default(),
+            options: TransportOptions::default(),
             _state: std::marker::PhantomData,
         }
     }
@@ -178,7 +179,7 @@ impl WinrmClientBuilder<NeedsCredentials> {
             config: self.config,
             credentials: Some(creds),
             before_send: self.before_send,
-            tls: self.tls,
+            options: self.options,
             _state: std::marker::PhantomData,
         }
     }
@@ -307,7 +308,7 @@ impl WinrmClientBuilder<Ready> {
             self.config,
             self.credentials
                 .expect("typestate guarantees credentials are set"),
-            &self.tls,
+            self.options,
         )?;
         if let Some(hook) = self.before_send {
             client.transport.set_before_send(hook.0);
@@ -337,13 +338,16 @@ mod tests {
         let before = WinrmClientBuilder::new(WinrmConfig::default())
             .tls_provider(TlsProvider::Ring)
             .credentials(creds());
-        assert_eq!(before.tls.provider, Some(TlsProvider::Ring));
+        assert_eq!(before.options.tls.provider, Some(TlsProvider::Ring));
         let after = WinrmClientBuilder::new(WinrmConfig::default())
             .credentials(creds())
             .tls_provider(TlsProvider::ProcessDefault);
-        assert_eq!(after.tls.provider, Some(TlsProvider::ProcessDefault));
+        assert_eq!(
+            after.options.tls.provider,
+            Some(TlsProvider::ProcessDefault)
+        );
         let default = WinrmClientBuilder::new(WinrmConfig::default()).credentials(creds());
-        assert_eq!(default.tls.provider, None);
+        assert_eq!(default.options.tls.provider, None);
     }
 
     /// The root options survive the typestate transition, and their errors
@@ -378,7 +382,10 @@ mod tests {
         .pin_server_certificate_sha256("aa")
         .credentials(WinrmCredentials::new("u", "p", ""))
         .pin_server_certificate_sha256(&"bb".repeat(32));
-        assert_eq!(builder.tls.pins, vec!["aa".to_string(), "bb".repeat(32)]);
+        assert_eq!(
+            builder.options.tls.pins,
+            vec!["aa".to_string(), "bb".repeat(32)]
+        );
         match builder.build() {
             Err(WinrmError::AuthFailed(m)) => assert!(m.contains("got 2"), "{m}"),
             other => panic!("expected AuthFailed, got {:?}", other.map(|_| ())),
@@ -390,14 +397,15 @@ mod tests {
     #[test]
     fn danger_accept_invalid_proxy_certs_is_carried_over_by_credentials() {
         let builder = WinrmClientBuilder::new(WinrmConfig::default());
-        assert!(!builder.tls.accept_invalid_proxy_certs);
+        assert!(!builder.options.tls.accept_invalid_proxy_certs);
         let builder = builder
             .danger_accept_invalid_proxy_certs(true)
             .credentials(WinrmCredentials::new("u", "p", ""));
-        assert!(builder.tls.accept_invalid_proxy_certs);
+        assert!(builder.options.tls.accept_invalid_proxy_certs);
         assert!(
             !builder
                 .danger_accept_invalid_proxy_certs(false)
+                .options
                 .tls
                 .accept_invalid_proxy_certs
         );

@@ -17,8 +17,7 @@ use crate::config::{WinrmConfig, WinrmCredentials};
 use crate::error::WinrmError;
 use crate::shell::{Shell, ShellKind};
 use crate::soap;
-use crate::tls::TlsOptions;
-use crate::transport::HttpTransport;
+use crate::transport::{HttpTransport, TransportOptions};
 
 /// Async WinRM (WS-Management) HTTP client.
 ///
@@ -69,17 +68,18 @@ impl WinrmClient {
     /// `tls_provider` to leave the process default alone.
     #[tracing::instrument(level = "debug", skip(config, credentials))]
     pub fn new(config: WinrmConfig, credentials: WinrmCredentials) -> Result<Self, WinrmError> {
-        Self::with_options(config, credentials, &TlsOptions::default())
+        Self::with_options(config, credentials, TransportOptions::default())
     }
 
-    /// Create a client with the TLS options chosen through the builder.
+    /// Create a client with the transport options chosen through the
+    /// builder.
     pub(crate) fn with_options(
         config: WinrmConfig,
         credentials: WinrmCredentials,
-        opts: &TlsOptions,
+        opts: TransportOptions,
     ) -> Result<Self, WinrmError> {
         Ok(Self {
-            transport: HttpTransport::with_tls(config, credentials, opts)?,
+            transport: HttpTransport::new_with(config, credentials, opts)?,
         })
     }
 

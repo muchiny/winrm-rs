@@ -308,18 +308,39 @@ jobs:
           persist-credentials: false
           # Full history: Sonar needs blame data to tell new code from old.
           fetch-depth: 0
-      # Each artifact holds one file, extracted at the repository root: the
-      # paths sonar-project.properties reads.
+      # The artifacts come from jobs that run build scripts: they are extracted
+      # outside the checkout, so nothing in them can replace a checked-out file
+      # such as sonar-project.properties.
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: coverage-cobertura
+          path: ${{ runner.temp }}/sonar-reports/coverage-cobertura
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: clippy-report
+          path: ${{ runner.temp }}/sonar-reports/clippy-report
+      # Only the two expected regular files reach the repository root, the
+      # paths sonar-project.properties reads. This step holds no token.
+      - name: Copy the two reports into the checkout
+        env:
+          REPORTS: ${{ runner.temp }}/sonar-reports
+        run: |
+          set -euo pipefail
+          for report in coverage-cobertura/cobertura.xml clippy-report/clippy-report.json; do
+            src="$REPORTS/$report"
+            dst="${report#*/}"
+            [[ -f "$src" && ! -L "$src" ]] \
+              || { echo "::error::$report is missing or not a regular file"; exit 1; }
+            [[ ! -e "$dst" && ! -L "$dst" ]] \
+              || { echo "::error::$dst already exists in the checkout"; exit 1; }
+            cp -- "$src" "$dst"
+          done
+          exit 0
       - name: SonarQube scan
         uses: SonarSource/sonarqube-scan-action@d209202bc7d53ff1cc128f7f907dac145c9d6ae9 # v8.3.0
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: https://sonarcloud.io
 
   doc:
     name: Documentation

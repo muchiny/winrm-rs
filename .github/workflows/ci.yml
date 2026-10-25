@@ -118,6 +118,9 @@ jobs:
           tool: cargo-nextest@0.9.135
       - name: Install OpenSSL headers
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+      # tests/pwsh_quote_oracle.rs skips itself without pwsh; this step makes
+      # a runner without it fail visibly.
+      - run: pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
       - run: cargo nextest run --locked --features credssp,__internal
       - run: cargo test --doc --locked --features credssp
       - name: Release build check (release-only branches)

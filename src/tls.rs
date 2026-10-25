@@ -50,8 +50,9 @@ pub(crate) struct CertCapturingVerifier {
     pinned: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
-/// Why a pinned [`CertCapturingVerifier`] refused a handshake, carried as
-/// `rustls::Error::Other` so callers can recognise it by type.
+/// Why a pinned [`CertCapturingVerifier`] or a [`PinnedVerifier`] refused a
+/// handshake, carried as `rustls::Error::Other` so callers can recognise it
+/// by type.
 #[derive(Debug)]
 pub(crate) struct PinMismatch(&'static str);
 
@@ -356,6 +357,197 @@ pub(crate) struct TlsOptions {
     /// Whether the operating system's certificate store is trusted instead of
     /// the built-in Mozilla roots.
     pub(crate) platform_roots: bool,
+    /// SHA-256 fingerprints of the accepted server certificates, as the
+    /// caller gave them (parsed by [`server_verifiers`]).
+    pub(crate) pins: Vec<String>,
+}
+
+/// Parse a SHA-256 certificate fingerprint: outer whitespace is trimmed,
+/// every `:` is removed, and exactly 64 ASCII hex digits, in any case, must
+/// remain.
+pub(crate) fn parse_sha256_fingerprint(s: &str) -> Result<[u8; 32], WinrmError> {
+    let mut digits = Vec::with_capacity(64);
+    let mut count: usize = 0;
+    for c in s.trim().chars().filter(|&c| c != ':') {
+        let digit = c
+            .to_digit(16)
+            .and_then(|d| u8::try_from(d).ok())
+            .ok_or_else(|| {
+                WinrmError::AuthFailed(format!(
+                    "pin_server_certificate_sha256: invalid character {c:?}; expected hex \
+                     digits, optionally separated by ':'"
+                ))
+            })?;
+        // Kept up to one past the expected count: enough to refuse a longer
+        // value without storing all of it.
+        if digits.len() <= 64 {
+            digits.push(digit);
+        }
+        count = count.saturating_add(1);
+    }
+    if count != 64 {
+        return Err(WinrmError::AuthFailed(format!(
+            "pin_server_certificate_sha256: expected 64 hex digits (SHA-256), got {count}"
+        )));
+    }
+    let mut fingerprint = [0u8; 32];
+    let (pairs, _) = digits.as_chunks::<2>();
+    for (byte, &[high, low]) in fingerprint.iter_mut().zip(pairs) {
+        // Both are below 16, so neither step can overflow.
+        *byte = high.saturating_mul(16).saturating_add(low);
+    }
+    Ok(fingerprint)
+}
+
+/// A verifier that accepts the server certificate only when its SHA-256
+/// digest (of the DER encoding) is one of `pins`.
+///
+/// The pin is the whole trust decision: the server name, the chain and the
+/// validity dates are not looked at, so a self-signed listener or one reached
+/// by IP address is accepted. The handshake signatures are still checked with
+/// the provider's algorithms: the server must prove it holds the key of the
+/// pinned certificate.
+#[derive(Debug)]
+pub(crate) struct PinnedVerifier {
+    pins: Vec<[u8; 32]>,
+    algs: WebPkiSupportedAlgorithms,
+}
+
+impl PinnedVerifier {
+    /// A verifier accepting the certificates whose SHA-256 is in `pins`,
+    /// checking handshake signatures with `provider`'s algorithms.
+    pub(crate) fn new(pins: Vec<[u8; 32]>, provider: &CryptoProvider) -> Self {
+        Self {
+            pins,
+            algs: provider.signature_verification_algorithms,
+        }
+    }
+}
+
+impl ServerCertVerifier for PinnedVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, Error> {
+        use sha2::Digest as _;
+        use subtle::ConstantTimeEq as _;
+
+        let digest = sha2::Sha256::digest(end_entity.as_ref());
+        let matched = self
+            .pins
+            .iter()
+            .fold(subtle::Choice::from(0), |found, pin| {
+                found | digest.as_slice().ct_eq(pin.as_slice())
+            });
+        if bool::from(matched) {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            Err(PinMismatch::refuse(
+                "server certificate matches no pin_server_certificate_sha256 fingerprint; \
+                 refusing the handshake",
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algs)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algs)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.algs.supported_schemes()
+    }
+}
+
+/// A verifier that sends the certificate of an `https://` proxy to `proxy`
+/// and every other certificate to `origin`, by the server name of the
+/// handshake: `reqwest` verifies the proxy leg with a copy of the client's
+/// TLS configuration, so one verifier sees both.
+///
+/// The signature callbacks and [`ServerCertVerifier::supported_verify_schemes`]
+/// receive no server name and go to `origin`; both verifiers must check
+/// signatures with the same provider algorithms, which [`server_verifiers`]
+/// guarantees. When the WinRM endpoint and a proxy share a server name, the
+/// `proxy` verifier applies to both: the endpoint must then pass the trusted
+/// roots and the name check, and its pin is not consulted (a self-signed
+/// endpoint is refused).
+#[derive(Debug)]
+pub(crate) struct ProxyRoutingVerifier {
+    origin: Arc<dyn ServerCertVerifier>,
+    proxy: Arc<dyn ServerCertVerifier>,
+    proxies: Vec<ServerName<'static>>,
+}
+
+impl ProxyRoutingVerifier {
+    /// Route the handshakes with `proxies` to `proxy`, the others to `origin`.
+    pub(crate) fn new(
+        origin: Arc<dyn ServerCertVerifier>,
+        proxy: Arc<dyn ServerCertVerifier>,
+        proxies: Vec<ServerName<'static>>,
+    ) -> Self {
+        Self {
+            origin,
+            proxy,
+            proxies,
+        }
+    }
+}
+
+impl ServerCertVerifier for ProxyRoutingVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, Error> {
+        let verifier = if self.proxies.contains(server_name) {
+            &self.proxy
+        } else {
+            &self.origin
+        };
+        verifier.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        self.origin.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        self.origin.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.origin.supported_verify_schemes()
+    }
 }
 
 /// Error message when [`TlsProvider::ProcessDefault`] finds no process-wide
@@ -498,7 +690,9 @@ fn load_root_certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>, W
 /// The server verifiers of a client, built once so that the shared client,
 /// the per-connection clients and CredSSP all verify alike.
 pub(crate) struct ServerVerifiers {
-    /// Verifies the WinRM server (HTTPS transport, CredSSP outer TLS).
+    /// Verifies the WinRM server (HTTPS transport, CredSSP outer TLS); when
+    /// pinned, it hands an `https://` proxy's handshake to the strict
+    /// verifier.
     pub(crate) origin: Arc<dyn ServerCertVerifier>,
     /// Verifies the certificate of an `https://` proxy.
     #[expect(
@@ -519,14 +713,43 @@ pub(crate) struct ServerVerifiers {
 ///   Mozilla roots plus the root files.
 ///
 /// `origin` is a verifier that accepts any certificate under
-/// `accept_invalid_certs`, else the strict one; `proxy` is always the strict
-/// one.
+/// `accept_invalid_certs`, a [`PinnedVerifier`] when `opts.pins` is not
+/// empty, else the strict one; `proxy` is always the strict one. A pinned
+/// `origin` is wrapped in a [`ProxyRoutingVerifier`] sending the handshakes
+/// with `proxies` (the server names of the `https://` proxies the client may
+/// use) to the strict verifier.
+///
+/// Pins are refused with `accept_invalid_certs` (the pin replaces it) and
+/// without `use_tls` (no server certificate to pin), and each must parse
+/// ([`parse_sha256_fingerprint`]).
 pub(crate) fn server_verifiers(
     opts: &TlsOptions,
     use_tls: bool,
     accept_invalid_certs: bool,
+    proxies: &[ServerName<'static>],
     provider: &Arc<CryptoProvider>,
 ) -> Result<ServerVerifiers, WinrmError> {
+    if !opts.pins.is_empty() {
+        if accept_invalid_certs {
+            return Err(WinrmError::AuthFailed(
+                "pin_server_certificate_sha256 replaces accept_invalid_certs: set \
+                 accept_invalid_certs = false"
+                    .into(),
+            ));
+        }
+        if !use_tls {
+            return Err(WinrmError::AuthFailed(
+                "pin_server_certificate_sha256 needs use_tls = true: over plain HTTP there is \
+                 no server certificate to pin"
+                    .into(),
+            ));
+        }
+    }
+    let pins = opts
+        .pins
+        .iter()
+        .map(|pin| parse_sha256_fingerprint(pin))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut extra = Vec::new();
     for file in &opts.root_files {
         extra.extend(load_root_certificates(file)?);
@@ -550,8 +773,19 @@ pub(crate) fn server_verifiers(
     };
     let origin: Arc<dyn ServerCertVerifier> = if accept_invalid_certs {
         Arc::new(NoVerifier::new(provider))
-    } else {
+    } else if pins.is_empty() {
         Arc::clone(&strict)
+    } else {
+        let pinned: Arc<dyn ServerCertVerifier> = Arc::new(PinnedVerifier::new(pins, provider));
+        if proxies.is_empty() {
+            pinned
+        } else {
+            Arc::new(ProxyRoutingVerifier::new(
+                pinned,
+                Arc::clone(&strict),
+                proxies.to_vec(),
+            ))
+        }
     };
     Ok(ServerVerifiers {
         origin,
@@ -1074,6 +1308,41 @@ mod tests {
         );
     }
 
+    /// The pin options are checked before anything is built.
+    #[test]
+    fn server_verifiers_refuse_a_pin_with_accept_invalid_certs_or_without_tls() {
+        let p = Arc::new(rustls::crypto::ring::default_provider());
+        let opts = TlsOptions {
+            pins: vec!["00".repeat(32)],
+            ..Default::default()
+        };
+        let message = |use_tls, accept_invalid| match server_verifiers(
+            &opts,
+            use_tls,
+            accept_invalid,
+            &[],
+            &p,
+        ) {
+            Err(WinrmError::AuthFailed(m)) => m,
+            Err(e) => panic!("expected AuthFailed, got {e:?}"),
+            Ok(_) => panic!("expected AuthFailed, got Ok"),
+        };
+        assert_eq!(
+            message(true, true),
+            "pin_server_certificate_sha256 replaces accept_invalid_certs: set \
+             accept_invalid_certs = false"
+        );
+        assert_eq!(
+            message(false, false),
+            "pin_server_certificate_sha256 needs use_tls = true: over plain HTTP there is no \
+             server certificate to pin"
+        );
+        let v = server_verifiers(&opts, true, false, &[], &p).unwrap();
+        assert!(format!("{:?}", v.origin).contains("PinnedVerifier"));
+        let v = server_verifiers(&opts, true, false, &[target("proxy.corp")], &p).unwrap();
+        assert!(format!("{:?}", v.origin).contains("ProxyRoutingVerifier"));
+    }
+
     /// Asking for the OS store and not getting it is an error, not a
     /// fallback to other roots.
     #[test]
@@ -1310,6 +1579,193 @@ mod tests {
             value in "[A-Za-z0-9+/=]{0,200}"
         ) {
             let _ = looks_like_key_material(&value);
+        }
+    }
+
+    #[test]
+    fn parse_sha256_fingerprint_accepts_colons_and_case() {
+        let lower = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let mut expected = [0u8; 32];
+        for (i, b) in expected.iter_mut().enumerate() {
+            *b = u8::try_from((i % 16) * 0x11).unwrap();
+        }
+        let colons = lower
+            .as_bytes()
+            .chunks(2)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect::<Vec<_>>()
+            .join(":");
+        for s in [
+            lower.to_string(),
+            lower.to_uppercase(),
+            colons,
+            format!(" {lower}\n"),
+        ] {
+            assert_eq!(parse_sha256_fingerprint(&s).unwrap(), expected, "{s:?}");
+        }
+    }
+
+    #[test]
+    fn parse_sha256_fingerprint_rejects_wrong_length_and_non_hex() {
+        let err = |s: &str| match parse_sha256_fingerprint(s) {
+            Err(WinrmError::AuthFailed(m)) => m,
+            other => panic!("{s:?}: {other:?}"),
+        };
+        assert!(err(&"a".repeat(62)).contains("expected 64 hex digits (SHA-256), got 62"));
+        assert!(err(&"a".repeat(66)).contains("got 66"));
+        assert!(err(&format!("zz{}", "a".repeat(62))).contains("invalid character 'z'"));
+        assert!(err("").contains("got 0"));
+        // Only ASCII hex digits: a full-width digit is not one.
+        assert!(err(&format!("{}\u{ff10}", "a".repeat(63))).contains("invalid character"));
+        // Colons only, or interior whitespace, are no fingerprint either.
+        assert!(err(&":".repeat(64)).contains("got 0"));
+        assert!(err(&format!("{} {}", "a".repeat(32), "a".repeat(32))).contains("' '"));
+    }
+
+    /// SHA-256 of the DER of a PEM certificate.
+    fn der_sha256(pem: &str) -> [u8; 32] {
+        use sha2::Digest as _;
+        let der = CertificateDer::from_pem_slice(pem.as_bytes()).unwrap();
+        sha2::Sha256::digest(der.as_ref()).into()
+    }
+
+    #[test]
+    fn pinned_verifier_compares_the_end_entity_digest() {
+        use crate::test_pki::{EC_CERT_PEM, RSA_CERT_PEM};
+        let p = rustls::crypto::ring::default_provider();
+        let verifier = PinnedVerifier::new(vec![der_sha256(EC_CERT_PEM)], &p);
+        let verify = |pem: &str, name: &str| {
+            let cert = CertificateDer::from_pem_slice(pem.as_bytes()).unwrap();
+            verifier.verify_server_cert(&cert, &[], &target(name), &[], UnixTime::now())
+        };
+        for name in ["win01", "127.0.0.1", "other.example"] {
+            assert!(verify(EC_CERT_PEM, name).is_ok(), "{name}");
+            match verify(RSA_CERT_PEM, name) {
+                Err(e) => assert!(is_pin_mismatch(&e), "{name}: {e:?}"),
+                Ok(_) => panic!("{name}: another certificate was accepted"),
+            }
+        }
+        // Any listed pin is enough.
+        let both = PinnedVerifier::new(vec![der_sha256(RSA_CERT_PEM), der_sha256(EC_CERT_PEM)], &p);
+        let ec = CertificateDer::from_pem_slice(EC_CERT_PEM.as_bytes()).unwrap();
+        assert!(
+            both.verify_server_cert(&ec, &[], &target("win01"), &[], UnixTime::now())
+                .is_ok()
+        );
+        assert_eq!(
+            verifier.supported_verify_schemes(),
+            p.signature_verification_algorithms.supported_schemes()
+        );
+    }
+
+    /// The pin decides which certificate is trusted, not whether the server
+    /// holds its key: the handshake signature is still checked.
+    #[test]
+    fn pinned_verifier_checks_handshake_signatures() {
+        use crate::test_pki::EC_CERT_PEM;
+        let p = rustls::crypto::ring::default_provider();
+        let verifier = PinnedVerifier::new(vec![der_sha256(EC_CERT_PEM)], &p);
+        let (cert, dss) = ec_signed(b"handshake transcript");
+        assert!(
+            verifier
+                .verify_tls12_signature(b"handshake transcript", &cert, &dss)
+                .is_ok()
+        );
+        assert!(
+            verifier
+                .verify_tls13_signature(b"handshake transcript", &cert, &dss)
+                .is_ok()
+        );
+        assert!(
+            verifier
+                .verify_tls12_signature(b"another transcript", &cert, &dss)
+                .is_err()
+        );
+        assert!(
+            verifier
+                .verify_tls13_signature(b"another transcript", &cert, &dss)
+                .is_err()
+        );
+    }
+
+    /// A verifier that accepts (`true`) or refuses (`false`) every
+    /// certificate.
+    #[derive(Debug)]
+    struct Answer(bool);
+
+    impl ServerCertVerifier for Answer {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, Error> {
+            if self.0 {
+                Ok(ServerCertVerified::assertion())
+            } else {
+                Err(Error::General("refused".into()))
+            }
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            if self.0 {
+                vec![SignatureScheme::ED25519]
+            } else {
+                vec![SignatureScheme::RSA_PKCS1_SHA256]
+            }
+        }
+    }
+
+    #[test]
+    fn proxy_routing_verifier_routes_by_server_name() {
+        let cert = CertificateDer::from(vec![1, 2, 3]);
+        for (origin, proxy) in [(true, false), (false, true)] {
+            let router = ProxyRoutingVerifier::new(
+                Arc::new(Answer(origin)),
+                Arc::new(Answer(proxy)),
+                vec![target("proxy.corp")],
+            );
+            let verify = |name: &str| {
+                router
+                    .verify_server_cert(&cert, &[], &target(name), &[], UnixTime::now())
+                    .is_ok()
+            };
+            assert_eq!(verify("win01"), origin, "win01 goes to the origin verifier");
+            assert_eq!(
+                verify("proxy.corp"),
+                proxy,
+                "the proxy goes to its verifier"
+            );
+            assert_eq!(
+                verify("PROXY.corp"),
+                proxy,
+                "names compare case-insensitively"
+            );
+            // The signature callbacks carry no server name: the origin's.
+            assert_eq!(
+                router.supported_verify_schemes(),
+                Answer(origin).supported_verify_schemes()
+            );
         }
     }
 

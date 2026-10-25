@@ -432,18 +432,32 @@ pub(crate) fn url_server_name(url: &str) -> Option<rustls::pki_types::ServerName
     rustls::pki_types::ServerName::try_from(url_host(url)?).ok()
 }
 
+/// The environment variable `name`, for [`proxy_server_names`]: `None` in
+/// unit tests, whose clients are built without environment proxies.
+fn proxy_env(name: &str) -> Option<String> {
+    if cfg!(test) {
+        None
+    } else {
+        std::env::var(name).ok()
+    }
+}
+
 /// Server names of the `https://` proxies a client built from `config` may
-/// do a TLS handshake with, for the pinned verifier's proxy exception:
-/// [`WinrmConfig::proxy`] when set (reqwest then ignores the environment),
-/// else every `https://` proxy in `HTTPS_PROXY`, `https_proxy`, `ALL_PROXY`
-/// or `all_proxy`, read through `var`.
+/// do a TLS handshake with, for the proxy exception of the pinned verifiers
+/// (the Kerberos certificate pin, `pin_server_certificate_sha256`). When
+/// [`WinrmConfig::proxy`] is set, reqwest ignores the environment: its name
+/// if it is an `https://` proxy, else none. Otherwise every `https://` proxy
+/// in `HTTPS_PROXY`, `https_proxy`, `ALL_PROXY` or `all_proxy`, read through
+/// `var`.
 ///
 /// For the environment this is a superset of what reqwest uses (it takes
 /// the first of each pair, prefers `HTTPS_PROXY` over `ALL_PROXY` for an
 /// `https://` endpoint, and skips the proxy for hosts in `NO_PROXY`): a
 /// name listed here that reqwest does not use is never the name of a
 /// handshake, since the dedicated client only connects to the endpoint (no
-/// redirects) and to its proxy, so the extra exception is inert. `http://`,
+/// redirects) and to its proxy, so the extra exception is inert, unless it
+/// is the endpoint's own name: the endpoint is then verified as a proxy
+/// would be, never less strictly than without a pin. `http://`,
 /// scheme-less (taken as `http://`) and SOCKS proxies only relay bytes and
 /// do no TLS of their own. A proxy from system settings
 /// (`hyper-util/client-proxy-system`, which another crate in the build may
@@ -456,6 +470,7 @@ fn proxy_server_names(
     if let Some(proxy) = config.proxy.as_deref() {
         return proxy::parse_proxy_url(proxy)
             .ok()
+            .filter(|url| url.scheme() == "https")
             .and_then(|url| url_server_name(url.as_str()))
             .into_iter()
             .collect();
@@ -769,6 +784,7 @@ impl HttpTransport {
             opts,
             config.use_tls,
             config.accept_invalid_certs,
+            &proxy_server_names(&config, proxy_env),
             &provider,
         )?
         .origin;
@@ -1182,14 +1198,7 @@ impl HttpTransport {
                     Arc::clone(verifier),
                     url_server_name(&self.endpoint(host)),
                 )
-                .with_proxies(proxy_server_names(&self.config, |name| {
-                    // Tests build their clients without environment proxies.
-                    if cfg!(test) {
-                        None
-                    } else {
-                        std::env::var(name).ok()
-                    }
-                }));
+                .with_proxies(proxy_server_names(&self.config, proxy_env));
                 let handle = capturing.cert_handle();
                 tls.dangerous()
                     .set_certificate_verifier(Arc::new(capturing));
@@ -2890,15 +2899,30 @@ mod tests {
         );
         assert!(proxy_server_names(&none, env(&[("HTTPS_PROXY", "proxy.corp:3128")])).is_empty());
         assert!(proxy_server_names(&none, env(&[])).is_empty());
-        let explicit = WinrmConfig {
-            proxy: Some("http://explicit.corp:8080".into()),
+        let explicit = |proxy: &str| WinrmConfig {
+            proxy: Some(proxy.into()),
             ..Default::default()
         };
         assert_eq!(
-            proxy_server_names(&explicit, env(&[("HTTPS_PROXY", "https://proxy.corp")])),
+            proxy_server_names(
+                &explicit("HTTPS://explicit.corp:8443"),
+                env(&[("HTTPS_PROXY", "https://proxy.corp")])
+            ),
             vec![name("explicit.corp")],
             "an explicit proxy makes reqwest ignore the environment"
         );
+        // An explicit proxy that does no TLS of its own gets no exception,
+        // and the environment is still ignored.
+        for plain in ["http://explicit.corp:8080", "explicit.corp:8080"] {
+            assert!(
+                proxy_server_names(
+                    &explicit(plain),
+                    env(&[("HTTPS_PROXY", "https://proxy.corp")])
+                )
+                .is_empty(),
+                "{plain}"
+            );
+        }
     }
 
     /// `Always` with a method that never seals is accepted (SemVer), but
@@ -5756,5 +5780,267 @@ mod tests {
             }
             other => panic!("expected AuthFailed, got {:?}", other.map(|_| ())),
         }
+    }
+
+    // --- Server certificate pin ---
+
+    /// Lowercase hex SHA-256 of the DER of a PEM certificate.
+    fn sha256_hex(pem: &str) -> String {
+        use rustls::pki_types::CertificateDer;
+        use rustls::pki_types::pem::PemObject;
+        use sha2::Digest as _;
+        use std::fmt::Write as _;
+        let der = CertificateDer::from_pem_slice(pem.as_bytes()).unwrap();
+        sha2::Sha256::digest(der.as_ref())
+            .iter()
+            .fold(String::new(), |mut hex, b| {
+                write!(hex, "{b:02x}").unwrap();
+                hex
+            })
+    }
+
+    /// Options pinning each of `pins`.
+    fn pinned(pins: &[&str]) -> TlsOptions {
+        TlsOptions {
+            pins: pins.iter().map(ToString::to_string).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// `hex` in upper case with `:` between bytes, as `openssl x509
+    /// -fingerprint` prints it.
+    fn openssl_form(hex: &str) -> String {
+        hex.to_uppercase()
+            .as_bytes()
+            .chunks(2)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect::<Vec<_>>()
+            .join(":")
+    }
+
+    /// `send_ntlm_over_tls` to `127.0.0.1`, bounded.
+    async fn ntlm_over_tls(t: &HttpTransport, url: &str) -> Result<String, WinrmError> {
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            t.send_ntlm_over_tls("127.0.0.1", url, "<soap/>", Lane::Data),
+        )
+        .await
+        .expect("did not finish in 20 s")
+    }
+
+    /// A self-signed CA:TRUE listener reached by IP address: neither a root
+    /// nor the name check could accept it, the pin does.
+    #[tokio::test]
+    async fn pin_accepts_a_matching_self_signed_listener_by_ip() {
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
+        let hex = sha256_hex(EC_CERT_PEM);
+        for pin in [hex.clone(), openssl_form(&hex)] {
+            let (_, read) =
+                basic_against_sink(&pinned(&[&pin]), EC_CERT_PEM, EC_KEY_PKCS8_PEM, "127.0.0.1")
+                    .await;
+            assert!(read > 0, "{pin}: the pinned listener must be trusted");
+        }
+    }
+
+    #[tokio::test]
+    async fn pin_refuses_another_certificate() {
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM, RSA_CERT_PEM};
+        let (result, read) = basic_against_sink(
+            &pinned(&[&sha256_hex(RSA_CERT_PEM)]),
+            EC_CERT_PEM,
+            EC_KEY_PKCS8_PEM,
+            "127.0.0.1",
+        )
+        .await;
+        let chain = http_error_chain(result);
+        assert!(chain.contains("pin_server_certificate_sha256"), "{chain}");
+        assert_eq!(read, 0);
+    }
+
+    /// The certificate matches the pin, but the server signs the handshake
+    /// with another key: refused by the signature check, before any byte.
+    #[tokio::test]
+    async fn pin_refuses_an_impostor_holding_the_wrong_key() {
+        use crate::test_pki::EC_CERT_PEM;
+        for (label, versions) in [
+            ("TLS 1.3", &[&rustls::version::TLS13][..]),
+            ("TLS 1.2", &[&rustls::version::TLS12][..]),
+        ] {
+            let (port, read) =
+                crate::test_pki::spawn_tls_sink(crate::test_pki::impostor_server_config(versions));
+            let t = transport_with(
+                tls_config(AuthMethod::Basic, port),
+                &pinned(&[&sha256_hex(EC_CERT_PEM)]),
+            )
+            .unwrap();
+            let result = send_basic(&t, "127.0.0.1").await;
+            assert!(result.is_err(), "{label}: {result:?}");
+            assert_eq!(read.load(Ordering::SeqCst), 0, "{label}");
+        }
+    }
+
+    /// The shared client and the per-connection clients (NTLM over HTTPS
+    /// through a proxy) both apply the pin; the channel binding follows the
+    /// pinned certificate.
+    #[tokio::test]
+    async fn pin_applies_to_shared_and_dedicated_legs() {
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM, RSA_CERT_PEM};
+        let proxy = Some(format!("http://127.0.0.1:{}", spawn_connect_proxy()));
+        let ntlm = |port| WinrmConfig {
+            proxy: proxy.clone(),
+            ..tls_config(AuthMethod::Ntlm, port)
+        };
+
+        let wrong = pinned(&[&sha256_hex(RSA_CERT_PEM)]);
+        let (result, read) =
+            basic_against_sink(&wrong, EC_CERT_PEM, EC_KEY_PKCS8_PEM, "127.0.0.1").await;
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(read, 0);
+        let (port, seen) = spawn_ntlm_tls_server(EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let url = format!("https://127.0.0.1:{port}/wsman");
+        let t = transport_with(ntlm(port), &wrong).unwrap();
+        match ntlm_over_tls(&t, &url).await {
+            Err(WinrmError::AuthFailed(m)) => {
+                assert!(m.contains("pinned certificate check"), "{m}");
+            }
+            other => panic!("expected AuthFailed, got {other:?}"),
+        }
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "no Type 3 on a refused pin"
+        );
+
+        let right = pinned(&[&sha256_hex(EC_CERT_PEM)]);
+        let (_, read) =
+            basic_against_sink(&right, EC_CERT_PEM, EC_KEY_PKCS8_PEM, "127.0.0.1").await;
+        assert!(read > 0);
+        let t = transport_with(ntlm(port), &right).unwrap();
+        assert_eq!(ntlm_over_tls(&t, &url).await.unwrap(), "<ok/>");
+        let recorded = seen.lock().unwrap().clone();
+        assert_eq!(
+            type3_channel_bindings(&recorded[0]),
+            Some(cbt_of(EC_CERT_PEM))
+        );
+    }
+
+    /// The leg to an `https://` proxy is verified with the trusted roots,
+    /// not with the pin: the proxy's certificate is not the pinned one.
+    #[tokio::test]
+    async fn pin_does_not_apply_to_the_https_proxy_leg() {
+        use crate::test_pki::TEST_CA_PEM;
+        use crate::test_pki::{CA_LEAF_KEY_PEM, CA_LEAF_PEM, EC_CERT_PEM, EC_KEY_PKCS8_PEM};
+        let ca = root_file("ca-pin-proxy", TEST_CA_PEM);
+        let (port, seen) = spawn_ntlm_tls_server(EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let p = spawn_https_connect_proxy(CA_LEAF_PEM, CA_LEAF_KEY_PEM);
+        let config = || WinrmConfig {
+            proxy: Some(format!("https://localhost:{p}")),
+            ..tls_config(AuthMethod::Ntlm, port)
+        };
+        let url = format!("https://127.0.0.1:{port}/wsman");
+        let pin = sha256_hex(EC_CERT_PEM);
+
+        let opts = TlsOptions {
+            pins: vec![pin.clone()],
+            ..roots(&[&ca])
+        };
+        let t = transport_with(config(), &opts).unwrap();
+        assert_eq!(ntlm_over_tls(&t, &url).await.unwrap(), "<ok/>");
+        let recorded = seen.lock().unwrap().clone();
+        assert_eq!(
+            type3_channel_bindings(&recorded[0]),
+            Some(cbt_of(EC_CERT_PEM))
+        );
+
+        seen.lock().unwrap().clear();
+        let t = transport_with(config(), &pinned(&[&pin])).unwrap();
+        let refused = ntlm_over_tls(&t, &url).await;
+        assert!(refused.is_err(), "{refused:?}");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "no Type 3 when the proxy is not trusted"
+        );
+    }
+
+    /// The build-time refusal of a pin, as `WinrmError::AuthFailed(m)`.
+    fn build_refusal(config: WinrmConfig, opts: &TlsOptions) -> String {
+        match transport_with(config, opts) {
+            Err(WinrmError::AuthFailed(m)) => m,
+            other => panic!("expected AuthFailed, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
+    fn pin_with_accept_invalid_certs_is_refused_at_build() {
+        let config = WinrmConfig {
+            accept_invalid_certs: true,
+            ..tls_config(AuthMethod::Basic, 5986)
+        };
+        assert_eq!(
+            build_refusal(config, &pinned(&[&"00".repeat(32)])),
+            "pin_server_certificate_sha256 replaces accept_invalid_certs: set \
+             accept_invalid_certs = false"
+        );
+    }
+
+    #[test]
+    fn pin_without_tls_is_refused_at_build() {
+        let config = WinrmConfig {
+            use_tls: false,
+            ..tls_config(AuthMethod::Basic, 5985)
+        };
+        assert_eq!(
+            build_refusal(config, &pinned(&[&"00".repeat(32)])),
+            "pin_server_certificate_sha256 needs use_tls = true: over plain HTTP there is no \
+             server certificate to pin"
+        );
+    }
+
+    #[test]
+    fn malformed_pin_is_refused_at_build() {
+        let config = || tls_config(AuthMethod::Basic, 5986);
+        assert_eq!(
+            build_refusal(config(), &pinned(&["xyz"])),
+            "pin_server_certificate_sha256: invalid character 'x'; expected hex digits, \
+             optionally separated by ':'"
+        );
+        assert_eq!(
+            build_refusal(config(), &pinned(&[&"0".repeat(63)])),
+            "pin_server_certificate_sha256: expected 64 hex digits (SHA-256), got 63"
+        );
+        // One malformed pin among valid ones is refused too.
+        let m = build_refusal(config(), &pinned(&[&"00".repeat(32), "00"]));
+        assert!(m.contains("got 2"), "{m}");
+    }
+
+    /// CredSSP's outer TLS applies the pin.
+    #[cfg(feature = "credssp")]
+    #[tokio::test]
+    async fn credssp_tls_outer_honours_the_pin() {
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM, RSA_CERT_PEM, RSA_KEY_PKCS1_PEM};
+        let opts = pinned(&[&sha256_hex(EC_CERT_PEM)]);
+
+        let (port, read) = crate::test_pki::spawn_tls_sink(crate::test_pki::server_config(
+            EC_CERT_PEM,
+            EC_KEY_PKCS8_PEM,
+        ));
+        let t = transport_with(tls_config(AuthMethod::CredSsp, port), &opts).unwrap();
+        let _ = send_basic(&t, "127.0.0.1").await;
+        assert!(
+            read.load(Ordering::SeqCst) > 0,
+            "the pinned outer TLS must be trusted"
+        );
+
+        let (port, read) = crate::test_pki::spawn_tls_sink(crate::test_pki::server_config(
+            RSA_CERT_PEM,
+            RSA_KEY_PKCS1_PEM,
+        ));
+        let t = transport_with(tls_config(AuthMethod::CredSsp, port), &opts).unwrap();
+        match send_basic(&t, "127.0.0.1").await {
+            Err(WinrmError::AuthFailed(m)) => {
+                assert!(m.starts_with("CredSSP outer TLS:"), "{m}");
+            }
+            other => panic!("expected AuthFailed, got {other:?}"),
+        }
+        assert_eq!(read.load(Ordering::SeqCst), 0);
     }
 }

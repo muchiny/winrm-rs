@@ -90,6 +90,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   trust an internal CA, or the operating system's certificate store, for the
   HTTPS listener, the CredSSP outer TLS and an `https://` proxy, without
   `accept_invalid_certs`.
+- **`WinrmClientBuilder::pin_server_certificate_sha256`**: accept the listener
+  only by its certificate's SHA-256 fingerprint (self-signed listeners,
+  connections by IP), on the HTTPS transport and the CredSSP outer TLS,
+  without `accept_invalid_certs`.
 
 ### Fixed
 

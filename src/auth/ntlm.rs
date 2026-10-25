@@ -141,7 +141,7 @@ impl NtlmAuth {
             .header("Content-Length", "0")
             .send()
             .await
-            .map_err(WinrmError::Http)?;
+            .map_err(crate::auth::send_error)?;
 
         // Step 2: Parse Type 2 (Challenge) from 401 response
         if resp.status().as_u16() != 401 {
@@ -258,7 +258,7 @@ impl NtlmAuth {
                 .body(body.to_string()),
             None => request.header("Content-Length", "0"),
         };
-        let resp = request.send().await.map_err(WinrmError::Http)?;
+        let resp = request.send().await.map_err(crate::auth::send_error)?;
 
         if resp.status().as_u16() == 401 {
             return Err(WinrmError::AuthFailed(

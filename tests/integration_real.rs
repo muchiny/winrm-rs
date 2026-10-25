@@ -5552,3 +5552,159 @@ async fn custom_ca_https_listener_authenticates() {
         }
     }
 }
+
+/// SHA-256 fingerprint of the bench's HTTPS listener certificate, from
+/// `WINRM_TEST_HTTPS_CERT_SHA256` (64 hex digits, `:` separators allowed).
+/// On the server:
+///
+/// ```powershell
+/// $c = Get-Item Cert:\LocalMachine\My\<thumbprint>
+/// -join ([Security.Cryptography.SHA256]::Create().ComputeHash($c.RawData) | % { $_.ToString('x2') })
+/// ```
+fn bench_https_pin() -> Option<String> {
+    std::env::var("WINRM_TEST_HTTPS_CERT_SHA256")
+        .ok()
+        .filter(|pin| !pin.trim().is_empty())
+}
+
+/// A client for `config` with `accept_invalid_certs = false` and `pin`.
+fn pinned_client(
+    mut config: WinrmConfig,
+    pin: &str,
+    user: String,
+    pass: String,
+) -> Result<WinrmClient, WinrmError> {
+    config.accept_invalid_certs = false;
+    WinrmClient::builder(config)
+        .pin_server_certificate_sha256(pin)
+        .credentials(WinrmCredentials::new(user, pass, ""))
+        .build()
+}
+
+/// `whoami` through `client` on `host`, which must exit with 0.
+async fn assert_whoami(client: &WinrmClient, host: &str, label: &str) {
+    let output = client
+        .run_command(host, "whoami", &[])
+        .await
+        .unwrap_or_else(|e| panic!("{label}: run_command on {host}: {e}"));
+    assert_eq!(output.exit_code, 0, "{label}");
+}
+
+/// HTTPS with the listener certificate pinned (`WINRM_TEST_HTTPS_CERT_SHA256`)
+/// and `accept_invalid_certs = false`: the self-signed bench listener, reached
+/// by IP address, is accepted on `https_test_port()` for Basic, NTLM,
+/// Certificate (when `WINRM_TEST_CLIENT_CERT` is set), CredSSP (`credssp`
+/// feature) and Kerberos on the DC (`kerberos` feature, when
+/// `WINRM_TEST_KRB_HOST` and `WINRM_TEST_KRB_HTTPS_CERT_SHA256` are set).
+#[tokio::test]
+#[ignore]
+async fn pinned_https_listener_authenticates() {
+    let Some(pin) = bench_https_pin() else {
+        eprintln!("SKIP pinned_https_listener_authenticates: set WINRM_TEST_HTTPS_CERT_SHA256");
+        return;
+    };
+    let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    let pass = std::env::var("WINRM_TEST_PASS").expect("WINRM_TEST_PASS");
+
+    #[cfg(feature = "credssp")]
+    let methods = [AuthMethod::Basic, AuthMethod::Ntlm, AuthMethod::CredSsp];
+    #[cfg(not(feature = "credssp"))]
+    let methods = [AuthMethod::Basic, AuthMethod::Ntlm];
+
+    for method in methods {
+        let label = format!("{method:?}");
+        let config = WinrmConfig {
+            auth_method: method,
+            use_tls: true,
+            port: https_test_port(),
+            ..Default::default()
+        };
+        let client = pinned_client(config, &pin, user.clone(), pass.clone())
+            .unwrap_or_else(|e| panic!("{label}: build: {e}"));
+        assert_whoami(&client, &host, &label).await;
+    }
+
+    // Configured as `certificate_auth_whoami`.
+    if let (Ok(cert), Ok(key)) = (
+        std::env::var("WINRM_TEST_CLIENT_CERT"),
+        std::env::var("WINRM_TEST_CLIENT_KEY"),
+    ) {
+        let config = WinrmConfig {
+            auth_method: AuthMethod::Certificate,
+            use_tls: true,
+            port: https_test_port(),
+            client_cert_pem: Some(cert),
+            client_key_pem: Some(key),
+            ..Default::default()
+        };
+        let client = pinned_client(config, &pin, user.clone(), pass.clone())
+            .unwrap_or_else(|e| panic!("Certificate: build: {e}"));
+        assert_whoami(&client, &host, "Certificate").await;
+    } else {
+        eprintln!(
+            "pinned_https_listener_authenticates: Certificate skipped (no WINRM_TEST_CLIENT_CERT)"
+        );
+    }
+
+    // Configured as `kerberos_over_https_whoami`, with the DC's own pin.
+    #[cfg(feature = "kerberos")]
+    if let (Ok(krb_host), Ok(krb_pin)) = (
+        std::env::var("WINRM_TEST_KRB_HOST"),
+        std::env::var("WINRM_TEST_KRB_HTTPS_CERT_SHA256"),
+    ) {
+        let port: u16 = std::env::var("WINRM_TEST_KRB_HTTPS_PORT")
+            .expect("WINRM_TEST_KRB_HTTPS_PORT")
+            .parse()
+            .expect("WINRM_TEST_KRB_HTTPS_PORT must be a port number");
+        let config = WinrmConfig {
+            auth_method: AuthMethod::Kerberos,
+            use_tls: true,
+            port,
+            ..Default::default()
+        };
+        let client = pinned_client(
+            config,
+            &krb_pin,
+            std::env::var("WINRM_TEST_KRB_USER").expect("WINRM_TEST_KRB_USER"),
+            std::env::var("WINRM_TEST_KRB_PASS").expect("WINRM_TEST_KRB_PASS"),
+        )
+        .unwrap_or_else(|e| panic!("Kerberos: build: {e}"));
+        assert_whoami(&client, &krb_host, "Kerberos").await;
+    } else {
+        eprintln!(
+            "pinned_https_listener_authenticates: Kerberos skipped (set WINRM_TEST_KRB_HOST and \
+             WINRM_TEST_KRB_HTTPS_CERT_SHA256)"
+        );
+    }
+}
+
+/// A pin that matches no certificate refuses the bench listener, for Basic
+/// and NTLM.
+#[tokio::test]
+#[ignore]
+async fn pinned_https_listener_refuses_a_wrong_pin() {
+    if bench_https_pin().is_none() {
+        eprintln!(
+            "SKIP pinned_https_listener_refuses_a_wrong_pin: set WINRM_TEST_HTTPS_CERT_SHA256"
+        );
+        return;
+    }
+    let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    let pass = std::env::var("WINRM_TEST_PASS").expect("WINRM_TEST_PASS");
+    let wrong = "00".repeat(32);
+    for method in [AuthMethod::Basic, AuthMethod::Ntlm] {
+        let label = format!("{method:?}");
+        let config = WinrmConfig {
+            auth_method: method,
+            use_tls: true,
+            port: https_test_port(),
+            ..Default::default()
+        };
+        let client = pinned_client(config, &wrong, user.clone(), pass.clone())
+            .unwrap_or_else(|e| panic!("{label}: build: {e}"));
+        let refused = client.run_command(&host, "whoami", &[]).await;
+        assert!(refused.is_err(), "{label}: a wrong pin must be refused");
+    }
+}

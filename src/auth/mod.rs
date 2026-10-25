@@ -117,8 +117,9 @@ pub(crate) fn peer_certificate(
 }
 
 /// [`WinrmError::Http`] for a request that failed to go out, unless the
-/// failure is the pinned verifier refusing the connection's certificate
-/// (see [`crate::tls::CertHandle::pin`]): that one is reported as such, as
+/// failure is a pinned verifier refusing the connection's certificate (see
+/// [`crate::tls::CertHandle::pin`] and [`crate::tls::PinnedVerifier`]): that
+/// one is reported as such, as
 /// an authentication failure, nothing having been sent.
 pub(crate) fn send_error(e: reqwest::Error) -> WinrmError {
     if crate::tls::is_pin_mismatch(&e) {

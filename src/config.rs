@@ -60,8 +60,9 @@ pub struct WinrmConfig {
     /// `tracing::warn` when this flag is enabled.
     ///
     /// For an internal CA or a self-signed listener, use
-    /// [`WinrmClientBuilder::add_root_certificates_pem`](crate::WinrmClientBuilder::add_root_certificates_pem)
-    /// or [`WinrmClientBuilder::platform_roots`](crate::WinrmClientBuilder::platform_roots)
+    /// [`WinrmClientBuilder::add_root_certificates_pem`](crate::WinrmClientBuilder::add_root_certificates_pem),
+    /// [`WinrmClientBuilder::platform_roots`](crate::WinrmClientBuilder::platform_roots)
+    /// or [`WinrmClientBuilder::pin_server_certificate_sha256`](crate::WinrmClientBuilder::pin_server_certificate_sha256)
     /// instead.
     ///
     /// Since 1.4.1 the WinRM server must still prove, in the TLS handshake,

@@ -207,7 +207,7 @@ it reads; the decoded key it hands to `rustls`, and the copies made while
 decoding it, are not wiped. Protect core dumps, swap and hibernation files on
 hosts that hold the key.
 
-### Trusting an internal CA
+### Trusting an internal CA or pinning the certificate
 
 By default the HTTPS listener must chain to the built-in Mozilla roots. For a
 private CA, add its certificate; `platform_roots(true)` trusts the operating
@@ -223,6 +223,24 @@ let client = WinrmClient::builder(WinrmConfig { use_tls: true, port: 5986, ..Def
 The listener certificate must still name the host in its Subject Alternative
 Name, and an intermediate CA the listener does not send must be added too; see
 the rustdoc of `WinrmClientBuilder::add_root_certificates_pem`.
+
+For a self-signed listener, or a connection by IP address, pin the listener
+certificate by its SHA-256 fingerprint instead. The pin is then the whole trust
+decision for the WinRM server: chain, dates and host name are not checked, and
+the pin must be updated when the certificate is renewed (pin both fingerprints
+during the switch).
+
+```rust
+let client = WinrmClient::builder(WinrmConfig { use_tls: true, port: 5986, ..Default::default() })
+    .pin_server_certificate_sha256("3f:a1:...:9c") // 64 hex digits, `:` optional
+    .credentials(WinrmCredentials::new("admin", "pass", ""))
+    .build()?;
+```
+
+`openssl s_client -connect <host>:5986 -servername <host> </dev/null | openssl
+x509 -noout -fingerprint -sha256` prints the fingerprint; the rustdoc of
+`WinrmClientBuilder::pin_server_certificate_sha256` shows how to compute it on
+the server.
 
 ### PowerShell execution
 

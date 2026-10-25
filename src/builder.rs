@@ -103,6 +103,43 @@ impl<S> WinrmClientBuilder<S> {
         self.tls.platform_roots = enabled;
         self
     }
+
+    /// Accept the WinRM server's HTTPS listener only if its certificate's
+    /// SHA-256 fingerprint is `fingerprint` (64 hex digits, any case, with or
+    /// without `:` separators). May be called several times: any listed
+    /// fingerprint is accepted, so a renewal can be rolled out by adding the
+    /// new fingerprint before the listener switches.
+    ///
+    /// The pin is the whole trust decision for the WinRM server (HTTPS
+    /// transport, per-connection clients, CredSSP outer TLS): chain, validity
+    /// dates, host name and Basic Constraints are not checked, so a
+    /// self-signed or expired listener certificate, or a connection by IP
+    /// address, is accepted. Update the pin when the certificate is renewed.
+    /// The server must still prove it holds the certificate's key. The leg to
+    /// an `https://` proxy is not pinned: it is verified with the trusted
+    /// roots ([`add_root_certificates_pem`](Self::add_root_certificates_pem),
+    /// [`platform_roots`](Self::platform_roots)). A proxy that `reqwest` takes
+    /// from system settings is refused while a pin is set.
+    ///
+    /// [`build`](WinrmClientBuilder::build) fails with
+    /// [`WinrmError::AuthFailed`] for a malformed fingerprint, with
+    /// `accept_invalid_certs = true` (the pin replaces it) and with
+    /// `use_tls = false`.
+    ///
+    /// On the server (Windows PowerShell 5.1 or PowerShell 7), with the
+    /// listener's thumbprint from `Get-ChildItem WSMan:\localhost\Listener`:
+    ///
+    /// ```powershell
+    /// $c = Get-Item Cert:\LocalMachine\My\<thumbprint>
+    /// -join ([Security.Cryptography.SHA256]::Create().ComputeHash($c.RawData) | % { $_.ToString('x2') })
+    /// ```
+    ///
+    /// From a client: `openssl s_client -connect <host>:5986 -servername <host>
+    /// </dev/null | openssl x509 -noout -fingerprint -sha256`.
+    pub fn pin_server_certificate_sha256(mut self, fingerprint: &str) -> Self {
+        self.tls.pins.push(fingerprint.to_string());
+        self
+    }
 }
 
 impl WinrmClientBuilder<NeedsCredentials> {
@@ -307,6 +344,25 @@ mod tests {
             Err(WinrmError::AuthFailed(m)) => {
                 assert!(m.contains("/nonexistent/winrm-rs/ca.pem"), "{m}");
             }
+            other => panic!("expected AuthFailed, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    /// Pins accumulate in call order, before or after the credentials, and
+    /// a malformed one surfaces from `build`.
+    #[test]
+    fn pins_accumulate_across_credentials() {
+        let builder = WinrmClientBuilder::new(WinrmConfig {
+            use_tls: true,
+            port: 5986,
+            ..Default::default()
+        })
+        .pin_server_certificate_sha256("aa")
+        .credentials(WinrmCredentials::new("u", "p", ""))
+        .pin_server_certificate_sha256(&"bb".repeat(32));
+        assert_eq!(builder.tls.pins, vec!["aa".to_string(), "bb".repeat(32)]);
+        match builder.build() {
+            Err(WinrmError::AuthFailed(m)) => assert!(m.contains("got 2"), "{m}"),
             other => panic!("expected AuthFailed, got {:?}", other.map(|_| ())),
         }
     }

@@ -3880,7 +3880,9 @@ async fn probe_bare_name_resolves_from_the_working_directory() {
     );
 }
 
-/// `-NoProfile` keeps the profile's output out of the command's stdout.
+/// `-NoProfile` keeps the profile's output out of the command's stdout, and
+/// `run_powershell` passes it by default. The leg that shows the profile does
+/// run launches PowerShell itself, without `-NoProfile`.
 ///
 /// It mutates a per-user profile file, so it must not run in parallel with
 /// other live tests (`--test-threads=1`).
@@ -3919,8 +3921,19 @@ async fn probe_noprofile_skips_profile_output() {
             "New-Item -Force -Path $PROFILE.CurrentUserAllHosts -Value 'Write-Output PROFILE-MARKER' | Out-Null",
         )
         .await;
-    // Collect both outputs, restore, then assert.
-    let with_profile = client.run_powershell(&host, "Write-Output body").await;
+    // Collect every output, restore, then assert.
+    let with_profile = client
+        .run_command(
+            &host,
+            FULL_POWERSHELL,
+            &[
+                "-NonInteractive",
+                "-EncodedCommand",
+                &ps("Write-Output body"),
+            ],
+        )
+        .await;
+    let by_default = client.run_powershell(&host, "Write-Output body").await;
     let without_profile = client
         .run_command(
             &host,
@@ -3960,6 +3973,7 @@ async fn probe_noprofile_skips_profile_output() {
         probe_text(&write.stderr)
     );
     let with_profile = probe_text(&with_profile.expect("run with the profile").stdout);
+    let by_default = probe_text(&by_default.expect("run run_powershell").stdout);
     let without_profile = probe_text(&without_profile.expect("run with -NoProfile").stdout);
     let restore = restore.expect("restore the profile");
     assert_eq!(
@@ -3975,6 +3989,14 @@ async fn probe_noprofile_skips_profile_output() {
     assert!(
         !without_profile.contains("PROFILE-MARKER"),
         "-NoProfile still ran the profile: {without_profile}"
+    );
+    assert!(
+        by_default.contains("body"),
+        "run_powershell did not run the script: {by_default}"
+    );
+    assert!(
+        !by_default.contains("PROFILE-MARKER"),
+        "run_powershell ran the profile by default: {by_default}"
     );
 }
 

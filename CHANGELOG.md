@@ -147,10 +147,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `WinrmClientBuilder::ignore_env_proxy`: build a client that does not read
   proxies from the environment.
 - `ProxySessionAuth` and `WinrmClientBuilder::proxy_session_auth`.
-- `ProxySessionAuth::RequireWhenUnsealed` and `ProxySessionAuth::Require`
-  refuse NTLM or Kerberos through a forwarding proxy that does not announce
-  `Proxy-Support: Session-Based-Authentication` (RFC 4559 section 6). The
-  default, `Allow`, keeps today's behaviour.
+- `ProxySessionAuth::Require` refuses NTLM or Kerberos to an `http://`
+  endpoint through a forwarding `http://` or `https://` proxy that does not
+  announce `Proxy-Support: Session-Based-Authentication` (RFC 4559 section
+  6); `ProxySessionAuth::RequireWhenUnsealed` refuses only
+  `EncryptionMode::Never` there and logs a WARN for sealed requests. Kerberos
+  reads the header from one unauthenticated request per endpoint. The
+  default, `Allow`, checks nothing and keeps today's behaviour.
 
 ### Fixed
 

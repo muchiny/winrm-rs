@@ -158,9 +158,7 @@ impl NtlmAuth {
         // connection to this client (RFC 4559 section 6). On a refusal no
         // Type 3 is sent, so that connection is never authenticated.
         if let Some(gate) = &self.proxy_gate {
-            gate.check(crate::transport::proxy::proxy_supports_session_auth(
-                resp.headers(),
-            ))?;
+            gate.check_answer(resp.status(), resp.headers())?;
         }
 
         let www_auth = resp

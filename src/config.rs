@@ -525,8 +525,10 @@ pub enum EncryptionMode {
 /// endpoint reached through an `http://` or `https://` proxy, which forwards
 /// each request and owns the server connection. NTLM reads the header on the
 /// 401 that carries the challenge, before it sends its last message. Kerberos
-/// first sends one unauthenticated request per endpoint, once for the
-/// client's life, and reads the header on its answer. Under the default,
+/// first sends an unauthenticated request to the endpoint, at most once per
+/// request until the first answer that is the server's 401, and reads the
+/// header on that answer, which the client then keeps. Any other answer
+/// is refused under the refusing variants and not kept. Under the default,
 /// [`Self::Allow`], nothing is checked and no such request is sent.
 ///
 /// SOCKS proxies, `https://` endpoints and direct connections are never

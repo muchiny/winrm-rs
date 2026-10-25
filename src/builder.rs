@@ -310,7 +310,9 @@ impl WinrmClientBuilder<Ready> {
     /// Choose what NTLM and Kerberos do through a forwarding `http://` or
     /// `https://` proxy (plain-HTTP endpoints only) that does not announce
     /// `Proxy-Support: Session-Based-Authentication` with the server's 401
-    /// (RFC 4559 section 6). Default: [`ProxySessionAuth::Allow`], no check.
+    /// (RFC 4559 section 6). The default, [`ProxySessionAuth::Allow`], does
+    /// not check, so that deployments through proxies that do not send the
+    /// header keep working.
     ///
     /// [`ProxySessionAuth::RequireWhenUnsealed`] refuses
     /// [`EncryptionMode::Never`](crate::EncryptionMode::Never) through such a

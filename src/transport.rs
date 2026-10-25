@@ -422,7 +422,8 @@ pub(crate) struct HttpTransport {
     /// session-based authentication (see [`proxy::ProxyGate`]).
     proxy_warned: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Kerberos: whether the proxy of each endpoint URL announced
-    /// session-based authentication, probed once for the client's life (see
+    /// session-based authentication with the server's 401, kept from the
+    /// first such answer for the client's life (see
     /// [`Self::kerberos_proxy_probe`]).
     #[cfg(feature = "kerberos")]
     proxy_probes: Mutex<std::collections::HashMap<String, bool>>,
@@ -1227,42 +1228,53 @@ impl HttpTransport {
 
     /// Kerberos, before any AP-REQ to `url`: when [`Self::proxy_gate`]
     /// applies, whether the proxy announces session-based authentication is
-    /// read from one unauthenticated empty POST on the shared client, the
-    /// first time for `url`, and kept for the client's life; then the gate
-    /// is checked. Kerberos has no 401 of its own to read it from: its
-    /// AP-REQ goes on the first request.
+    /// read from an unauthenticated empty POST on the shared client and
+    /// checked ([`proxy::ProxyGate::check_answer`]). The answer is kept for
+    /// the client's life only when it is the server's 401, so the POST is
+    /// sent at most once per request until then. Kerberos has no 401 of its
+    /// own to read it from: its AP-REQ goes on the first request.
     #[cfg(feature = "kerberos")]
     async fn kerberos_proxy_probe(&self, url: &str) -> Result<(), WinrmError> {
-        let Some(gate) = self.proxy_gate(url) else {
-            return Ok(());
-        };
+        // Only a gated URL is ever kept, so a kept answer is read before the
+        // route's matcher is built: a proxy that announced it needs nothing
+        // more.
         let known = self
             .proxy_probes
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(url)
             .copied();
-        let supports = match known {
-            Some(supports) => supports,
-            None => {
-                let resp = self
-                    .http
-                    .post(url)
-                    .header(CONTENT_TYPE, "application/soap+xml;charset=UTF-8")
-                    .header("Content-Length", "0")
-                    .send()
-                    .await
-                    .map_err(crate::auth::send_error)?;
-                let supports = proxy::proxy_supports_session_auth(resp.headers());
-                let _ = crate::auth::read_body_capped(resp, self.max_response_bytes()).await;
-                self.proxy_probes
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .insert(url.to_string(), supports);
-                supports
-            }
+        if known == Some(true) {
+            return Ok(());
+        }
+        let Some(gate) = self.proxy_gate(url) else {
+            return Ok(());
         };
-        gate.check(supports)
+        if let Some(supports) = known {
+            return gate.check(supports);
+        }
+        let resp = self
+            .http
+            .post(url)
+            .header(CONTENT_TYPE, "application/soap+xml;charset=UTF-8")
+            .header("Content-Length", "0")
+            .send()
+            .await
+            .map_err(crate::auth::send_error)?;
+        let status = resp.status();
+        let outcome = gate.check_answer(status, resp.headers());
+        // Only the server's 401 carries the proxy's announcement: another
+        // answer (a proxy error, a server that is down) is not kept, and the
+        // next request probes again.
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            let supports = proxy::proxy_supports_session_auth(resp.headers());
+            self.proxy_probes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(url.to_string(), supports);
+        }
+        let _ = crate::auth::read_body_capped(resp, self.max_response_bytes()).await;
+        outcome
     }
 
     #[expect(
@@ -6052,7 +6064,7 @@ mod tests {
     async fn allow_skips_the_check() {
         let server = MockServer::start().await;
         let fake = FakeNtlmServer::mount(&server).await;
-        let (proxy, _seen) = spawn_forwarding_proxy(false);
+        let (proxy, seen) = spawn_forwarding_proxy(false);
         let t = ntlm_via_proxy(
             proxy,
             &server,
@@ -6065,6 +6077,10 @@ mod tests {
             .unwrap();
         assert_eq!(reply, "<ok/>");
         assert_eq!(fake.handshakes(), 1);
+        assert!(
+            !seen.lock().unwrap().is_empty(),
+            "the request went through the proxy"
+        );
     }
 
     #[test]
@@ -6175,6 +6191,147 @@ mod tests {
                 .all(|r| !r.headers.contains_key("authorization")),
             "no AP-REQ was sent"
         );
+    }
+
+    /// A Kerberos transport (`EncryptionMode::Never`) for `server`, through
+    /// the forwarding proxy on `proxy_port`, with `policy`.
+    #[cfg(feature = "kerberos")]
+    fn kerberos_via_proxy(
+        proxy_port: u16,
+        server: &MockServer,
+        policy: ProxySessionAuth,
+    ) -> HttpTransport {
+        let config = WinrmConfig {
+            auth_method: AuthMethod::Kerberos,
+            port: server.address().port(),
+            encryption: EncryptionMode::Never,
+            proxy: Some(format!("http://127.0.0.1:{proxy_port}")),
+            operation_timeout_secs: 5,
+            ..Default::default()
+        };
+        HttpTransport::new_with_env(
+            config,
+            WinrmCredentials::new("u", "p", ""),
+            TransportOptions {
+                proxy_session_auth: policy,
+                ..Default::default()
+            },
+            |_| None,
+        )
+        .unwrap()
+    }
+
+    /// The probes `server` received: requests without `Authorization` (an
+    /// AP-REQ, if a ticket could be had here, carries one).
+    #[cfg(feature = "kerberos")]
+    async fn probes(server: &MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| !r.headers.contains_key("authorization"))
+            .count()
+    }
+
+    /// Whether `err` is a refusal of the proxy check.
+    #[cfg(feature = "kerberos")]
+    fn is_proxy_refusal(err: &WinrmError) -> bool {
+        err.to_string().contains("proxy_session_auth")
+    }
+
+    /// A probe answered by something other than the server's 401 is not
+    /// kept: the next request probes again, and goes on once a 401 with the
+    /// announcement comes back.
+    #[cfg(feature = "kerberos")]
+    #[tokio::test]
+    async fn kerberos_probe_without_a_401_is_not_kept() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(502))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401).insert_header("WWW-Authenticate", "Negotiate"))
+            .mount(&server)
+            .await;
+        let (proxy, _seen) = spawn_forwarding_proxy(true);
+        let t = kerberos_via_proxy(proxy, &server, ProxySessionAuth::Require);
+        let host = server.address().ip().to_string();
+        let err = t.send_soap_raw(&host, "<a/>".into()).await.unwrap_err();
+        assert!(
+            is_proxy_refusal(&err) && err.to_string().contains("502"),
+            "{err}"
+        );
+        let err = t.send_soap_raw(&host, "<a/>".into()).await.unwrap_err();
+        assert!(!is_proxy_refusal(&err), "the check passed: {err}");
+        assert_eq!(probes(&server).await, 2, "the 502 was not kept");
+    }
+
+    /// A 407 under `Require` is refused with its status named, and not kept.
+    #[cfg(feature = "kerberos")]
+    #[tokio::test]
+    async fn kerberos_probe_answered_407_is_refused_and_not_kept() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(407))
+            .mount(&server)
+            .await;
+        let (proxy, _seen) = spawn_forwarding_proxy(true);
+        let t = kerberos_via_proxy(proxy, &server, ProxySessionAuth::Require);
+        let host = server.address().ip().to_string();
+        for _ in 0..2 {
+            let err = t.send_soap_raw(&host, "<a/>".into()).await.unwrap_err();
+            assert!(
+                is_proxy_refusal(&err)
+                    && err.to_string().contains("407")
+                    && !err.to_string().contains("with the server's 401"),
+                "{err}"
+            );
+        }
+        assert_eq!(probes(&server).await, 2, "the 407 was not kept");
+    }
+
+    /// A kept announcement lets every later request through to the
+    /// Kerberos exchange, with no second probe.
+    #[cfg(feature = "kerberos")]
+    #[tokio::test]
+    async fn kerberos_kept_announcement_lets_the_request_through() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401).insert_header("WWW-Authenticate", "Negotiate"))
+            .mount(&server)
+            .await;
+        let (proxy, _seen) = spawn_forwarding_proxy(true);
+        let t = kerberos_via_proxy(proxy, &server, ProxySessionAuth::Require);
+        let host = server.address().ip().to_string();
+        for _ in 0..2 {
+            if let Err(err) = t.send_soap_raw(&host, "<a/>".into()).await {
+                assert!(!is_proxy_refusal(&err), "the check passed: {err}");
+            }
+        }
+        assert_eq!(probes(&server).await, 1, "one probe, kept");
+    }
+
+    /// Under `Allow` no probe is sent.
+    #[cfg(feature = "kerberos")]
+    #[tokio::test]
+    async fn kerberos_allow_sends_no_probe() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401).insert_header("WWW-Authenticate", "Negotiate"))
+            .mount(&server)
+            .await;
+        let (proxy, _seen) = spawn_forwarding_proxy(false);
+        let t = kerberos_via_proxy(proxy, &server, ProxySessionAuth::Allow);
+        let host = server.address().ip().to_string();
+        for _ in 0..2 {
+            if let Err(err) = t.send_soap_raw(&host, "<a/>".into()).await {
+                assert!(!is_proxy_refusal(&err), "{err}");
+            }
+        }
+        assert_eq!(probes(&server).await, 0);
     }
 
     /// Basic over plain HTTP through an `https://` proxy on loopback whose

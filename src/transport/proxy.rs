@@ -250,9 +250,35 @@ pub(crate) struct ProxyGate {
 }
 
 impl ProxyGate {
-    /// `Ok` when the proxy announced session-based authentication
-    /// (`supports`). Otherwise [`WinrmError::AuthFailed`] when refusing, else
-    /// `Ok` with a WARN the first time for this endpoint.
+    /// The check on the answer that should be the server's 401 (`status`
+    /// and `headers`, as relayed by the proxy): [`Self::check`] on a 401.
+    /// Any other status says nothing about the proxy: it is refused when
+    /// refusing ([`WinrmError::AuthFailed`] naming the status), and passes
+    /// silently otherwise.
+    pub(crate) fn check_answer(
+        &self,
+        status: reqwest::StatusCode,
+        headers: &reqwest::header::HeaderMap,
+    ) -> Result<(), WinrmError> {
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return self.check(proxy_supports_session_auth(headers));
+        }
+        if self.refuse {
+            let proxy = &self.proxy;
+            return Err(WinrmError::AuthFailed(format!(
+                "the proxy check got {status} instead of the server's 401 through the proxy \
+                 {proxy}, so whether it announces `Proxy-Support: Session-Based-Authentication` \
+                 (RFC 4559 section 6) is unknown; nothing more was sent. Use HTTPS or a SOCKS \
+                 proxy, or choose with WinrmClientBuilder::proxy_session_auth"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The check on the server's 401: `Ok` when the proxy announced
+    /// session-based authentication with it (`supports`). Otherwise
+    /// [`WinrmError::AuthFailed`] when refusing, else `Ok` with a WARN the
+    /// first time for this endpoint.
     pub(crate) fn check(&self, supports: bool) -> Result<(), WinrmError> {
         if supports {
             return Ok(());

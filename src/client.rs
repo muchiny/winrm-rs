@@ -3249,34 +3249,31 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    #[tokio::test]
-    async fn download_file_write_local_success() {
-        let server = MockServer::start().await;
-        let port = server.address().port();
-
-        let ps_output_b64 = B64.encode(b"test bytes");
-        let stdout_b64 = B64.encode(ps_output_b64.as_bytes());
+    /// Mount the four responses of a download whose script prints `content`
+    /// as base64: create shell, command `{id}-CMD`, one receive, delete.
+    async fn mount_download_mocks(server: &MockServer, id: &str, content: &[u8]) {
+        let stdout_b64 = B64.encode(B64.encode(content).as_bytes());
 
         Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(
-                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>DL2-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
-            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>{id}-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
+            )))
             .up_to_n_times(1)
-            .mount(&server)
+            .mount(server)
             .await;
 
         Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(
-                r"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>DL2-CMD</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
-            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>{id}-CMD</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
+            )))
             .up_to_n_times(1)
-            .mount(&server)
+            .mount(server)
             .await;
 
         let receive_body = format!(
             r#"<s:Envelope><s:Body><rsp:ReceiveResponse>
-                <rsp:Stream Name="stdout" CommandId="DL2-CMD">{stdout_b64}</rsp:Stream>
-                <rsp:CommandState CommandId="DL2-CMD" State="http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Done">
+                <rsp:Stream Name="stdout" CommandId="{id}-CMD">{stdout_b64}</rsp:Stream>
+                <rsp:CommandState CommandId="{id}-CMD" State="http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Done">
                     <rsp:ExitCode>0</rsp:ExitCode>
                 </rsp:CommandState>
             </rsp:ReceiveResponse></s:Body></s:Envelope>"#
@@ -3284,15 +3281,22 @@ mod tests {
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string(receive_body))
             .up_to_n_times(1)
-            .mount(&server)
+            .mount(server)
             .await;
 
         Mock::given(method("POST"))
             .respond_with(
                 ResponseTemplate::new(200).set_body_string("<s:Envelope><s:Body/></s:Envelope>"),
             )
-            .mount(&server)
+            .mount(server)
             .await;
+    }
+
+    #[tokio::test]
+    async fn download_file_write_local_success() {
+        let server = MockServer::start().await;
+        let port = server.address().port();
+        mount_download_mocks(&server, "DL2", b"test bytes").await;
 
         let client = WinrmClient::new(basic_config(port), test_creds()).unwrap();
         let local_path = unique_temp_path("winrm-rs-test-dl2.bin");
@@ -3311,46 +3315,7 @@ mod tests {
     async fn download_file_replaces_the_destination_and_leaves_no_temp_file() {
         let server = MockServer::start().await;
         let port = server.address().port();
-
-        let ps_output_b64 = B64.encode(b"test bytes");
-        let stdout_b64 = B64.encode(ps_output_b64.as_bytes());
-
-        Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(
-                r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>DL3-SHELL</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
-            ))
-            .up_to_n_times(1)
-            .mount(&server)
-            .await;
-
-        Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(
-                r"<s:Envelope><s:Body><rsp:CommandResponse><rsp:CommandId>DL3-CMD</rsp:CommandId></rsp:CommandResponse></s:Body></s:Envelope>",
-            ))
-            .up_to_n_times(1)
-            .mount(&server)
-            .await;
-
-        let receive_body = format!(
-            r#"<s:Envelope><s:Body><rsp:ReceiveResponse>
-                <rsp:Stream Name="stdout" CommandId="DL3-CMD">{stdout_b64}</rsp:Stream>
-                <rsp:CommandState CommandId="DL3-CMD" State="http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Done">
-                    <rsp:ExitCode>0</rsp:ExitCode>
-                </rsp:CommandState>
-            </rsp:ReceiveResponse></s:Body></s:Envelope>"#
-        );
-        Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(receive_body))
-            .up_to_n_times(1)
-            .mount(&server)
-            .await;
-
-        Mock::given(method("POST"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_string("<s:Envelope><s:Body/></s:Envelope>"),
-            )
-            .mount(&server)
-            .await;
+        mount_download_mocks(&server, "DL3", b"test bytes").await;
 
         let dir = unique_temp_path("winrm-rs-test-dl3");
         std::fs::create_dir_all(&dir).unwrap();

@@ -43,14 +43,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Changed
 
 - **Downloads create new files owner-only and replace existing ones
-  atomically.** On Unix a file created by `download_file` /
-  `download_file_with_timeout` is now mode 0600 (it was 0666 minus the
-  umask): `chmod` it if other users or services must read it. An existing
-  file is replaced through a temporary file and a rename, so a failed local
-  write no longer truncates it; it keeps its mode and, when possible, its
-  owner and group, but it gets a new inode and loses ACLs and extended
-  attributes. A symbolic link at the destination is now refused instead of
-  written through.
+  atomically.** On Unix, on filesystems that store Unix modes, a file
+  created by `download_file` / `download_file_with_timeout` is now mode 0600
+  (it was 0666 minus the umask): `chmod` it if other users or services must
+  read it. An existing file is replaced through a temporary file and a
+  rename, so a failed local write no longer truncates it, except in the
+  cases listed on `download_file` (a hard-linked file, a read-only
+  directory, an owner that cannot be kept); it keeps its mode without the
+  set-user-ID and set-group-ID bits and, when possible, its owner and group,
+  but it gets a new inode and loses ACLs and extended attributes. A symbolic
+  link at the destination is now refused instead of written through. In a
+  sticky, world-writable directory such as `/tmp`, an existing file owned by
+  neither the current user nor the directory's owner is refused, whatever
+  the `fs.protected_regular` setting.
 - NTLM: the AUTHENTICATE message's workstation name now comes from
   `HOSTNAME`, `/proc/sys/kernel/hostname` (Linux) or `COMPUTERNAME` (Windows):
   its first label, ASCII letters, numbers, `-` and `_` only, upper-cased and

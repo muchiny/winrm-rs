@@ -217,18 +217,22 @@ impl WinrmClient {
     /// `local_path` is replaced atomically once the whole remote file has
     /// arrived: the data goes to a temporary `.winrm-rs-<random>.tmp` file in
     /// the same directory, which is then renamed over `local_path`, so a failed
-    /// write leaves `local_path` as it was. On Unix a new file is created with
-    /// mode 0600 (`chmod` it afterwards if others must read it). An existing
-    /// file keeps its permission bits and, when this process may set them, its
-    /// owner and group; ACLs and extended attributes are not carried over. A
-    /// symbolic link at `local_path` is refused (resolve it yourself and pass
-    /// its target), and so is anything that is not a regular file; directories
-    /// along the path are still resolved through links. A read-only
-    /// destination is refused as before. The file is rewritten in place, which
-    /// is not atomic, when its directory is not writable, when it has other
-    /// hard links, or when its owner cannot be kept. On Windows the rename
-    /// fails while another process holds `local_path` open without delete
-    /// sharing.
+    /// write leaves `local_path` as it was. On Unix, on filesystems that store
+    /// Unix modes, a new file is created with mode 0600 (`chmod` it afterwards
+    /// if others must read it). An existing file keeps its permission bits,
+    /// minus the set-user-ID and set-group-ID bits, and, when this process may
+    /// set them, its owner and group; ACLs and extended attributes are not
+    /// carried over. A symbolic link at `local_path` is refused (resolve it
+    /// yourself and pass its target), and so is anything that is not a
+    /// regular file; directories along the path are still resolved through
+    /// links. A read-only destination is refused as before. In a sticky,
+    /// world-writable directory such as `/tmp`, an existing file owned by
+    /// neither this user nor the directory's owner is refused, as Linux's
+    /// `fs.protected_regular` rule refuses a plain write there. The file is
+    /// rewritten in place, which is not atomic, when its directory is not
+    /// writable, when it has other hard links, or when its owner cannot be
+    /// kept. On Windows the rename fails while another process holds
+    /// `local_path` open without delete sharing.
     ///
     /// Nothing local is created or modified when the remote read fails or
     /// times out. The write runs on tokio's blocking pool: dropping the future
@@ -253,7 +257,11 @@ impl WinrmClient {
     /// - `local_path` is written with this process's privileges. A symbolic
     ///   link at `local_path` itself is refused, but the directories above it
     ///   are resolved through links. Check an untrusted local path yourself
-    ///   before passing it.
+    ///   before passing it. A party able to write in the destination
+    ///   directory can make the local write block (with a FIFO put at
+    ///   `local_path`); the limit of
+    ///   [`download_file_with_timeout`](Self::download_file_with_timeout)
+    ///   does not cover the local write.
     pub async fn download_file(
         &self,
         host: &str,
@@ -284,18 +292,22 @@ impl WinrmClient {
     /// `local_path` is replaced atomically once the whole remote file has
     /// arrived: the data goes to a temporary `.winrm-rs-<random>.tmp` file in
     /// the same directory, which is then renamed over `local_path`, so a failed
-    /// write leaves `local_path` as it was. On Unix a new file is created with
-    /// mode 0600 (`chmod` it afterwards if others must read it). An existing
-    /// file keeps its permission bits and, when this process may set them, its
-    /// owner and group; ACLs and extended attributes are not carried over. A
-    /// symbolic link at `local_path` is refused (resolve it yourself and pass
-    /// its target), and so is anything that is not a regular file; directories
-    /// along the path are still resolved through links. A read-only
-    /// destination is refused as before. The file is rewritten in place, which
-    /// is not atomic, when its directory is not writable, when it has other
-    /// hard links, or when its owner cannot be kept. On Windows the rename
-    /// fails while another process holds `local_path` open without delete
-    /// sharing.
+    /// write leaves `local_path` as it was. On Unix, on filesystems that store
+    /// Unix modes, a new file is created with mode 0600 (`chmod` it afterwards
+    /// if others must read it). An existing file keeps its permission bits,
+    /// minus the set-user-ID and set-group-ID bits, and, when this process may
+    /// set them, its owner and group; ACLs and extended attributes are not
+    /// carried over. A symbolic link at `local_path` is refused (resolve it
+    /// yourself and pass its target), and so is anything that is not a
+    /// regular file; directories along the path are still resolved through
+    /// links. A read-only destination is refused as before. In a sticky,
+    /// world-writable directory such as `/tmp`, an existing file owned by
+    /// neither this user nor the directory's owner is refused, as Linux's
+    /// `fs.protected_regular` rule refuses a plain write there. The file is
+    /// rewritten in place, which is not atomic, when its directory is not
+    /// writable, when it has other hard links, or when its owner cannot be
+    /// kept. On Windows the rename fails while another process holds
+    /// `local_path` open without delete sharing.
     ///
     /// Nothing local is created or modified when the remote read fails or
     /// times out. The write runs on tokio's blocking pool: dropping the future
@@ -320,7 +332,11 @@ impl WinrmClient {
     /// - `local_path` is written with this process's privileges. A symbolic
     ///   link at `local_path` itself is refused, but the directories above it
     ///   are resolved through links. Check an untrusted local path yourself
-    ///   before passing it.
+    ///   before passing it. A party able to write in the destination
+    ///   directory can make the local write block (with a FIFO put at
+    ///   `local_path`); the limit of
+    ///   [`download_file_with_timeout`](Self::download_file_with_timeout)
+    ///   does not cover the local write.
     ///
     /// # Example
     /// ```rust,no_run
@@ -536,7 +552,8 @@ fn open_existing(local_path: &Path) -> std::io::Result<Option<(std::fs::File, st
 }
 
 /// Rewrite `file` in place with `data`: not atomic, a failed write leaves it
-/// truncated.
+/// truncated. On Unix the set-user-ID and set-group-ID bits are cleared, so
+/// the new content never runs with them.
 fn write_in_place(
     file: &mut std::fs::File,
     data: &[u8],
@@ -544,7 +561,42 @@ fn write_in_place(
 ) -> std::io::Result<()> {
     file.set_len(0)?;
     write(file, data)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = file.metadata()?.permissions().mode();
+        if mode & SET_ID_BITS != 0 {
+            file.set_permissions(std::fs::Permissions::from_mode(mode & !SET_ID_BITS))?;
+        }
+    }
     file.sync_all()
+}
+
+/// The set-user-ID and set-group-ID bits, never carried onto downloaded
+/// content.
+#[cfg(unix)]
+const SET_ID_BITS: u32 = 0o6000;
+
+/// The permissions the new content takes from the file it replaces: the same
+/// bits, without set-user-ID and set-group-ID on Unix.
+fn carried_permissions(meta: &std::fs::Metadata) -> std::fs::Permissions {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::Permissions::from_mode(meta.permissions().mode() & !SET_ID_BITS)
+    }
+    #[cfg(not(unix))]
+    {
+        meta.permissions()
+    }
+}
+
+/// Remove a temporary file after an error or a fallback; best effort (its
+/// handle must be closed first, for Windows).
+fn remove_temp(path: &Path) {
+    let _ = std::fs::remove_file(path);
 }
 
 /// Create the temporary file at `path`: never an existing entry (no link is
@@ -557,7 +609,52 @@ fn create_temp(path: &Path) -> std::io::Result<std::fs::File> {
     options.open(path)
 }
 
+/// Whether an existing file may be written in a directory, by the rule the
+/// Linux kernel applies with `fs.protected_regular`: in a sticky,
+/// world-writable directory (mode bits `0o1002`, as on `/tmp`) only a file
+/// owned by the directory's owner or by this user. `our_uid` is `None` when
+/// this user could not be determined, which then allows only the
+/// directory owner's files there.
+#[cfg(unix)]
+fn sticky_rule_allows(dir_mode: u32, dir_uid: u32, file_uid: u32, our_uid: Option<u32>) -> bool {
+    dir_mode & 0o1002 != 0o1002 || file_uid == dir_uid || our_uid == Some(file_uid)
+}
+
+/// Refuse to touch the existing file `file` at `local_path` when
+/// [`sticky_rule_allows`] says no for its directory `dir`.
+#[cfg(unix)]
+fn check_sticky_rule(
+    local_path: &Path,
+    dir: &Path,
+    file: &std::fs::Metadata,
+    our_uid: Option<u32>,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir_meta = std::fs::metadata(dir)?;
+    if sticky_rule_allows(dir_meta.mode(), dir_meta.uid(), file.uid(), our_uid) {
+        return Ok(());
+    }
+    let why = if our_uid.is_some() {
+        "is owned by neither this user nor the directory's owner"
+    } else {
+        "is not owned by the directory's owner, and this user could not be determined"
+    };
+    Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!(
+            "{} is in a sticky, world-writable directory and {why}; it is not replaced",
+            local_path.display()
+        ),
+    ))
+}
+
 /// Give `tmp` the owner and group of the file it replaces, when they differ.
+///
+/// Called only after [`check_sticky_rule`] accepted the file with this
+/// user's uid: in a sticky, world-writable directory the file then belongs
+/// to this user or to the directory's owner, so the data never goes to
+/// anyone else there.
 #[cfg(unix)]
 fn keep_owner(tmp: &std::fs::File, meta: &std::fs::Metadata) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
@@ -574,11 +671,14 @@ fn keep_owner(tmp: &std::fs::File, meta: &std::fs::Metadata) -> std::io::Result<
 ///
 /// The data goes to a fresh `.winrm-rs-<uuid>.tmp` file next to
 /// `local_path`, which is renamed over it, so a failed write leaves
-/// `local_path` as it was. An existing file keeps its permission bits and,
-/// on Unix, its owner and group. The file is rewritten in place instead when
-/// its directory refuses the temporary file, when it has other hard links,
-/// or when its owner cannot be kept. The temporary file is removed on every
-/// error.
+/// `local_path` as it was. An existing file keeps its permission bits
+/// (without set-user-ID and set-group-ID) and, on Unix, its owner and group.
+/// On Unix an existing file in a sticky, world-writable directory is refused
+/// unless [`sticky_rule_allows`] it; this user's uid is read from the
+/// temporary file, created before any decision. The file is rewritten in
+/// place instead when its directory refuses the temporary file, when it has
+/// other hard links, or when its owner cannot be kept. The temporary file is
+/// removed on every error.
 fn replace_local_file_with(
     local_path: &Path,
     data: &[u8],
@@ -586,17 +686,39 @@ fn replace_local_file_with(
 ) -> std::io::Result<()> {
     let dir = temp_dir_of(local_path)?;
     let mut existing = open_existing(local_path)?;
+    let tmp_path = dir.join(format!(".winrm-rs-{}.tmp", uuid::Uuid::new_v4().simple()));
+    let created = create_temp(&tmp_path);
+
+    // Before any write to the existing file, in place or by rename.
+    #[cfg(unix)]
+    if let Some((_, meta)) = existing.as_ref() {
+        let our_uid = created
+            .as_ref()
+            .ok()
+            .and_then(|tmp| tmp.metadata().ok())
+            .map(|m| std::os::unix::fs::MetadataExt::uid(&m));
+        if let Err(e) = check_sticky_rule(local_path, dir, meta, our_uid) {
+            if let Ok(tmp) = created {
+                drop(tmp);
+                remove_temp(&tmp_path);
+            }
+            return Err(e);
+        }
+    }
 
     // A rename would split a hard link from its other names.
     #[cfg(unix)]
     if let Some((file, meta)) = existing.as_mut()
         && std::os::unix::fs::MetadataExt::nlink(meta) > 1
     {
+        if let Ok(tmp) = created {
+            drop(tmp);
+            remove_temp(&tmp_path);
+        }
         return write_in_place(file, data, write);
     }
 
-    let tmp_path = dir.join(format!(".winrm-rs-{}.tmp", uuid::Uuid::new_v4().simple()));
-    let mut tmp = match create_temp(&tmp_path) {
+    let mut tmp = match created {
         Ok(tmp) => tmp,
         Err(e)
             if matches!(
@@ -619,14 +741,14 @@ fn replace_local_file_with(
         && keep_owner(&tmp, meta).is_err()
     {
         drop(tmp);
-        let _ = std::fs::remove_file(&tmp_path);
+        remove_temp(&tmp_path);
         return write_in_place(file, data, write);
     }
 
     // The modes are set after the write, which may clear set-id bits.
     let staged = write(&mut tmp, data)
         .and_then(|()| match existing.as_ref() {
-            Some((_, meta)) => tmp.set_permissions(meta.permissions()),
+            Some((_, meta)) => tmp.set_permissions(carried_permissions(meta)),
             None => Ok(()),
         })
         .and_then(|()| tmp.sync_all());
@@ -635,7 +757,7 @@ fn replace_local_file_with(
     drop(tmp);
     drop(existing);
     if let Err(e) = staged.and_then(|()| std::fs::rename(&tmp_path, local_path)) {
-        let _ = std::fs::remove_file(&tmp_path);
+        remove_temp(&tmp_path);
         return Err(e);
     }
 
@@ -1160,6 +1282,144 @@ mod tests {
         assert_eq!(std::fs::read(&dest).unwrap(), b"new");
         assert_eq!(std::fs::metadata(&dest).unwrap().nlink(), 2);
         assert_eq!(leftover_temp_files(&dir), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sticky_rule_allows_matches_the_kernel_rule() {
+        // Named cases: /tmp is 1777 root-owned; this user is 1000.
+        assert!(sticky_rule_allows(0o1777, 0, 1000, Some(1000)));
+        assert!(sticky_rule_allows(0o1777, 0, 0, Some(1000)));
+        assert!(!sticky_rule_allows(0o1777, 0, 2000, Some(1000)));
+        assert!(!sticky_rule_allows(0o1777, 0, 1000, None));
+        assert!(sticky_rule_allows(0o1777, 0, 0, None));
+        assert!(sticky_rule_allows(0o0777, 0, 2000, Some(1000)));
+        assert!(sticky_rule_allows(0o1775, 0, 2000, Some(1000)));
+        assert!(sticky_rule_allows(0o1002, 1000, 1000, None));
+        assert!(!sticky_rule_allows(0o41777, 0, 2000, Some(1000)));
+
+        // Every permission mode against every owner combination.
+        let uids = [0_u32, 1000, 2000];
+        let ours = [None, Some(0_u32), Some(1000), Some(2000)];
+        for mode in 0..=0o7777_u32 {
+            let refused_dir = mode & 0o1000 != 0 && mode & 0o0002 != 0;
+            for dir_uid in uids {
+                for file_uid in uids {
+                    for our_uid in ours {
+                        let owner_ok = file_uid == dir_uid || our_uid == Some(file_uid);
+                        assert_eq!(
+                            sticky_rule_allows(mode, dir_uid, file_uid, our_uid),
+                            !refused_dir || owner_ok,
+                            "mode {mode:o} dir {dir_uid} file {file_uid} ours {our_uid:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replace_local_file_accepts_its_own_file_in_a_sticky_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = test_dir("replace-sticky");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let dest = dir.join("f.bin");
+        std::fs::write(&dest, b"old").unwrap();
+        replace_local_file(&dest, b"new").unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+        let other = dir.join("g.bin");
+        std::fs::write(&other, b"old").unwrap();
+        std::fs::hard_link(&other, dir.join("h.bin")).unwrap();
+        replace_local_file(&other, b"new").unwrap();
+        assert_eq!(std::fs::read(dir.join("h.bin")).unwrap(), b"new");
+        assert_eq!(leftover_temp_files(&dir), 0);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// In a sticky, world-writable directory owned by another user (the
+    /// system temporary directory, usually root's), this user's own file is
+    /// replaced: the rule reads this user's uid from the temporary file.
+    #[cfg(unix)]
+    #[test]
+    fn replace_local_file_accepts_its_own_file_in_a_shared_sticky_directory() {
+        use std::os::unix::fs::MetadataExt;
+
+        let shared = std::env::temp_dir();
+        let dest = shared.join(format!("winrm-rs-sticky-own-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&dest, b"old").unwrap();
+        let shared_meta = std::fs::metadata(&shared).unwrap();
+        let ours = std::fs::metadata(&dest).unwrap().uid();
+        if shared_meta.mode() & 0o1002 != 0o1002 || shared_meta.uid() == ours {
+            eprintln!("the temporary directory is not a shared sticky one: test skipped");
+        } else {
+            // Without this user's uid the file is not the directory owner's,
+            // so the rule refuses it.
+            let meta = std::fs::symlink_metadata(&dest).unwrap();
+            let err = check_sticky_rule(&dest, &shared, &meta, None).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(err.to_string().contains("sticky, world-writable"), "{err}");
+            check_sticky_rule(&dest, &shared, &meta, Some(ours)).unwrap();
+
+            replace_local_file(&dest, b"new").unwrap();
+            assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+            assert_eq!(std::fs::metadata(&dest).unwrap().uid(), ours);
+        }
+        std::fs::remove_file(&dest).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replace_local_file_drops_set_id_bits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = test_dir("replace-set-id");
+        for (name, hard_link) in [("renamed.bin", false), ("in-place.bin", true)] {
+            let dest = dir.join(name);
+            std::fs::write(&dest, b"old").unwrap();
+            if hard_link {
+                std::fs::hard_link(&dest, dir.join(format!("{name}.link"))).unwrap();
+            }
+            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o6755)).unwrap();
+            let before = std::fs::metadata(&dest).unwrap().permissions().mode();
+            if before & 0o6000 == 0 {
+                eprintln!("set-id bits not kept here ({before:o}): {name} skipped");
+                continue;
+            }
+            replace_local_file(&dest, b"new").unwrap();
+            let mode = std::fs::metadata(&dest).unwrap().permissions().mode();
+            assert_eq!(mode & 0o7777, 0o755, "{name}: mode {mode:o}");
+            assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+        }
+        assert_eq!(leftover_temp_files(&dir), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replace_local_file_writes_into_an_owner_only_temp_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = test_dir("replace-temp-mode");
+        let dest = dir.join("f.bin");
+        std::fs::write(&dest, b"old").unwrap();
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o644)).unwrap();
+        replace_local_file_with(&dest, b"new", |f, d| {
+            let mode = f.metadata()?.permissions().mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "temp file mode {mode:o} during the write"
+            );
+            std::io::Write::write_all(f, d)
+        })
+        .unwrap();
+        let mode = std::fs::metadata(&dest).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o644, "mode {mode:o}");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new");
         std::fs::remove_dir_all(&dir).ok();
     }
 

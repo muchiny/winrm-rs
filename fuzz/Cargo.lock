@@ -1605,6 +1605,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "idna",
  "md-5",
  "md4",
  "openssl",

@@ -10,7 +10,10 @@
 //! endpoint URL, when the URL parser accepts it, reads back with that host,
 //! the configured port, the `/wsman` path, and no userinfo, query or
 //! fragment. A URL the parser refuses fails the request before anything is
-//! sent, so it is allowed.
+//! sent, so it is allowed. A host that is not a bracketed IPv6 literal is
+//! refused when the parser would rewrite it (short or octal IPv4 forms,
+//! fullwidth characters, decomposed accents), so an accepted ASCII host
+//! reads back as its lowercase self, addresses included.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
@@ -68,7 +71,7 @@ fuzz_target!(|data: &[u8]| {
             !parts.has_query && !parts.has_fragment && !parts.has_userinfo,
             "{url:?} grew a query, fragment or userinfo: {parts:?}"
         );
-        if parts.is_domain && accepted.is_ascii() {
+        if accepted.is_ascii() && !accepted.starts_with('[') {
             assert_eq!(
                 parts.host.as_deref(),
                 Some(accepted.to_ascii_lowercase().as_str()),

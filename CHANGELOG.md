@@ -94,6 +94,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   bare name with a WARN. It is now refused with `WinrmError::AuthFailed` before
   anything is sent. Migration: pass the host alone, and set the port in
   `WinrmConfig::port`.
+- **A host must be in the form the URL parser keeps.** A host the URL parser
+  would rewrite is refused with `WinrmError::AuthFailed`, with the form it
+  would use: short or octal IPv4 forms (`10.1`, `010.0.0.1`), fullwidth
+  characters, an ideographic full stop, decomposed accents. Migration: pass
+  the form in the error.
 
 ### Added
 

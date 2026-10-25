@@ -75,6 +75,7 @@ bytes = { version = "1", optional = true }
 http = { version = "1", optional = true }
 x509-cert = { version = "0.3", optional = true }
 openssl = { version = "0.10", optional = true }
+idna = "1.1"
 
 
 [lints.rust]

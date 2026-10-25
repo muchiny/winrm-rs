@@ -591,6 +591,12 @@ pub(crate) fn log_host(host: &str) -> String {
 /// name made of ASCII letters, digits, `-`, `_` and `.` and of any non-ASCII
 /// character that is not whitespace or a control character (internationalised
 /// names, converted to punycode by the URL parser).
+///
+/// A host that is not a bracketed IPv6 literal must also be the form the URL
+/// parser keeps (lowercase aside), so the host on the wire is the string the
+/// caller checked: `10.1`, `010.0.0.1`, `167772161`, fullwidth characters, an
+/// ideographic full stop and decomposed accents are refused, and the error
+/// names the form the parser reads.
 pub(crate) fn validate_host(host: &str) -> Result<(), WinrmError> {
     if sanitize_host(host) != host {
         return Err(WinrmError::AuthFailed(format!(
@@ -599,8 +605,7 @@ pub(crate) fn validate_host(host: &str) -> Result<(), WinrmError> {
             crate::error::excerpt_chars(&redact_userinfo(host), 64)
         )));
     }
-    let sanitized = host;
-    let valid = if let Some(inner) = sanitized
+    let valid = if let Some(inner) = host
         .strip_prefix('[')
         .and_then(|rest| rest.strip_suffix(']'))
     {
@@ -609,8 +614,8 @@ pub(crate) fn validate_host(host: &str) -> Result<(), WinrmError> {
                 .bytes()
                 .all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.')
     } else {
-        !sanitized.is_empty()
-            && sanitized.chars().all(|c| {
+        !host.is_empty()
+            && host.chars().all(|c| {
                 if c.is_ascii() {
                     c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')
                 } else {
@@ -618,16 +623,48 @@ pub(crate) fn validate_host(host: &str) -> Result<(), WinrmError> {
                 }
             })
     };
-    if valid {
-        Ok(())
-    } else {
-        Err(WinrmError::AuthFailed(format!(
+    if !valid {
+        return Err(WinrmError::AuthFailed(format!(
             // Debug form: shows whitespace and control characters.
             "invalid host {:?}: expected a host name, an IPv4 address or a bracketed IPv6 \
              literal (letters, digits, '-', '_' and '.')",
-            crate::error::excerpt_chars(sanitized, 64)
-        )))
+            crate::error::excerpt_chars(host, 64)
+        )));
     }
+    if !host.starts_with('[') {
+        check_parser_keeps_host(host)?;
+    }
+    Ok(())
+}
+
+/// Refuse a host the URL parser would rewrite, so the host on the wire is
+/// the string the caller checked.
+///
+/// The parser reads `10.1`, `0x0a.0.0.1`, `167772161` and fullwidth digits as
+/// `10.0.0.1`, and maps fullwidth letters, `U+3002` and decomposed accents to
+/// other characters. An ASCII host must come back as its lowercase self. A
+/// non-ASCII host must not become an IPv4 address, and must equal the Unicode
+/// form of what the parser produced (lowercase, composed).
+fn check_parser_keeps_host(host: &str) -> Result<(), WinrmError> {
+    let refuse = |read_as: &str| {
+        WinrmError::AuthFailed(format!(
+            "invalid host {:?}: the URL parser reads it as {:?}; pass that form",
+            crate::error::excerpt_chars(host, 64),
+            crate::error::excerpt_chars(read_as, 64)
+        ))
+    };
+    let parsed = reqwest::Url::parse(&endpoint_url(false, host, 1))
+        .map_err(|e| refuse(&format!("an unparsable URL ({e})")))?;
+    let read_as = parsed.host_str().unwrap_or_default();
+    let kept = if host.is_ascii() {
+        read_as == host.to_ascii_lowercase()
+    } else {
+        let (unicode, result) = idna::domain_to_unicode(read_as);
+        read_as.parse::<std::net::Ipv4Addr>().is_err()
+            && result.is_ok()
+            && unicode == host.to_lowercase()
+    };
+    if kept { Ok(()) } else { Err(refuse(read_as)) }
 }
 
 /// Build the `reqwest` client for `config`: timeouts, redirects off, user
@@ -1875,7 +1912,6 @@ mod tests {
         "win-01.corp.local",
         "WIN_01",
         "10.0.0.5",
-        "10.1",
         "[::1]",
         "[fe80::1]",
         "[::ffff:10.0.0.1]",
@@ -1906,6 +1942,53 @@ mod tests {
                 "{host:?}: {err}"
             );
             assert!(!err.contains("s3cret"), "{host:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn validate_host_refuses_non_canonical_ipv4_forms() {
+        for host in [
+            "10.1",
+            "0x0a.0.0.1",
+            "167772161",
+            "010.0.0.1",
+            "10.0.0.1.",
+            "\u{ff11}\u{ff10}.0.0.1",
+        ] {
+            let err = validate_host(host).unwrap_err().to_string();
+            assert!(
+                err.contains("invalid host") && err.contains("reads it as"),
+                "{host:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_host_refuses_names_the_url_parser_would_rewrite() {
+        for host in [
+            "\u{ff57}\u{ff49}\u{ff4e}01.example",
+            "win01\u{3002}example",
+            "e\u{301}cole.example",
+        ] {
+            assert!(validate_host(host).is_err(), "{host:?}");
+        }
+    }
+
+    #[test]
+    fn validate_host_keeps_canonical_names() {
+        for host in [
+            "win01",
+            "WIN01",
+            "win-01.corp.local",
+            "WIN_01",
+            "10.0.0.5",
+            "bücher.example",
+            "BÜCHER.example",
+            "xn--bcher-kva.example",
+            "win01.",
+            "[::ffff:10.0.0.1]",
+        ] {
+            assert!(validate_host(host).is_ok(), "{host:?}");
         }
     }
 
@@ -3282,19 +3365,23 @@ mod tests {
         assert!(!text.contains('\u{1b}'), "{text}");
     }
 
-    /// `validate_host` accepts a bidi override character, so the URL of the
-    /// request event is escaped like the host field is. (A line break is
-    /// refused by `validate_host`, see the test above.)
+    /// The URL parser refuses a bidi override character in a host, so
+    /// `validate_host` refuses it too; the refusal is logged with the host
+    /// escaped like the host field is.
     #[tokio::test]
-    async fn request_url_log_field_escapes_bidi_characters() {
+    async fn bidi_characters_in_a_host_are_refused_and_logged_escaped() {
         let (logs, _guard) = capture_logs();
         let (_socket, port) = refused_port();
         let transport = basic_transport_retrying(port, 0);
-        let _ = transport
+        let err = transport
             .send_soap_raw("win\u{202E}01.test", "<a/>".into())
-            .await;
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, WinrmError::AuthFailed(m) if m.contains("invalid host")),
+            "{err:?}"
+        );
         let text = logs.text();
-        assert!(text.contains("sending WinRM SOAP request"), "{text}");
         assert!(text.contains("win\\u{202e}01.test"), "{text}");
         assert!(!text.contains('\u{202E}'), "{text}");
     }

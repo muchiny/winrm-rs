@@ -293,15 +293,17 @@ impl<'a> Shell<'a> {
     /// script blocks (event 4104) record its text. Do not embed secrets in it.
     ///
     /// The host's PowerShell profile scripts run first, and a prompt waits for
-    /// input until the call is bounded or cancelled;
+    /// input until the call is bounded or cancelled, unless the client was
+    /// built with
+    /// [`non_interactive_powershell(true)`](crate::WinrmClientBuilder::non_interactive_powershell),
+    /// which starts PowerShell with `-NoProfile -NonInteractive`;
     /// [`upload_file`](crate::WinrmClient::upload_file) and
-    /// [`download_file`](crate::WinrmClient::download_file) start PowerShell
-    /// with `-NoProfile -NonInteractive`.
+    /// [`download_file`](crate::WinrmClient::download_file) always do.
     pub async fn run_powershell(&self, script: &str) -> Result<CommandOutput, WinrmError> {
         let encoded = crate::command::encode_powershell_command(script);
         self.run_command(
             crate::command::POWERSHELL_EXE,
-            &["-EncodedCommand", &encoded],
+            &self.client.powershell_args(&encoded),
         )
         .await
     }
@@ -320,7 +322,7 @@ impl<'a> Shell<'a> {
         let encoded = crate::command::encode_powershell_command(script);
         self.run_command_with_cancel(
             crate::command::POWERSHELL_EXE,
-            &["-EncodedCommand", &encoded],
+            &self.client.powershell_args(&encoded),
             cancel,
         )
         .await

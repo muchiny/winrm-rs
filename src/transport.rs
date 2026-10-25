@@ -537,6 +537,9 @@ pub(crate) struct TransportOptions {
     /// The NTLM `Workstation` field the caller set (UTF-16LE, reduced by
     /// `ntlm::sanitize_workstation`); `None` sends the detected name.
     pub(crate) workstation: Option<Vec<u8>>,
+    /// Whether `run_powershell` starts PowerShell with
+    /// [`NON_INTERACTIVE_FLAGS`](crate::command::NON_INTERACTIVE_FLAGS).
+    pub(crate) non_interactive_powershell: bool,
 }
 
 impl Default for TransportOptions {
@@ -546,6 +549,7 @@ impl Default for TransportOptions {
             tls: TlsOptions::default(),
             proxy_session_auth: ProxySessionAuth::default(),
             workstation: None,
+            non_interactive_powershell: false,
         }
     }
 }
@@ -1049,10 +1053,9 @@ impl HttpTransport {
         &self.route
     }
 
-    /// The options this transport was built with, for tests.
-    #[cfg(test)]
-    pub(crate) fn options(&self) -> TransportOptions {
-        self.options.clone()
+    /// The options this transport was built with.
+    pub(crate) fn options(&self) -> &TransportOptions {
+        &self.options
     }
 
     /// Install the gate checked before every request attempt.

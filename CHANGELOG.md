@@ -255,6 +255,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   bound or stop a WQL enumeration.
 - **`RemotePathPolicy` and `WinrmClientBuilder::remote_path_policy`.** With `RemotePathPolicy::LocalDrive`, the transfer methods accept only drive-absolute remote paths and refuse UNC, WebDAV and device paths before anything is sent. The default, `Any`, keeps today's behaviour.
 - `quote_powershell_string`: quote a value as a PowerShell single-quoted literal, for passing untrusted values to `run_powershell` scripts.
+- `WinrmClientBuilder::non_interactive_powershell(true)` starts `run_powershell` scripts with `-NoProfile -NonInteractive`.
 
 ### Fixed
 

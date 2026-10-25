@@ -12,7 +12,7 @@ use tokio::time::Instant;
 use tracing::debug;
 
 use crate::builder::WinrmClientBuilder;
-use crate::command::{CommandOutput, encode_powershell_command};
+use crate::command::{CommandOutput, NON_INTERACTIVE_FLAGS, encode_powershell_command};
 use crate::config::{WinrmConfig, WinrmCredentials};
 use crate::error::WinrmError;
 use crate::shell::{Shell, ShellKind};
@@ -343,6 +343,18 @@ impl WinrmClient {
     }
 
     // --- High-level operations ---
+
+    /// The `powershell.exe` arguments for an encoded script: the
+    /// non-interactive flags first when the builder asked for them.
+    pub(crate) fn powershell_args<'a>(&self, encoded: &'a str) -> Vec<&'a str> {
+        let mut args = Vec::with_capacity(NON_INTERACTIVE_FLAGS.len() + 2);
+        if self.transport.options().non_interactive_powershell {
+            args.extend(NON_INTERACTIVE_FLAGS);
+        }
+        args.push("-EncodedCommand");
+        args.push(encoded);
+        args
+    }
 
     /// Run a command on a remote host, collecting all output.
     ///
@@ -675,10 +687,12 @@ impl WinrmClient {
     /// script blocks (event 4104) record its text. Do not embed secrets in it.
     ///
     /// The host's PowerShell profile scripts run first, and a prompt waits for
-    /// input until the call is bounded or cancelled;
+    /// input until the call is bounded or cancelled, unless the client was
+    /// built with
+    /// [`non_interactive_powershell(true)`](crate::WinrmClientBuilder::non_interactive_powershell),
+    /// which starts PowerShell with `-NoProfile -NonInteractive`;
     /// [`upload_file`](crate::WinrmClient::upload_file) and
-    /// [`download_file`](crate::WinrmClient::download_file) start PowerShell
-    /// with `-NoProfile -NonInteractive`.
+    /// [`download_file`](crate::WinrmClient::download_file) always do.
     #[tracing::instrument(
         level = "debug",
         skip(self, script, host),
@@ -693,7 +707,7 @@ impl WinrmClient {
         self.run_command(
             host,
             crate::command::POWERSHELL_EXE,
-            &["-EncodedCommand", &encoded],
+            &self.powershell_args(&encoded),
         )
         .await
     }
@@ -737,7 +751,7 @@ impl WinrmClient {
         self.run_command_with_timeout(
             host,
             crate::command::POWERSHELL_EXE,
-            &["-EncodedCommand", &encoded],
+            &self.powershell_args(&encoded),
             timeout,
         )
         .await
@@ -799,7 +813,7 @@ impl WinrmClient {
         self.run_command_with_cancel(
             host,
             crate::command::POWERSHELL_EXE,
-            &["-EncodedCommand", &encoded],
+            &self.powershell_args(&encoded),
             cancel,
         )
         .await
@@ -2242,6 +2256,96 @@ mod tests {
             0
         );
         assert_eq!(count_containing(&bodies, "-EncodedCommand"), 1);
+    }
+
+    /// A client over `basic_config(port)` with the non-interactive option set
+    /// as asked.
+    fn client_with_non_interactive(port: u16, on: bool) -> WinrmClient {
+        WinrmClient::builder(basic_config(port))
+            .credentials(test_creds())
+            .non_interactive_powershell(on)
+            .build()
+            .unwrap()
+    }
+
+    /// Whether the one Command request carries `flag` as an argument.
+    fn has_argument(bodies: &[String], flag: &str) -> bool {
+        count_containing(bodies, &format!("<rsp:Arguments>{flag}</rsp:Arguments>")) > 0
+    }
+
+    #[tokio::test]
+    async fn run_powershell_sends_the_flags_when_asked() {
+        for on in [true, false] {
+            let server = MockServer::start().await;
+            let client = client_with_non_interactive(server.address().port(), on);
+            mount_ok(&server, SHELL_S1, 1).await;
+            mount_ok(&server, COMMAND_C1, 1).await;
+            mount_ok(&server, DONE_HELLO, 1).await;
+            mount_ok(&server, EMPTY_BODY, u64::MAX).await;
+
+            client
+                .run_powershell("127.0.0.1", "Get-Date")
+                .await
+                .unwrap();
+
+            let bodies = received_bodies(&server).await;
+            assert!(has_argument(&bodies, "-EncodedCommand"), "{bodies:?}");
+            for flag in NON_INTERACTIVE_FLAGS {
+                assert_eq!(has_argument(&bodies, flag), on, "{flag} with on={on}");
+            }
+        }
+    }
+
+    /// Every `run_powershell*` method, on the client and on a shell, passes
+    /// the flags when asked and none when not.
+    #[tokio::test]
+    async fn every_run_powershell_method_honours_the_option() {
+        use std::time::Duration;
+        for on in [true, false] {
+            for site in 0..5 {
+                let server = MockServer::start().await;
+                let client = client_with_non_interactive(server.address().port(), on);
+                mount_ok(&server, SHELL_S1, 1).await;
+                mount_ok(&server, COMMAND_C1, 1).await;
+                mount_ok(&server, DONE_HELLO, 1).await;
+                mount_ok(&server, EMPTY_BODY, u64::MAX).await;
+                let token = tokio_util::sync::CancellationToken::new();
+
+                match site {
+                    0 => drop(client.run_powershell("127.0.0.1", "x").await.unwrap()),
+                    1 => drop(
+                        client
+                            .run_powershell_with_timeout("127.0.0.1", "x", Duration::from_secs(30))
+                            .await
+                            .unwrap(),
+                    ),
+                    2 => drop(
+                        client
+                            .run_powershell_with_cancel("127.0.0.1", "x", token)
+                            .await
+                            .unwrap(),
+                    ),
+                    3 => {
+                        let shell = client.open_shell("127.0.0.1").await.unwrap();
+                        drop(shell.run_powershell("x").await.unwrap());
+                    }
+                    _ => {
+                        let shell = client.open_shell("127.0.0.1").await.unwrap();
+                        drop(shell.run_powershell_with_cancel("x", token).await.unwrap());
+                    }
+                }
+
+                let bodies = received_bodies(&server).await;
+                assert!(has_argument(&bodies, "-EncodedCommand"), "site {site}");
+                for flag in NON_INTERACTIVE_FLAGS {
+                    assert_eq!(
+                        has_argument(&bodies, flag),
+                        on,
+                        "{flag}, site {site}, on={on}"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]

@@ -18,7 +18,9 @@ const MUTUAL_TLS_SECPROFILE: &str =
 ///
 /// The TLS client certificate itself is presented by the `reqwest::Client`,
 /// whose rustls config is built with it at construction time
-/// (`HttpTransport::new`). Each request carries the mutual security profile
+/// (`HttpTransport::with_provider`, reached from `WinrmClient::with_options`
+/// through `HttpTransport::new_with`).
+/// Each request carries the mutual security profile
 /// in its `Authorization` header so the server uses that certificate.
 pub(crate) struct CertificateAuth {
     /// Largest response body read (see `transport::max_response_bytes`).

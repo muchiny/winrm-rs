@@ -34,40 +34,48 @@ kerberos = ["dep:cross-krb5"]
 # Microsoft CredSSP server silently drops the context after Type3 +
 # pubKeyAuth. See the comment block in `src/auth/credssp.rs` around the
 # `build_inner_openssl_tls` function for the full background.
-credssp = ["dep:hyper", "dep:hyper-util", "dep:tokio-rustls", "dep:http-body-util", "dep:bytes", "dep:http", "dep:x509-cert", "dep:openssl"]
+credssp = ["dep:hyper", "dep:tokio-rustls", "dep:http-body-util", "dep:bytes", "dep:x509-cert", "dep:openssl"]
 # Internal-only. Re-exports crate internals needed by `fuzz/` targets.
 # NOT part of the public API. Do not enable from downstream code — any
 # item gated by this feature may change or disappear without a SemVer
-# bump.
+# bump. With debug assertions it also enables the environment debug hooks
+# `SSLKEYLOGFILE` (CredSSP outer TLS), `CREDSSP_DUMP`, `CREDSSP_DEBUG`,
+# `CREDSSP_FIXED_CC`, `CREDSSP_FIXED_RSK` and `CREDSSP_FIXED_NONCE`, used by
+# `fuzz/` and the pyspnego differential. Cargo features unify: a crate in your
+# build that enables this feature turns those hooks on in your debug builds.
 __internal = []
 
 [dependencies]
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "socks"] }
 cross-krb5 = { version = "0.5", optional = true }
-tokio = { version = "1", features = ["time", "macros", "sync"] }
+tokio = { version = "1", features = ["time", "macros", "sync", "rt"] }
 base64 = "0.23"
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
-md4 = "0.11"
-md-5 = "0.11"
-hmac = "0.13"
+md4 = { version = "0.11", features = ["zeroize"] }
+md-5 = { version = "0.11", features = ["zeroize"] }
+hmac = { version = "0.13", features = ["zeroize"] }
 rand = "0.10"
 secrecy = { version = "0.10", features = ["serde"] }
 tracing = "0.1"
 zeroize = { version = "1.8", features = ["derive"] }
 tokio-util = { version = "0.7.18", features = ["rt"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-platform-verifier = { version = "0.7", default-features = false }
 sha2 = "0.11"
 subtle = "2.6"
 webpki-roots = "1.0.6"
+tower-layer = "0.3"
+tower-service = "0.3"
 hyper = { version = "1", features = ["client", "http1"], optional = true }
-hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+hyper-util = { version = "0.1.21", features = ["tokio", "client-proxy"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"], optional = true }
 http-body-util = { version = "0.1", optional = true }
 bytes = { version = "1", optional = true }
-http = { version = "1", optional = true }
+http = "1.5"
 x509-cert = { version = "0.3", optional = true }
 openssl = { version = "0.10", optional = true }
+idna = "1.1"
 
 
 [lints.rust]
@@ -88,3 +96,9 @@ serde_json = "1"
 tracing-test = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 proptest = "1"
+bytes = "1"
+
+# The OS proxy check (tests/proxy_env.rs, `os_proxy_is_never_used`) enables the
+# system proxy lookup the library must never use; the feature is test-only.
+[target.'cfg(windows)'.dev-dependencies]
+hyper-util = { version = "0.1.21", features = ["client-proxy-system"] }

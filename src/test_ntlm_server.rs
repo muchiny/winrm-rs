@@ -27,7 +27,7 @@ use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 use crate::auth::ntlm::{seal_body, unseal_body};
-use crate::ntlm::NtlmSession;
+use crate::ntlm::SealingSession;
 use crate::ntlm::crypto::{Rc4State, compute_nt_hash, compute_ntlmv2_hash, hmac_md5};
 
 /// Credentials the fake server accepts (local account, empty domain).
@@ -85,7 +85,7 @@ pub(crate) enum Event {
 struct State {
     /// Type 3 answers still to send with `Connection: close`.
     close_after_auth: usize,
-    sessions: Vec<NtlmSession>,
+    sessions: Vec<SealingSession>,
     replies: VecDeque<Reply>,
     log: Vec<Event>,
 }
@@ -161,14 +161,43 @@ impl FakeNtlmServer {
     }
 }
 
-/// The Type 2 challenge the fake server sends (no target info).
+/// The Type 2 challenge the fake server sends: the flags a Windows server
+/// grants a sealing client, and a target info naming the NetBIOS domain and
+/// computer.
 pub(crate) fn challenge_header() -> String {
+    use crate::ntlm::crypto::{
+        AV_EOL, AV_NB_COMPUTER_NAME, AV_NB_DOMAIN_NAME, NEGOTIATE_128, NEGOTIATE_ALWAYS_SIGN,
+        NEGOTIATE_EXTENDED_SESSIONSECURITY, NEGOTIATE_KEY_EXCH, NEGOTIATE_NTLM, NEGOTIATE_SEAL,
+        NEGOTIATE_SIGN, NEGOTIATE_UNICODE, to_utf16le,
+    };
+    let flags = NEGOTIATE_UNICODE
+        | NEGOTIATE_NTLM
+        | NEGOTIATE_EXTENDED_SESSIONSECURITY
+        | NEGOTIATE_ALWAYS_SIGN
+        | NEGOTIATE_SIGN
+        | NEGOTIATE_SEAL
+        | NEGOTIATE_KEY_EXCH
+        | NEGOTIATE_128;
+    let mut target_info = Vec::new();
+    for (id, value) in [
+        (AV_NB_DOMAIN_NAME, to_utf16le("WORKGROUP")),
+        (AV_NB_COMPUTER_NAME, to_utf16le("WIN01")),
+        (AV_EOL, Vec::new()),
+    ] {
+        target_info.extend_from_slice(&id.to_le_bytes());
+        target_info.extend_from_slice(&u16::try_from(value.len()).unwrap().to_le_bytes());
+        target_info.extend_from_slice(&value);
+    }
     let mut type2 = vec![0u8; 48];
     type2[0..8].copy_from_slice(b"NTLMSSP\0");
     type2[8..12].copy_from_slice(&2u32.to_le_bytes());
-    // UNICODE | NTLM | ALWAYS_SIGN | EXTENDED_SESSIONSECURITY
-    type2[20..24].copy_from_slice(&0x0008_8201_u32.to_le_bytes());
+    type2[20..24].copy_from_slice(&flags.to_le_bytes());
     type2[24..32].copy_from_slice(&[0x01; 8]);
+    let len = u16::try_from(target_info.len()).unwrap();
+    type2[40..42].copy_from_slice(&len.to_le_bytes());
+    type2[42..44].copy_from_slice(&len.to_le_bytes());
+    type2[44..48].copy_from_slice(&48u32.to_le_bytes());
+    type2.extend_from_slice(&target_info);
     format!("Negotiate {}", B64.encode(&type2))
 }
 
@@ -181,13 +210,13 @@ fn security_buffer(msg: &[u8], at: usize) -> (usize, usize) {
 
 /// The exported session key a server derives from a Type 3 (NTLMv2 with key
 /// exchange), for the fake server's credentials.
-fn exported_session_key(type3: &[u8]) -> [u8; 16] {
+pub(crate) fn exported_session_key(type3: &[u8]) -> [u8; 16] {
     let (nt_off, nt_len) = security_buffer(type3, 20);
     let (key_off, key_len) = security_buffer(type3, 52);
     assert!(nt_len >= 16 && key_len == 16, "unexpected Type 3 layout");
     let nt_proof = &type3[nt_off..nt_off + 16];
     let ntlmv2_hash = compute_ntlmv2_hash(&compute_nt_hash(PASS), USER, "");
-    let key_exchange_key = hmac_md5(&ntlmv2_hash, nt_proof);
+    let key_exchange_key = hmac_md5(ntlmv2_hash.as_slice(), nt_proof);
     let mut key = [0u8; 16];
     key.copy_from_slice(&type3[key_off..key_off + 16]);
     Rc4State::new(&key_exchange_key).process(&mut key);
@@ -215,7 +244,7 @@ impl Respond for FakeNtlmServer {
                 }
                 Some([3, 0, 0, 0]) => {
                     let key = exported_session_key(&msg);
-                    state.sessions.push(NtlmSession::server_side(&key));
+                    state.sessions.push(*SealingSession::server_side(&key));
                     state.log.push(Event::Authenticate {
                         body_len: request.body.len(),
                     });
@@ -256,7 +285,8 @@ impl Respond for FakeNtlmServer {
                     body,
                     delay,
                 } => {
-                    let (content_type, sealed) = seal_body(&mut state.sessions[index], &body);
+                    let (content_type, sealed) =
+                        seal_body(&mut state.sessions[index], &body).expect("live server session");
                     ResponseTemplate::new(status)
                         .insert_header("content-type", content_type.as_str())
                         .set_body_bytes(sealed)
@@ -264,7 +294,8 @@ impl Respond for FakeNtlmServer {
                 }
                 Reply::Unauthorized => ResponseTemplate::new(401),
                 Reply::SealedThenClose(body) => {
-                    let (content_type, sealed) = seal_body(&mut state.sessions[index], &body);
+                    let (content_type, sealed) =
+                        seal_body(&mut state.sessions[index], &body).expect("live server session");
                     ResponseTemplate::new(200)
                         .insert_header("content-type", content_type.as_str())
                         .insert_header("connection", "close")

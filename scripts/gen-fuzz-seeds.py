@@ -283,6 +283,13 @@ SEED_SETS: dict[str, list[bytes]] = {
         SPNEGO_OID,
     ],
     "fuzz_asn1_cert": [fake_certificate(), seq(b""), b"\x30\x82\xff\xff"],
+    "fuzz_credssp_http": [
+        b"HTTP/1.1 401 \r\nWWW-Authenticate: CredSSP TlRMTVNTUAABAAAA\r\nContent-Length: 0\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/soap+xml\r\nContent-Length: 1234\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\n",
+        "HTTP/1.1 401 \r\nWWW-Authenticate: \u0250 CredSSP QUJD, Negotiate\r\n\r\n".encode(),
+        b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    ],
 }
 
 

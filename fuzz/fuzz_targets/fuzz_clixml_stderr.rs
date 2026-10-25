@@ -74,15 +74,21 @@ fn slice<'a>(stream: &'a [u8], seeds: &[u8]) -> Vec<&'a [u8]> {
 
 /// Build a well-formed CLIXML stream from `data` and the text it decodes to.
 /// Each byte picks a record kind and a character; `0x00` closes the current
-/// document and opens another, `0x01` doubles the leading marker.
+/// document and opens another, `0x01` doubles the leading marker, a leading
+/// `0x02` puts a raw stderr line between the marker and the first document.
 fn multi_document(data: &[u8]) -> (Vec<u8>, String) {
     const OPEN: &str = "<Objs Version=\"1.1.0.1\">";
     let mut stream = String::from("#< CLIXML\r\n");
     if data.first() == Some(&1) {
         stream.push_str("#< CLIXML\r\n");
     }
-    stream.push_str(OPEN);
     let mut expected = String::new();
+    if data.first() == Some(&2) {
+        // Raw stderr between the marker and its document.
+        stream.push_str("x\r\n");
+        expected.push_str("x\r\n");
+    }
+    stream.push_str(OPEN);
     for &b in data {
         if b == 0 {
             stream.push_str("</Objs>\r\n");

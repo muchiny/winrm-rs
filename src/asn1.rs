@@ -142,11 +142,58 @@ pub(crate) fn encode_ts_request(
     encode_sequence(&contents)
 }
 
+/// Size of a TLV whose content is `content_len` bytes long.
+fn tlv_len(content_len: usize) -> usize {
+    1usize
+        .saturating_add(encode_length(content_len).len())
+        .saturating_add(content_len)
+}
+
+/// Push the tag and length of a TLV, leaving the content to the caller.
+fn push_tlv_header(out: &mut Vec<u8>, tag: u8, content_len: usize) {
+    out.push(tag);
+    out.extend_from_slice(&encode_length(content_len));
+}
+
+/// Number of bytes `s` takes in UTF-16LE.
+fn utf16le_len(s: &str) -> usize {
+    s.encode_utf16().count().saturating_mul(2)
+}
+
+/// Append `s` to `out` as UTF-16LE, without an intermediate buffer.
+fn push_utf16le(out: &mut Vec<u8>, s: &str) {
+    for unit in s.encode_utf16() {
+        out.extend_from_slice(&unit.to_le_bytes());
+    }
+}
+
+/// Sizes of the nested TSCredentials parts, outermost last:
+/// `(pwd_content, pwd_seq, octet, outer_content)`.
+fn ts_credentials_sizes(domain: &str, username: &str, password: &str) -> [usize; 4] {
+    // Each field is `[n] { OCTET STRING { utf16 } }`.
+    let field = |s: &str| tlv_len(tlv_len(utf16le_len(s)));
+    let pwd_content = field(domain)
+        .saturating_add(field(username))
+        .saturating_add(field(password));
+    let pwd_seq = tlv_len(pwd_content);
+    let octet = tlv_len(pwd_seq);
+    // `[0] { INTEGER 1 }` is 5 bytes, then `[1] { OCTET STRING { SEQUENCE } }`.
+    let outer_content = 5usize.saturating_add(tlv_len(octet));
+    [pwd_content, pwd_seq, octet, outer_content]
+}
+
+/// Exact size of the DER encoding of the TSCredentials.
+fn ts_credentials_len(domain: &str, username: &str, password: &str) -> usize {
+    let [_, _, _, outer_content] = ts_credentials_sizes(domain, username, password);
+    tlv_len(outer_content)
+}
+
 /// Encode TSCredentials (MS-CSSP 2.2.1.2).
 ///
-/// Returns a [`Zeroizing`] buffer so the cleartext-credentials DER blob is
-/// wiped from memory once the caller drops it (typically right after the
-/// blob is sealed by NTLM).
+/// The DER is written once, in a buffer of its exact size, so it is never
+/// reallocated and no intermediate copy of the credentials is left behind.
+/// The returned [`Zeroizing`] buffer is wiped when the caller drops it
+/// (typically right after the blob is sealed by NTLM).
 pub(crate) fn encode_ts_credentials(
     domain: &str,
     username: &str,
@@ -154,25 +201,29 @@ pub(crate) fn encode_ts_credentials(
 ) -> zeroize::Zeroizing<Vec<u8>> {
     use zeroize::Zeroizing;
 
-    let domain_bytes = Zeroizing::new(crate::ntlm::crypto::to_utf16le(domain));
-    let user_bytes = Zeroizing::new(crate::ntlm::crypto::to_utf16le(username));
-    let pass_bytes = Zeroizing::new(crate::ntlm::crypto::to_utf16le(password));
-
-    // TSPasswordCreds
-    let mut pwd_contents = Zeroizing::new(Vec::new());
-    pwd_contents.extend_from_slice(&encode_context_tag(0, &encode_octet_string(&domain_bytes)));
-    pwd_contents.extend_from_slice(&encode_context_tag(1, &encode_octet_string(&user_bytes)));
-    pwd_contents.extend_from_slice(&encode_context_tag(2, &encode_octet_string(&pass_bytes)));
-    let ts_password_creds = Zeroizing::new(encode_sequence(&pwd_contents));
+    let [pwd_content, pwd_seq, octet, outer_content] =
+        ts_credentials_sizes(domain, username, password);
+    let total = tlv_len(outer_content);
+    let mut out = Zeroizing::new(Vec::with_capacity(total));
+    let cap0 = out.capacity();
 
     // TSCredentials { credType: 1, credentials: DER(TSPasswordCreds) }
-    let mut cred_contents = Zeroizing::new(Vec::new());
-    cred_contents.extend_from_slice(&encode_context_tag(0, &encode_integer_value(1)));
-    cred_contents.extend_from_slice(&encode_context_tag(
-        1,
-        &encode_octet_string(&ts_password_creds),
-    ));
-    Zeroizing::new(encode_sequence(&cred_contents))
+    push_tlv_header(&mut out, TAG_SEQUENCE, outer_content);
+    out.extend_from_slice(&[0xA0, 0x03, 0x02, 0x01, 0x01]);
+    push_tlv_header(&mut out, 0xA1, octet);
+    push_tlv_header(&mut out, TAG_OCTET_STRING, pwd_seq);
+    // TSPasswordCreds
+    push_tlv_header(&mut out, TAG_SEQUENCE, pwd_content);
+    for (ctx, text) in [(0xA0, domain), (0xA1, username), (0xA2, password)] {
+        let n = utf16le_len(text);
+        push_tlv_header(&mut out, ctx, tlv_len(n));
+        push_tlv_header(&mut out, TAG_OCTET_STRING, n);
+        push_utf16le(&mut out, text);
+    }
+
+    debug_assert_eq!(out.capacity(), cap0, "TSCredentials buffer reallocated");
+    debug_assert_eq!(out.len(), total, "TSCredentials size mismatch");
+    out
 }
 
 /// Wrap an NTLM Type 1 message in SPNEGO NegTokenInit (RFC 4178).
@@ -342,13 +393,9 @@ pub(crate) fn decode_ts_request(data: &[u8]) -> Result<TsRequest, CredSspError> 
         .transpose()?
         .unwrap_or(2);
 
-    let nego_token = find_context_tag(seq_data, 1).and_then(|nego_data| {
-        // NegoData → SEQUENCE OF SEQUENCE { [0] OCTET STRING }
-        let (_, seq_of, _) = read_tlv(nego_data).ok()?;
-        let (_, inner_seq, _) = read_tlv(seq_of).ok()?;
-        let token_data = find_context_tag(inner_seq, 0)?;
-        Some(decode_octet_string(token_data).ok()?.to_vec())
-    });
+    let nego_token = find_context_tag(seq_data, 1)
+        .map(decode_nego_data)
+        .transpose()?;
 
     let auth_info = find_context_tag(seq_data, 2)
         .map(|d| decode_octet_string(d).map(|v| v.to_vec()))
@@ -374,6 +421,29 @@ pub(crate) fn decode_ts_request(data: &[u8]) -> Result<TsRequest, CredSspError> 
         error_code,
         client_nonce,
     })
+}
+
+/// Decode `NegoData ::= SEQUENCE OF SEQUENCE { [0] OCTET STRING }`, checking
+/// every tag. Any deviation is an error, not an absent token.
+fn decode_nego_data(d: &[u8]) -> Result<Vec<u8>, CredSspError> {
+    let malformed = || CredSspError::Asn1Decode("TSRequest: malformed negoTokens".into());
+    let (seq_of_tag, seq_of, _) = read_tlv(d)?;
+    if seq_of_tag != TAG_SEQUENCE {
+        return Err(malformed());
+    }
+    let (inner_tag, inner, _) = read_tlv(seq_of)?;
+    if inner_tag != TAG_SEQUENCE {
+        return Err(malformed());
+    }
+    let (ctx_tag, token, _) = read_tlv(inner)?;
+    if ctx_tag != 0xA0 {
+        return Err(malformed());
+    }
+    let (octet_tag, value, _) = read_tlv(token)?;
+    if octet_tag != TAG_OCTET_STRING {
+        return Err(malformed());
+    }
+    Ok(value.to_vec())
 }
 
 /// Extract the inner NTLM token from a SPNEGO message (NegTokenInit or NegTokenResp).
@@ -420,17 +490,59 @@ pub(crate) fn decode_spnego_token(data: &[u8]) -> Result<Vec<u8>, CredSspError> 
 /// NegTokenResp with negState accept-completed and a mechListMIC but no
 /// responseToken, so [`decode_spnego_token`] cannot be used for it.
 pub(crate) fn decode_spnego_mech_list_mic(data: &[u8]) -> Result<Option<Vec<u8>>, CredSspError> {
+    decode_spnego_final(data).map(|(_, mic)| mic)
+}
+
+/// negState `accept-completed` (RFC 4178 §4.2.2).
+pub(crate) const NEG_STATE_ACCEPT_COMPLETED: u8 = 0;
+
+/// Decode the server's final SPNEGO `NegTokenResp` into its `negState` and
+/// `mechListMIC` (`[0] ENUMERATED`, `[3] OCTET STRING`).
+///
+/// The SEQUENCE is walked strictly: every field goes through [`read_tlv`], so
+/// a truncated or malformed field is an error, never "absent". `[0]` must hold
+/// an ENUMERATED with exactly one content byte and `[3]` an OCTET STRING; other
+/// fields are skipped.
+pub(crate) fn decode_spnego_final(
+    data: &[u8],
+) -> Result<(Option<u8>, Option<Vec<u8>>), CredSspError> {
     let (tag, contents, _) = read_tlv(data)?;
     if tag != 0xA1 {
         return Err(CredSspError::Asn1Decode(format!(
             "expected NegTokenResp (0xa1), got tag 0x{tag:02x}"
         )));
     }
-    let (_, seq_data, _) = read_tlv(contents)?;
-    match find_context_tag(seq_data, 3) {
-        Some(mic) => Ok(Some(decode_octet_string(mic)?.to_vec())),
-        None => Ok(None),
+    let (seq_tag, mut rest, _) = read_tlv(contents)?;
+    if seq_tag != TAG_SEQUENCE {
+        return Err(CredSspError::Asn1Decode(format!(
+            "expected NegTokenResp SEQUENCE (0x30), got tag 0x{seq_tag:02x}"
+        )));
     }
+    let mut state = None;
+    let mut mic = None;
+    while !rest.is_empty() {
+        let (field_tag, value, consumed) = read_tlv(rest)?;
+        match field_tag {
+            0xA0 => {
+                let (enum_tag, enum_value, _) = read_tlv(value)?;
+                let [byte] = *enum_value else {
+                    return Err(CredSspError::Asn1Decode(
+                        "NegTokenResp: negState must be one byte".into(),
+                    ));
+                };
+                if enum_tag != TAG_ENUM {
+                    return Err(CredSspError::Asn1Decode(format!(
+                        "NegTokenResp: negState must be ENUMERATED (0x0a), got 0x{enum_tag:02x}"
+                    )));
+                }
+                state = Some(byte);
+            }
+            0xA3 => mic = Some(decode_octet_string(value)?.to_vec()),
+            _ => {}
+        }
+        rest = rest.get(consumed..).unwrap_or_default();
+    }
+    Ok((state, mic))
 }
 
 /// Extract SubjectPublicKey from a DER-encoded X.509 certificate.
@@ -475,6 +587,64 @@ pub(crate) fn extract_subject_public_key(cert_der: &[u8]) -> Result<Vec<u8>, Cre
     ))
 }
 
+// --- Acceptor-side helpers for the in-process CredSSP test server ---
+
+/// A TSRequest that carries only a version and an error code
+/// (`SEQUENCE { [0] version, [4] errorCode }`), as Windows sends on failure.
+#[cfg(test)]
+pub(crate) fn encode_ts_request_error(version: u32, error_code: u32) -> Vec<u8> {
+    let mut contents = encode_context_tag(0, &encode_integer_value(version));
+    contents.extend_from_slice(&encode_context_tag(4, &encode_integer_value(error_code)));
+    encode_sequence(&contents)
+}
+
+/// The server's final SPNEGO NegTokenResp: a negState and an optional
+/// mechListMIC, no responseToken (the shape Server 2025 sends).
+#[cfg(test)]
+pub(crate) fn encode_spnego_final(neg_state: u8, mech_list_mic: Option<&[u8]>) -> Vec<u8> {
+    let mut contents = encode_context_tag(0, &[TAG_ENUM, 0x01, neg_state]);
+    if let Some(mic) = mech_list_mic {
+        contents.extend_from_slice(&encode_context_tag(3, &encode_octet_string(mic)));
+    }
+    encode_context_tag(1, &encode_sequence(&contents))
+}
+
+/// Decode TSCredentials holding TSPasswordCreds into
+/// `(domain, user, password)`, the inverse of [`encode_ts_credentials`].
+#[cfg(test)]
+pub(crate) fn decode_ts_credentials(der: &[u8]) -> Result<(String, String, String), CredSspError> {
+    let missing = |what: &str| CredSspError::Asn1Decode(format!("TSCredentials: no {what}"));
+    let (tag, creds, _) = read_tlv(der)?;
+    if tag != TAG_SEQUENCE {
+        return Err(CredSspError::Asn1Decode(
+            "TSCredentials: expected SEQUENCE".into(),
+        ));
+    }
+    let cred_type = decode_integer(find_context_tag(creds, 0).ok_or_else(|| missing("credType"))?)?;
+    if cred_type != 1 {
+        return Err(CredSspError::Asn1Decode(format!(
+            "TSCredentials: credType {cred_type}, expected 1"
+        )));
+    }
+    let password_creds =
+        decode_octet_string(find_context_tag(creds, 1).ok_or_else(|| missing("credentials"))?)?;
+    let (tag, fields, _) = read_tlv(password_creds)?;
+    if tag != TAG_SEQUENCE {
+        return Err(CredSspError::Asn1Decode(
+            "TSPasswordCreds: expected SEQUENCE".into(),
+        ));
+    }
+    let field = |n: u8, what: &str| -> Result<String, CredSspError> {
+        let value = decode_octet_string(find_context_tag(fields, n).ok_or_else(|| missing(what))?)?;
+        Ok(crate::ntlm::crypto::from_utf16le(value))
+    };
+    Ok((
+        field(0, "domainName")?,
+        field(1, "userName")?,
+        field(2, "password")?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -513,6 +683,74 @@ mod tests {
         assert_eq!(creds[0], TAG_SEQUENCE);
         // Should contain UTF-16LE encoded strings
         assert!(creds.len() > 20);
+    }
+
+    /// The previous nested encoder, kept verbatim as the byte oracle.
+    fn nested_ts_credentials(d: &str, u: &str, p: &str) -> Vec<u8> {
+        let domain_bytes = crate::ntlm::crypto::to_utf16le(d);
+        let user_bytes = crate::ntlm::crypto::to_utf16le(u);
+        let pass_bytes = crate::ntlm::crypto::to_utf16le(p);
+
+        let mut pwd_contents = Vec::new();
+        pwd_contents.extend_from_slice(&encode_context_tag(0, &encode_octet_string(&domain_bytes)));
+        pwd_contents.extend_from_slice(&encode_context_tag(1, &encode_octet_string(&user_bytes)));
+        pwd_contents.extend_from_slice(&encode_context_tag(2, &encode_octet_string(&pass_bytes)));
+        let ts_password_creds = encode_sequence(&pwd_contents);
+
+        let mut cred_contents = Vec::new();
+        cred_contents.extend_from_slice(&encode_context_tag(0, &encode_integer_value(1)));
+        cred_contents.extend_from_slice(&encode_context_tag(
+            1,
+            &encode_octet_string(&ts_password_creds),
+        ));
+        encode_sequence(&cred_contents)
+    }
+
+    #[test]
+    fn ts_credentials_matches_nested_encoder_across_length_forms() {
+        for n in (0..=140).chain([0x7f00, 0x7ff8, 0x7fff, 0x8000, 0x8001]) {
+            let long = "p".repeat(n);
+            for (d, u, p) in [
+                ("", "u", long.as_str()),
+                ("DOMAIN", "üser", long.as_str()),
+                ("d", long.as_str(), "\u{1d11e}"),
+            ] {
+                assert_eq!(
+                    *encode_ts_credentials(d, u, p),
+                    nested_ts_credentials(d, u, p),
+                    "{d:?} {u:?} n={n}"
+                );
+            }
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn ts_credentials_matches_nested_encoder(
+            d in "\\PC{0,40}",
+            u in "\\PC{0,40}",
+            p in "\\PC{0,300}",
+        ) {
+            proptest::prop_assert_eq!(
+                encode_ts_credentials(&d, &u, &p).to_vec(),
+                nested_ts_credentials(&d, &u, &p)
+            );
+        }
+    }
+
+    #[test]
+    fn ts_credentials_buffer_is_sized_exactly() {
+        let long = "p".repeat(0x8000);
+        for (d, u, p) in [
+            ("", "", ""),
+            ("DOMAIN", "user", "pass"),
+            ("", "u", long.as_str()),
+        ] {
+            assert_eq!(
+                encode_ts_credentials(d, u, p).len(),
+                ts_credentials_len(d, u, p)
+            );
+        }
     }
 
     #[test]
@@ -712,15 +950,86 @@ mod tests {
         assert!(matches!(err, CredSspError::Asn1Decode(_)));
     }
 
+    /// Server 2025's final NegTokenResp (pubKeyAuth TSRequest): accept-completed + mechListMIC.
+    const SERVER_2025_FINAL_TOKEN: [u8; 29] = [
+        0xa1, 0x1b, 0x30, 0x19, 0xa0, 0x03, 0x0a, 0x01, 0x00, 0xa3, 0x12, 0x04, 0x10, 0x01, 0x00,
+        0x00, 0x00, 0x7c, 0x04, 0x2c, 0xe7, 0x3e, 0x8f, 0x62, 0x15, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    #[test]
+    fn decode_spnego_final_reads_state_and_mic_from_server_2025_token() {
+        let tok: &[u8] = &SERVER_2025_FINAL_TOKEN;
+        let (state, mic) = decode_spnego_final(tok).unwrap();
+        assert_eq!(state, Some(NEG_STATE_ACCEPT_COMPLETED));
+        assert_eq!(mic.as_deref(), Some(&tok[13..]));
+    }
+
+    #[test]
+    fn decode_spnego_final_reads_the_client_shape() {
+        let tok = encode_spnego_response(b"NTLMSSP\0", Some(&[0xAB; 16]));
+        assert_eq!(
+            decode_spnego_final(&tok).unwrap(),
+            (Some(1), Some(vec![0xAB; 16]))
+        );
+    }
+
+    /// The decoder reports the state it reads; the caller refuses anything but
+    /// accept-completed and accepts an absent state (RFC 4178 §4.2.2).
+    #[test]
+    fn decode_spnego_final_reports_other_states_and_an_absent_state() {
+        let mic = [0x5a_u8; 16];
+        for state in [1_u8, 3] {
+            let mut tok = vec![0xa1, 0x1b, 0x30, 0x19, 0xa0, 0x03, 0x0a, 0x01, state];
+            tok.extend_from_slice(&[0xa3, 0x12, 0x04, 0x10]);
+            tok.extend_from_slice(&mic);
+            let (got, got_mic) = decode_spnego_final(&tok).unwrap();
+            assert_eq!(got, Some(state));
+            assert_ne!(got, Some(NEG_STATE_ACCEPT_COMPLETED));
+            assert_eq!(got_mic.as_deref(), Some(&mic[..]));
+        }
+        let mut absent = vec![0xa1, 0x16, 0x30, 0x14, 0xa3, 0x12, 0x04, 0x10];
+        absent.extend_from_slice(&mic);
+        assert_eq!(
+            decode_spnego_final(&absent).unwrap(),
+            (None, Some(mic.to_vec()))
+        );
+    }
+
+    #[test]
+    fn decode_spnego_final_rejects_malformed_neg_state() {
+        // negState as INTEGER, then as a two-byte ENUMERATED.
+        assert!(
+            decode_spnego_final(&[0xa1, 0x07, 0x30, 0x05, 0xa0, 0x03, 0x02, 0x01, 0x00]).is_err()
+        );
+        assert!(
+            decode_spnego_final(&[0xa1, 0x08, 0x30, 0x06, 0xa0, 0x04, 0x0a, 0x02, 0x00, 0x00])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn decode_spnego_final_rejects_truncated_field() {
+        // [3] announces 16 bytes, 2 follow. The lenient walk read this as "no MIC".
+        let tok = [0xa1, 0x06, 0x30, 0x04, 0xa3, 0x10, 0x04, 0x0e];
+        assert!(decode_spnego_final(&tok).is_err());
+        assert!(decode_spnego_mech_list_mic(&tok).is_err());
+    }
+
+    #[test]
+    fn decode_ts_request_rejects_malformed_nego_data() {
+        let mut contents = encode_context_tag(0, &encode_integer_value(6));
+        contents.extend_from_slice(&encode_context_tag(
+            1,
+            &encode_octet_string(b"not NegoData"),
+        ));
+        assert!(decode_ts_request(&encode_sequence(&contents)).is_err());
+    }
+
     #[test]
     fn decode_spnego_mech_list_mic_from_server_final_token() {
         // Captured from Server 2025 in the pubKeyAuth TSRequest: NegTokenResp
         // { negState accept-completed, mechListMIC } — no responseToken.
-        let tok: &[u8] = &[
-            0xa1, 0x1b, 0x30, 0x19, 0xa0, 0x03, 0x0a, 0x01, 0x00, 0xa3, 0x12, 0x04, 0x10, 0x01,
-            0x00, 0x00, 0x00, 0x7c, 0x04, 0x2c, 0xe7, 0x3e, 0x8f, 0x62, 0x15, 0x00, 0x00, 0x00,
-            0x00,
-        ];
+        let tok: &[u8] = &SERVER_2025_FINAL_TOKEN;
         let mic = decode_spnego_mech_list_mic(tok).unwrap();
         assert_eq!(
             mic,
@@ -933,5 +1242,40 @@ mod tests {
         assert_eq!(encoded[0], 0xA3); // 0xA0 | 3
         assert_eq!(encoded[1], 1); // length
         assert_eq!(encoded[2], 0x42); // content
+    }
+
+    #[test]
+    fn ts_request_error_decodes_to_its_error_code() {
+        let req = decode_ts_request(&encode_ts_request_error(6, 0xC000_006D)).unwrap();
+        assert_eq!(req.version, 6);
+        assert_eq!(req.error_code, Some(0xC000_006D));
+        assert!(req.nego_token.is_none() && req.pub_key_auth.is_none());
+    }
+
+    #[test]
+    fn spnego_final_matches_the_server_2025_capture() {
+        let mic = [
+            0x01, 0x00, 0x00, 0x00, 0x7c, 0x04, 0x2c, 0xe7, 0x3e, 0x8f, 0x62, 0x15, 0x00, 0x00,
+            0x00, 0x00,
+        ];
+        let captured: &[u8] = &[
+            0xa1, 0x1b, 0x30, 0x19, 0xa0, 0x03, 0x0a, 0x01, 0x00, 0xa3, 0x12, 0x04, 0x10, 0x01,
+            0x00, 0x00, 0x00, 0x7c, 0x04, 0x2c, 0xe7, 0x3e, 0x8f, 0x62, 0x15, 0x00, 0x00, 0x00,
+            0x00,
+        ];
+        assert_eq!(encode_spnego_final(0, Some(&mic)), captured);
+        let bare = encode_spnego_final(2, None);
+        assert_eq!(bare, [0xa1, 0x07, 0x30, 0x05, 0xa0, 0x03, 0x0a, 0x01, 0x02]);
+        assert_eq!(decode_spnego_mech_list_mic(&bare).unwrap(), None);
+    }
+
+    #[test]
+    fn ts_credentials_roundtrip() {
+        let der = encode_ts_credentials("DOM", "user", "pässword");
+        assert_eq!(
+            decode_ts_credentials(&der).unwrap(),
+            ("DOM".into(), "user".into(), "pässword".into())
+        );
+        assert!(decode_ts_credentials(&[0x04, 0x00]).is_err());
     }
 }

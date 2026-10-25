@@ -14,8 +14,8 @@
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use winrm_rs::__fuzz::{
-    ChallengeMessage, create_authenticate_message, create_authenticate_message_with_cbt_and_key,
-    create_authenticate_message_with_key_and_mic, create_negotiate_message,
+    ChallengeMessage, TYPE3_NEVER_ECHO, create_authenticate_message,
+    create_authenticate_message_http, create_negotiate_message,
 };
 
 #[derive(Arbitrary, Debug)]
@@ -53,6 +53,15 @@ fn check_type3(msg: &[u8]) {
         "bad message type"
     );
 
+    // The flags are a server-controlled input; the datagram, LM-key,
+    // anonymous, OEM-name and identify bits are never repeated.
+    let type3_flags = u32::from_le_bytes(msg[60..64].try_into().unwrap());
+    assert_eq!(
+        type3_flags & TYPE3_NEVER_ECHO,
+        0,
+        "Type 3 echoes a server-only flag: {type3_flags:#010x}"
+    );
+
     for (at, name) in SECURITY_BUFFERS {
         let len = u16::from_le_bytes(msg[at..at + 2].try_into().unwrap()) as usize;
         let max_len = u16::from_le_bytes(msg[at + 2..at + 4].try_into().unwrap()) as usize;
@@ -64,6 +73,68 @@ fn check_type3(msg: &[u8]) {
             msg.len()
         );
     }
+
+    // The smallest buffer offset is where the payload starts (header +
+    // version + MIC); the declared lengths must fill the message exactly.
+    // A wrapped `as u16` length would shrink `sum`, so the equality fails.
+    let sum: usize = SECURITY_BUFFERS
+        .iter()
+        .map(|(at, _)| u16::from_le_bytes(msg[*at..at + 2].try_into().unwrap()) as usize)
+        .sum();
+    let first_off = SECURITY_BUFFERS
+        .iter()
+        .map(|(at, _)| u32::from_le_bytes(msg[at + 4..at + 8].try_into().unwrap()) as usize)
+        .min()
+        .unwrap();
+    assert_eq!(
+        first_off + sum,
+        msg.len(),
+        "declared buffer lengths must fill the message exactly"
+    );
+}
+
+/// The AV list of the NTLMv2 blob in a Type 3 must be the client's canonical
+/// one: each id once, exactly one `MsvAvEOL` (last), a `MsvAvChannelBindings`
+/// iff `cb_expected`, a `MsvAvFlags` with the MIC bit (0x2) iff
+/// `mic_expected`, and never the untrusted-target-name bit (0x4).
+fn check_av_list(msg: &[u8], cb_expected: bool, mic_expected: bool) {
+    let nt_len = u16::from_le_bytes(msg[20..22].try_into().unwrap()) as usize;
+    let nt_off = u32::from_le_bytes(msg[24..28].try_into().unwrap()) as usize;
+    let nt = &msg[nt_off..nt_off + nt_len];
+    let mut p = &nt[16 + 28..]; // NTProofStr(16) + blob header(28)
+    let mut ids = Vec::new();
+    let mut flags = None;
+    loop {
+        assert!(p.len() >= 4, "AV list runs past the NTLMv2 blob");
+        let id = u16::from_le_bytes([p[0], p[1]]);
+        let len = u16::from_le_bytes([p[2], p[3]]) as usize;
+        assert!(
+            p.len() >= 4 + len,
+            "AV pair {id:#x} runs past the NTLMv2 blob"
+        );
+        let value = &p[4..4 + len];
+        assert!(!ids.contains(&id), "AV id {id:#x} appears twice");
+        ids.push(id);
+        if id == 0x0006 {
+            let v: [u8; 4] = value.try_into().expect("MsvAvFlags is 4 bytes");
+            flags = Some(u32::from_le_bytes(v));
+        }
+        p = &p[4 + len..];
+        if id == 0x0000 {
+            break;
+        }
+    }
+    assert_eq!(p, [0u8; 4], "MsvAvEOL is the last pair of the blob");
+    assert_eq!(ids.contains(&0x000A), cb_expected, "MsvAvChannelBindings");
+    assert_eq!(
+        flags.is_some_and(|f| f & 0x2 != 0),
+        mic_expected,
+        "MsvAvFlags MIC bit"
+    );
+    assert!(
+        flags.is_none_or(|f| f & 0x4 == 0),
+        "MsvAvFlags untrusted-target-name bit"
+    );
 }
 
 fuzz_target!(|input: Input<'_>| {
@@ -75,32 +146,35 @@ fuzz_target!(|input: Input<'_>| {
         timestamp: Some(input.timestamp),
     };
 
-    check_type3(&create_authenticate_message(
+    // An input that does not fit a 16-bit length is refused, never wrapped.
+    let Ok(msg) = create_authenticate_message(
         &challenge,
         input.username,
         input.password,
         input.domain,
-    ));
-
-    let (msg, key) = create_authenticate_message_with_cbt_and_key(
-        &challenge,
-        input.username,
-        input.password,
-        input.domain,
-        input.channel_bindings,
-    );
+    ) else {
+        return;
+    };
     check_type3(&msg);
-    assert_eq!(key.len(), 16);
 
+    // The HTTP/HTTPS builder: over TLS (with a channel binding), then over
+    // plain HTTP (without one). Both carry a MIC.
     let type1 = create_negotiate_message();
-    let (msg, _) = create_authenticate_message_with_key_and_mic(
-        &challenge,
-        input.username,
-        input.password,
-        input.domain,
-        &type1,
-        input.type2_bytes,
-        input.target_name,
-    );
-    check_type3(&msg);
+    for channel_bindings in [Some(input.channel_bindings), None] {
+        let Ok((msg, key)) = create_authenticate_message_http(
+            &challenge,
+            input.username,
+            input.password,
+            input.domain,
+            &type1,
+            input.type2_bytes,
+            input.target_name,
+            channel_bindings,
+        ) else {
+            return;
+        };
+        check_type3(&msg);
+        check_av_list(&msg, channel_bindings.is_some(), true);
+        assert_eq!(key.len(), 16);
+    }
 });

@@ -9,8 +9,9 @@ pub(crate) mod messages;
 
 // Re-export crate-internal API
 pub(crate) use messages::{
-    create_authenticate_message_with_cbt_and_key, create_authenticate_message_with_key_and_mic,
-    create_negotiate_message, decode_challenge_header, encode_authorization,
+    check_challenge, create_authenticate_message_http, create_negotiate_message,
+    decode_challenge_header, encode_authorization, log_challenge, sanitize_workstation,
+    workstation,
 };
 // `parse_challenge` is only reached from outside `ntlm::messages` by the
 // CredSSP path; `crate::__fuzz` calls it through its full path. Tests inside
@@ -22,114 +23,217 @@ pub use messages::parse_challenge;
 #[allow(unreachable_pub)] // used in-crate by auth/credssp.rs
 pub use messages::{create_authenticate_message_credssp, create_negotiate_message_credssp};
 
-// NtlmSession uses crypto internals
+// The sealing session uses crypto internals
 use crate::error::NtlmError;
-use crypto::{Rc4State, hmac_md5};
+use crypto::{Rc4State, hmac_md5_parts};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-/// NTLM session state for message encryption/decryption after authentication.
+/// Length of an NTLM message signature (MS-NLMP 2.2.2.9.1).
+const SIGNATURE_LEN: usize = 16;
+
+/// The signature version every NTLM message signature carries.
+const SIGNATURE_VERSION: u32 = 1;
+
+/// Error text once a sequence counter has used `u32::MAX`.
+const SEQ_EXHAUSTED: &str = "NTLM sequence number exhausted";
+
+/// Error text of every call on a session that failed earlier.
+const SESSION_DEAD: &str = "NTLM sealing session is unusable after an earlier error";
+
+fn invalid(what: &str) -> NtlmError {
+    NtlmError::InvalidMessage(what.into())
+}
+
+/// The first 8 bytes of an HMAC-MD5 digest: the NTLM signature checksum.
+fn checksum_head(mac: &[u8; 16]) -> [u8; 8] {
+    let mut out = [0u8; 8];
+    for (slot, byte) in out.iter_mut().zip(mac) {
+        *slot = *byte;
+    }
+    out
+}
+
+/// `Version(4) || Checksum(8) || SeqNum(4)`, all little-endian.
+fn signature(checksum: &[u8; 8], seq: u32) -> [u8; SIGNATURE_LEN] {
+    let mut sig = [0u8; SIGNATURE_LEN];
+    let fields = SIGNATURE_VERSION
+        .to_le_bytes()
+        .into_iter()
+        .chain(checksum.iter().copied())
+        .chain(seq.to_le_bytes());
+    for (slot, byte) in sig.iter_mut().zip(fields) {
+        *slot = byte;
+    }
+    sig
+}
+
+/// The fields of a 16-byte signature, or `None` when `sig` is not 16 bytes.
+fn parse_signature(sig: &[u8]) -> Option<(u32, [u8; 8], u32)> {
+    let (version, rest) = sig.split_first_chunk::<4>()?;
+    let (checksum, rest) = rest.split_first_chunk::<8>()?;
+    let (seq, rest) = rest.split_first_chunk::<4>()?;
+    rest.is_empty().then(|| {
+        (
+            u32::from_le_bytes(*version),
+            *checksum,
+            u32::from_le_bytes(*seq),
+        )
+    })
+}
+
+/// The NTLM sealing session of one authenticated connection (MS-NLMP
+/// section 3.4.4): seal and sign towards the server, unseal and verify what
+/// the server sends.
 ///
-/// Derived from the NTLMv2 authentication exchange per MS-NLMP section 3.4.4.
-/// Provides seal (encrypt+sign) and unseal (decrypt+verify) for WinRM
-/// message-level encryption over HTTP.
+/// The session enforces its call order:
 ///
-/// # Usage
+/// - [`Self::sign_mech_list_mic`] resets the client RC4 handle only when it
+///   is the first client operation; later it signs without a reset.
+/// - Any error poisons the session: every later call returns
+///   [`NtlmError::InvalidMessage`]. That covers a failed
+///   [`Self::unseal`] or [`Self::verify_mech_list_mic`] and an exhausted
+///   sequence counter.
+/// - Sequence numbers never wrap: the message that carries `u32::MAX` goes
+///   out, and the call after it fails with "NTLM sequence number exhausted".
 ///
-/// After completing the NTLM handshake with
-/// `create_authenticate_message_with_key`, use the returned exported
-/// session key to create an `NtlmSession`:
-///
-/// ```ignore
-/// let (type3_msg, session_key) = create_authenticate_message_with_key(...);
-/// let mut session = NtlmSession::from_auth(&session_key);
-/// let sealed = session.seal(b"plaintext payload");
-/// ```
-///
-/// The actual integration into the HTTP transport (MIME multipart framing for
-/// encrypted payloads) is deferred to a future release.
-///
-/// # Memory hygiene
-///
-/// All four derived session keys plus the two RC4 S-boxes are wiped from
-/// memory when the session drops, via `ZeroizeOnDrop`. This is defence in
-/// depth — once `from_auth` runs, the long-lived session is the only place
-/// the sealing/signing key material lives, and its `Drop` ensures it does
-/// not survive the session in the process heap.
-#[derive(Zeroize, ZeroizeOnDrop)]
+/// The keys and RC4 S-boxes are wiped when the session drops.
+#[derive(ZeroizeOnDrop)]
 #[cfg_attr(test, derive(Clone))]
-pub struct NtlmSession {
+pub(crate) struct SealingSession {
     client_sign_key: [u8; 16],
     server_sign_key: [u8; 16],
     /// Sealing keys are kept so the RC4 handles can be re-initialised after
     /// a SPNEGO mechListMIC — see [`Self::sign_mech_list_mic`].
     client_seal_key: [u8; 16],
     server_seal_key: [u8; 16],
-    client_seq_num: u32,
-    server_seq_num: u32,
+    /// Sequence number of the next client operation; `None` once a message
+    /// carried `u32::MAX`.
+    client_seq_num: Option<u32>,
+    /// Sequence number the next server message must carry; `None` once a
+    /// message carried `u32::MAX`.
+    server_seq_num: Option<u32>,
     client_seal_handle: Rc4State,
     server_seal_handle: Rc4State,
+    /// Set by any error: the session then refuses every call.
+    poisoned: bool,
 }
 
-impl NtlmSession {
-    /// Derive a session from the exported session key produced during
-    /// the NTLMv2 authentication exchange.
+impl SealingSession {
+    /// The session of `exported_session_key`, built in its box.
     ///
-    /// Computes the four session keys (client/server seal/sign) per
-    /// MS-NLMP section 3.4.4 and initializes the RC4 cipher handles.
-    pub fn from_auth(exported_session_key: &[u8; 16]) -> Self {
-        let client_seal_key = Self::derive_key(
+    /// The keys and RC4 S-boxes are written straight into the heap
+    /// allocation, so no stack copy of them is made on the way to the box.
+    pub(crate) fn boxed_from_auth(exported_session_key: &[u8; 16]) -> Box<Self> {
+        let mut session = Box::new(Self::INERT);
+        session.rekey_in_place(exported_session_key);
+        session
+    }
+
+    /// The same session as [`Self::boxed_from_auth`], by value. Tests use it
+    /// to check that both constructors agree.
+    #[cfg(test)]
+    fn from_auth(exported_session_key: &[u8; 16]) -> Self {
+        let mut session = Self::INERT;
+        session.rekey_in_place(exported_session_key);
+        session
+    }
+
+    /// An all-zero session holding no key material. It is only ever a
+    /// placeholder for [`Self::rekey_in_place`] to fill, never sealed with.
+    const INERT: Self = Self {
+        client_sign_key: [0; 16],
+        server_sign_key: [0; 16],
+        client_seal_key: [0; 16],
+        server_seal_key: [0; 16],
+        client_seq_num: Some(0),
+        server_seq_num: Some(0),
+        client_seal_handle: Rc4State::INERT,
+        server_seal_handle: Rc4State::INERT,
+        poisoned: false,
+    };
+
+    /// Test-only setter used to drive the client sequence counter to its limit.
+    #[cfg(test)]
+    fn set_client_seq_num(&mut self, n: u32) {
+        self.client_seq_num = Some(n);
+    }
+
+    /// Test-only setter used to drive the server sequence counter to its limit.
+    #[cfg(test)]
+    fn set_server_seq_num(&mut self, n: u32) {
+        self.server_seq_num = Some(n);
+    }
+
+    /// Derive the four session keys (client/server seal/sign) from the
+    /// exported session key per MS-NLMP section 3.4.4, reset the sequence
+    /// numbers, and initialise the RC4 handles, all in place.
+    fn rekey_in_place(&mut self, exported_session_key: &[u8; 16]) {
+        Self::derive_key_into(
+            &mut self.client_seal_key,
             exported_session_key,
             b"session key to client-to-server sealing key magic constant\0",
         );
-        let client_sign_key = Self::derive_key(
+        Self::derive_key_into(
+            &mut self.client_sign_key,
             exported_session_key,
             b"session key to client-to-server signing key magic constant\0",
         );
-        let server_seal_key = Self::derive_key(
+        Self::derive_key_into(
+            &mut self.server_seal_key,
             exported_session_key,
             b"session key to server-to-client sealing key magic constant\0",
         );
-        let server_sign_key = Self::derive_key(
+        Self::derive_key_into(
+            &mut self.server_sign_key,
             exported_session_key,
             b"session key to server-to-client signing key magic constant\0",
         );
-
-        Self {
-            client_sign_key,
-            server_sign_key,
-            client_seal_key,
-            server_seal_key,
-            client_seq_num: 0,
-            server_seq_num: 0,
-            client_seal_handle: Rc4State::new(&client_seal_key),
-            server_seal_handle: Rc4State::new(&server_seal_key),
-        }
+        self.client_seq_num = Some(0);
+        self.server_seq_num = Some(0);
+        self.poisoned = false;
+        self.client_seal_handle.reinit(&self.client_seal_key);
+        self.server_seal_handle.reinit(&self.server_seal_key);
     }
 
     /// The server's view of the session derived from the same key: what it
-    /// seals, a client [`Self::from_auth`] session unseals, and back.
+    /// seals, a client [`Self::boxed_from_auth`] session unseals, and back.
     ///
     /// For tests and the `__internal` fuzz surface only: builds the sealed
     /// bodies a WinRM server sends.
     #[cfg(any(test, feature = "__internal"))]
-    pub(crate) fn server_side(exported_session_key: &[u8; 16]) -> Self {
-        let mut session = Self::from_auth(exported_session_key);
+    pub(crate) fn server_side(exported_session_key: &[u8; 16]) -> Box<Self> {
+        let mut session = Self::boxed_from_auth(exported_session_key);
         std::mem::swap(&mut session.client_sign_key, &mut session.server_sign_key);
         std::mem::swap(&mut session.client_seal_key, &mut session.server_seal_key);
-        session.client_seal_handle = Rc4State::new(&session.client_seal_key);
-        session.server_seal_handle = Rc4State::new(&session.server_seal_key);
+        session.client_seal_handle.reinit(&session.client_seal_key);
+        session.server_seal_handle.reinit(&session.server_seal_key);
         session
     }
 
-    fn derive_key(session_key: &[u8; 16], magic: &[u8]) -> [u8; 16] {
+    /// `out = MD5(session_key || magic)`, with the digest output wiped.
+    fn derive_key_into(out: &mut [u8; 16], session_key: &[u8; 16], magic: &[u8]) {
         use md5::Digest;
         let mut hasher = md5::Md5::new();
         hasher.update(session_key);
         hasher.update(magic);
-        let result = hasher.finalize();
-        let mut key = [0u8; 16];
-        key.copy_from_slice(&result);
-        key
+        let mut result = hasher.finalize();
+        out.copy_from_slice(&result);
+        result.as_mut_slice().zeroize();
+    }
+
+    /// Run `op` on a live session, and poison the session if it fails.
+    fn guarded<T>(
+        &mut self,
+        op: impl FnOnce(&mut Self) -> Result<T, NtlmError>,
+    ) -> Result<T, NtlmError> {
+        if self.poisoned {
+            return Err(invalid(SESSION_DEAD));
+        }
+        let result = op(self);
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
     }
 
     /// Seal (encrypt + sign) a message for sending to the server.
@@ -138,59 +242,66 @@ impl NtlmSession {
     /// - Version (4 bytes, always 1)
     /// - Encrypted HMAC-MD5 checksum (8 bytes)
     /// - Sequence number (4 bytes, little-endian)
-    pub fn seal(&mut self, plaintext: &[u8]) -> Vec<u8> {
-        // 1. Compute signature: HMAC_MD5(sign_key, seq_num + plaintext)[0..8]
-        let mut sig_input = Vec::with_capacity(4 + plaintext.len());
-        sig_input.extend_from_slice(&self.client_seq_num.to_le_bytes());
-        sig_input.extend_from_slice(plaintext);
-        let checksum = hmac_md5(&self.client_sign_key, &sig_input);
-        let mut checksum_8 = [0u8; 8];
-        checksum_8.copy_from_slice(&checksum[..8]);
+    ///
+    /// # Errors
+    ///
+    /// [`NtlmError::InvalidMessage`] when the session is poisoned or the
+    /// client sequence number is exhausted.
+    pub(crate) fn seal(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, NtlmError> {
+        self.guarded(|s| {
+            let seq = s.client_seq_num.ok_or_else(|| invalid(SEQ_EXHAUSTED))?;
+            // 1. Compute signature: HMAC_MD5(sign_key, seq_num + plaintext)[0..8]
+            let mac = hmac_md5_parts(&s.client_sign_key, &[&seq.to_le_bytes(), plaintext]);
+            let mut checksum = checksum_head(&mac);
 
-        // 2. Encrypt the plaintext with RC4 FIRST (MS-NLMP 3.4.3 / _mac_with_ess
-        //    in pyspnego: seal() does rc4(plaintext) then sign() does rc4(checksum)).
-        let mut ciphertext = plaintext.to_vec();
-        self.client_seal_handle.process(&mut ciphertext);
+            // 2. Encrypt the plaintext with RC4 FIRST (MS-NLMP 3.4.3 / _mac_with_ess
+            //    in pyspnego: seal() does rc4(plaintext) then sign() does rc4(checksum)).
+            let mut ciphertext = plaintext.to_vec();
+            s.client_seal_handle.process(&mut ciphertext);
 
-        // 3. Then encrypt the checksum with RC4 (consumes next bytes of keystream).
-        self.client_seal_handle.process(&mut checksum_8);
+            // 3. Then encrypt the checksum with RC4 (consumes next bytes of keystream).
+            s.client_seal_handle.process(&mut checksum);
 
-        // 4. Build signature: Version(4) + Checksum(8) + SeqNum(4) = 16 bytes
-        let mut result = Vec::with_capacity(16 + ciphertext.len());
-        result.extend_from_slice(&1u32.to_le_bytes()); // version
-        result.extend_from_slice(&checksum_8);
-        result.extend_from_slice(&self.client_seq_num.to_le_bytes());
-
-        self.client_seq_num += 1;
-
-        result.extend_from_slice(&ciphertext);
-        result
+            // 4. Signature, then ciphertext.
+            let mut result = Vec::with_capacity(SIGNATURE_LEN.saturating_add(ciphertext.len()));
+            result.extend_from_slice(&signature(&checksum, seq));
+            result.extend_from_slice(&ciphertext);
+            s.client_seq_num = seq.checked_add(1);
+            Ok(result)
+        })
     }
 
     /// Compute an NTLM signature over `data` (no encryption of payload).
     /// Returns the 16-byte NTLMSSP_MESSAGE_SIGNATURE per MS-NLMP 3.4.4.1
     /// (with extended session security + key exchange). Consumes 8 bytes of
     /// the client RC4 keystream and increments the client sequence number.
-    pub fn sign(&mut self, data: &[u8]) -> [u8; 16] {
-        let mut sig_input = Vec::with_capacity(4 + data.len());
-        sig_input.extend_from_slice(&self.client_seq_num.to_le_bytes());
-        sig_input.extend_from_slice(data);
-        let checksum = hmac_md5(&self.client_sign_key, &sig_input);
-        let mut checksum_8 = [0u8; 8];
-        checksum_8.copy_from_slice(&checksum[..8]);
-        // KEY_EXCH path: encrypt the checksum with the client RC4 stream.
-        self.client_seal_handle.process(&mut checksum_8);
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::seal`].
+    ///
+    /// Compiled for tests and the `__internal` fuzz surface only: the client
+    /// signs through [`Self::seal`] and [`Self::sign_mech_list_mic`].
+    #[cfg(any(test, feature = "__internal"))]
+    pub(crate) fn sign(&mut self, data: &[u8]) -> Result<[u8; 16], NtlmError> {
+        self.guarded(|s| s.sign_live(data))
+    }
 
-        let mut sig = [0u8; 16];
-        sig[0..4].copy_from_slice(&1u32.to_le_bytes());
-        sig[4..12].copy_from_slice(&checksum_8);
-        sig[12..16].copy_from_slice(&self.client_seq_num.to_le_bytes());
-        self.client_seq_num += 1;
-        sig
+    /// [`Self::sign`] on a session already checked live.
+    #[cfg(any(test, feature = "credssp", feature = "__internal"))]
+    fn sign_live(&mut self, data: &[u8]) -> Result<[u8; 16], NtlmError> {
+        let seq = self.client_seq_num.ok_or_else(|| invalid(SEQ_EXHAUSTED))?;
+        let mac = hmac_md5_parts(&self.client_sign_key, &[&seq.to_le_bytes(), data]);
+        let mut checksum = checksum_head(&mac);
+        // KEY_EXCH path: encrypt the checksum with the client RC4 stream.
+        self.client_seal_handle.process(&mut checksum);
+        self.client_seq_num = seq.checked_add(1);
+        Ok(signature(&checksum, seq))
     }
 
     /// Sign the SPNEGO mech_type_list for the `mechListMIC` of the final
-    /// NegTokenResp, then re-initialise the client RC4 sealing handle.
+    /// NegTokenResp, then re-initialise the client RC4 sealing handle when
+    /// this was the first client operation.
     ///
     /// Windows SPNEGO computes the mechListMIC with GSS_GetMIC — which
     /// consumes 8 bytes of RC4 keystream and one sequence number — and then
@@ -203,10 +314,27 @@ impl NtlmSession {
     /// CredSSP depends on this: a pubKeyAuth sealed at keystream offset 8
     /// decrypts to garbage on the server, which drops the context and
     /// answers a bare 401 without any TSRequest.
-    pub fn sign_mech_list_mic(&mut self, mech_type_list: &[u8]) -> [u8; 16] {
-        let sig = self.sign(mech_type_list);
-        self.client_seal_handle = Rc4State::new(&self.client_seal_key);
-        sig
+    ///
+    /// Call it first and once. Called after another client operation, it
+    /// signs without the reset, so the keystream is not rewound over bytes
+    /// already sent.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::seal`].
+    #[cfg(any(test, feature = "credssp", feature = "__internal"))]
+    pub(crate) fn sign_mech_list_mic(
+        &mut self,
+        mech_type_list: &[u8],
+    ) -> Result<[u8; 16], NtlmError> {
+        self.guarded(|s| {
+            let first = s.client_seq_num == Some(0);
+            let sig = s.sign_live(mech_type_list)?;
+            if first {
+                s.client_seal_handle.reinit(&s.client_seal_key);
+            }
+            Ok(sig)
+        })
     }
 
     /// Verify the server's SPNEGO `mechListMIC` over `mech_type_list`, then
@@ -216,56 +344,50 @@ impl NtlmSession {
     /// signs with its seq 0 and resets its sealing state, so its next sealed
     /// message (the CredSSP pubKeyAuth echo) is at seq 1, keystream offset 0.
     ///
+    /// Unlike [`Self::sign_mech_list_mic`], which resets the client keystream
+    /// only when it is the first client operation, this always resets the
+    /// server keystream after a valid MIC.
+    ///
     /// # Errors
     ///
     /// Returns [`NtlmError::InvalidMessage`] if the MIC is not 16 bytes, has
     /// a version other than 1, carries an unexpected sequence number, or its
-    /// checksum does not match. The session must not be used after an error.
-    pub fn verify_mech_list_mic(
+    /// checksum does not match, and on a poisoned session. Any error poisons
+    /// the session.
+    #[cfg(any(test, feature = "credssp", feature = "__internal"))]
+    pub(crate) fn verify_mech_list_mic(
         &mut self,
         mech_type_list: &[u8],
         mic: &[u8],
     ) -> Result<(), NtlmError> {
-        if mic.len() != 16 {
-            return Err(NtlmError::InvalidMessage(
-                "mechListMIC must be 16 bytes".into(),
-            ));
-        }
-        let version = u32::from_le_bytes([mic[0], mic[1], mic[2], mic[3]]);
-        if version != 1 {
-            return Err(NtlmError::InvalidMessage(
-                "mechListMIC bad signature version".into(),
-            ));
-        }
-        let sig_seq = u32::from_le_bytes([mic[12], mic[13], mic[14], mic[15]]);
-        if sig_seq != self.server_seq_num {
-            return Err(NtlmError::InvalidMessage(
-                "mechListMIC sequence number mismatch".into(),
-            ));
-        }
+        self.guarded(|s| {
+            let (version, received, sig_seq) =
+                parse_signature(mic).ok_or_else(|| invalid("mechListMIC must be 16 bytes"))?;
+            if version != SIGNATURE_VERSION {
+                return Err(invalid("mechListMIC bad signature version"));
+            }
+            let seq = s.server_seq_num.ok_or_else(|| invalid(SEQ_EXHAUSTED))?;
+            if sig_seq != seq {
+                return Err(invalid("mechListMIC sequence number mismatch"));
+            }
 
-        // Expected checksum: RC4(server handle, HMAC_MD5(server sign key,
-        // seq || data)[0..8]). RC4 is symmetric, so encrypting our expected
-        // value and comparing against the received (encrypted) checksum is
-        // equivalent to decrypting theirs.
-        let mut sig_input = Vec::with_capacity(4 + mech_type_list.len());
-        sig_input.extend_from_slice(&self.server_seq_num.to_le_bytes());
-        sig_input.extend_from_slice(mech_type_list);
-        let checksum = hmac_md5(&self.server_sign_key, &sig_input);
-        let mut expected = [0u8; 8];
-        expected.copy_from_slice(&checksum[..8]);
-        self.server_seal_handle.process(&mut expected);
+            // Expected checksum: RC4(server handle, HMAC_MD5(server sign key,
+            // seq || data)[0..8]). RC4 is symmetric, so encrypting our expected
+            // value and comparing against the received (encrypted) checksum is
+            // equivalent to decrypting theirs.
+            let mac = hmac_md5_parts(&s.server_sign_key, &[&seq.to_le_bytes(), mech_type_list]);
+            let mut expected = checksum_head(&mac);
+            s.server_seal_handle.process(&mut expected);
 
-        use subtle::ConstantTimeEq;
-        if expected.ct_eq(&mic[4..12]).unwrap_u8() == 0 {
-            return Err(NtlmError::InvalidMessage(
-                "mechListMIC checksum mismatch".into(),
-            ));
-        }
+            use subtle::ConstantTimeEq;
+            if expected.ct_eq(&received).unwrap_u8() == 0 {
+                return Err(invalid("mechListMIC checksum mismatch"));
+            }
 
-        self.server_seq_num += 1;
-        self.server_seal_handle = Rc4State::new(&self.server_seal_key);
-        Ok(())
+            s.server_seq_num = seq.checked_add(1);
+            s.server_seal_handle.reinit(&s.server_seal_key);
+            Ok(())
+        })
     }
 
     /// Unseal (decrypt + verify) a message received from the server.
@@ -281,52 +403,49 @@ impl NtlmSession {
     /// - The signature version is not 1
     /// - The sequence number does not match the expected value
     /// - The HMAC-MD5 checksum does not match the expected value
-    pub fn unseal(&mut self, sealed: &[u8]) -> Result<Vec<u8>, NtlmError> {
-        if sealed.len() < 16 {
-            return Err(NtlmError::InvalidMessage("sealed message too short".into()));
-        }
+    /// - The session is poisoned
+    ///
+    /// Any error poisons the session.
+    pub(crate) fn unseal(&mut self, sealed: &[u8]) -> Result<Vec<u8>, NtlmError> {
+        self.guarded(|s| {
+            let (sig, ciphertext) = sealed
+                .split_at_checked(SIGNATURE_LEN)
+                .ok_or_else(|| invalid("sealed message too short"))?;
+            let (version, mut sig_checksum, sig_seq) =
+                parse_signature(sig).ok_or_else(|| invalid("sealed message too short"))?;
 
-        let signature = &sealed[..16];
-        let ciphertext = &sealed[16..];
+            // Verify signature version (unencrypted field)
+            if version != SIGNATURE_VERSION {
+                return Err(invalid("bad signature version"));
+            }
 
-        // Verify signature version (unencrypted field)
-        let version = u32::from_le_bytes([signature[0], signature[1], signature[2], signature[3]]);
-        if version != 1 {
-            return Err(NtlmError::InvalidMessage("bad signature version".into()));
-        }
+            // Verify sequence number (unencrypted field)
+            let seq = s.server_seq_num.ok_or_else(|| invalid(SEQ_EXHAUSTED))?;
+            if sig_seq != seq {
+                return Err(invalid("sequence number mismatch"));
+            }
 
-        // Verify sequence number (unencrypted field)
-        let sig_seq =
-            u32::from_le_bytes([signature[12], signature[13], signature[14], signature[15]]);
-        if sig_seq != self.server_seq_num {
-            return Err(NtlmError::InvalidMessage("sequence number mismatch".into()));
-        }
+            // Decrypt payload first (matches seal order: rc4(plaintext) then rc4(checksum)).
+            let mut plaintext = ciphertext.to_vec();
+            s.server_seal_handle.process(&mut plaintext);
 
-        // Decrypt payload first (matches seal order: rc4(plaintext) then rc4(checksum)).
-        let mut plaintext = ciphertext.to_vec();
-        self.server_seal_handle.process(&mut plaintext);
+            // Then decrypt the checksum.
+            s.server_seal_handle.process(&mut sig_checksum);
 
-        // Then decrypt the checksum.
-        let mut sig_checksum = [0u8; 8];
-        sig_checksum.copy_from_slice(&signature[4..12]);
-        self.server_seal_handle.process(&mut sig_checksum);
+            // Verify HMAC-MD5 checksum against decrypted plaintext.
+            //
+            // Use a constant-time comparison so the time taken to detect a
+            // mismatch does not leak how many leading bytes of the checksum
+            // are correct. Defence-in-depth against timing oracles.
+            use subtle::ConstantTimeEq;
+            let mac = hmac_md5_parts(&s.server_sign_key, &[&seq.to_le_bytes(), &plaintext]);
+            if sig_checksum.ct_eq(&checksum_head(&mac)).unwrap_u8() == 0 {
+                return Err(invalid("checksum mismatch"));
+            }
 
-        // Verify HMAC-MD5 checksum against decrypted plaintext.
-        //
-        // Use a constant-time comparison so the time taken to detect a
-        // mismatch does not leak how many leading bytes of the checksum
-        // are correct. Defence-in-depth against timing oracles.
-        use subtle::ConstantTimeEq;
-        let mut expected_sig_input = Vec::with_capacity(4 + plaintext.len());
-        expected_sig_input.extend_from_slice(&self.server_seq_num.to_le_bytes());
-        expected_sig_input.extend_from_slice(&plaintext);
-        let expected_checksum = hmac_md5(&self.server_sign_key, &expected_sig_input);
-        if sig_checksum.ct_eq(&expected_checksum[..8]).unwrap_u8() == 0 {
-            return Err(NtlmError::InvalidMessage("checksum mismatch".into()));
-        }
-
-        self.server_seq_num += 1;
-        Ok(plaintext)
+            s.server_seq_num = seq.checked_add(1);
+            Ok(plaintext)
+        })
     }
 }
 
@@ -335,14 +454,140 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sign_mech_list_mic_after_seal_does_not_reset_keystream() {
+        let key = [0x42; 16];
+        let mut with_mic = SealingSession::boxed_from_auth(&key);
+        let mut plain = SealingSession::boxed_from_auth(&key);
+        with_mic.seal(b"A").unwrap();
+        plain.seal(b"A").unwrap();
+        assert_eq!(
+            with_mic.sign_mech_list_mic(b"mechs").unwrap(),
+            plain.sign(b"mechs").unwrap()
+        );
+        assert_eq!(
+            with_mic.seal(b"B").unwrap(),
+            plain.seal(b"B").unwrap(),
+            "a MIC signed after the first client operation must not reset the keystream"
+        );
+    }
+
+    #[test]
+    fn sign_mech_list_mic_first_still_resets() {
+        let key = [0x42; 16];
+        let mut client = SealingSession::boxed_from_auth(&key);
+        let mut server = SealingSession::server_side(&key);
+        let mic = client.sign_mech_list_mic(b"mechs").unwrap();
+        server.verify_mech_list_mic(b"mechs", &mic).unwrap();
+        let sealed = client.seal(b"pubKeyAuth").unwrap();
+        assert_eq!(u32::from_le_bytes(sealed[12..16].try_into().unwrap()), 1);
+        assert_eq!(
+            server.unseal(&sealed).unwrap(),
+            b"pubKeyAuth",
+            "offset 0 on both sides"
+        );
+    }
+
+    #[test]
+    fn unseal_after_a_failed_unseal_is_refused() {
+        let key = [0x42; 16];
+        let mut client = SealingSession::boxed_from_auth(&key);
+        let mut server = SealingSession::server_side(&key);
+        let good = server.seal(b"first").unwrap();
+        let mut bad_version = good.clone();
+        bad_version[0] = 2; // rejected before any keystream is used
+        assert!(client.unseal(&bad_version).is_err());
+        assert!(
+            client.unseal(&good).is_err(),
+            "a session that failed an unseal stays failed"
+        );
+    }
+
+    #[test]
+    fn internal_session_refuses_sequence_exhaustion() {
+        let mut s = SealingSession::boxed_from_auth(&[0x42; 16]);
+        s.set_client_seq_num(u32::MAX);
+        let last = s.seal(b"last").unwrap();
+        assert_eq!(
+            u32::from_le_bytes(last[12..16].try_into().unwrap()),
+            u32::MAX
+        );
+        let err = s.seal(b"one too many").unwrap_err();
+        assert!(matches!(err, NtlmError::InvalidMessage(ref m) if m.contains("exhausted")));
+        assert!(
+            s.sign(b"after").is_err(),
+            "an exhausted session stays poisoned"
+        );
+    }
+
+    #[test]
+    fn unseal_after_a_failed_mech_list_mic_is_refused() {
+        let key = [0x42; 16];
+        let mut client = SealingSession::boxed_from_auth(&key);
+        let mut server = SealingSession::server_side(&key);
+        let mut mic = server.sign_mech_list_mic(b"mechs").unwrap();
+        mic[0] = 2; // rejected before any keystream is used
+        assert!(client.verify_mech_list_mic(b"mechs", &mic).is_err());
+        // Seq 0 at keystream offset 0: what the client would still accept,
+        // were the session not poisoned.
+        let good = SealingSession::server_side(&key).seal(b"first").unwrap();
+        let err = client.unseal(&good).unwrap_err();
+        assert!(
+            matches!(err, NtlmError::InvalidMessage(ref m) if m.contains("unusable")),
+            "a session that failed a mechListMIC stays failed: {err}"
+        );
+    }
+
+    #[test]
+    fn unseal_refuses_server_sequence_exhaustion() {
+        let key = [0x42; 16];
+        let mut client = SealingSession::boxed_from_auth(&key);
+        let mut server = SealingSession::server_side(&key);
+        server.set_client_seq_num(u32::MAX);
+        client.set_server_seq_num(u32::MAX);
+        let last = server.seal(b"last").unwrap();
+        assert_eq!(client.unseal(&last).unwrap(), b"last", "seq u32::MAX");
+        let err = client.unseal(&last).unwrap_err();
+        assert!(matches!(err, NtlmError::InvalidMessage(ref m) if m.contains("exhausted")));
+        assert!(
+            client.seal(b"to server").is_err(),
+            "server-side exhaustion poisons the whole session"
+        );
+    }
+
+    #[test]
+    fn verify_mech_list_mic_refuses_server_sequence_exhaustion() {
+        let key = [0x42; 16];
+        let mut client = SealingSession::boxed_from_auth(&key);
+        let mut server = SealingSession::server_side(&key);
+        server.set_client_seq_num(u32::MAX);
+        client.set_server_seq_num(u32::MAX);
+        let mic = server.sign_mech_list_mic(b"mechs").unwrap();
+        client.verify_mech_list_mic(b"mechs", &mic).unwrap();
+        let err = client.verify_mech_list_mic(b"mechs", &mic).unwrap_err();
+        assert!(matches!(err, NtlmError::InvalidMessage(ref m) if m.contains("exhausted")));
+        assert!(
+            client.sign(b"to server").is_err(),
+            "server-side exhaustion poisons the whole session"
+        );
+    }
+
+    #[test]
+    fn boxed_session_matches_by_value_session() {
+        let key = [0x42; 16];
+        let mut boxed = SealingSession::boxed_from_auth(&key);
+        let mut by_val = SealingSession::from_auth(&key);
+        assert_eq!(boxed.seal(b"ping").unwrap(), by_val.seal(b"ping").unwrap());
+    }
+
+    #[test]
     fn server_side_session_mirrors_the_client_session() {
         let key = [0x42; 16];
-        let mut client = NtlmSession::from_auth(&key);
-        let mut server = NtlmSession::server_side(&key);
+        let mut client = SealingSession::boxed_from_auth(&key);
+        let mut server = SealingSession::server_side(&key);
         for i in 0..2u8 {
-            let to_server = client.seal(&[b'c', i]);
+            let to_server = client.seal(&[b'c', i]).unwrap();
             assert_eq!(server.unseal(&to_server).unwrap(), [b'c', i]);
-            let to_client = server.seal(&[b's', i]);
+            let to_client = server.seal(&[b's', i]).unwrap();
             assert_eq!(client.unseal(&to_client).unwrap(), [b's', i]);
         }
     }
@@ -384,19 +629,24 @@ mod tests {
             0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
             0x1e, 0x1f,
         ];
-        let cli_seal = NtlmSession::derive_key(
+        let derive = |key: &[u8; 16], magic: &[u8]| {
+            let mut out = [0u8; 16];
+            SealingSession::derive_key_into(&mut out, key, magic);
+            out
+        };
+        let cli_seal = derive(
             &key,
             b"session key to client-to-server sealing key magic constant\0",
         );
-        let srv_seal = NtlmSession::derive_key(
+        let srv_seal = derive(
             &key,
             b"session key to server-to-client sealing key magic constant\0",
         );
-        let cli_sign = NtlmSession::derive_key(
+        let cli_sign = derive(
             &key,
             b"session key to client-to-server signing key magic constant\0",
         );
-        let srv_sign = NtlmSession::derive_key(
+        let srv_sign = derive(
             &key,
             b"session key to server-to-client signing key magic constant\0",
         );
@@ -429,9 +679,9 @@ mod tests {
             0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
             0x1e, 0x1f,
         ];
-        let mut s = NtlmSession::from_auth(&key);
+        let mut s = SealingSession::boxed_from_auth(&key);
         let mech = unhex("300c060a2b06010401823702020a");
-        let sig = s.sign(&mech);
+        let sig = s.sign(&mech).unwrap();
         assert_eq!(
             sig.to_vec(),
             unhex("0100000002f81117bb3953f700000000"),
@@ -458,11 +708,11 @@ mod tests {
 
     #[test]
     fn sign_mech_list_mic_then_seal_matches_pyspnego() {
-        let mut s = NtlmSession::from_auth(&VECTOR_KEY);
-        let mic = s.sign_mech_list_mic(MECH_LIST_NTLM);
+        let mut s = SealingSession::boxed_from_auth(&VECTOR_KEY);
+        let mic = s.sign_mech_list_mic(MECH_LIST_NTLM).unwrap();
         assert_eq!(mic.to_vec(), unhex("0100000002f81117bb3953f700000000"));
         let client_hash = unhex("f976d979417938eaa4cf8078ddda0e268deed123e5bf944763a0a2202dad3952");
-        let sealed = s.seal(&client_hash);
+        let sealed = s.seal(&client_hash).unwrap();
         assert_eq!(
             sealed,
             unhex(
@@ -474,7 +724,7 @@ mod tests {
 
     #[test]
     fn verify_mech_list_mic_then_unseal_matches_pyspnego() {
-        let mut s = NtlmSession::from_auth(&VECTOR_KEY);
+        let mut s = SealingSession::boxed_from_auth(&VECTOR_KEY);
         s.verify_mech_list_mic(MECH_LIST_NTLM, &unhex(SERVER_MIC))
             .expect("server mechListMIC");
         let sealed = unhex(
@@ -488,7 +738,7 @@ mod tests {
     fn unseal_after_verify_rejects_non_reset_peer() {
         // Same server sealing but WITHOUT the RC4 reset — what a peer that
         // keeps the keystream running would produce. Must fail the checksum.
-        let mut s = NtlmSession::from_auth(&VECTOR_KEY);
+        let mut s = SealingSession::boxed_from_auth(&VECTOR_KEY);
         s.verify_mech_list_mic(MECH_LIST_NTLM, &unhex(SERVER_MIC))
             .unwrap();
         let noreset = unhex(
@@ -499,7 +749,7 @@ mod tests {
 
     #[test]
     fn verify_mech_list_mic_rejects_tampered_checksum() {
-        let mut s = NtlmSession::from_auth(&VECTOR_KEY);
+        let mut s = SealingSession::boxed_from_auth(&VECTOR_KEY);
         let mut mic = unhex(SERVER_MIC);
         mic[5] ^= 0x01;
         assert!(s.verify_mech_list_mic(MECH_LIST_NTLM, &mic).is_err());
@@ -507,7 +757,7 @@ mod tests {
 
     #[test]
     fn verify_mech_list_mic_rejects_wrong_seq() {
-        let mut s = NtlmSession::from_auth(&VECTOR_KEY);
+        let mut s = SealingSession::boxed_from_auth(&VECTOR_KEY);
         let mut mic = unhex(SERVER_MIC);
         mic[12] = 1; // seq 1, expected 0
         assert!(s.verify_mech_list_mic(MECH_LIST_NTLM, &mic).is_err());
@@ -515,11 +765,11 @@ mod tests {
 
     #[test]
     fn verify_mech_list_mic_rejects_bad_version_and_length() {
-        let mut s = NtlmSession::from_auth(&VECTOR_KEY);
+        let mut s = SealingSession::boxed_from_auth(&VECTOR_KEY);
         let mut mic = unhex(SERVER_MIC);
         mic[0] = 2;
         assert!(s.verify_mech_list_mic(MECH_LIST_NTLM, &mic).is_err());
-        let mut s = NtlmSession::from_auth(&VECTOR_KEY);
+        let mut s = SealingSession::boxed_from_auth(&VECTOR_KEY);
         assert!(
             s.verify_mech_list_mic(MECH_LIST_NTLM, &unhex(SERVER_MIC)[..15])
                 .is_err()
@@ -532,9 +782,9 @@ mod tests {
             0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
             0x1e, 0x1f,
         ];
-        let mut session = NtlmSession::from_auth(&key);
+        let mut session = SealingSession::boxed_from_auth(&key);
         let plaintext: Vec<u8> = (0u8..32).collect();
-        let sealed = session.seal(&plaintext);
+        let sealed = session.seal(&plaintext).unwrap();
         let expected = unhex(
             "010000000f62d40713d158d4000000001b23173031109ef42a884e223417c37909fada44f3180048ab67dc2d64ea9c41",
         );
@@ -548,9 +798,9 @@ mod tests {
             0x0F, 0x10,
         ];
 
-        let mut session = NtlmSession::from_auth(&session_key);
+        let mut session = SealingSession::boxed_from_auth(&session_key);
         let plaintext = b"Hello, WinRM! This is a test SOAP message.";
-        let sealed = session.seal(plaintext);
+        let sealed = session.seal(plaintext).unwrap();
 
         assert_eq!(sealed.len(), 16 + plaintext.len());
 
@@ -566,10 +816,10 @@ mod tests {
     #[test]
     fn ntlm_session_seal_increments_sequence() {
         let session_key: [u8; 16] = [0xAA; 16];
-        let mut session = NtlmSession::from_auth(&session_key);
+        let mut session = SealingSession::boxed_from_auth(&session_key);
 
-        let sealed1 = session.seal(b"message 1");
-        let sealed2 = session.seal(b"message 2");
+        let sealed1 = session.seal(b"message 1").unwrap();
+        let sealed2 = session.seal(b"message 2").unwrap();
 
         let seq1 = u32::from_le_bytes(sealed1[12..16].try_into().unwrap());
         let seq2 = u32::from_le_bytes(sealed2[12..16].try_into().unwrap());
@@ -580,7 +830,7 @@ mod tests {
     #[test]
     fn ntlm_session_unseal_too_short() {
         let session_key: [u8; 16] = [0xBB; 16];
-        let mut session = NtlmSession::from_auth(&session_key);
+        let mut session = SealingSession::boxed_from_auth(&session_key);
         let result = session.unseal(&[0u8; 10]);
         assert!(result.is_err());
         let err = format!("{}", result.unwrap_err());
@@ -590,7 +840,7 @@ mod tests {
     #[test]
     fn ntlm_session_unseal_bad_version() {
         let session_key: [u8; 16] = [0xCC; 16];
-        let mut session = NtlmSession::from_auth(&session_key);
+        let mut session = SealingSession::boxed_from_auth(&session_key);
         let mut fake = vec![0u8; 32];
         fake[0..4].copy_from_slice(&2u32.to_le_bytes());
         fake[12..16].copy_from_slice(&0u32.to_le_bytes());
@@ -603,7 +853,7 @@ mod tests {
     #[test]
     fn ntlm_session_unseal_bad_sequence() {
         let session_key: [u8; 16] = [0xDD; 16];
-        let mut session = NtlmSession::from_auth(&session_key);
+        let mut session = SealingSession::boxed_from_auth(&session_key);
         let mut fake = vec![0u8; 32];
         fake[0..4].copy_from_slice(&1u32.to_le_bytes());
         fake[12..16].copy_from_slice(&99u32.to_le_bytes());
@@ -620,16 +870,16 @@ mod tests {
             0xF0, 0x00,
         ];
 
-        let mut client = NtlmSession::from_auth(&session_key);
+        let mut client = SealingSession::boxed_from_auth(&session_key);
         let plaintext = b"SOAP envelope data for WinRM";
-        let sealed = client.seal(plaintext);
+        let sealed = client.seal(plaintext).unwrap();
 
         assert!(sealed.len() > 16);
         let version = u32::from_le_bytes(sealed[0..4].try_into().unwrap());
         assert_eq!(version, 1);
 
-        let mut client2 = NtlmSession::from_auth(&session_key);
-        let sealed2 = client2.seal(plaintext);
+        let mut client2 = SealingSession::boxed_from_auth(&session_key);
+        let sealed2 = client2.seal(plaintext).unwrap();
         assert_eq!(sealed, sealed2);
     }
 
@@ -642,7 +892,7 @@ mod tests {
         // For simplicity, test that an invalid checksum on a 16-byte message
         // is now correctly rejected.
         let session_key: [u8; 16] = [0xEE; 16];
-        let mut session = NtlmSession::from_auth(&session_key);
+        let mut session = SealingSession::boxed_from_auth(&session_key);
         let mut msg = vec![0u8; 16];
         msg[0..4].copy_from_slice(&1u32.to_le_bytes());
         msg[12..16].copy_from_slice(&0u32.to_le_bytes());
@@ -656,25 +906,25 @@ mod tests {
     fn ntlm_session_derive_key_is_deterministic() {
         let key1 = [0x42u8; 16];
         let key2 = [0x42u8; 16];
-        let mut s1 = NtlmSession::from_auth(&key1);
-        let mut s2 = NtlmSession::from_auth(&key2);
+        let mut s1 = SealingSession::boxed_from_auth(&key1);
+        let mut s2 = SealingSession::boxed_from_auth(&key2);
 
-        let sealed1 = s1.seal(b"test");
-        let sealed2 = s2.seal(b"test");
+        let sealed1 = s1.seal(b"test").unwrap();
+        let sealed2 = s2.seal(b"test").unwrap();
         assert_eq!(
             sealed1, sealed2,
             "same key must produce identical sealed output"
         );
 
-        let mut s3 = NtlmSession::from_auth(&[0u8; 16]);
-        let sealed3 = s3.seal(b"test");
+        let mut s3 = SealingSession::boxed_from_auth(&[0u8; 16]);
+        let sealed3 = s3.seal(b"test").unwrap();
         assert_ne!(
             sealed1, sealed3,
             "different keys must produce different sealed output"
         );
 
-        let mut s4 = NtlmSession::from_auth(&[1u8; 16]);
-        let sealed4 = s4.seal(b"test");
+        let mut s4 = SealingSession::boxed_from_auth(&[1u8; 16]);
+        let sealed4 = s4.seal(b"test").unwrap();
         assert_ne!(
             sealed1, sealed4,
             "different keys must produce different sealed output"
@@ -684,10 +934,10 @@ mod tests {
     #[test]
     fn ntlm_session_multiple_seal_sequence_numbers() {
         let key = [0xAA; 16];
-        let mut sealer = NtlmSession::from_auth(&key);
+        let mut sealer = SealingSession::boxed_from_auth(&key);
 
-        let msg1 = sealer.seal(b"first");
-        let msg2 = sealer.seal(b"second");
+        let msg1 = sealer.seal(b"first").unwrap();
+        let msg2 = sealer.seal(b"second").unwrap();
 
         let seq1 = u32::from_le_bytes(msg1[12..16].try_into().unwrap());
         let seq2 = u32::from_le_bytes(msg2[12..16].try_into().unwrap());
@@ -698,7 +948,7 @@ mod tests {
     #[test]
     fn ntlm_session_unseal_rejects_stale_sequence() {
         let key = [0xAA; 16];
-        let mut session = NtlmSession::from_auth(&key);
+        let mut session = SealingSession::boxed_from_auth(&key);
         // Fake message with seq_num=99 (expected 0)
         let mut fake = vec![0u8; 20];
         fake[0..4].copy_from_slice(&1u32.to_le_bytes());
@@ -710,7 +960,7 @@ mod tests {
     #[test]
     fn ntlm_session_unseal_rejects_tampered_checksum() {
         let key = [0xBB; 16];
-        let mut session = NtlmSession::from_auth(&key);
+        let mut session = SealingSession::boxed_from_auth(&key);
         // Fake message with valid version and seq_num but wrong checksum
         let mut fake = vec![0u8; 32];
         fake[0..4].copy_from_slice(&1u32.to_le_bytes());
@@ -728,9 +978,9 @@ mod tests {
     #[test]
     fn sign_increments_sequence_number() {
         let key = [0xDD; 16];
-        let mut session = NtlmSession::from_auth(&key);
-        let sig1 = session.sign(b"msg1");
-        let sig2 = session.sign(b"msg1"); // same data, different seq
+        let mut session = SealingSession::boxed_from_auth(&key);
+        let sig1 = session.sign(b"msg1").unwrap();
+        let sig2 = session.sign(b"msg1").unwrap(); // same data, different seq
         let seq1 = u32::from_le_bytes(sig1[12..16].try_into().unwrap());
         let seq2 = u32::from_le_bytes(sig2[12..16].try_into().unwrap());
         assert_eq!(seq1, 0);

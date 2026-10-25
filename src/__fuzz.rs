@@ -18,6 +18,9 @@ use crate::error::{NtlmError, SoapError, WinrmError};
 
 pub use crate::ntlm::messages::ChallengeMessage;
 
+/// Type 2 flag bits a Type 3 never repeats.
+pub const TYPE3_NEVER_ECHO: u32 = crate::ntlm::crypto::TYPE3_NEVER_ECHO;
+
 /// Parse a raw NTLM Type 2 (Challenge) message.
 pub fn parse_challenge(data: &[u8]) -> Result<ChallengeMessage, NtlmError> {
     crate::ntlm::messages::parse_challenge(data)
@@ -44,29 +47,63 @@ pub fn create_authenticate_message(
     username: &str,
     password: &str,
     domain: &str,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, NtlmError> {
     crate::ntlm::messages::create_authenticate_message(challenge, username, password, domain)
 }
 
-/// Build a Type 3 with a channel binding token; also returns the session key.
+/// Build the Type 3 of the HTTP and HTTPS handshakes (MIC, `MsvAvFlags`,
+/// target name, zero LM; the channel binding when given); also returns the
+/// session key.
+#[allow(clippy::too_many_arguments, reason = "mirrors the wrapped builder")]
+pub fn create_authenticate_message_http(
+    challenge: &ChallengeMessage,
+    username: &str,
+    password: &str,
+    domain: &str,
+    type1: &[u8],
+    type2: &[u8],
+    target_name: &str,
+    channel_bindings: Option<[u8; 16]>,
+) -> Result<(Vec<u8>, [u8; 16]), NtlmError> {
+    crate::ntlm::messages::create_authenticate_message_http(
+        challenge,
+        username,
+        password,
+        domain,
+        type1,
+        type2,
+        target_name,
+        channel_bindings,
+        crate::ntlm::workstation(),
+    )
+    .map(|(msg, key)| (msg, *key))
+}
+
+/// Build a Type 3 with a channel binding token and no MIC; also returns the
+/// session key. No transport sends this shape any more; kept so the
+/// `TargetInfo` builder stays reachable with a channel binding and no MIC.
 pub fn create_authenticate_message_with_cbt_and_key(
     challenge: &ChallengeMessage,
     username: &str,
     password: &str,
     domain: &str,
     channel_bindings: [u8; 16],
-) -> (Vec<u8>, [u8; 16]) {
-    let (msg, key) = crate::ntlm::messages::create_authenticate_message_with_cbt_and_key(
+) -> Result<(Vec<u8>, [u8; 16]), NtlmError> {
+    crate::ntlm::messages::create_authenticate_message_internal(
         challenge,
         username,
         password,
         domain,
-        channel_bindings,
-    );
-    (msg, *key)
+        Some(channel_bindings),
+        None,
+        None,
+        &[],
+    )
+    .map(|(msg, key)| (msg, *key))
 }
 
-/// Build a Type 3 with a MIC over Type1 || Type2 || Type3.
+/// Build a Type 3 with a MIC over Type1 || Type2 || Type3: the plain-HTTP
+/// shape, [`create_authenticate_message_http`] without a channel binding.
 pub fn create_authenticate_message_with_key_and_mic(
     challenge: &ChallengeMessage,
     username: &str,
@@ -75,8 +112,8 @@ pub fn create_authenticate_message_with_key_and_mic(
     type1: &[u8],
     type2: &[u8],
     target_name: &str,
-) -> (Vec<u8>, [u8; 16]) {
-    let (msg, key) = crate::ntlm::messages::create_authenticate_message_with_key_and_mic(
+) -> Result<(Vec<u8>, [u8; 16]), NtlmError> {
+    create_authenticate_message_http(
         challenge,
         username,
         password,
@@ -84,8 +121,8 @@ pub fn create_authenticate_message_with_key_and_mic(
         type1,
         type2,
         target_name,
-    );
-    (msg, *key)
+        None,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -109,12 +146,12 @@ pub fn to_utf16le(s: &str) -> Vec<u8> {
 
 /// NTOWFv1: MD4 of the UTF-16-LE password.
 pub fn compute_nt_hash(password: &str) -> [u8; 16] {
-    crate::ntlm::crypto::compute_nt_hash(password)
+    *crate::ntlm::crypto::compute_nt_hash(password)
 }
 
 /// NTOWFv2: HMAC-MD5 over uppercased user + domain.
 pub fn compute_ntlmv2_hash(nt_hash: &[u8; 16], username: &str, domain: &str) -> [u8; 16] {
-    crate::ntlm::crypto::compute_ntlmv2_hash(nt_hash, username, domain)
+    *crate::ntlm::crypto::compute_ntlmv2_hash(nt_hash, username, domain)
 }
 
 /// Build the NTLMv2 client blob (MS-NLMP 3.3.2).
@@ -149,15 +186,70 @@ pub fn rc4_process(key: &[u8], data: &mut [u8]) {
 /// Unseal a multipart/encrypted WinRM response with the client session of
 /// `key` (`auth/ntlm.rs::unseal_body`).
 pub fn unseal_body(key: &[u8; 16], data: &[u8]) -> Result<String, WinrmError> {
-    let mut session = crate::ntlm::NtlmSession::from_auth(key);
+    let mut session = crate::ntlm::SealingSession::boxed_from_auth(key);
     crate::auth::ntlm::unseal_body(&mut session, data)
 }
 
 /// A response sealed by the server side of the session of `key`, framed as
 /// Windows frames it (`auth/ntlm.rs::seal_body` with server keys).
+///
+/// A fresh session cannot fail to seal; were it to, the empty frame would
+/// fail every unseal of it.
 pub fn seal_body_as_server(key: &[u8; 16], plaintext: &str) -> Vec<u8> {
-    let mut server = crate::ntlm::NtlmSession::server_side(key);
-    crate::auth::ntlm::seal_body(&mut server, plaintext).1
+    let mut server = crate::ntlm::SealingSession::server_side(key);
+    crate::auth::ntlm::seal_body(&mut server, plaintext)
+        .map(|(_, body)| body)
+        .unwrap_or_default()
+}
+
+/// The crate's NTLM sealing session (`ntlm::SealingSession`), client side.
+pub struct SealingSession {
+    inner: Box<crate::ntlm::SealingSession>,
+}
+
+impl SealingSession {
+    /// The client session of the exported session key `key`.
+    pub fn from_auth(key: &[u8; 16]) -> Self {
+        Self {
+            inner: crate::ntlm::SealingSession::boxed_from_auth(key),
+        }
+    }
+
+    /// The server side of the same session.
+    pub fn server_side(key: &[u8; 16]) -> Self {
+        Self {
+            inner: crate::ntlm::SealingSession::server_side(key),
+        }
+    }
+
+    /// Seal `plaintext`: `signature (16 bytes) || ciphertext`.
+    pub fn seal(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, NtlmError> {
+        self.inner.seal(plaintext)
+    }
+
+    /// Sign `data`: a 16-byte signature.
+    pub fn sign(&mut self, data: &[u8]) -> Result<[u8; 16], NtlmError> {
+        self.inner.sign(data)
+    }
+
+    /// Sign the SPNEGO `mechListMIC` (resets the keystream only when first).
+    pub fn sign_mech_list_mic(&mut self, mech_type_list: &[u8]) -> Result<[u8; 16], NtlmError> {
+        self.inner.sign_mech_list_mic(mech_type_list)
+    }
+
+    /// Verify the peer's SPNEGO `mechListMIC`.
+    pub fn verify_mech_list_mic(
+        &mut self,
+        mech_type_list: &[u8],
+        mic: &[u8],
+    ) -> Result<(), NtlmError> {
+        self.inner.verify_mech_list_mic(mech_type_list, mic)
+    }
+
+    /// Unseal (decrypt + verify) a message from the peer.
+    pub fn unseal(&mut self, sealed: &[u8]) -> Result<Vec<u8>, NtlmError> {
+        self.inner.unseal(sealed)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -171,10 +263,15 @@ pub fn kerberos_parse_sealed(data: &[u8]) -> Result<(Vec<u8>, usize), WinrmError
     crate::auth::kerberos::parse_sealed_answer(data).map(|f| (f.sealed.to_vec(), f.length))
 }
 
-/// RFC 4121 checks of a sealed answer's token
-/// (`kerberos::check_acceptor_sealed`).
-pub fn kerberos_check_acceptor_sealed(token: &[u8]) -> Result<(), WinrmError> {
-    crate::auth::kerberos::check_acceptor_sealed(token)
+/// RFC 4121 checks of a sealed answer's token and of its framing
+/// (`kerberos::check_acceptor_sealed`): `token` is the security header then
+/// the data, `length` the announced plaintext length, so any header/data
+/// split can be tried.
+pub fn kerberos_check_acceptor_sealed(token: &[u8], length: usize) -> Result<(), WinrmError> {
+    crate::auth::kerberos::check_acceptor_sealed(&crate::auth::sealed::Frame {
+        sealed: token,
+        length,
+    })
 }
 
 /// `gss_wrap_iov` buffers to the Windows SSPI layout
@@ -323,6 +420,99 @@ pub fn delete_shell_request(
     )
 }
 
+pub fn create_psrp_shell_request(
+    endpoint: &str,
+    config: &crate::config::WinrmConfig,
+    creation_xml_b64: &str,
+    ps_resource_uri: &str,
+    shell_id: &str,
+) -> String {
+    crate::soap::envelope::create_psrp_shell_request(
+        endpoint,
+        config,
+        creation_xml_b64,
+        ps_resource_uri,
+        shell_id,
+    )
+}
+
+#[allow(clippy::too_many_arguments, reason = "mirrors the wrapped builder")]
+pub fn execute_command_with_id_request(
+    endpoint: &str,
+    shell_id: &str,
+    command: &str,
+    args: &[&str],
+    command_id: &str,
+    timeout_secs: u64,
+    max_envelope_size: u32,
+    resource_uri: &str,
+) -> String {
+    crate::soap::envelope::execute_command_with_id_request(
+        endpoint,
+        shell_id,
+        command,
+        args,
+        command_id,
+        timeout_secs,
+        max_envelope_size,
+        resource_uri,
+    )
+}
+
+pub fn receive_psrp_request(
+    endpoint: &str,
+    shell_id: &str,
+    command_id: Option<&str>,
+    timeout_secs: u64,
+    max_envelope_size: u32,
+    resource_uri: &str,
+) -> String {
+    crate::soap::envelope::receive_psrp_request(
+        endpoint,
+        shell_id,
+        command_id,
+        timeout_secs,
+        max_envelope_size,
+        resource_uri,
+    )
+}
+
+pub fn send_psrp_request(
+    endpoint: &str,
+    shell_id: &str,
+    data: &[u8],
+    timeout_secs: u64,
+    max_envelope_size: u32,
+    resource_uri: &str,
+) -> String {
+    crate::soap::envelope::send_psrp_request(
+        endpoint,
+        shell_id,
+        data,
+        timeout_secs,
+        max_envelope_size,
+        resource_uri,
+    )
+}
+
+pub fn signal_psrp_ctrl_c_request(
+    endpoint: &str,
+    shell_id: &str,
+    command_id: &str,
+    resource_uri: &str,
+    timeout_secs: u64,
+    max_envelope_size: u32,
+) -> String {
+    crate::soap::envelope::signal_psrp_ctrl_c_request(
+        endpoint,
+        shell_id,
+        command_id,
+        resource_uri,
+        timeout_secs,
+        max_envelope_size,
+    )
+}
+
 pub fn send_input_request(
     endpoint: &str,
     shell_id: &str,
@@ -396,10 +586,11 @@ pub struct EndpointParts {
     pub has_userinfo: bool,
 }
 
-/// `None` when `validate_host` refuses `input`. Otherwise the host
-/// `sanitize_host` kept, the endpoint URL the transport builds from it, and
-/// that URL as the parser reads it back (`Err` with the parser's message
-/// when it refuses the URL: the request then fails before anything is sent).
+/// `None` when `validate_host` refuses `input`. Otherwise the host (an
+/// accepted input equals its `sanitize_host` form), the endpoint URL the
+/// transport builds from it, and that URL as the parser reads it back (`Err`
+/// with the parser's message when it refuses the URL: the request then fails
+/// before anything is sent).
 pub fn accepted_host_endpoint(
     input: &str,
     use_tls: bool,
@@ -429,9 +620,17 @@ pub fn validate_remote_path(path: &str) -> Result<(), WinrmError> {
     crate::transfer::validate_remote_path(path)
 }
 
+/// `validate_remote_path`, then the restriction `policy` adds.
+pub fn validate_remote_path_for(
+    path: &str,
+    policy: crate::RemotePathPolicy,
+) -> Result<(), WinrmError> {
+    crate::transfer::validate_remote_path_for(path, policy)
+}
+
 /// Escape a value for a PowerShell single-quoted string literal.
 pub fn escape_ps_single_quoted(s: &str) -> String {
-    crate::transfer::escape_ps_single_quoted(s)
+    crate::command::escape_ps_single_quoted(s)
 }
 
 // ---------------------------------------------------------------------------
@@ -479,6 +678,15 @@ pub fn decode_spnego_mech_list_mic(
     crate::asn1::decode_spnego_mech_list_mic(data)
 }
 
+/// Decode the `negState` and `mechListMIC` of a server's final SPNEGO
+/// `NegTokenResp`, rejecting any malformed field.
+#[cfg(feature = "credssp")]
+pub fn decode_spnego_final(
+    data: &[u8],
+) -> Result<(Option<u8>, Option<Vec<u8>>), crate::error::CredSspError> {
+    crate::asn1::decode_spnego_final(data)
+}
+
 /// Wrap an NTLM Type 1 in a SPNEGO `NegTokenInit`.
 #[cfg(feature = "credssp")]
 pub fn encode_spnego_init(ntlm_token: &[u8]) -> Vec<u8> {
@@ -497,6 +705,37 @@ pub fn extract_subject_public_key(cert_der: &[u8]) -> Result<Vec<u8>, crate::err
     crate::asn1::extract_subject_public_key(cert_der)
 }
 
+// ---------------------------------------------------------------------------
+// CredSSP HTTP (`src/auth/credssp.rs`)
+// ---------------------------------------------------------------------------
+
+/// Feed `chunks` one by one to the CredSSP response reader (head cap of the
+/// connection, body cap `max_body`). Returns the status and body of the first
+/// complete final response, `Ok(None)` when the input ends before one, or the
+/// error text.
+#[cfg(feature = "credssp")]
+pub fn credssp_parse_response(
+    chunks: &[&[u8]],
+    max_body: usize,
+) -> Result<Option<(u16, Vec<u8>)>, String> {
+    use crate::auth::credssp::{MAX_RESPONSE_HEAD_BYTES, ResponseReader};
+    let mut reader = ResponseReader::new(MAX_RESPONSE_HEAD_BYTES, max_body);
+    for chunk in chunks {
+        match reader.feed(chunk) {
+            Ok(Some(resp)) => return Ok(Some((resp.status, resp.body))),
+            Ok(None) => {}
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(None)
+}
+
+/// Extract the CredSSP token from a `WWW-Authenticate` value.
+#[cfg(feature = "credssp")]
+pub fn credssp_extract_token(www_auth: &str) -> Option<String> {
+    crate::auth::credssp::extract_credssp_token_str(www_auth)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,6 +747,7 @@ mod tests {
             let Some((accepted, url, parsed)) = accepted_host_endpoint(host, use_tls, 5985) else {
                 continue;
             };
+            assert_eq!(accepted, host, "an accepted host is its sanitized form");
             assert!(!accepted.is_empty(), "{host:?}");
             assert!(
                 !accepted

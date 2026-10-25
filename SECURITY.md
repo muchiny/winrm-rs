@@ -78,17 +78,26 @@ We will credit reporters in the release notes and CHANGELOG (unless you prefer t
   - Kerberos over plain HTTP carries no channel binding;
   - Basic over plain HTTP, and `EncryptionMode::Never` over plain HTTP, send
     everything in plaintext.
+- Relay of NTLM or Kerberos authentication over plain HTTP by a party on the
+  network path or controlling DNS. It is inherent to Windows authentication
+  without a TLS channel. Client-side remedy: HTTPS. Server side:
+  `AllowUnencrypted = false` (the default), an HTTPS listener with
+  `CbtHardeningLevel = Strict`, and SMB and LDAP signing plus Extended
+  Protection on the account's other services.
 - What `accept_invalid_certs = true` gives up, as its documentation states:
-  the server is not authenticated, CredSSP's outer TLS is not bound to the
-  authentication, and the certificate of an `https://` proxy is not verified.
+  the server is not authenticated. CredSSP refuses the flag.
+- What `danger_accept_invalid_proxy_certs(true)` gives up: the `https://`
+  proxy is not authenticated. The WinRM server stays verified.
 - Windows server settings: `AllowUnencrypted = true`,
   `CbtHardeningLevel = None`, SMB signing, LDAP channel binding, Extended
   Protection on other services.
 - What a malicious server runs or returns, except for the client-side issues
   listed above.
-- Command text and arguments recorded in `debug` spans, and SOAP bodies
-  logged in plaintext at `trace` level (before sealing, after unsealing).
-  Keep the `winrm_rs` target at `info` where commands carry secrets.
+- Security issues in the OpenSSL library that the `credssp` feature links from
+  the host: report them to OpenSSL or to your distribution. A way this crate
+  uses OpenSSL that weakens it is in scope.
+- SOAP bodies logged by a client built with
+  `WinrmClientBuilder::log_soap_bodies(true)`.
 - Resource use within the bounds the rustdoc documents. Each HTTP response
   body is capped at 4 × max(`max_envelope_size`, 512 KiB). The stdout and
   stderr of `run_command`, `run_powershell`, `Shell::run_command`, `run_wql`

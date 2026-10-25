@@ -54,6 +54,22 @@ pub(crate) fn with_session_id(envelope: &str, session_id: &str) -> String {
     envelope.replacen("</s:Header>", &element, 1)
 }
 
+/// Opening tag of the header's `wsa:Action`. Only [`build_header_for`]
+/// writes it, after values that are all escaped, so [`request_action`] can
+/// read the action back from a built envelope.
+const ACTION_TAG_OPEN: &str = r#"<wsa:Action s:mustUnderstand="true">"#;
+
+/// The `wsa:Action` URI of an envelope built by this module: the text
+/// between the first [`ACTION_TAG_OPEN`] and the next `</wsa:Action>`.
+/// `None` when either is missing.
+pub(crate) fn request_action(envelope: &str) -> Option<&str> {
+    envelope
+        .split_once(ACTION_TAG_OPEN)?
+        .1
+        .split_once("</wsa:Action>")
+        .map(|(action, _)| action)
+}
+
 /// Build the common SOAP envelope header.
 ///
 /// Most WS-Management operations share the same header structure.
@@ -107,7 +123,7 @@ fn build_header_for(
     <wsa:ReplyTo>
       <wsa:Address s:mustUnderstand="true">{REPLY_TO_ANONYMOUS}</wsa:Address>
     </wsa:ReplyTo>
-    <wsa:Action s:mustUnderstand="true">{action}</wsa:Action>
+    {ACTION_TAG_OPEN}{action}</wsa:Action>
     <wsman:MaxEnvelopeSize s:mustUnderstand="true">{max_envelope_size}</wsman:MaxEnvelopeSize>
     <wsa:MessageID>uuid:{message_id}</wsa:MessageID>
     <wsman:Locale xml:lang="en-US" s:mustUnderstand="false"/>
@@ -229,6 +245,9 @@ pub(crate) fn create_psrp_shell_request(
     // [0-9a-f-], but escaping costs nothing and survives future
     // refactors that might let a caller-supplied id leak into here.
     let escaped_shell_id = xml_escape(shell_id);
+    // Valid base64 has no character that `xml_escape` changes, so the wire
+    // bytes of a well-formed value are identical.
+    let escaped_creation_xml = xml_escape(creation_xml_b64);
     format!(
         r#"<s:Envelope {NS_DECL_WITH_RSP}>
 {header_with_options}
@@ -236,7 +255,7 @@ pub(crate) fn create_psrp_shell_request(
     <rsp:Shell ShellId="{escaped_shell_id}">
       <rsp:InputStreams>stdin pr</rsp:InputStreams>
       <rsp:OutputStreams>stdout</rsp:OutputStreams>{idle_timeout}
-      <creationXml xmlns="http://schemas.microsoft.com/powershell">{creation_xml_b64}</creationXml>
+      <creationXml xmlns="http://schemas.microsoft.com/powershell">{escaped_creation_xml}</creationXml>
     </rsp:Shell>
   </s:Body>
 </s:Envelope>"#
@@ -862,6 +881,7 @@ pub(crate) fn pull_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::request::RequestKind;
 
     #[test]
     fn enumerate_wql_request_default_namespace() {
@@ -1318,6 +1338,27 @@ mod tests {
     }
 
     #[test]
+    fn creation_xml_is_escaped() {
+        let config = crate::config::WinrmConfig::default();
+        let xml = create_psrp_shell_request(
+            "http://h:5985/wsman",
+            &config,
+            "AAA</creationXml><rsp:Environment/>",
+            "uri",
+            "ID",
+        );
+        assert!(
+            xml.contains("AAA&lt;/creationXml&gt;&lt;rsp:Environment/&gt;</creationXml>"),
+            "{xml}"
+        );
+        let b64 = "PE9ianM+AA==";
+        assert!(
+            create_psrp_shell_request("http://h:5985/wsman", &config, b64, "uri", "ID")
+                .contains(&format!(">{b64}</creationXml>"))
+        );
+    }
+
+    #[test]
     fn execute_command_with_id_contains_required_elements() {
         let xml = execute_command_with_id_request(
             "http://host:5985/wsman",
@@ -1581,5 +1622,238 @@ mod tests {
         let del =
             delete_shell_request_for("http://h:5985/wsman", "S", RESOURCE_URI_CMD, 60, 153_600);
         assert!(del.contains("xmlns:wsmv="), "{del}");
+    }
+
+    /// One row per request builder: its name, an envelope it built, and the
+    /// kind the gate must see.
+    fn kind_table() -> Vec<(&'static str, String, RequestKind)> {
+        use RequestKind as K;
+        let (ep, ps, cmd) = ("http://h:5985/wsman", RESOURCE_URI_PSRP, RESOURCE_URI_CMD);
+        let cfg = crate::config::WinrmConfig::default();
+        let (t, m) = (60, 153_600);
+        vec![
+            (
+                "create_shell_request",
+                create_shell_request(ep, &cfg),
+                K::Create,
+            ),
+            (
+                "create_psrp_shell_request",
+                create_psrp_shell_request(ep, &cfg, "AAAA", ps, "S"),
+                K::Create,
+            ),
+            (
+                "execute_command_with_id_request",
+                execute_command_with_id_request(ep, "S", "c", &[], "C", t, m, ps),
+                K::Command,
+            ),
+            (
+                "execute_command_request",
+                execute_command_request(ep, "S", "c", &[], t, m),
+                K::Command,
+            ),
+            (
+                "execute_command_request_with_uri",
+                execute_command_request_with_uri(ep, "S", "c", &[], t, m, ps),
+                K::Command,
+            ),
+            (
+                "receive_psrp_request",
+                receive_psrp_request(ep, "S", Some("C"), t, m, ps),
+                K::Receive,
+            ),
+            (
+                "receive_output_request",
+                receive_output_request(ep, "S", "C", t, m),
+                K::Receive,
+            ),
+            (
+                "receive_output_request_with_uri",
+                receive_output_request_with_uri(ep, "S", "C", t, m, ps),
+                K::Receive,
+            ),
+            (
+                "send_input_request",
+                send_input_request(ep, "S", "C", b"x", false, t, m),
+                K::SendInput,
+            ),
+            (
+                "send_input_request_with_uri",
+                send_input_request_with_uri(ep, "S", "C", b"x", true, t, m, ps),
+                K::SendInput,
+            ),
+            (
+                "send_psrp_request",
+                send_psrp_request(ep, "S", b"x", t, m, ps),
+                K::SendInput,
+            ),
+            (
+                "signal_terminate_request",
+                signal_terminate_request(ep, "S", "C", t, m),
+                K::Signal,
+            ),
+            (
+                "signal_ctrl_c_request",
+                signal_ctrl_c_request(ep, "S", "C", t, m),
+                K::Signal,
+            ),
+            (
+                "signal_psrp_ctrl_c_request",
+                signal_psrp_ctrl_c_request(ep, "S", "C", ps, t, m),
+                K::Signal,
+            ),
+            (
+                "delete_shell_request_for",
+                delete_shell_request_for(ep, "S", cmd, t, m),
+                K::Delete,
+            ),
+            (
+                "disconnect_shell_request",
+                disconnect_shell_request(ep, "S", t, m),
+                K::Disconnect,
+            ),
+            (
+                "disconnect_shell_request_with_uri",
+                disconnect_shell_request_with_uri(ep, "S", t, m, ps),
+                K::Disconnect,
+            ),
+            (
+                "reconnect_shell_request",
+                reconnect_shell_request(ep, "S", t, m),
+                K::Reconnect,
+            ),
+            (
+                "reconnect_shell_request_with_uri",
+                reconnect_shell_request_with_uri(ep, "S", t, m, ps),
+                K::Reconnect,
+            ),
+            (
+                "enumerate_wql_request",
+                enumerate_wql_request(ep, "SELECT * FROM Win32_Service", None, t, m),
+                K::Enumerate,
+            ),
+            ("pull_request", pull_request(ep, "ctx", t, m), K::Pull),
+        ]
+    }
+
+    #[test]
+    fn every_request_builder_has_a_known_kind() {
+        for (name, envelope, kind) in kind_table() {
+            let action =
+                request_action(&envelope).unwrap_or_else(|| panic!("{name}: no wsa:Action"));
+            assert_eq!(RequestKind::from_action(action), kind, "{name}: {action}");
+        }
+    }
+
+    /// A new builder must get a row above, or a deny-list hook would see `Other`.
+    #[test]
+    fn every_request_builder_is_in_the_kind_table() {
+        // The functions of this file that are not request builders.
+        let not_builders = [
+            "xml_escape",
+            "with_session_id",
+            "request_action",
+            "build_header",
+            "build_header_for",
+            "signal_request",
+        ];
+        // The non-test source, so the helpers of the test module do not count.
+        let source = include_str!("envelope.rs");
+        let source = source.split("#[cfg(test)]").next().unwrap();
+        // Every `fn` of any visibility, qualifier or indentation: a builder
+        // that is private, `async`, `const` or inside an `impl` is not missed.
+        let mut in_source: Vec<&str> = source
+            .lines()
+            .filter_map(|line| {
+                let mut rest = line.trim_start();
+                loop {
+                    let stripped = ["pub(crate) ", "pub(super) ", "pub ", "const ", "async "]
+                        .iter()
+                        .find_map(|prefix| rest.strip_prefix(prefix));
+                    match stripped {
+                        Some(next) => rest = next,
+                        None => break,
+                    }
+                }
+                let signature = rest.strip_prefix("fn ")?;
+                signature.split(['(', '<']).next()
+            })
+            .filter(|name| !not_builders.contains(name))
+            .collect();
+        let mut in_table: Vec<&str> = kind_table().iter().map(|(name, _, _)| *name).collect();
+        in_source.sort_unstable();
+        in_table.sort_unstable();
+        assert_eq!(
+            in_source, in_table,
+            "a new request builder needs a row in kind_table"
+        );
+        // One header writer: a second place that writes `wsa:Action` would
+        // build envelopes the table does not see.
+        assert_eq!(
+            source.matches("{ACTION_TAG_OPEN}").count(),
+            1,
+            "only build_header_for writes the wsa:Action header"
+        );
+    }
+
+    /// A new `ACTION_*` constant needs a `RequestKind` and a table row, or a
+    /// hook would see `Other` for it.
+    #[test]
+    fn every_action_constant_has_a_kind_and_a_table_row() {
+        use std::collections::BTreeSet;
+        let constants = include_str!("namespaces.rs")
+            .lines()
+            .filter(|l| l.starts_with("pub(crate) const ACTION_"))
+            .count();
+        let table = kind_table();
+        let actions: BTreeSet<&str> = table
+            .iter()
+            .map(|(name, envelope, _)| request_action(envelope).unwrap_or_else(|| panic!("{name}")))
+            .collect();
+        assert_eq!(
+            actions.len(),
+            constants,
+            "each ACTION_ constant is the action of some row of kind_table"
+        );
+        let kinds: BTreeSet<String> = table
+            .iter()
+            .map(|(_, _, kind)| format!("{kind:?}"))
+            .collect();
+        assert!(!kinds.contains("Other"), "{kinds:?}");
+        assert_eq!(kinds.len(), constants, "{kinds:?}");
+    }
+
+    #[test]
+    fn request_action_reads_the_header_action() {
+        let env = create_shell_request(
+            "http://h:5985/wsman",
+            &crate::config::WinrmConfig::default(),
+        );
+        assert_eq!(request_action(&env), Some(ACTION_CREATE));
+        assert_eq!(
+            request_action(&with_session_id(&env, "uuid:X")),
+            Some(ACTION_CREATE)
+        );
+        assert_eq!(request_action("<a/>"), None);
+        assert_eq!(
+            request_action(r#"<wsa:Action s:mustUnderstand="true">x"#),
+            None
+        );
+    }
+
+    /// A caller-influenced value before the header's action (here the WMI
+    /// namespace, spliced into the ResourceURI) cannot fake an action: it is escaped.
+    #[test]
+    fn request_action_ignores_an_action_tag_in_an_escaped_value() {
+        let ns =
+            r#"x"><wsa:Action s:mustUnderstand="true">http://other.invalid/</wsa:Action><y a=""#;
+        let env = enumerate_wql_request(
+            "http://h:5985/wsman",
+            "SELECT * FROM X",
+            Some(ns),
+            60,
+            153_600,
+        );
+        assert_eq!(request_action(&env), Some(ACTION_ENUMERATE));
     }
 }

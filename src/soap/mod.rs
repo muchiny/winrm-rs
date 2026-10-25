@@ -4,11 +4,13 @@
 //! - `envelope` -- SOAP envelope builders for shell lifecycle operations
 //! - `parser` -- response parsers for shell IDs, command IDs, and output streams
 //! - `clixml` -- incremental decoder for PowerShell CLIXML on stderr
+//! - `scan` -- forward-only substring search shared by the parsers
 
 pub(crate) mod clixml;
 pub(crate) mod envelope;
 pub(crate) mod namespaces;
 pub(crate) mod parser;
+mod scan;
 
 // Re-export for internal use
 pub(crate) use envelope::*;

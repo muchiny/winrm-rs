@@ -26,17 +26,35 @@ pub(crate) struct NtlmAuth {
     pub(crate) domain: String,
     /// Largest response body read (see `transport::max_response_bytes`).
     pub(crate) max_response_bytes: usize,
+    /// The proxy check of `crate::ProxySessionAuth`, run on the 401 that
+    /// carries the challenge, before the Type 3. `None` when it does not
+    /// apply (no forwarding proxy, HTTPS, or `Allow`).
+    pub(crate) proxy_gate: Option<crate::transport::proxy::ProxyGate>,
+    /// The `Workstation` field the caller set (UTF-16LE, already reduced by
+    /// `ntlm::sanitize_workstation`); `None` sends the detected name.
+    pub(crate) workstation: Option<Vec<u8>>,
 }
 
 /// Length of an NTLM message signature (MS-NLMP 2.2.2.9.1).
 const SIGNATURE_LEN: usize = 16;
 
 /// Wrap a SOAP body in NTLM-sealed multipart/encrypted format (MS-WSMV 2.2.9.1).
-pub(crate) fn seal_body(session: &mut ntlm::NtlmSession, body: &str) -> (String, Vec<u8>) {
-    let sealed = session.seal(body.as_bytes());
+///
+/// Fails when the session is spent (see [`ntlm::SealingSession::seal`]):
+/// nothing is framed then.
+pub(crate) fn seal_body(
+    session: &mut ntlm::SealingSession,
+    body: &str,
+) -> Result<(String, Vec<u8>), WinrmError> {
+    let sealed = session.seal(body.as_bytes()).map_err(WinrmError::Ntlm)?;
     // sealed = signature(16) + ciphertext
     let (signature, ciphertext) = sealed.split_at(SIGNATURE_LEN.min(sealed.len()));
-    sealed::frame(sealed::SPNEGO_PROTOCOL, body.len(), signature, ciphertext)
+    Ok(sealed::frame(
+        sealed::SPNEGO_PROTOCOL,
+        body.len(),
+        signature,
+        ciphertext,
+    ))
 }
 
 /// Extract and unseal the SOAP body of a multipart/encrypted response.
@@ -46,7 +64,7 @@ pub(crate) fn seal_body(session: &mut ntlm::NtlmSession, body: &str) -> (String,
 /// else is an error, as is a signature that does not verify. Nothing is
 /// allocated from the claimed length.
 pub(crate) fn unseal_body(
-    session: &mut ntlm::NtlmSession,
+    session: &mut ntlm::SealingSession,
     data: &[u8],
 ) -> Result<String, WinrmError> {
     let bad = |what: &str| {
@@ -141,7 +159,7 @@ impl NtlmAuth {
             .header("Content-Length", "0")
             .send()
             .await
-            .map_err(WinrmError::Http)?;
+            .map_err(crate::auth::send_error)?;
 
         // Step 2: Parse Type 2 (Challenge) from 401 response
         if resp.status().as_u16() != 401 {
@@ -149,6 +167,12 @@ impl NtlmAuth {
                 "expected 401 for NTLM negotiate, got {}",
                 resp.status()
             )));
+        }
+        // A forwarding proxy announces here whether it keeps the server
+        // connection to this client (RFC 4559 section 6). On a refusal no
+        // Type 3 is sent, so that connection is never authenticated.
+        if let Some(gate) = &self.proxy_gate {
+            gate.check_answer(resp.status(), resp.headers())?;
         }
 
         let www_auth = resp
@@ -179,16 +203,23 @@ impl NtlmAuth {
         let _ = crate::auth::read_body_capped(resp, self.max_response_bytes).await;
 
         // Decode challenge and keep raw Type 2 bytes for MIC computation
+        let token = www_auth.strip_prefix("Negotiate ").ok_or_else(|| {
+            WinrmError::AuthFailed("missing Negotiate prefix in challenge".into())
+        })?;
         let type2_raw = {
-            let token = www_auth.strip_prefix("Negotiate ").ok_or_else(|| {
-                WinrmError::AuthFailed("missing Negotiate prefix in challenge".into())
-            })?;
             use base64::Engine;
             base64::engine::general_purpose::STANDARD
                 .decode(token.trim_ascii())
                 .map_err(|e| WinrmError::AuthFailed(format!("base64 decode: {e}")))?
         };
         let challenge = ntlm::decode_challenge_header(&www_auth).map_err(WinrmError::Ntlm)?;
+        // A Type 2 holds no secret (server challenge, names, timestamp). It is
+        // logged before the check, so a refused challenge is visible too.
+        tracing::trace!(target: "winrm_rs::ntlm::challenge", type2 = %token, "NTLM challenge received");
+        ntlm::log_challenge(&challenge);
+        // Sealed (no SOAP body in the Type 3), the exchange must also grant
+        // signing, sealing and key exchange.
+        ntlm::check_challenge(&challenge, body.is_none()).map_err(WinrmError::Ntlm)?;
 
         // Step 3: Send Type 3 (Authenticate), with the SOAP body or none
         // The domain for NTLMv2Hash must match what the user provided.
@@ -208,7 +239,7 @@ impl NtlmAuth {
         // TLS channel and are the mitigation against NTLM-over-TLS relay.
         // Over TLS, a connection that reports no server certificate fails
         // the handshake instead of authenticating unbound.
-        let (type3, session_key) = if over_tls {
+        let channel_bindings = if over_tls {
             let cert_der = peer_certificate.ok_or_else(|| {
                 WinrmError::Ntlm(NtlmError::InvalidMessage(
                     "NTLM over TLS: the connection reported no server certificate to bind \
@@ -216,32 +247,35 @@ impl NtlmAuth {
                         .into(),
                 ))
             })?;
-            let cbt = crate::ntlm::crypto::compute_channel_bindings(&cert_der)
-                .map_err(WinrmError::Ntlm)?;
-            ntlm::create_authenticate_message_with_cbt_and_key(
-                &challenge,
-                &self.username,
-                &self.password,
-                &domain,
-                cbt,
+            Some(
+                crate::ntlm::crypto::compute_channel_bindings(&cert_der)
+                    .map_err(WinrmError::Ntlm)?,
             )
         } else {
-            ntlm::create_authenticate_message_with_key_and_mic(
-                &challenge,
-                &self.username,
-                &self.password,
-                &domain,
-                &type1,
-                &type2_raw,
-                &target_name,
-            )
+            None
         };
+        // One Type 3 shape over HTTP and HTTPS: MIC, MsvAvFlags, target name,
+        // workstation and a zero LM response; plus the CBT over TLS.
+        let (type3, session_key) = ntlm::create_authenticate_message_http(
+            &challenge,
+            &self.username,
+            &self.password,
+            &domain,
+            &type1,
+            &type2_raw,
+            &target_name,
+            channel_bindings,
+            self.workstation
+                .as_deref()
+                .unwrap_or_else(|| ntlm::workstation()),
+        )
+        .map_err(WinrmError::Ntlm)?;
         // Copy the exported session key to the heap before the awaits below
         // and wipe this copy in place, so no unboxed copy of it lives in this
         // future while it waits on the network, and returning it moves a
         // pointer. Not wiped: the stack copies the message builder made
-        // (`ntlm::messages`), and later the `NtlmSession` built from it on
-        // the stack (keys and RC4 S-boxes) before it moves into its box.
+        // (`ntlm::messages`). The `SealingSession` built from it is constructed
+        // in its box, so its keys and RC4 S-boxes have no stack copy.
         let mut session_key = session_key;
         let mut boxed_key = Box::new(Zeroizing::new([0u8; 16]));
         boxed_key.copy_from_slice(&*session_key);
@@ -256,7 +290,7 @@ impl NtlmAuth {
                 .body(body.to_string()),
             None => request.header("Content-Length", "0"),
         };
-        let resp = request.send().await.map_err(WinrmError::Http)?;
+        let resp = request.send().await.map_err(crate::auth::send_error)?;
 
         if resp.status().as_u16() == 401 {
             return Err(WinrmError::AuthFailed(
@@ -294,15 +328,15 @@ impl AuthTransport for NtlmAuth {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ntlm::NtlmSession;
+    use crate::ntlm::SealingSession;
 
     const ENCRYPTED_BOUNDARY: &str = "--Encrypted Boundary";
 
     #[test]
     fn seal_body_produces_multipart_format() {
-        let mut session = NtlmSession::from_auth(&[0xAB; 16]);
+        let mut session = SealingSession::boxed_from_auth(&[0xAB; 16]);
         let body = "<soap>hello</soap>";
-        let (content_type, mime_body) = seal_body(&mut session, body);
+        let (content_type, mime_body) = seal_body(&mut session, body).unwrap();
 
         // Content-Type should be multipart/encrypted with HTTP-SPNEGO
         assert!(content_type.contains("multipart/encrypted"));
@@ -319,8 +353,8 @@ mod tests {
 
     #[test]
     fn seal_body_includes_signature_length_prefix() {
-        let mut session = NtlmSession::from_auth(&[0xCD; 16]);
-        let (_, mime_body) = seal_body(&mut session, "test");
+        let mut session = SealingSession::boxed_from_auth(&[0xCD; 16]);
+        let (_, mime_body) = seal_body(&mut session, "test").unwrap();
         // Find the octet-stream marker, then 4 bytes = signature length (LE u32 = 16)
         let marker = b"application/octet-stream\r\n";
         let pos = mime_body
@@ -339,8 +373,8 @@ mod tests {
 
     #[test]
     fn seal_body_ends_with_closing_boundary() {
-        let mut session = NtlmSession::from_auth(&[0xEF; 16]);
-        let (_, mime_body) = seal_body(&mut session, "x");
+        let mut session = SealingSession::boxed_from_auth(&[0xEF; 16]);
+        let (_, mime_body) = seal_body(&mut session, "x").unwrap();
         let body_str = String::from_utf8_lossy(&mime_body);
         assert!(body_str.trim_end().ends_with("--Encrypted Boundary--"));
     }
@@ -350,9 +384,9 @@ mod tests {
     /// A CRLF between them makes HTTP.sys answer 400 to every sealed request.
     #[test]
     fn seal_body_puts_the_closing_boundary_right_after_the_payload() {
-        let mut session = NtlmSession::from_auth(&[0xEF; 16]);
+        let mut session = SealingSession::boxed_from_auth(&[0xEF; 16]);
         let body = "<soap>hello</soap>";
-        let (_, mime_body) = seal_body(&mut session, body);
+        let (_, mime_body) = seal_body(&mut session, body).unwrap();
         let marker = b"application/octet-stream\r\n";
         let pos = mime_body
             .windows(marker.len())
@@ -372,8 +406,8 @@ mod tests {
     #[test]
     fn unseal_body_reads_a_windows_framed_response() {
         let key = [0x37; 16];
-        let mut server = NtlmSession::server_side(&key);
-        let mut client = NtlmSession::from_auth(&key);
+        let mut server = SealingSession::server_side(&key);
+        let mut client = SealingSession::boxed_from_auth(&key);
         let plaintext = "<s:Envelope>reply</s:Envelope>";
         let mut response = format!(
             "{ENCRYPTED_BOUNDARY}\r\n\
@@ -385,7 +419,7 @@ mod tests {
         )
         .into_bytes();
         response.extend_from_slice(&16u32.to_le_bytes());
-        response.extend_from_slice(&server.seal(plaintext.as_bytes()));
+        response.extend_from_slice(&server.seal(plaintext.as_bytes()).unwrap());
         response.extend_from_slice(format!("{ENCRYPTED_BOUNDARY}--\r\n").as_bytes());
 
         assert_eq!(unseal_body(&mut client, &response).unwrap(), plaintext);
@@ -395,9 +429,9 @@ mod tests {
     #[test]
     fn seal_body_output_unseals_on_the_other_side() {
         let key = [0x21; 16];
-        let mut client = NtlmSession::from_auth(&key);
-        let mut server = NtlmSession::server_side(&key);
-        let (_, mime_body) = seal_body(&mut client, "<soap>ping</soap>");
+        let mut client = SealingSession::boxed_from_auth(&key);
+        let mut server = SealingSession::server_side(&key);
+        let (_, mime_body) = seal_body(&mut client, "<soap>ping</soap>").unwrap();
         assert_eq!(
             unseal_body(&mut server, &mime_body).unwrap(),
             "<soap>ping</soap>"
@@ -408,8 +442,8 @@ mod tests {
     // With +→- or +→* on the offset arithmetic, the bytes read would be wrong.
     #[test]
     fn unseal_body_sig_len_parsing_is_correct() {
-        let mut session = NtlmSession::from_auth(&[0x55; 16]);
-        let (_, sealed) = seal_body(&mut session, "test");
+        let mut session = SealingSession::boxed_from_auth(&[0x55; 16]);
+        let (_, sealed) = seal_body(&mut session, "test").unwrap();
 
         // Verify the sig_len bytes at the expected offset are 16, 0, 0, 0 (LE for 16)
         let marker = b"application/octet-stream\r\n";
@@ -450,11 +484,13 @@ mod tests {
     }
 
     fn server_sealed_reply() -> Vec<u8> {
-        NtlmSession::server_side(&KEY).seal(REPLY.as_bytes())
+        SealingSession::server_side(&KEY)
+            .seal(REPLY.as_bytes())
+            .unwrap()
     }
 
     fn unseal_err(data: &[u8]) -> String {
-        let mut client = NtlmSession::from_auth(&KEY);
+        let mut client = SealingSession::boxed_from_auth(&KEY);
         match unseal_body(&mut client, data) {
             Ok(text) => panic!("accepted a malformed frame: {text:?}"),
             Err(WinrmError::Ntlm(e)) => e.to_string(),
@@ -470,7 +506,7 @@ mod tests {
             b"--Encrypted Boundary--",
         ] {
             let data = framed(&len, 16, &server_sealed_reply(), trailer);
-            let mut client = NtlmSession::from_auth(&KEY);
+            let mut client = SealingSession::boxed_from_auth(&KEY);
             assert_eq!(unseal_body(&mut client, &data).unwrap(), REPLY);
         }
     }
@@ -609,14 +645,14 @@ mod tests {
     #[test]
     fn unseal_body_rejects_a_replayed_message() {
         let len = REPLY.len().to_string();
-        let mut server = NtlmSession::server_side(&KEY);
+        let mut server = SealingSession::server_side(&KEY);
         let first = framed(
             &len,
             16,
-            &server.seal(REPLY.as_bytes()),
+            &server.seal(REPLY.as_bytes()).unwrap(),
             b"--Encrypted Boundary--\r\n",
         );
-        let mut client = NtlmSession::from_auth(&KEY);
+        let mut client = SealingSession::boxed_from_auth(&KEY);
         assert_eq!(unseal_body(&mut client, &first).unwrap(), REPLY);
         let err = unseal_body(&mut client, &first).unwrap_err();
         assert!(

@@ -42,6 +42,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
 dependencies = [
  "hybrid-array",
+ "zeroize",
 ]
 
 [[package]]
@@ -195,6 +196,7 @@ dependencies = [
  "const-oid",
  "crypto-common",
  "ctutils",
+ "zeroize",
 ]
 
 [[package]]
@@ -1603,12 +1605,14 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "idna",
  "md-5",
  "md4",
  "openssl",
  "rand",
  "reqwest",
  "rustls",
+ "rustls-platform-verifier",
  "secrecy",
  "sha2",
  "subtle",
@@ -1616,6 +1620,8 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-util",
+ "tower-layer",
+ "tower-service",
  "tracing",
  "uuid",
  "webpki-roots",

@@ -11,8 +11,10 @@
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use winrm_rs::__fuzz::{
-    create_shell_request, delete_shell_request, enumerate_wql_request, execute_command_request,
-    receive_output_request, send_input_request, signal_terminate_request,
+    create_psrp_shell_request, create_shell_request, delete_shell_request, enumerate_wql_request,
+    execute_command_request, execute_command_with_id_request, receive_output_request,
+    receive_psrp_request, send_input_request, send_psrp_request, signal_psrp_ctrl_c_request,
+    signal_terminate_request,
 };
 use winrm_rs::WinrmConfig;
 
@@ -29,6 +31,8 @@ struct Input<'a> {
     working_directory: Option<&'a str>,
     env_vars: Vec<(&'a str, &'a str)>,
     stdin: &'a [u8],
+    creation_xml: &'a str,
+    data: &'a [u8],
     end_of_stream: bool,
     timeout_secs: u64,
     max_envelope_size: u32,
@@ -76,7 +80,7 @@ fuzz_target!(|input: Input<'_>| {
     let t = input.timeout_secs;
     let m = input.max_envelope_size;
 
-    let checks: [(&str, String, String); 7] = [
+    let checks: [(&str, String, String); 12] = [
         (
             "create_shell",
             create_shell_request(ep, &config(&input, false)),
@@ -113,6 +117,47 @@ fuzz_target!(|input: Input<'_>| {
             // The namespace is spliced into the ResourceURI element, so the
             // baseline drops it: `Some(ns)` and `None` differ only in text.
             enumerate_wql_request("", "", None, t, m),
+        ),
+        (
+            "create_psrp_shell",
+            create_psrp_shell_request(
+                ep,
+                &config(&input, false),
+                input.creation_xml,
+                input.resource_uri,
+                sid,
+            ),
+            create_psrp_shell_request("", &config(&input, true), "", "", ""),
+        ),
+        (
+            "execute_command_with_id",
+            execute_command_with_id_request(
+                ep,
+                sid,
+                input.command,
+                &input.args,
+                cid,
+                t,
+                m,
+                input.resource_uri,
+            ),
+            execute_command_with_id_request("", "", "", &blank_args, "", t, m, ""),
+        ),
+        (
+            "receive_psrp",
+            receive_psrp_request(ep, sid, Some(cid), t, m, input.resource_uri),
+            receive_psrp_request("", "", Some(""), t, m, ""),
+        ),
+        (
+            "send_psrp",
+            send_psrp_request(ep, sid, input.data, t, m, input.resource_uri),
+            // Blank data is an empty slice: base64 adds no markup either way.
+            send_psrp_request("", "", &[], t, m, ""),
+        ),
+        (
+            "signal_psrp_ctrl_c",
+            signal_psrp_ctrl_c_request(ep, sid, cid, input.resource_uri, t, m),
+            signal_psrp_ctrl_c_request("", "", "", "", t, m),
         ),
     ];
 

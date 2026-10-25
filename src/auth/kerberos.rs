@@ -24,12 +24,52 @@ pub(crate) struct KerberosAuth {
     /// Largest response body read (see `transport::max_response_bytes`).
     #[cfg_attr(not(feature = "kerberos"), allow(dead_code))]
     pub(crate) max_response_bytes: usize,
+    /// Budget of one ticket request: the request budget of the client
+    /// (`operation_timeout_secs + 10` seconds).
+    #[cfg_attr(not(feature = "kerberos"), allow(dead_code))]
+    pub(crate) kdc_timeout: std::time::Duration,
+    /// Ticket requests in flight for the client (see [`run_blocking_bounded`]).
+    #[cfg_attr(not(feature = "kerberos"), allow(dead_code))]
+    pub(crate) kdc_slots: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+/// Run `f`, a blocking library call (the KDC exchange of libkrb5 or SSPI),
+/// on tokio's blocking pool instead of an async worker, within `budget`.
+///
+/// `f` starts once a slot of `slots` is free, and the wait for it counts in
+/// `budget`. The slot stays held until `f` returns: a call that outlives its
+/// budget cannot be cancelled, so it keeps its slot (and its pool thread) and
+/// the number of such calls is at most the size of `slots`. A call that
+/// exceeds `budget` gives `WinrmError::Timeout` (in whole seconds, at least
+/// 1); one that panics gives `WinrmError::AuthFailed`.
+#[cfg(any(feature = "kerberos", test))]
+async fn run_blocking_bounded<T: Send + 'static>(
+    budget: std::time::Duration,
+    slots: std::sync::Arc<tokio::sync::Semaphore>,
+    f: impl FnOnce() -> Result<T, WinrmError> + Send + 'static,
+) -> Result<T, WinrmError> {
+    let run = async {
+        let permit = slots.acquire_owned().await.map_err(|_| {
+            WinrmError::AuthFailed("Kerberos: internal: KDC slot semaphore closed".into())
+        })?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            f()
+        })
+        .await
+        .map_err(|e| WinrmError::AuthFailed(format!("Kerberos: library call failed: {e}")))?
+    };
+    tokio::time::timeout(budget, run)
+        .await
+        .unwrap_or_else(|_| Err(WinrmError::Timeout(budget.as_secs().max(1))))
 }
 
 /// The pure parts of Kerberos message encryption (no GSS-API call): wrap
 /// token checks, the Windows layout, the sealed-answer framing. Built with
 /// the `kerberos` feature, and for tests and the fuzz targets (`__internal`)
-/// without it.
+/// without it. `check_bound_certificate`, `StepOutcome`, `PendingStep` and
+/// `finish_mutual` are the exception: they are built with the `kerberos`
+/// feature and for tests, not for the fuzz targets.
 #[cfg(any(feature = "kerberos", feature = "__internal", test))]
 mod wire {
     use crate::auth::sealed;
@@ -52,6 +92,9 @@ mod wire {
     pub(super) const FLAG_SEALED: u8 = 0x02;
     /// Length of the wrap token header (`TOK_ID` .. `SND_SEQ`).
     pub(super) const TOKEN_HEADER_LEN: usize = 16;
+    /// Length of the confounder that follows the token header in the
+    /// security header of an AES wrap token.
+    pub(super) const CONFOUNDER_LEN: usize = 16;
     /// Largest security header accepted in a sealed answer: an AES wrap token
     /// header is 60 bytes (16-byte token header, 16-byte confounder, 16-byte
     /// encrypted header copy, 12-byte checksum).
@@ -119,15 +162,20 @@ mod wire {
         Ok((out_header, out_data))
     }
 
-    /// Check that `token` (security header then data of a sealed answer) is an
-    /// RFC 4121 wrap token sent by the acceptor with its data encrypted. The
-    /// token's integrity is checked by unwrap.
+    /// Check that `frame.sealed` (security header then data of a sealed
+    /// answer) is an RFC 4121 wrap token sent by the acceptor with its data
+    /// encrypted, framed the way Windows frames it: a zero extra count (EC),
+    /// and a security header of `TOKEN_HEADER_LEN + RRC + CONFOUNDER_LEN`
+    /// bytes (60 for the rotation count of 28 that Windows sends), where the
+    /// header length is what the framing leaves besides `frame.length` bytes
+    /// of data. The token's integrity is checked by unwrap.
     ///
     /// Its sequence number is not checked: WinRM sends `SND_SEQ` 0 in every
     /// answer (measured on Server 2025), so it cannot detect a replay. The
     /// transport binds each sealed answer to its request through `RelatesTo`
     /// instead (see `soap::parser::check_relates_to`).
-    pub(crate) fn check_acceptor_sealed(token: &[u8]) -> Result<(), WinrmError> {
+    pub(crate) fn check_acceptor_sealed(frame: &sealed::Frame<'_>) -> Result<(), WinrmError> {
+        let token = frame.sealed;
         let header = token
             .get(..TOKEN_HEADER_LEN)
             .ok_or_else(|| sealing_error("sealed answer shorter than a wrap token header"))?;
@@ -140,6 +188,44 @@ mod wire {
         }
         if flags & FLAG_SEALED == 0 {
             return Err(sealing_error("answer is signed but not encrypted"));
+        }
+        let header_len = token
+            .len()
+            .checked_sub(frame.length)
+            .ok_or_else(|| sealing_error("sealed answer shorter than its plaintext length"))?;
+        let be16 = |range: std::ops::Range<usize>| {
+            header
+                .get(range)
+                .and_then(|b| <[u8; 2]>::try_from(b).ok())
+                .map(u16::from_be_bytes)
+        };
+        // Cannot fail: `header` is exactly `TOKEN_HEADER_LEN` (16) bytes, so both
+        // ranges exist. Kept so that no index is needed.
+        let (Some(ec), Some(rrc)) = (be16(4..6), be16(6..8)) else {
+            return Err(sealing_error(
+                "sealed answer shorter than a wrap token header",
+            ));
+        };
+        tracing::trace!(
+            target: "winrm_rs::kerberos::sealed",
+            ec,
+            rrc,
+            header_len,
+            "sealed answer framing"
+        );
+        if ec != 0 {
+            return Err(sealing_error(
+                "sealed answer has a non-zero extra count (EC): a DCE-style or EC != 0 server, \
+                 which this client does not accept",
+            ));
+        }
+        let expected = TOKEN_HEADER_LEN
+            .checked_add(usize::from(rrc))
+            .and_then(|n| n.checked_add(CONFOUNDER_LEN));
+        if expected != Some(header_len) {
+            return Err(sealing_error(
+                "security header length does not match the token's rotation count (RRC)",
+            ));
         }
         Ok(())
     }
@@ -161,10 +247,86 @@ mod wire {
             |what| sealing_error(format!("sealed answer: {what} ({} bytes)", data.len())),
         )
     }
+
+    /// Check that the connection which carried the AP-REQ presented the
+    /// certificate the channel binding was computed for. Without a bound
+    /// certificate (plain HTTP) there is nothing to check; with one, only the
+    /// very same, certainly known certificate passes.
+    #[cfg(any(feature = "kerberos", test))]
+    pub(crate) fn check_bound_certificate(
+        bound: Option<&[u8]>,
+        peer: &crate::auth::PeerCertificate,
+    ) -> Result<(), WinrmError> {
+        let Some(bound) = bound else {
+            return Ok(());
+        };
+        match peer {
+            crate::auth::PeerCertificate::Known(der) if der.as_slice() == bound => Ok(()),
+            _ => Err(WinrmError::AuthFailed(
+                "Kerberos over TLS: the connection that carried the AP-REQ did not present the \
+                 certificate its channel binding was computed for; refusing the context"
+                    .into(),
+            )),
+        }
+    }
+
+    /// What one step of a pending security context gave.
+    #[cfg(any(feature = "kerberos", test))]
+    pub(crate) enum StepOutcome<C> {
+        /// The context is established; `extra_token` tells whether the library
+        /// also produced a final token to send to the server.
+        Finished { ctx: C, extra_token: bool },
+        /// The context needs another round trip.
+        Continue,
+    }
+
+    /// A security context that is not yet established, behind the library
+    /// that implements it (so the decisions on its outcome can be tested).
+    #[cfg(any(feature = "kerberos", test))]
+    pub(crate) trait PendingStep: Sized {
+        /// The established context.
+        type Ctx;
+
+        /// Feed the server's token to the pending context.
+        fn step(self, token: &[u8]) -> Result<StepOutcome<Self::Ctx>, String>;
+    }
+
+    /// Complete a context with the server's AP-REP (mutual authentication):
+    /// the token must be there, and a single step must finish the context
+    /// with nothing more to send, which is all WinRM supports.
+    #[cfg(any(feature = "kerberos", test))]
+    pub(crate) fn finish_mutual<P: PendingStep>(
+        pending: P,
+        server_token: Option<Vec<u8>>,
+    ) -> Result<P::Ctx, WinrmError> {
+        let server_token = server_token.ok_or_else(|| {
+            WinrmError::AuthFailed(
+                "Kerberos: the server sent no mutual authentication token, so no context \
+                 for message encryption"
+                    .into(),
+            )
+        })?;
+        match pending.step(&server_token) {
+            Ok(StepOutcome::Finished {
+                ctx,
+                extra_token: false,
+            }) => Ok(ctx),
+            Ok(StepOutcome::Finished { .. } | StepOutcome::Continue) => {
+                Err(WinrmError::AuthFailed(
+                    "Kerberos: the context needs another round trip, which WinRM does not \
+                     support"
+                        .into(),
+                ))
+            }
+            Err(e) => Err(WinrmError::AuthFailed(format!(
+                "Kerberos mutual authentication failed: {e}"
+            ))),
+        }
+    }
 }
 
 #[cfg(feature = "kerberos")]
-use wire::{SEALING_PROTOCOL, sealing_error};
+use wire::{SEALING_PROTOCOL, check_bound_certificate, finish_mutual, sealing_error};
 #[cfg(any(feature = "kerberos", feature = "__internal", test))]
 pub(crate) use wire::{check_acceptor_sealed, parse_sealed_answer, windows_layout};
 
@@ -259,7 +421,7 @@ impl KerberosSession {
         let frame = parse_sealed_answer(data)?;
         // The rotated header followed by the data is a complete RFC 4121
         // token; the library undoes the rotation (RRC).
-        check_acceptor_sealed(frame.sealed)?;
+        check_acceptor_sealed(&frame)?;
         let plaintext = self
             .ctx
             .unwrap(frame.sealed)
@@ -271,6 +433,24 @@ impl KerberosSession {
     }
 }
 
+/// The library's pending client context, seen through the testable seam.
+#[cfg(feature = "kerberos")]
+impl wire::PendingStep for cross_krb5::PendingClientCtx {
+    type Ctx = cross_krb5::ClientCtx;
+
+    fn step(self, token: &[u8]) -> Result<wire::StepOutcome<Self::Ctx>, String> {
+        use cross_krb5::Step;
+        match cross_krb5::PendingClientCtx::step(self, token) {
+            Ok(Step::Finished((ctx, extra))) => Ok(wire::StepOutcome::Finished {
+                ctx,
+                extra_token: extra.is_some(),
+            }),
+            Ok(Step::Continue(_)) => Ok(wire::StepOutcome::Continue),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
+
 #[cfg(feature = "kerberos")]
 impl KerberosAuth {
     /// The first Kerberos token for the service principal, and the pending
@@ -279,23 +459,27 @@ impl KerberosAuth {
     /// `channel_bindings` is the application data of the GSS-API channel
     /// bindings (`tls-server-end-point:` and the certificate hash over
     /// HTTPS), carried in the AP-REQ authenticator.
-    fn initiate(
+    async fn initiate(
         &self,
-        channel_bindings: Option<&[u8]>,
+        channel_bindings: Option<Vec<u8>>,
     ) -> Result<(cross_krb5::PendingClientCtx, String), WinrmError> {
-        use base64::Engine;
-        use base64::engine::general_purpose::STANDARD as B64;
-        use cross_krb5::{ClientCtx, InitiateFlags};
-        // Empty flags: mutual authentication and confidentiality are both
-        // requested and required by cross-krb5.
-        let (ctx, token) = ClientCtx::new(
-            InitiateFlags::empty(),
-            None, // use default credentials (from kinit)
-            &self.service_principal,
-            channel_bindings,
-        )
-        .map_err(|e| WinrmError::AuthFailed(format!("Kerberos init: {e}")))?;
-        Ok((ctx, format!("Negotiate {}", B64.encode(&*token))))
+        let service_principal = self.service_principal.clone();
+        run_blocking_bounded(self.kdc_timeout, self.kdc_slots.clone(), move || {
+            use base64::Engine;
+            use base64::engine::general_purpose::STANDARD as B64;
+            use cross_krb5::{ClientCtx, InitiateFlags};
+            // Empty flags: mutual authentication and confidentiality are both
+            // requested and required by cross-krb5.
+            let (ctx, token) = ClientCtx::new(
+                InitiateFlags::empty(),
+                None, // use default credentials (from kinit)
+                &service_principal,
+                channel_bindings.as_deref(),
+            )
+            .map_err(|e| WinrmError::AuthFailed(format!("Kerberos init: {e}")))?;
+            Ok((ctx, format!("Negotiate {}", B64.encode(&*token))))
+        })
+        .await
     }
 
     /// The server's Kerberos token (`WWW-Authenticate: Negotiate <token>`).
@@ -332,7 +516,7 @@ impl KerberosAuth {
             .header("Content-Length", "0")
             .send()
             .await
-            .map_err(WinrmError::Http)?;
+            .map_err(crate::auth::send_error)?;
         let peer = crate::auth::peer_certificate(&resp, cert);
         let _ = crate::auth::read_body_capped(resp, self.max_response_bytes).await;
         match peer {
@@ -369,7 +553,6 @@ impl KerberosAuth {
         cert: Option<&crate::tls::CertHandle>,
         url: &str,
     ) -> Result<(KerberosSession, bool), WinrmError> {
-        use cross_krb5::Step;
         use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
         let bound = if url.starts_with("https://") {
             let der = self.endpoint_certificate(http, cert, url).await?;
@@ -392,7 +575,7 @@ impl KerberosAuth {
             .map(crate::ntlm::crypto::tls_server_end_point)
             .transpose()
             .map_err(|e| WinrmError::AuthFailed(format!("Kerberos channel binding: {e}")))?;
-        let (pending, auth_header) = self.initiate(bindings.as_deref())?;
+        let (pending, auth_header) = self.initiate(bindings).await?;
         let resp = http
             .post(url)
             .header(CONTENT_TYPE, "application/soap+xml;charset=UTF-8")
@@ -404,16 +587,10 @@ impl KerberosAuth {
             .send()
             .await
             .map_err(crate::auth::send_error)?;
-        if let Some(bound) = &bound
-            && crate::auth::peer_certificate(&resp, cert)
-                != crate::auth::PeerCertificate::Known(bound.clone())
-        {
-            return Err(WinrmError::AuthFailed(
-                "Kerberos over TLS: the connection that carried the AP-REQ did not present the \
-                 certificate its channel binding was computed for; refusing the context"
-                    .into(),
-            ));
-        }
+        check_bound_certificate(
+            bound.as_deref(),
+            &crate::auth::peer_certificate(&resp, cert),
+        )?;
         let status = resp.status();
         if status.as_u16() == 401 {
             return Err(WinrmError::AuthFailed(
@@ -435,28 +612,7 @@ impl KerberosAuth {
                 },
             ));
         }
-        let server_token = server_token.ok_or_else(|| {
-            WinrmError::AuthFailed(
-                "Kerberos: the server sent no mutual authentication token, so no context \
-                 for message encryption"
-                    .into(),
-            )
-        })?;
-        let ctx = match pending.step(&server_token) {
-            Ok(Step::Finished((ctx, None))) => ctx,
-            Ok(Step::Finished((_, Some(_))) | Step::Continue(_)) => {
-                return Err(WinrmError::AuthFailed(
-                    "Kerberos: the context needs another round trip, which WinRM does not \
-                     support"
-                        .into(),
-                ));
-            }
-            Err(e) => {
-                return Err(WinrmError::AuthFailed(format!(
-                    "Kerberos mutual authentication failed: {e}"
-                )));
-            }
-        };
+        let ctx = finish_mutual(pending, server_token)?;
         Ok((KerberosSession { ctx }, closing))
     }
 }
@@ -477,7 +633,7 @@ impl AuthTransport for KerberosAuth {
     ) -> Result<String, WinrmError> {
         use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 
-        let (ctx, auth_header) = self.initiate(None)?;
+        let (ctx, auth_header) = self.initiate(None).await?;
         let resp = http
             .post(url)
             .header(CONTENT_TYPE, "application/soap+xml;charset=UTF-8")
@@ -638,11 +794,68 @@ mod layout_tests {
         t
     }
 
+    /// `header` (a token header, possibly longer) followed by `data_len` data
+    /// bytes, as the contiguous bytes of a parsed sealed answer.
+    fn sealed_bytes(header: &[u8], data_len: usize) -> Vec<u8> {
+        let mut bytes = header.to_vec();
+        bytes.extend(std::iter::repeat_n(0xAB, data_len));
+        bytes
+    }
+
+    fn check(bytes: &[u8], length: usize) -> Result<(), WinrmError> {
+        check_acceptor_sealed(&crate::auth::sealed::Frame {
+            sealed: bytes,
+            length,
+        })
+    }
+
     #[test]
     fn acceptor_sealed_token_is_accepted() {
         // Windows sets SentByAcceptor | Sealed | AcceptorSubkey, SND_SEQ 0.
-        assert!(check_acceptor_sealed(&acceptor_token(0x07, 0)).is_ok());
-        assert!(check_acceptor_sealed(&acceptor_token(0x03, 42)).is_ok());
+        let bytes = sealed_bytes(&acceptor_token(0x07, 0), 5);
+        assert!(check(&bytes, 5).is_ok());
+        let bytes = sealed_bytes(&acceptor_token(0x03, 42), 5);
+        assert!(check(&bytes, 5).is_ok());
+    }
+
+    #[test]
+    fn acceptor_sealed_windows_layout_is_accepted() {
+        let bytes = sealed_bytes(&acceptor_token(0x07, 0), 10);
+        assert_eq!(bytes.len(), 70);
+        assert!(check(&bytes, 10).is_ok());
+    }
+
+    #[test]
+    fn acceptor_sealed_nonzero_ec_is_refused() {
+        // A genuine 92-byte frame (60-byte header, 32 data bytes); the
+        // forgery sets EC to 16 and announces 16 bytes of plaintext, so the
+        // header is read as 76 bytes (CVE-2024-37370 shape).
+        let mut bytes = sealed_bytes(&acceptor_token(0x07, 0), 32);
+        assert_eq!(bytes.len(), 92);
+        assert!(check(&bytes, 32).is_ok());
+        bytes[4..6].copy_from_slice(&16u16.to_be_bytes());
+        match check(&bytes, 16) {
+            Err(WinrmError::AuthFailed(m)) => {
+                assert!(m.contains("extra count (EC)"), "{m}");
+            }
+            other => panic!("expected AuthFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn acceptor_sealed_header_len_must_match_rrc() {
+        // RRC 28 needs a 60-byte header; 61 is refused.
+        let bytes = sealed_bytes(&acceptor_token(0x07, 0), 11);
+        match check(&bytes, 10) {
+            Err(WinrmError::AuthFailed(m)) => assert!(m.contains("rotation count"), "{m}"),
+            other => panic!("expected AuthFailed, got {other:?}"),
+        }
+        // RRC 40 (an AES-SHA2-shaped token) goes with a 72-byte header.
+        let mut token = acceptor_token(0x07, 0);
+        token[6..8].copy_from_slice(&40u16.to_be_bytes());
+        token.resize(72, 0);
+        let bytes = sealed_bytes(&token, 10);
+        assert!(check(&bytes, 10).is_ok());
     }
 
     #[test]
@@ -657,7 +870,8 @@ mod layout_tests {
                 t
             }),
         ] {
-            assert!(check_acceptor_sealed(&token).is_err(), "{name}");
+            // No data bytes, so the 15-byte token is the whole input.
+            assert!(check(&token, 0).is_err(), "{name}");
         }
     }
 
@@ -705,6 +919,181 @@ mod layout_tests {
             WinrmError::Soap(_)
         ));
     }
+
+    /// A pending context whose next step is fixed in advance.
+    struct FakePending(Result<wire::StepOutcome<u8>, String>);
+
+    impl wire::PendingStep for FakePending {
+        type Ctx = u8;
+        fn step(self, _token: &[u8]) -> Result<wire::StepOutcome<u8>, String> {
+            self.0
+        }
+    }
+
+    fn auth_failed(result: Result<u8, WinrmError>) -> String {
+        match result {
+            Err(WinrmError::AuthFailed(m)) => m,
+            other => panic!("expected AuthFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn establish_refuses_a_missing_ap_rep() {
+        let pending = FakePending(Ok(wire::StepOutcome::Finished {
+            ctx: 1,
+            extra_token: false,
+        }));
+        let m = auth_failed(wire::finish_mutual(pending, None));
+        assert!(m.contains("no mutual authentication token"), "{m}");
+    }
+
+    #[test]
+    fn establish_refuses_a_failed_ap_rep_step() {
+        let pending = FakePending(Err("boom".into()));
+        let m = auth_failed(wire::finish_mutual(pending, Some(vec![1])));
+        assert!(m.contains("Kerberos mutual authentication failed"), "{m}");
+        assert!(m.contains("boom"), "{m}");
+    }
+
+    #[test]
+    fn establish_refuses_a_continue_needed_context() {
+        let pending = FakePending(Ok(wire::StepOutcome::Continue));
+        let m = auth_failed(wire::finish_mutual(pending, Some(vec![1])));
+        assert!(m.contains("another round trip"), "{m}");
+    }
+
+    #[test]
+    fn establish_refuses_a_finished_context_with_an_extra_token() {
+        let pending = FakePending(Ok(wire::StepOutcome::Finished {
+            ctx: 1,
+            extra_token: true,
+        }));
+        let m = auth_failed(wire::finish_mutual(pending, Some(vec![1])));
+        assert!(m.contains("another round trip"), "{m}");
+    }
+
+    #[test]
+    fn establish_accepts_a_finished_context_without_token() {
+        let pending = FakePending(Ok(wire::StepOutcome::Finished {
+            ctx: 7,
+            extra_token: false,
+        }));
+        assert!(matches!(wire::finish_mutual(pending, Some(vec![1])), Ok(7)));
+    }
+
+    #[test]
+    fn bound_certificate_must_be_the_known_same_certificate() {
+        use crate::auth::PeerCertificate;
+        let der = vec![9u8; 4];
+        assert!(wire::check_bound_certificate(None, &PeerCertificate::Unknown).is_ok());
+        assert!(
+            wire::check_bound_certificate(Some(&der), &PeerCertificate::Known(der.clone())).is_ok()
+        );
+        for peer in [
+            PeerCertificate::Known(vec![8u8; 4]),
+            PeerCertificate::Ambiguous,
+            PeerCertificate::Unknown,
+        ] {
+            match wire::check_bound_certificate(Some(&der), &peer) {
+                Err(WinrmError::AuthFailed(m)) => assert!(
+                    m.contains(
+                        "did not present the certificate its channel binding was computed for"
+                    ),
+                    "{m}"
+                ),
+                other => panic!("expected AuthFailed for {peer:?}, got {other:?}"),
+            }
+        }
+    }
+
+    mod blocking {
+        use super::super::run_blocking_bounded;
+        use crate::error::WinrmError;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::time::{Duration, Instant};
+        use tokio::sync::Semaphore;
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn kerberos_blocking_call_returns_its_result() {
+            let out =
+                run_blocking_bounded(Duration::from_secs(5), Arc::new(Semaphore::new(4)), || {
+                    Ok::<_, WinrmError>(42u32)
+                })
+                .await;
+            assert!(matches!(out, Ok(42)), "{out:?}");
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn kerberos_blocking_call_does_not_stall_a_current_thread_runtime() {
+            let ticks = Arc::new(AtomicU32::new(0));
+            let ticker = {
+                let ticks = Arc::clone(&ticks);
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        ticks.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+            };
+            let start = Instant::now();
+            let out = run_blocking_bounded(
+                Duration::from_millis(100),
+                Arc::new(Semaphore::new(4)),
+                || {
+                    std::thread::sleep(Duration::from_millis(1000));
+                    Ok::<_, WinrmError>(())
+                },
+            )
+            .await;
+            let elapsed = start.elapsed();
+            ticker.abort();
+            assert!(matches!(out, Err(WinrmError::Timeout(1))), "{out:?}");
+            assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+            assert!(
+                ticks.load(Ordering::Relaxed) >= 1,
+                "the executor made no progress during the blocking call"
+            );
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn kerberos_blocking_call_panic_is_auth_failed() {
+            let out = run_blocking_bounded(
+                Duration::from_secs(5),
+                Arc::new(Semaphore::new(4)),
+                || -> Result<(), WinrmError> { panic!("x") },
+            )
+            .await;
+            match out {
+                Err(WinrmError::AuthFailed(m)) => {
+                    assert!(m.contains("library call failed"), "{m}");
+                }
+                other => panic!("expected AuthFailed, got {other:?}"),
+            }
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn kerberos_blocking_slot_is_held_until_the_call_returns() {
+            let slots = Arc::new(Semaphore::new(1));
+            let start = Instant::now();
+            let first = run_blocking_bounded(Duration::from_millis(50), Arc::clone(&slots), || {
+                std::thread::sleep(Duration::from_millis(300));
+                Ok::<_, WinrmError>(0u32)
+            })
+            .await;
+            assert!(matches!(first, Err(WinrmError::Timeout(1))), "{first:?}");
+            let second = run_blocking_bounded(Duration::from_millis(800), slots, || {
+                Ok::<_, WinrmError>(1u32)
+            })
+            .await;
+            assert!(matches!(second, Ok(1)), "{second:?}");
+            assert!(
+                start.elapsed() >= Duration::from_millis(300),
+                "the second call did not wait for the slot: {:?}",
+                start.elapsed()
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -717,6 +1106,8 @@ mod tests {
         let auth = KerberosAuth {
             service_principal: "HTTP/test".into(),
             max_response_bytes: 1024,
+            kdc_timeout: std::time::Duration::from_secs(1),
+            kdc_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
         };
         let http = crate::transport::test_http_client();
         let result = auth

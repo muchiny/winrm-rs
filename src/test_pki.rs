@@ -16,6 +16,29 @@
 //   openssl ec -in ec-sec1.key -aes128 -passout pass:throwaway -out ec-sec1-enc.key
 //   openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256   # impostor key
 //
+// Trust-anchor fixtures (CA, a CA-issued leaf, a non-CA self-signed leaf), made
+// with OpenSSL 3.5 and equally throwaway. The CA and its leaf also reach the
+// operating system's verifier (an `https://` proxy over plain HTTP,
+// `platform_roots`). On macOS a TLS server certificate issued on or after
+// 1 July 2019 that chains to a root added by the application may be valid for
+// at most 825 days, so their validity starts before that date and still runs
+// for a century. The non-CA self-signed leaf only reaches the WebPKI
+// verifier, which sets no such limit.
+//
+//   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout ca.key \
+//       -out ca.pem -not_before 20190101000000Z -not_after 21190101000000Z \
+//       -subj "/CN=winrm-rs throwaway test CA"   # default v3_ca: CA:TRUE
+//   printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:localhost\n' > leaf.ext
+//   openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout leaf.key \
+//       -out leaf.csr -subj "/CN=winrm-rs throwaway CA-issued leaf"
+//   openssl x509 -req -in leaf.csr -CA ca.pem -CAkey ca.key -set_serial 2 \
+//       -not_before 20190101000000Z -not_after 21181201000000Z -extfile leaf.ext -out leaf.pem
+//   openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout ss.key \
+//       -out ss.csr -subj "/CN=winrm-rs throwaway non-CA self-signed"
+//   openssl x509 -req -in ss.csr -key ss.key -set_serial 3 -days 36500 -extfile leaf.ext -out ss.pem
+//
+// Check with `openssl x509 -noout -ext basicConstraints,subjectAltName -in <file>`.
+//
 // One EC key in two encodings (SEC1, PKCS#8) and one RSA key in PKCS#1 cover
 // the three private-key formats Certificate auth accepts. The impostor key is
 // unrelated to any certificate here.
@@ -38,6 +61,12 @@ YWxob3N0MAoGCCqGSM49BAMCA0gAMEUCIBtJjwIRLUZrQdKDmdrOlBBI5KPfVcsG
 koySnOGaSI9xAiEAnlCMdQbfDAQpp3i9w9M2UCeHia4DZzG+kSK8NOKSx44=
 -----END CERTIFICATE-----
 ";
+
+/// SHA-256 fingerprint of [`EC_CERT_PEM`] as `openssl x509 -fingerprint
+/// -sha256 -noout` prints it, in lower case (a known-answer vector for the
+/// pin).
+pub(crate) const EC_CERT_SHA256_OPENSSL: &str = "a7:65:5d:cc:be:aa:e6:bc:34:44:5a:6a:76:36:7f:33:\
+     17:3b:aa:f1:27:ad:b0:7e:40:d8:f0:c4:eb:de:6f:64";
 
 /// Key of [`EC_CERT_PEM`], SEC1 encoding (`EC PRIVATE KEY`).
 pub(crate) const EC_KEY_SEC1_PEM: &str = "\
@@ -508,12 +537,88 @@ TZkzaJG8kyjjXD9Hm+4XvQoYWD7qDvK1xYymIr+F28TE4IV/nKG5Axfi
 -----END PRIVATE KEY-----
 ";
 
+/// Throwaway P-256 CA (`CN=winrm-rs throwaway test CA`, `CA:TRUE`); it issued [`CA_LEAF_PEM`].
+pub(crate) const TEST_CA_PEM: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIBoTCCAUegAwIBAgIUcA+cqr9ttGm82Ag+kT3NfVW3fkgwCgYIKoZIzj0EAwIw
+JTEjMCEGA1UEAwwad2lucm0tcnMgdGhyb3dhd2F5IHRlc3QgQ0EwIBcNMTkwMTAx
+MDAwMDAwWhgPMjExOTAxMDEwMDAwMDBaMCUxIzAhBgNVBAMMGndpbnJtLXJzIHRo
+cm93YXdheSB0ZXN0IENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE1wmNbja/
+pC2W0d0gmidS/m6fOCi5mqjgJFhNkG15tKuRtB+EDwcqDxwgz0uU/WDeyXObAqIL
+v8sETWZmjKWWj6NTMFEwHQYDVR0OBBYEFF1riqkKL8/CAYJbVVuruAJiobtbMB8G
+A1UdIwQYMBaAFF1riqkKL8/CAYJbVVuruAJiobtbMA8GA1UdEwEB/wQFMAMBAf8w
+CgYIKoZIzj0EAwIDSAAwRQIgPoW/j2nSjgMB4RVWBPULNYsCdl9F2+CbgLVu0ERD
+Sr8CIQCqoAYI2hn3YJNoy95Ps03/VgxepsxUb5w7Iytg6Io+hg==
+-----END CERTIFICATE-----
+";
+
+/// P-256 listener certificate issued by [`TEST_CA_PEM`]: `CA:FALSE`, `serverAuth`, SAN `DNS:localhost`.
+pub(crate) const CA_LEAF_PEM: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIBzjCCAXWgAwIBAgIBAjAKBggqhkjOPQQDAjAlMSMwIQYDVQQDDBp3aW5ybS1y
+cyB0aHJvd2F3YXkgdGVzdCBDQTAgFw0xOTAxMDEwMDAwMDBaGA8yMTE4MTIwMTAw
+MDAwMFowLDEqMCgGA1UEAwwhd2lucm0tcnMgdGhyb3dhd2F5IENBLWlzc3VlZCBs
+ZWFmMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEmn+7NK9sOsbjxhj5QvadWQYD
+0ghmc3lkdHllp5l+M6zSuMeFBj7LRcW2CEILMUku+iDBxUZ4CpPk+1goN8/p5KOB
+jDCBiTAMBgNVHRMBAf8EAjAAMA4GA1UdDwEB/wQEAwIHgDATBgNVHSUEDDAKBggr
+BgEFBQcDATAUBgNVHREEDTALgglsb2NhbGhvc3QwHQYDVR0OBBYEFCIVDJGH8rvt
+A91y84n3y0zd1tx5MB8GA1UdIwQYMBaAFF1riqkKL8/CAYJbVVuruAJiobtbMAoG
+CCqGSM49BAMCA0cAMEQCIHlQvg/4vO7TnCK5gt1qndZ5Svk1r8Mmzd2aWerABTBA
+AiB527LnHujmvIrlVzJi/vPw7Qv3a1hvdAs+4WQ3d00VrQ==
+-----END CERTIFICATE-----
+";
+
+/// Key of [`CA_LEAF_PEM`], PKCS#8 (`PRIVATE KEY`).
+pub(crate) const CA_LEAF_KEY_PEM: &str = "\
+-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgcvZHJJSPiQeeTrua
+qwtbWKsTq1c3sgfG9Bu3TiwB35ChRANCAASaf7s0r2w6xuPGGPlC9p1ZBgPSCGZz
+eWR0eWWnmX4zrNK4x4UGPstFxbYIQgsxSS76IMHFRngKk+T7WCg3z+nk
+-----END PRIVATE KEY-----
+";
+
+/// Self-signed P-256 certificate that is not a CA: `CA:FALSE`, `serverAuth`, SAN `DNS:localhost`.
+pub(crate) const NON_CA_SELF_SIGNED_PEM: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIBuzCCAWGgAwIBAgIBAzAKBggqhkjOPQQDAjAwMS4wLAYDVQQDDCV3aW5ybS1y
+cyB0aHJvd2F3YXkgbm9uLUNBIHNlbGYtc2lnbmVkMCAXDTI2MTAyNTAwNTUxOVoY
+DzIxMjYxMDAxMDA1NTE5WjAwMS4wLAYDVQQDDCV3aW5ybS1ycyB0aHJvd2F3YXkg
+bm9uLUNBIHNlbGYtc2lnbmVkMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEfvSH
+H5kZbJ9Mx7bahe8es5czIx0+e7mKLZRs3o0wOwY520JhPDy69fvipIffEn/C5J5z
+y9XbsBgy/j1uU7A3NaNqMGgwDAYDVR0TAQH/BAIwADAOBgNVHQ8BAf8EBAMCB4Aw
+EwYDVR0lBAwwCgYIKwYBBQUHAwEwFAYDVR0RBA0wC4IJbG9jYWxob3N0MB0GA1Ud
+DgQWBBRRWfhbsNNIxoQcgrw0Ppv0nRRlFjAKBggqhkjOPQQDAgNIADBFAiBMDUge
+67lJPpN70bxW1XJXIDAQXn9EADnLmQPb3qB2jAIhAMkLcX/ye+I58dBWGhf6szTA
+sBIpF5KMbj5lLMqNmt32
+-----END CERTIFICATE-----
+";
+
+/// Key of [`NON_CA_SELF_SIGNED_PEM`], PKCS#8 (`PRIVATE KEY`).
+pub(crate) const NON_CA_SELF_SIGNED_KEY_PEM: &str = "\
+-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQge4qqz64WFk3lnmiZ
+I3cho+VUxn+vtRjYUqXiNY+aLlahRANCAAR+9IcfmRlsn0zHttqF7x6zlzMjHT57
+uYotlGzejTA7BjnbQmE8PLr1++Kkh98Sf8LknnPL1duwGDL+PW5TsDc1
+-----END PRIVATE KEY-----
+";
+
+/// Install `ring` as the process-wide rustls provider, if none is installed
+/// yet. Test servers (`ServerConfig::builder`) and `reqwest` clients built
+/// without a preconfigured TLS configuration read it.
+pub(crate) fn install_test_provider() {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test servers and reqwest test clients need a process provider"
+    )]
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 /// A TLS server config presenting `cert_pem` with its own key `key_pem`.
 pub(crate) fn server_config(cert_pem: &str, key_pem: &str) -> Arc<rustls::ServerConfig> {
     use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    install_test_provider();
     let chain = vec![CertificateDer::from_pem_slice(cert_pem.as_bytes()).unwrap()];
     let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).unwrap();
     Arc::new(
@@ -543,7 +648,7 @@ pub(crate) fn impostor_server_config(
         }
     }
 
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    install_test_provider();
     let cert = CertificateDer::from_pem_slice(EC_CERT_PEM.as_bytes()).unwrap();
     let key = PrivateKeyDer::from_pem_slice(IMPOSTOR_EC_KEY_PKCS8_PEM.as_bytes()).unwrap();
     let signing_key = rustls::crypto::ring::sign::any_ecdsa_type(&key).unwrap();

@@ -6,6 +6,10 @@
 ///
 /// Variants cover the full error surface: HTTP transport, authentication
 /// handshake, NTLM protocol, SOAP-level faults, and operation timeouts.
+///
+/// Codes, reasons and quoted bodies come from the server. Control and
+/// bidirectional formatting characters are neutralised (line breaks become
+/// spaces, the rest `\u{..}` escapes), but the text itself is not trustworthy.
 #[derive(Debug, thiserror::Error)]
 pub enum WinrmError {
     /// HTTP transport error from `reqwest` (connection refused, timeout, TLS, etc.).
@@ -24,13 +28,25 @@ pub enum WinrmError {
     /// The operation exceeded a deadline, which the payload gives in
     /// seconds. The value depends on where it was raised:
     /// - `Shell::run_command` reports `2 * operation_timeout_secs` (its
-    ///   total deadline);
+    ///   total deadline; the product saturates at `u64::MAX`; the call itself
+    ///   can take up to `min(operation_timeout_secs, 10)` s (at least 1 s)
+    ///   more, the time to terminate the command);
     /// - the `WinrmClient::*_with_timeout` methods report the caller's
     ///   `timeout` rounded up to whole seconds (at least 1);
     /// - a request that needs a dedicated connection (NTLM or Kerberos
-    ///   sealing, NTLM over HTTPS, Kerberos over HTTPS) and waited for one of
-    ///   the 32 connection slots of the client longer than one request may
-    ///   take reports `operation_timeout_secs + 10`; nothing was sent.
+    ///   sealing, NTLM over HTTPS, Kerberos over HTTPS) and waited for a
+    ///   connection slot (32 per host and 128 per client; Signal and Delete
+    ///   have 8 more per host) longer than one request may take, or whose new
+    ///   connection did not finish its authentication within that time,
+    ///   reports `operation_timeout_secs + 10`; nothing was sent;
+    /// - a Kerberos ticket request (the KDC exchange) that runs longer than
+    ///   one request may take reports `operation_timeout_secs + 10`;
+    /// - with `AuthMethod::CredSsp`, a TCP connect plus TLS handshake longer
+    ///   than `connect_timeout_secs` reports that value, and one HTTP exchange
+    ///   longer than `operation_timeout_secs + 10` reports that value; only a
+    ///   timeout on the last exchange of the handshake, which carries the
+    ///   delegated credentials and the request body, may leave the request run
+    ///   on the server.
     #[error("WinRM operation timed out after {0}s")]
     Timeout(u64),
     /// File transfer error (upload or download failure).
@@ -59,6 +75,53 @@ pub(crate) fn excerpt_chars(text: &str, max_chars: usize) -> String {
     }
 }
 
+/// `text` from the server as quoted in an error message or a log line.
+///
+/// Leading and trailing ASCII whitespace is trimmed, the result is cut as
+/// [`excerpt_chars`] cuts it, and then made inert:
+/// - each run of `\t`, `\r`, `\n` becomes one space;
+/// - every other control character (C0, DEL, C1, so `char::is_control`) and
+///   the bidi and line-separator characters U+061C, U+200E, U+200F, U+2028,
+///   U+2029, U+202A-U+202E and U+2066-U+2069 are written with
+///   `char::escape_unicode` (`\u{1b}`).
+///
+/// The text is trimmed with `trim_ascii`, not `trim`, because the latter would
+/// also strip U+0085 and U+2028, which must show as escapes. The escaping runs
+/// after the cut, so the output stays within 10 times `max_chars` plus the
+/// suffix.
+pub(crate) fn quote_server_text(text: &str, max_chars: usize) -> String {
+    let cut = excerpt_chars(text.trim_ascii(), max_chars);
+    let mut out = String::with_capacity(cut.len());
+    let mut in_break = false;
+    for c in cut.chars() {
+        if matches!(c, '\t' | '\r' | '\n') {
+            if !in_break {
+                out.push(' ');
+            }
+            in_break = true;
+            continue;
+        }
+        in_break = false;
+        let inert = !c.is_control()
+            && !matches!(
+                c,
+                '\u{061C}'
+                    | '\u{200E}'
+                    | '\u{200F}'
+                    | '\u{2028}'
+                    | '\u{2029}'
+                    | '\u{202A}'..='\u{202E}'
+                    | '\u{2066}'..='\u{2069}'
+            );
+        if inert {
+            out.push(c);
+        } else {
+            out.extend(c.escape_unicode());
+        }
+    }
+    out
+}
+
 /// Errors from the CredSSP authentication protocol (MS-CSSP).
 #[derive(Debug, thiserror::Error)]
 pub enum CredSspError {
@@ -84,6 +147,11 @@ pub enum SoapError {
     #[error("parse error: {0}")]
     ParseError(String),
     /// The WinRM service returned a SOAP fault with the given code and reason.
+    ///
+    /// Codes, reasons and quoted bodies come from the server. Control and
+    /// bidirectional formatting characters are neutralised (line breaks become
+    /// spaces, the rest `\u{..}` escapes), but the text itself is not
+    /// trustworthy.
     #[error("SOAP fault [{code}]: {reason}")]
     Fault {
         /// Fault code, typically a WS-Addressing or WS-Management URI.
@@ -98,7 +166,8 @@ pub enum SoapError {
 pub enum NtlmError {
     /// An NTLM exchange failed. The message says which case:
     /// - an NTLM message is structurally invalid: too short, bad signature,
-    ///   wrong message type, corrupt base64, a MIC of the wrong size;
+    ///   wrong message type, corrupt base64, a MIC of the wrong size, or a field
+    ///   of an outgoing message too large for its 16-bit length or 32-bit offset;
     /// - a sealed answer does not unseal: bad framing, signature, sequence
     ///   number or checksum;
     /// - the server answered a sealed request without sealing (any error
@@ -113,4 +182,23 @@ pub enum NtlmError {
     ///   algorithms).
     #[error("NTLM error: {0}")]
     InvalidMessage(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quote_server_text_neutralises_controls_and_bidi() {
+        assert_eq!(quote_server_text("a\tb\r\n\r\nc", 64), "a b c");
+        assert_eq!(
+            quote_server_text("  x\u{202E}y\u{7f}z\u{85}\u{2028}\n", 64),
+            r"x\u{202e}y\u{7f}z\u{85}\u{2028}"
+        );
+        assert_eq!(quote_server_text("plain é text", 64), "plain é text");
+        assert_eq!(
+            quote_server_text(&"\u{1b}".repeat(40), 32),
+            format!("{}… [40 bytes in total]", r"\u{1b}".repeat(32))
+        );
+    }
 }

@@ -23,13 +23,30 @@ pub(crate) const NEGOTIATE_OEM: u32 = 0x0000_0002;
 pub(crate) const REQUEST_TARGET: u32 = 0x0000_0004;
 pub(crate) const NEGOTIATE_SIGN: u32 = 0x0000_0010;
 pub(crate) const NEGOTIATE_SEAL: u32 = 0x0000_0020;
+pub(crate) const NEGOTIATE_DATAGRAM: u32 = 0x0000_0040;
+pub(crate) const NEGOTIATE_LM_KEY: u32 = 0x0000_0080;
 pub(crate) const NEGOTIATE_NTLM: u32 = 0x0000_0200;
+pub(crate) const NEGOTIATE_ANONYMOUS: u32 = 0x0000_0800;
+pub(crate) const NEGOTIATE_OEM_DOMAIN_SUPPLIED: u32 = 0x0000_1000;
+pub(crate) const NEGOTIATE_OEM_WORKSTATION_SUPPLIED: u32 = 0x0000_2000;
 pub(crate) const NEGOTIATE_ALWAYS_SIGN: u32 = 0x0000_8000;
 pub(crate) const NEGOTIATE_EXTENDED_SESSIONSECURITY: u32 = 0x0008_0000;
+pub(crate) const NEGOTIATE_IDENTIFY: u32 = 0x0010_0000;
 pub(crate) const NEGOTIATE_VERSION: u32 = 0x0200_0000;
 pub(crate) const NEGOTIATE_128: u32 = 0x2000_0000;
 pub(crate) const NEGOTIATE_KEY_EXCH: u32 = 0x4000_0000;
 pub(crate) const NEGOTIATE_56: u32 = 0x8000_0000;
+
+/// Flag bits of a Type 2 that the Type 3 never repeats: they describe the
+/// server's side of the exchange (datagram mode, the LM key, an anonymous
+/// context, the OEM name hints, identify-level) and none applies to this
+/// client's NTLMv2 authentication.
+pub(crate) const TYPE3_NEVER_ECHO: u32 = NEGOTIATE_DATAGRAM
+    | NEGOTIATE_LM_KEY
+    | NEGOTIATE_ANONYMOUS
+    | NEGOTIATE_OEM_DOMAIN_SUPPLIED
+    | NEGOTIATE_OEM_WORKSTATION_SUPPLIED
+    | NEGOTIATE_IDENTIFY;
 
 pub(crate) const TYPE1_FLAGS: u32 = NEGOTIATE_UNICODE
     | REQUEST_TARGET
@@ -60,39 +77,119 @@ pub(crate) const TYPE1_FLAGS_CREDSSP: u32 = NEGOTIATE_UNICODE
 
 // AV_PAIR IDs (MS-NLMP 2.2.2.1)
 pub(crate) const AV_EOL: u16 = 0x0000;
+pub(crate) const AV_NB_COMPUTER_NAME: u16 = 0x0001;
 pub(crate) const AV_NB_DOMAIN_NAME: u16 = 0x0002;
 pub(crate) const AV_FLAGS_ID: u16 = 0x0006;
 pub(crate) const AV_TIMESTAMP: u16 = 0x0007;
+pub(crate) const AV_SINGLE_HOST: u16 = 0x0008;
 pub(crate) const AV_TARGET_NAME: u16 = 0x0009;
 pub(crate) const AV_CHANNEL_BINDINGS: u16 = 0x000A;
 
+/// Bit in AV_FLAGS indicating that the server's account authentication is
+/// constrained (MS-NLMP 2.2.2.1); the only server flag the client echoes.
+pub(crate) const AV_FLAG_CONSTRAINED: u32 = 0x0000_0001;
 /// Bit in AV_FLAGS indicating that a MIC is present in the AUTHENTICATE_MESSAGE.
 pub(crate) const AV_FLAG_MIC: u32 = 0x0000_0002;
 
 /// NT Hash = MD4(UTF-16LE(password)) (MS-NLMP 3.3.1, NTOWFv1).
-pub(crate) fn compute_nt_hash(password: &str) -> [u8; 16] {
-    let utf16 = to_utf16le(password);
+///
+/// The result is password-equivalent, so it is wiped when dropped, as are the
+/// UTF-16 copy of the password and the digest's output buffer.
+pub(crate) fn compute_nt_hash(password: &str) -> Zeroizing<[u8; 16]> {
+    let utf16 = to_utf16le_secret(password);
     let mut hasher = Md4::new();
-    hasher.update(&utf16);
-    let result = hasher.finalize();
-    let mut hash = [0u8; 16];
+    hasher.update(utf16.as_slice());
+    let mut result = hasher.finalize();
+    let mut hash = Zeroizing::new([0u8; 16]);
     hash.copy_from_slice(&result);
+    result.as_mut_slice().zeroize();
     hash
 }
 
 /// NTLMv2 Hash = HMAC-MD5(NT_Hash, UTF-16LE(UPPER(username) + domain)) (MS-NLMP 3.3.2, NTOWFv2).
-pub(crate) fn compute_ntlmv2_hash(nt_hash: &[u8; 16], username: &str, domain: &str) -> [u8; 16] {
+///
+/// Password-equivalent: the result is wiped when dropped.
+pub(crate) fn compute_ntlmv2_hash(
+    nt_hash: &[u8; 16],
+    username: &str,
+    domain: &str,
+) -> Zeroizing<[u8; 16]> {
     let identity = Zeroizing::new(format!("{}{}", username.to_uppercase(), domain));
-    let identity_bytes = Zeroizing::new(to_utf16le(&identity));
-    hmac_md5(nt_hash, &identity_bytes)
+    let identity_bytes = to_utf16le_secret(&identity);
+    hmac_md5_secret(nt_hash, &identity_bytes)
 }
 
+/// HMAC-MD5 for callers whose key is not secret: the tests, the fuzz
+/// facade and the test NTLM server. Anything keyed by key material (NTLMv2
+/// hash, session keys, the MIC) goes through [`hmac_md5_secret`] or
+/// [`hmac_md5_parts`], which wipe the pad blocks they build.
 pub(crate) fn hmac_md5(key: &[u8], data: &[u8]) -> [u8; 16] {
     let mut mac = HmacMd5::new_from_slice(key).expect("HMAC accepts any key size");
     mac.update(data);
     let result = mac.finalize();
     let mut out = [0u8; 16];
     out.copy_from_slice(&result.into_bytes());
+    out
+}
+
+/// HMAC-MD5 (RFC 2104) whose key or output is key material: the `key XOR pad`
+/// blocks, the inner digest and the output buffer are all wiped.
+///
+/// Written over `Md5` directly because `hmac` does not wipe the pad block it
+/// builds from the key.
+pub(crate) fn hmac_md5_secret(key: &[u8], data: &[u8]) -> Zeroizing<[u8; 16]> {
+    hmac_md5_wiping(key, &[data])
+}
+
+/// HMAC-MD5 of the concatenation of `parts`, keyed by key material, without
+/// copying the parts into one buffer.
+///
+/// Same construction as [`hmac_md5_secret`] (the pad blocks and the inner
+/// digest are wiped), so the NTLM sign and seal checksums, which are keyed by
+/// the session sign keys, stay on it. Equal to `hmac_md5(key, &parts.concat())`.
+pub(crate) fn hmac_md5_parts(key: &[u8], parts: &[&[u8]]) -> [u8; 16] {
+    let mac = hmac_md5_wiping(key, parts);
+    *mac
+}
+
+/// The wiping HMAC-MD5 behind [`hmac_md5_secret`] and [`hmac_md5_parts`].
+fn hmac_md5_wiping(key: &[u8], parts: &[&[u8]]) -> Zeroizing<[u8; 16]> {
+    const BLOCK: usize = 64;
+    let hashed_key: Zeroizing<[u8; 16]>;
+    let key = if key.len() > BLOCK {
+        let mut digest = Md5::digest(key);
+        let mut copy = Zeroizing::new([0u8; 16]);
+        copy.copy_from_slice(&digest);
+        digest.as_mut_slice().zeroize();
+        hashed_key = copy;
+        hashed_key.as_slice()
+    } else {
+        key
+    };
+
+    let mut ipad = Zeroizing::new([0x36u8; BLOCK]);
+    let mut opad = Zeroizing::new([0x5cu8; BLOCK]);
+    for ((inner, outer), k) in ipad.iter_mut().zip(opad.iter_mut()).zip(key) {
+        *inner ^= k;
+        *outer ^= k;
+    }
+
+    let mut inner = Md5::new();
+    inner.update(ipad.as_slice());
+    for part in parts {
+        inner.update(part);
+    }
+    let mut inner_digest = inner.finalize();
+
+    let mut outer = Md5::new();
+    outer.update(opad.as_slice());
+    outer.update(inner_digest.as_slice());
+    let mut digest = outer.finalize();
+
+    let mut out = Zeroizing::new([0u8; 16]);
+    out.copy_from_slice(&digest);
+    inner_digest.as_mut_slice().zeroize();
+    digest.as_mut_slice().zeroize();
     out
 }
 
@@ -114,40 +211,44 @@ pub(crate) fn build_ntlmv2_blob(
     blob
 }
 
+/// The `(AvId, Value)` pairs of a `TargetInfo` AV list (MS-NLMP 2.2.2.1), in
+/// wire order.
+///
+/// The walk ends before the first `MsvAvEOL`, or at a pair whose declared
+/// length runs past the end of `data`: a truncated trailing pair is dropped,
+/// never read.
+pub(crate) fn av_pairs(data: &[u8]) -> impl Iterator<Item = (u16, &[u8])> + '_ {
+    let mut rest = data;
+    std::iter::from_fn(move || {
+        let ([id_lo, id_hi, len_lo, len_hi], tail) = rest.split_first_chunk::<4>()?;
+        let id = u16::from_le_bytes([*id_lo, *id_hi]);
+        if id == AV_EOL {
+            return None;
+        }
+        let len = usize::from(u16::from_le_bytes([*len_lo, *len_hi]));
+        let (value, after) = tail.split_at_checked(len)?;
+        rest = after;
+        Some((id, value))
+    })
+}
+
 /// Parse AV_PAIRs from target info, extracting domain name and timestamp.
+///
+/// The first `MsvAvNbDomainName` wins, and the first `MsvAvTimestamp` whose
+/// value is 8 bytes wins.
 pub(crate) fn parse_av_pairs(data: &[u8]) -> (String, Option<[u8; 8]>) {
-    let mut domain = String::new();
+    let mut domain: Option<String> = None;
     let mut timestamp: Option<[u8; 8]> = None;
-    let mut offset = 0;
 
-    while offset + 4 <= data.len() {
-        let av_id = u16::from_le_bytes([data[offset], data[offset + 1]]);
-        let av_len = u16::from_le_bytes([data[offset + 2], data[offset + 3]]) as usize;
-        offset += 4;
-
-        if av_id == AV_EOL {
-            break;
-        }
-        if offset + av_len > data.len() {
-            break;
-        }
-
-        match av_id {
-            AV_NB_DOMAIN_NAME => {
-                domain = from_utf16le(&data[offset..offset + av_len]);
-            }
-            AV_TIMESTAMP if av_len == 8 => {
-                let mut ts = [0u8; 8];
-                ts.copy_from_slice(&data[offset..offset + 8]);
-                timestamp = Some(ts);
-            }
+    for (id, value) in av_pairs(data) {
+        match id {
+            AV_NB_DOMAIN_NAME if domain.is_none() => domain = Some(from_utf16le(value)),
+            AV_TIMESTAMP if timestamp.is_none() => timestamp = <[u8; 8]>::try_from(value).ok(),
             _ => {}
         }
-
-        offset += av_len;
     }
 
-    (domain, timestamp)
+    (domain.unwrap_or_default(), timestamp)
 }
 
 pub(crate) fn write_security_buffer(buf: &mut Vec<u8>, len: u16, offset: u32) {
@@ -158,6 +259,21 @@ pub(crate) fn write_security_buffer(buf: &mut Vec<u8>, len: u16, offset: u32) {
 
 pub(crate) fn to_utf16le(s: &str) -> Vec<u8> {
     s.encode_utf16().flat_map(|c| c.to_le_bytes()).collect()
+}
+
+/// [`to_utf16le`] into a buffer that is wiped on drop, for secrets.
+///
+/// UTF-16 code units never outnumber UTF-8 bytes, so `2 * s.len()` bytes
+/// always suffice and the buffer is never reallocated (a reallocation would
+/// leave an unwiped copy of the old buffer behind).
+pub(crate) fn to_utf16le_secret(s: &str) -> Zeroizing<Vec<u8>> {
+    let mut out = Zeroizing::new(Vec::with_capacity(s.len().saturating_mul(2)));
+    let capacity = out.capacity();
+    for unit in s.encode_utf16() {
+        out.extend_from_slice(&unit.to_le_bytes());
+    }
+    debug_assert_eq!(out.capacity(), capacity, "UTF-16 buffer was reallocated");
+    out
 }
 
 pub(crate) fn from_utf16le(data: &[u8]) -> String {
@@ -402,7 +518,7 @@ fn channel_bindings_with(hash: CbtHash, cert_der: &[u8]) -> [u8; 16] {
 
 /// RC4 (arcfour) cipher state for NTLM message sealing.
 ///
-/// Minimal inline implementation per the RC4 algorithm. Used by [`super::NtlmSession`]
+/// Minimal inline implementation per the RC4 algorithm. Used by [`super::SealingSession`]
 /// for encrypting/decrypting NTLM message signatures and payloads.
 ///
 /// The S-box (256 B) is derived from a sealing key and so is itself secret —
@@ -418,17 +534,33 @@ pub(crate) struct Rc4State {
 }
 
 impl Rc4State {
+    /// An all-zero state holding no key material: a placeholder for
+    /// [`Self::reinit`] to fill, never used to process data.
+    pub(crate) const INERT: Self = Rc4State {
+        s: [0; 256],
+        i: 0,
+        j: 0,
+    };
+
     pub(crate) fn new(key: &[u8]) -> Self {
-        let mut s = [0u8; 256];
-        for (i, v) in s.iter_mut().enumerate() {
+        let mut state = Self::INERT;
+        state.reinit(key);
+        state
+    }
+
+    /// Re-key the state in place: the S-box is rewritten where it lies, so no
+    /// new copy of it is made, and the keystream restarts at offset 0.
+    pub(crate) fn reinit(&mut self, key: &[u8]) {
+        for (i, v) in self.s.iter_mut().enumerate() {
             *v = i as u8;
         }
+        self.i = 0;
+        self.j = 0;
         let mut j: u8 = 0;
         for i in 0..256 {
-            j = j.wrapping_add(s[i]).wrapping_add(key[i % key.len()]);
-            s.swap(i, j as usize);
+            j = j.wrapping_add(self.s[i]).wrapping_add(key[i % key.len()]);
+            self.s.swap(i, j as usize);
         }
-        Rc4State { s, i: 0, j: 0 }
     }
 
     pub(crate) fn process(&mut self, data: &mut [u8]) {
@@ -443,9 +575,67 @@ impl Rc4State {
     }
 }
 
+/// Parse exactly `N` bytes from `2 * N` hex digits.
+///
+/// Used by the debug-only environment hooks that pin a random value. Returns
+/// `None` for any other length, for a non-hex byte (including a leading `+`,
+/// which `u8::from_str_radix` would accept) and for non-ASCII text. It never
+/// panics.
+#[cfg(any(test, all(debug_assertions, feature = "__internal")))]
+pub(crate) fn parse_fixed_hex<const N: usize>(s: &str) -> Option<[u8; N]> {
+    if s.len() != N.checked_mul(2)? {
+        return None;
+    }
+    let mut out = [0u8; N];
+    // The length check above leaves no remainder.
+    let (pairs, _) = s.as_bytes().as_chunks::<2>();
+    for (slot, pair) in out.iter_mut().zip(pairs) {
+        if !pair.iter().all(u8::is_ascii_hexdigit) {
+            return None;
+        }
+        let text = std::str::from_utf8(pair).ok()?;
+        *slot = u8::from_str_radix(text, 16).ok()?;
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_fixed_hex_rejects_odd_length_and_non_ascii() {
+        assert_eq!(parse_fixed_hex::<1>("0f"), Some([0x0f]));
+        assert_eq!(parse_fixed_hex::<2>("00fF"), Some([0x00, 0xff]));
+        for bad in ["0", "\u{250}", "\u{250}0", "+f", "zz", "0f0f", ""] {
+            assert_eq!(parse_fixed_hex::<1>(bad), None, "{bad:?}");
+        }
+        assert_eq!(parse_fixed_hex::<2>("0f"), None);
+    }
+
+    #[test]
+    fn rc4_reinit_equals_new() {
+        let mut a = Rc4State::new(&[0x11; 16]);
+        let mut b = Rc4State::new(&[0x22; 16]);
+        b.reinit(&[0x11; 16]);
+        let (mut x, mut y) = ([0xABu8; 32], [0xABu8; 32]);
+        a.process(&mut x);
+        b.process(&mut y);
+        assert_eq!(x, y);
+    }
+
+    #[test]
+    fn rc4_reinit_resets_the_keystream_position() {
+        let mut a = Rc4State::new(&[0x11; 16]);
+        let mut used = [0u8; 40];
+        a.process(&mut used);
+        a.reinit(&[0x11; 16]);
+        let mut fresh = Rc4State::new(&[0x11; 16]);
+        let (mut x, mut y) = ([0u8; 24], [0u8; 24]);
+        a.process(&mut x);
+        fresh.process(&mut y);
+        assert_eq!(x, y);
+    }
 
     // Kills | → ^ and | → & mutants on TYPE1_FLAGS and TYPE1_FLAGS_CREDSSP.
     // Assert against hardcoded hex values so the constant itself is tested.
@@ -459,13 +649,85 @@ mod tests {
         assert_eq!(TYPE1_FLAGS_CREDSSP, 0xe208_8237);
     }
 
+    /// Compile-time proof the digest cores wipe on drop; fails to build if the
+    /// `zeroize` features are dropped from Cargo.toml.
+    #[test]
+    fn hash_states_wipe_on_drop() {
+        fn assert_zod<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zod::<md4::Md4>();
+        assert_zod::<md5::Md5>();
+    }
+
+    #[test]
+    fn to_utf16le_secret_matches_to_utf16le_without_growing() {
+        for s in ["", "ascii", "é-bmp", "a\u{1F600}b"] {
+            let v = to_utf16le_secret(s);
+            assert_eq!(v.as_slice(), to_utf16le(s).as_slice());
+            assert!(v.capacity() >= v.len());
+        }
+    }
+
+    #[test]
+    fn hmac_md5_secret_matches_rfc_2202_vectors() {
+        // RFC 2202 test case 1: key 0x0b * 16, data "Hi There".
+        let out = hmac_md5_secret(&[0x0b; 16], b"Hi There");
+        assert_eq!(
+            *out,
+            [
+                0x92, 0x94, 0x72, 0x7a, 0x36, 0x38, 0xbb, 0x1c, 0x13, 0xf4, 0x8e, 0xf8, 0x15, 0x8b,
+                0xfc, 0x9d
+            ]
+        );
+        // RFC 2202 test case 2: key "Jefe".
+        let out = hmac_md5_secret(b"Jefe", b"what do ya want for nothing?");
+        assert_eq!(
+            *out,
+            [
+                0x75, 0x0c, 0x78, 0x3e, 0x6a, 0xb0, 0xb5, 0x03, 0xea, 0xa8, 0x6e, 0x31, 0x0a, 0x5d,
+                0xb7, 0x38
+            ]
+        );
+    }
+
+    #[test]
+    fn hmac_md5_parts_matches_hmac_md5_over_the_concatenation() {
+        let key = [0x0b; 16];
+        assert_eq!(
+            hmac_md5_parts(&key, &[&[0, 0, 0, 0], b"hello"]),
+            hmac_md5(&key, b"\0\0\0\0hello")
+        );
+        assert_eq!(hmac_md5_parts(&key, &[]), hmac_md5(&key, b""));
+        assert_eq!(
+            hmac_md5_parts(&key, &[b"", b"ab", b"", b"c"]),
+            hmac_md5(&key, b"abc")
+        );
+        // Keys longer than the block are hashed first, as in `hmac_md5_secret`.
+        for key_len in [0usize, 16, 64, 65, 200] {
+            let key = vec![0xAAu8; key_len];
+            assert_eq!(
+                hmac_md5_parts(&key, &[b"seq".as_slice(), &[0x5C; 50]]),
+                *hmac_md5_secret(&key, &[b"seq".as_slice(), &[0x5C; 50]].concat())
+            );
+        }
+    }
+
+    #[test]
+    fn hmac_md5_secret_matches_hmac_md5_for_long_keys() {
+        // A key longer than the 64-byte block is hashed first (RFC 2104).
+        for key_len in [0usize, 1, 16, 63, 64, 65, 200] {
+            let key = vec![0xAAu8; key_len];
+            let data = [0x5Cu8; 50];
+            assert_eq!(*hmac_md5_secret(&key, &data), hmac_md5(&key, &data));
+        }
+    }
+
     #[test]
     fn nt_hash_known_value() {
         // Known test vector: password "Password" -> MD4 of UTF-16LE
         let hash = compute_nt_hash("Password");
         assert_eq!(hash.len(), 16);
         // Verify it's not all zeros (actual computation happened)
-        assert_ne!(hash, [0u8; 16]);
+        assert_ne!(*hash, [0u8; 16]);
     }
 
     #[test]
@@ -474,7 +736,7 @@ mod tests {
         // Known value: A4F49C406510BDCAB6824EE7C30FD852
         let hash = compute_nt_hash("Password");
         assert_eq!(
-            hash,
+            *hash,
             [
                 0xA4, 0xF4, 0x9C, 0x40, 0x65, 0x10, 0xBD, 0xCA, 0xB6, 0x82, 0x4E, 0xE7, 0xC3, 0x0F,
                 0xD8, 0x52
@@ -488,8 +750,8 @@ mod tests {
         let h2 = compute_nt_hash("password2");
         assert_ne!(h1, h2);
         // Verify it's not the [1; 16] mutation replacement
-        assert_ne!(h1, [1u8; 16]);
-        assert_ne!(h2, [1u8; 16]);
+        assert_ne!(*h1, [1u8; 16]);
+        assert_ne!(*h2, [1u8; 16]);
     }
 
     #[test]
@@ -599,6 +861,68 @@ mod tests {
 
         let (parsed_domain, _) = parse_av_pairs(&ti);
         assert_eq!(parsed_domain, "AB");
+    }
+
+    fn av(id: u16, value: &[u8]) -> Vec<u8> {
+        let mut v = id.to_le_bytes().to_vec();
+        v.extend_from_slice(&u16::try_from(value.len()).unwrap().to_le_bytes());
+        v.extend_from_slice(value);
+        v
+    }
+
+    #[test]
+    fn av_pairs_yields_pairs_in_order_up_to_the_first_eol() {
+        let ti = [
+            av(0x0002, b"ab"),
+            av(0x0005, b""),
+            av(0x0007, b"12345678"),
+            av(AV_EOL, b""),
+            av(0x0003, b"after"),
+        ]
+        .concat();
+        let pairs: Vec<(u16, &[u8])> = av_pairs(&ti).collect();
+        assert_eq!(
+            pairs,
+            [
+                (0x0002, &b"ab"[..]),
+                (0x0005, &b""[..]),
+                (0x0007, &b"12345678"[..])
+            ]
+        );
+    }
+
+    #[test]
+    fn av_pairs_drops_a_truncated_trailing_pair() {
+        let mut ti = av(0x0002, b"ab");
+        ti.extend_from_slice(&[0x03, 0x00, 40, 0x00, 1, 2, 3, 4]);
+        let pairs: Vec<(u16, &[u8])> = av_pairs(&ti).collect();
+        assert_eq!(pairs, [(0x0002, &b"ab"[..])]);
+        // A dangling partial header is no pair either.
+        let pairs: Vec<(u16, &[u8])> = av_pairs(&[0x02, 0x00, 0x00]).collect();
+        assert!(pairs.is_empty());
+    }
+
+    #[test]
+    fn av_pairs_reads_a_pair_that_ends_exactly_at_the_end() {
+        let ti = av(0x0004, b"xyz");
+        let pairs: Vec<(u16, &[u8])> = av_pairs(&ti).collect();
+        assert_eq!(pairs, [(0x0004, &b"xyz"[..])]);
+    }
+
+    #[test]
+    fn parse_av_pairs_first_domain_and_first_8_byte_timestamp_win() {
+        let ti = [
+            av(AV_NB_DOMAIN_NAME, &to_utf16le("FIRST")),
+            av(AV_TIMESTAMP, &[0x11; 4]),
+            av(AV_TIMESTAMP, &[0x22; 8]),
+            av(AV_NB_DOMAIN_NAME, &to_utf16le("SECOND")),
+            av(AV_TIMESTAMP, &[0x33; 8]),
+            av(AV_EOL, b""),
+        ]
+        .concat();
+        let (domain, timestamp) = parse_av_pairs(&ti);
+        assert_eq!(domain, "FIRST");
+        assert_eq!(timestamp, Some([0x22; 8]));
     }
 
     #[test]

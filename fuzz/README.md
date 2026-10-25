@@ -1,6 +1,6 @@
 # Fuzzing `winrm-rs`
 
-21 libFuzzer targets covering everything the crate parses off the network and
+22 libFuzzer targets covering everything the crate parses off the network and
 everything it splices into an outgoing request. Driven through
 [`scripts/fuzz.sh`](../scripts/fuzz.sh).
 
@@ -34,25 +34,25 @@ drives; "invariant" is what it asserts beyond *must not panic*.
 | `fuzz_ntlm_challenge_header` | same, magic-prefixed inputs | — |
 | `fuzz_ntlm_header_decode` | `decode_challenge_header` | base64 framing does not change message validity |
 | `fuzz_ntlm_av_pairs` | `crypto::parse_av_pairs`, `from_utf16le` | decoded text never exceeds its code-unit count |
-| `fuzz_ntlm_type3` | `create_authenticate_message*` | every Type 3 security buffer stays inside the message |
+| `fuzz_ntlm_type3` | `create_authenticate_message*` | every Type 3 security buffer stays inside the message, the declared lengths fill it exactly, and the AV list is the canonical one (`check_av_list`) |
 
 ### NTLM crypto and session state
 
 | Target | Source | Invariant |
 |---|---|---|
 | `fuzz_ntlm_crypto` | NTOWFv1/v2, client blob, CBT, RC4, UTF-16 | blob framing is exact; RC4 self-inverse; UTF-16 roundtrips |
-| `fuzz_ntlm_seal` | `NtlmSession::seal`/`unseal` | seal prepends exactly 16 bytes |
+| `fuzz_ntlm_seal` | `SealingSession::seal`/`unseal` | seal prepends exactly 16 bytes |
 | `fuzz_ntlm_session` | multi-message seal/sign/unseal | signature version and sequence numbering across a conversation |
 | `fuzz_ntlm_unseal_body` | `auth/ntlm.rs::unseal_body` (MS-WSMV multipart/encrypted framing) | never panics; errors do not echo the body; a server-sealed frame round-trips exactly; a flipped bit is rejected or leaves the plaintext unchanged; any truncation is rejected |
-| `fuzz_kerberos_sealed` | `auth/sealed.rs::parse` with the Kerberos header rule, `auth/kerberos.rs` `check_acceptor_sealed` / `windows_layout`, `soap/parser.rs::check_relates_to` (no KDC needed) | never panics; errors stay short; a parsed token is a 16..=1024-byte header plus exactly `Length` bytes; the layout conversion keeps the data, writes RRC = trailer length and is a right rotation by it |
+| `fuzz_kerberos_sealed` | `auth/sealed.rs::parse` with the Kerberos header rule, `auth/kerberos.rs` `check_acceptor_sealed` / `windows_layout`, `soap/parser.rs::check_relates_to` (no KDC needed) | never panics; errors stay short; a parsed token is a 16..=1024-byte header plus exactly `Length` bytes, and `check_acceptor_sealed` (given that length) accepts only EC = 0 and a header of 32 + RRC bytes; the layout conversion keeps the data, writes RRC = trailer length and is a right rotation by it |
 
 ### SOAP
 
 | Target | Source | Invariant |
 |---|---|---|
 | `fuzz_soap_parse` | `soap/parser.rs` response parsers | decoded streams fit in the response; a fault is never read as success |
-| `fuzz_soap_enumerate` | `parse_enumerate_response` | `EndOfSequence` clears the context; the context cannot inject into the next `Pull` |
-| `fuzz_soap_envelope` | all envelope builders | **no input can add XML markup** — tag counts match an empty-input baseline |
+| `fuzz_soap_enumerate` | `parse_enumerate_response` | an `EndOfSequence` element after the document clears the context; escaped item text never does and is never a fault; the context cannot add XML elements to the next `Pull` |
+| `fuzz_soap_envelope` | all envelope builders, the five PSRP ones included (shell creation with `creationXml`, command, receive, send, signal) | **no input can add XML markup** — tag counts match an empty-input baseline |
 | `fuzz_xml_escape` | `envelope::xml_escape` | complete (no raw markup survives) and reversible |
 | `fuzz_clixml_stderr` | `soap/clixml.rs::ClixmlDecoder` | output does not depend on how stderr is sliced; plain stderr passes through; output ≤ 3× input |
 
@@ -61,7 +61,7 @@ drives; "invariant" is what it asserts beyond *must not panic*.
 | Target | Source | Invariant |
 |---|---|---|
 | `fuzz_transport_host` | `transport::sanitize_host`, `transport::validate_host` | no `/` or `@` survives; the rebuilt URL has one authority; an accepted host has no `?`, `#`, `\`, whitespace or control character, and its endpoint URL (when the URL parser takes it) reads back with that host, the port, `/wsman`, and no userinfo, query or fragment |
-| `fuzz_transfer_path` | `validate_remote_path`, `escape_ps_single_quoted` | accepted paths are bounded and control-free; every PowerShell single quote (U+0027, U+2018, U+2019, U+201A, U+201B) is doubled with itself and collapses back to the input |
+| `fuzz_transfer_path` | `validate_remote_path`, `validate_remote_path_for`, `escape_ps_single_quoted`, `quote_powershell_string` | accepted paths are bounded and control-free; LocalDrive accepts only drive-absolute paths and refuses DOS device names (last component after resolving `.` and `..`); every PowerShell single quote (U+0027, U+2018, U+2019, U+201A, U+201B) is doubled with itself and collapses back to the input; `quote_powershell_string` wraps that escape in one pair of ASCII single quotes and its inner part collapses back to the input |
 | `fuzz_powershell_encode` | `command::encode_powershell_command` | output is ASCII base64 and roundtrips |
 
 ### CredSSP ASN.1 / DER — pre-authentication attack surface
@@ -69,15 +69,16 @@ drives; "invariant" is what it asserts beyond *must not panic*.
 | Target | Source | Invariant |
 |---|---|---|
 | `fuzz_asn1_ts_request` | `decode_ts_request`, `encode_ts_request`, `encode_ts_credentials` | encode → decode is the identity for every field |
-| `fuzz_asn1_spnego` | `decode_spnego_token`, `decode_spnego_mech_list_mic`, `encode_spnego_init/response` | both wrappers roundtrip; the `mechListMIC` does not disturb the token and comes back out unchanged; a `NegTokenInit` is refused by the MIC extractor |
+| `fuzz_asn1_spnego` | `decode_spnego_token`, `decode_spnego_mech_list_mic`, `decode_spnego_final` (strict final-token decoder, must not panic), `encode_spnego_init/response` | both wrappers roundtrip; the `mechListMIC` does not disturb the token and comes back out unchanged; a `NegTokenInit` is refused by the MIC extractor |
 | `fuzz_asn1_cert` | `extract_subject_public_key` | extracted key fits inside the certificate |
+| `fuzz_credssp_http` | `ResponseReader`, `extract_credssp_token_str` | never panics; same result for any chunking; a single all-digit `Content-Length` frames the body exactly; an extracted token is non-empty, has no whitespace or comma, and occurs in the header |
 
 ## Layout
 
 ```
 fuzz/
   fuzz_targets/     one file per target
-  dict/             libFuzzer dictionaries: ntlm, soap, asn1, shell
+  dict/             libFuzzer dictionaries: ntlm, soap, asn1, shell, http
   seeds/            committed starting corpus (regenerate: scripts/gen-fuzz-seeds.py)
   corpus/           evolving corpus, git-ignored, cached in CI
   artifacts/        crash reproducers, git-ignored
@@ -101,8 +102,9 @@ silently producing a wrong offset.
 ## Reproducibility
 
 `create_authenticate_message_full` draws its client challenge from the CSPRNG,
-which makes Type 3 output non-deterministic. In debug-assertion builds it
-honours `CREDSSP_FIXED_CC`; `scripts/fuzz.sh` sets it, so `fuzz_ntlm_type3`
+which makes Type 3 output non-deterministic. In debug-assertion builds with the
+`__internal` feature (which the fuzz crate enables) it honours
+`CREDSSP_FIXED_CC`; `scripts/fuzz.sh` sets it, so `fuzz_ntlm_type3`
 replays identically. The challenge timestamp is supplied by the target rather
 than read from the clock for the same reason.
 
@@ -120,6 +122,26 @@ cargo +nightly fuzz run <target> fuzz/artifacts/<target>/crash-<hash>
   per target under ASan, plus a sanitizer-free pass on the four parsers where
   overflow checks are the more useful detector. The corpus is cached per target
   and minimised after each run; crashes upload as artifacts.
+
+## Long inputs
+
+The nightly `long-inputs` job (`fuzz.yml`) fuzzes the three Receive-path
+parsers (`fuzz_soap_parse`, `fuzz_soap_enumerate`, `fuzz_clixml_stderr`) with
+inputs up to 2 MiB (the default `max_response_bytes`) and a 10 s per-input
+timeout, so a superlinear parse shows up as a timeout. Turn every input it
+reports into a time-bounded unit test next to
+`extract_element_text_is_linear_on_unclosed_tags`, then fix the parser.
+
+To reproduce locally, one target at a time:
+
+```bash
+FUZZ_MAX_LEN=2097152 FUZZ_TIMEOUT=10 FUZZ_LEN_CONTROL=0 \
+  scripts/fuzz.sh run fuzz_soap_parse 120
+```
+
+`FUZZ_TIMEOUT` (libFuzzer per-input timeout, seconds) and `FUZZ_LEN_CONTROL`
+(`0` tries inputs up to `FUZZ_MAX_LEN` at once) are optional; when unset,
+`scripts/fuzz.sh` passes neither flag.
 
 ## Adding a target
 

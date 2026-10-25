@@ -6,7 +6,7 @@
 //! ```bash
 //! export WINRM_TEST_HOST=192.168.x.x     # Windows host IP
 //! export WINRM_TEST_USER=vagrant          # WinRM username
-//! export WINRM_TEST_PASS=vagrant          # WinRM password
+//! export WINRM_TEST_PASS=...              # WinRM password
 //! cargo test --test integration_real -- --ignored
 //! ```
 //!
@@ -30,7 +30,9 @@
 //! The Kerberos tests (`kerberos_*`, `silent_command_completes_over_kerberos`,
 //! `--features kerberos`) target a separate domain controller bench instead
 //! and, like the certificate tests, panic by design without its `eval`: see
-//! the "Kerberos" section at the end of this file.
+//! the "Kerberos" section at the end of this file. The relay tests there make
+//! the relay's certificate with the `openssl` command, which must be on the
+//! `PATH`.
 //!
 //! BENCH ONLY: the `setup_*` and `enable_*` tests change the host's
 //! configuration (HTTPS listener, CredSSP, CBT hardening, a trusted root CA
@@ -48,8 +50,8 @@
 
 use std::time::{Duration, Instant};
 use winrm_rs::{
-    AuthMethod, CancellationToken, EncryptionMode, WinrmClient, WinrmConfig, WinrmCredentials,
-    WinrmError,
+    AuthMethod, CancellationToken, EncryptionMode, SecretString, WinrmClient, WinrmConfig,
+    WinrmCredentials, WinrmError,
 };
 
 fn test_client() -> Option<(WinrmClient, String)> {
@@ -68,8 +70,9 @@ fn test_client_with(tweak: impl FnOnce(&mut WinrmConfig)) -> Option<(WinrmClient
 
     let mut config = WinrmConfig {
         auth_method: AuthMethod::Basic,
-        port,
-        ..Default::default()
+        encryption: EncryptionMode::Never,
+        port: Some(port),
+        ..WinrmConfig::http()
     };
     tweak(&mut config);
     let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).ok()?;
@@ -377,6 +380,33 @@ async fn wql_query_win32_service() {
     );
 }
 
+/// Many small pages: the enumeration is followed to its end.
+#[tokio::test]
+#[ignore]
+async fn run_wql_pages_to_the_end_with_a_small_envelope() {
+    let (client, host) = test_client_with(|c| c.max_envelope_size = 8192)
+        .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let xml = client
+        .run_wql(&host, "SELECT * FROM Win32_Service", None)
+        .await
+        .unwrap();
+    let count = client
+        .run_powershell(
+            &host,
+            "(Get-CimInstance Win32_Service | Measure-Object).Count",
+        )
+        .await
+        .unwrap();
+    let expected: usize = String::from_utf8_lossy(&count.stdout)
+        .trim()
+        .parse()
+        .unwrap();
+    // One `Name` key per instance. Counting `<p:Win32_Service ...>` start
+    // tags missed subclass instances: `SELECT * FROM Win32_Service` also
+    // returns TermService as a `<p:Win32_TerminalService ...>`.
+    assert_eq!(xml.matches("<p:Name>").count(), expected);
+}
+
 // === NTLM authentication ===
 
 fn test_client_ntlm() -> Option<(WinrmClient, String)> {
@@ -390,8 +420,8 @@ fn test_client_ntlm() -> Option<(WinrmClient, String)> {
 
     let config = WinrmConfig {
         auth_method: AuthMethod::Ntlm,
-        port,
-        ..Default::default()
+        port: Some(port),
+        ..WinrmConfig::http()
     };
     let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).ok()?;
     Some((client, host))
@@ -437,6 +467,111 @@ async fn ntlm_shell_reuse() {
     shell.close().await.expect("close shell");
 }
 
+/// Log sink of [`ntlm_through_a_forward_proxy`].
+#[derive(Clone, Default)]
+struct LogLines(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl LogLines {
+    fn text(&self) -> String {
+        let bytes = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+impl std::io::Write for LogLines {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogLines {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// NTLM with `EncryptionMode::Auto` (sealed) through the forward proxy
+/// `WINRM_TEST_PROXY` (for example a Squid 6 with its default configuration,
+/// `http://squid:3128`), which must reach `WINRM_TEST_HOST`: `whoami` runs
+/// with the default `ProxySessionAuth`, with `RequireWhenUnsealed` (which
+/// would log a WARN for these sealed requests) and with `Require` (which
+/// would refuse them), and the client never logs that the proxy did not
+/// announce `Proxy-Support: Session-Based-Authentication`. Skipped without
+/// `WINRM_TEST_PROXY`.
+#[tokio::test]
+#[ignore]
+async fn ntlm_through_a_forward_proxy() {
+    use tracing_subscriber::util::SubscriberInitExt;
+    use winrm_rs::ProxySessionAuth;
+
+    let Ok(proxy) = std::env::var("WINRM_TEST_PROXY") else {
+        eprintln!("SKIP ntlm_through_a_forward_proxy: set WINRM_TEST_PROXY");
+        return;
+    };
+    let host = std::env::var("WINRM_TEST_HOST").expect("set WINRM_TEST_HOST");
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    let pass = std::env::var("WINRM_TEST_PASS").expect("set WINRM_TEST_PASS");
+    let port: u16 = std::env::var("WINRM_TEST_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(5985);
+
+    // A `#[tokio::test]` runs on one thread, so this default sees every log.
+    let logs = LogLines::default();
+    let _guard = tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
+        .with_ansi(false)
+        .finish()
+        .set_default();
+
+    for policy in [
+        ProxySessionAuth::default(),
+        ProxySessionAuth::RequireWhenUnsealed,
+        ProxySessionAuth::Require,
+    ] {
+        let config = WinrmConfig {
+            auth_method: AuthMethod::Ntlm,
+            encryption: EncryptionMode::Auto,
+            port: Some(port),
+            proxy: Some(SecretString::from(proxy.clone())),
+            ..WinrmConfig::http()
+        };
+        let client = WinrmClient::builder(config)
+            .credentials(WinrmCredentials::new(user.clone(), pass.clone(), ""))
+            .proxy_session_auth(policy)
+            .build()
+            .expect("build the client");
+        let output = client
+            .run_command(&host, "whoami", &[])
+            .await
+            .unwrap_or_else(|e| panic!("whoami through {proxy} with {policy:?}: {e}"));
+        assert_eq!(output.exit_code, 0, "{policy:?}");
+        assert!(
+            !String::from_utf8_lossy(&output.stdout).trim().is_empty(),
+            "{policy:?}: whoami should return a username"
+        );
+    }
+    let text = logs.text();
+    assert!(
+        !text.contains("did not announce"),
+        "the proxy did not announce session-based authentication:\n{text}"
+    );
+}
+
 // === File transfer ===
 
 #[tokio::test]
@@ -475,6 +610,224 @@ async fn upload_and_download_file() {
         .await;
     let _ = std::fs::remove_file(&local_upload);
     let _ = std::fs::remove_file(&local_download);
+}
+
+/// An empty local file truncates an existing remote file, and creates the
+/// remote file when it is missing.
+#[tokio::test]
+#[ignore]
+async fn upload_empty_file_truncates_the_remote_file() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+
+    // Unique per run, so that concurrent runs do not share files.
+    let run_id = uuid::Uuid::new_v4().simple().to_string();
+    let remote_path = format!("C:\\Users\\Public\\winrm-rs-empty-{run_id}.txt");
+    let remote_path = remote_path.as_str();
+    let length_query = format!("(Get-Item -LiteralPath '{remote_path}').Length");
+    let local_full = std::env::temp_dir().join(format!("winrm_rs_test_full_{run_id}.txt"));
+    let local_empty = std::env::temp_dir().join(format!("winrm_rs_test_empty_{run_id}.txt"));
+    std::fs::write(&local_full, b"abc").expect("write local file");
+    std::fs::write(&local_empty, b"").expect("write empty local file");
+
+    // A remote file with content, then truncated by the empty upload.
+    let bytes_up = client
+        .upload_file(&host, &local_full, remote_path)
+        .await
+        .expect("upload file");
+    assert_eq!(bytes_up, 3);
+    let bytes_up = client
+        .upload_file(&host, &local_empty, remote_path)
+        .await
+        .expect("upload empty file");
+    assert_eq!(bytes_up, 0);
+    let output = client
+        .run_powershell(&host, &length_query)
+        .await
+        .expect("query length");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "0");
+
+    // A missing remote file, created by the empty upload.
+    client
+        .run_powershell(
+            &host,
+            &format!("Remove-Item -LiteralPath '{remote_path}' -Force"),
+        )
+        .await
+        .expect("remove remote file");
+    let bytes_up = client
+        .upload_file(&host, &local_empty, remote_path)
+        .await
+        .expect("upload empty file");
+    assert_eq!(bytes_up, 0);
+    let output = client
+        .run_powershell(&host, &length_query)
+        .await
+        .expect("query length");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "0");
+
+    // Cleanup
+    let _ = client
+        .run_powershell(
+            &host,
+            &format!("Remove-Item -LiteralPath '{remote_path}' -Force"),
+        )
+        .await;
+    let _ = std::fs::remove_file(&local_full);
+    let _ = std::fs::remove_file(&local_empty);
+}
+
+/// One-off check that the chunk size shrinks with a long, quote-heavy path:
+/// a 10 000-byte file goes to a 200-character path holding four U+2019 and
+/// comes back identical.
+#[tokio::test]
+#[ignore]
+async fn upload_to_a_long_quoted_path() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+
+    // 200 characters: the temp directory, four U+2019, filler, ".bin".
+    // Unique per run, so that concurrent runs do not share files.
+    let run_id = uuid::Uuid::new_v4().simple().to_string();
+    let mut remote_path = format!("C:\\Windows\\Temp\\winrm_rs_long_{run_id}_");
+    for _ in 0..4 {
+        remote_path.push('\u{2019}');
+        remote_path.push('q');
+    }
+    while remote_path.chars().count() < 196 {
+        remote_path.push('x');
+    }
+    remote_path.push_str(".bin");
+    assert_eq!(remote_path.chars().count(), 200);
+
+    let content: Vec<u8> = (0..10_000_u32)
+        .map(|i| u8::try_from(i % 251).expect("below 251"))
+        .collect();
+    let local_upload = std::env::temp_dir().join(format!("winrm_rs_test_long_upload_{run_id}.bin"));
+    let local_download =
+        std::env::temp_dir().join(format!("winrm_rs_test_long_download_{run_id}.bin"));
+    std::fs::write(&local_upload, &content).expect("write local file");
+
+    let bytes_up = client
+        .upload_file(&host, &local_upload, &remote_path)
+        .await
+        .expect("upload file");
+    assert_eq!(bytes_up, content.len() as u64);
+
+    let bytes_down = client
+        .download_file(&host, &remote_path, &local_download)
+        .await
+        .expect("download file");
+    assert_eq!(bytes_down, content.len() as u64);
+    let downloaded = std::fs::read(&local_download).expect("read downloaded file");
+    assert_eq!(downloaded, content);
+
+    // Cleanup: double every single-quote character for the PowerShell literal.
+    let quoted = remote_path
+        .replace('\'', "''")
+        .replace('\u{2019}', "\u{2019}\u{2019}");
+    let _ = client
+        .run_powershell(
+            &host,
+            &format!("Remove-Item -LiteralPath '{quoted}' -Force"),
+        )
+        .await;
+    let _ = std::fs::remove_file(&local_upload);
+    let _ = std::fs::remove_file(&local_download);
+}
+
+/// A failed upload leaves no shell behind.
+///
+/// A 4001-byte upload sends three chunks. A `before_send` hook refuses a
+/// Receive of the second chunk (request number 6 when each chunk takes one
+/// Receive: 1 Create; chunk 1: 2 Command, 3 Receive, 4 Signal; chunk 2:
+/// 5 Command, 6 Receive); the test depends only on the refusal happening
+/// before the clean-up Delete, which the hook allows. The open shells,
+/// counted by a separate client, must be back to their earlier value.
+///
+/// The `powershell.exe` process counts are printed before and after, not
+/// asserted: other tests and the counting client's own processes change them,
+/// and a leftover process with the shell count restored is a documented limit
+/// (the shell Delete does not end a running command on every host). Run the
+/// test alone (`-- --ignored --test-threads=1`) to read them.
+#[tokio::test]
+#[ignore]
+async fn upload_failure_leaves_no_shell_behind() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let (counter, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    let pass = std::env::var("WINRM_TEST_PASS").expect("set WINRM_TEST_PASS");
+    let port: u16 = std::env::var("WINRM_TEST_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(5985);
+    let sent = Arc::new(AtomicU32::new(0));
+    let hook_sent = Arc::clone(&sent);
+    let client = WinrmClient::builder(WinrmConfig {
+        auth_method: AuthMethod::Basic,
+        encryption: EncryptionMode::Never,
+        port: Some(port),
+        ..WinrmConfig::http()
+    })
+    .credentials(WinrmCredentials::new(user, pass, ""))
+    .before_send(move || hook_sent.fetch_add(1, Ordering::SeqCst) + 1 != 6)
+    .build()
+    .expect("build client");
+
+    let count = |script: &'static str| {
+        let counter = &counter;
+        let host = &host;
+        async move {
+            let out = counter
+                .run_powershell(host, script)
+                .await
+                .expect("count query");
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            stdout
+                .trim()
+                .parse::<usize>()
+                .unwrap_or_else(|_| panic!("cannot parse count from {stdout:?}"))
+        }
+    };
+    let shells_script = "@(Get-WSManInstance -ResourceURI shell -Enumerate).Count";
+    let processes_script =
+        "@(Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\").Count";
+    let shells_before = count(shells_script).await;
+    let processes_before = count(processes_script).await;
+
+    // Unique per run, so that concurrent runs do not share files.
+    let run_id = uuid::Uuid::new_v4().simple().to_string();
+    let local = std::env::temp_dir().join(format!("winrm_rs_test_leak_{run_id}.bin"));
+    std::fs::write(&local, vec![0x5a_u8; 4001]).expect("write local file");
+    let remote_path = format!("C:\\Users\\Public\\winrm-rs-leak-{run_id}.bin");
+
+    let err = client
+        .upload_file(&host, &local, &remote_path)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, WinrmError::Cancelled), "{err:?}");
+
+    let shells_after = count(shells_script).await;
+    let processes_after = count(processes_script).await;
+    eprintln!(
+        "open shells: before={shells_before} after={shells_after}; \
+         powershell.exe: before={processes_before} after={processes_after}"
+    );
+
+    let _ = counter
+        .run_powershell(
+            &host,
+            &format!(
+                "Remove-Item -LiteralPath '{remote_path}' -Force -ErrorAction SilentlyContinue"
+            ),
+        )
+        .await;
+    let _ = std::fs::remove_file(&local);
+
+    assert_eq!(
+        shells_after, shells_before,
+        "shell leaked after failed upload"
+    );
 }
 
 // === CLIXML stderr parsing ===
@@ -769,6 +1122,86 @@ async fn run_powershell_with_timeout_expires_and_releases_shell() {
     assert_eq!(after, before, "shell leaked after the timeout");
 }
 
+/// Poll `observer` once a second, for at most 10 s, until no process matches
+/// the WMI `CommandLine like` filter `pattern`; the last count is returned.
+/// `run_powershell` encodes its own script, so it never matches itself.
+async fn wait_until_no_process_matches(
+    observer: &WinrmClient,
+    host: &str,
+    pattern: &str,
+) -> String {
+    let script = format!(
+        "(Get-CimInstance Win32_Process -Filter \"CommandLine like '{pattern}'\" | Measure-Object).Count"
+    );
+    let mut last = String::new();
+    for _ in 0..10 {
+        let out = observer
+            .run_powershell(host, &script)
+            .await
+            .expect("count processes");
+        last = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if last == "0" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    last
+}
+
+/// `Shell::run_command` terminates the remote command when it gives up, on
+/// its deadline (`2 * operation_timeout_secs`) and on `max_output_bytes`, and
+/// the shell stays usable.
+#[tokio::test]
+#[ignore]
+async fn shell_run_command_terminates_on_cap_and_deadline() {
+    let (observer, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+
+    // Deadline: operation_timeout_secs = 5 gives Timeout(10).
+    let (client, _) = test_client_with(|c| c.operation_timeout_secs = 5)
+        .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let shell = client.open_shell(&host).await.expect("open shell");
+    let err = shell
+        .run_command(
+            "powershell.exe",
+            &[
+                "-NoProfile",
+                "-Command",
+                "Start-Sleep 60; Write-Output late",
+            ],
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, WinrmError::Timeout(10)), "got {err:?}");
+    let left = wait_until_no_process_matches(&observer, &host, "%Start-Sleep 60%").await;
+
+    // Shell reuse after the terminate.
+    let again = shell.run_command("cmd", &["/c", "echo again"]).await;
+    shell.close().await.expect("close shell");
+    assert_eq!(left, "0", "the timed-out command is still running");
+    let again = again.expect("the shell must stay usable after a terminate");
+    assert!(String::from_utf8_lossy(&again.stdout).contains("again"));
+
+    // Cap: max_output_bytes = 1 MiB.
+    let (capped, _) = test_client_with(|c| c.max_output_bytes = Some(1 << 20))
+        .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let shell = capped.open_shell(&host).await.expect("open shell");
+    let err = shell
+        .run_command(
+            "powershell.exe",
+            &[
+                "-NoProfile",
+                "-Command",
+                "foreach ($i in 1..1000000) { 'x' * 100 }",
+            ],
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, WinrmError::Transfer(_)), "got {err:?}");
+    let left = wait_until_no_process_matches(&observer, &host, "%1..1000000%").await;
+    shell.close().await.expect("close shell");
+    assert_eq!(left, "0", "the capped command is still running");
+}
+
 /// A command that finishes inside the limit returns its output as
 /// `run_powershell` would, and leaves no shell.
 #[tokio::test]
@@ -1017,9 +1450,10 @@ async fn shell_with_working_directory() {
 
     let config = WinrmConfig {
         auth_method: AuthMethod::Basic,
-        port,
+        encryption: EncryptionMode::Never,
+        port: Some(port),
         working_directory: Some("C:\\Windows".into()),
-        ..Default::default()
+        ..WinrmConfig::http()
     };
     let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
     let output = client
@@ -1049,9 +1483,10 @@ async fn shell_with_env_vars() {
 
     let config = WinrmConfig {
         auth_method: AuthMethod::Basic,
-        port,
+        encryption: EncryptionMode::Never,
+        port: Some(port),
         env_vars: vec![("WINRM_RS_TEST_VAR".into(), "hello_from_rust".into())],
-        ..Default::default()
+        ..WinrmConfig::http()
     };
     let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
     let output = client
@@ -1120,9 +1555,10 @@ async fn retry_config_works_with_real_server() {
 
     let config = WinrmConfig {
         auth_method: AuthMethod::Basic,
-        port,
+        encryption: EncryptionMode::Never,
+        port: Some(port),
         max_retries: 2,
-        ..Default::default()
+        ..WinrmConfig::http()
     };
     let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
     // Should work normally — retries don't interfere with successful requests
@@ -1174,9 +1610,10 @@ async fn cancel_long_running_command() {
 async fn connect_timeout_is_honoured() {
     let config = WinrmConfig {
         auth_method: AuthMethod::Basic,
+        encryption: EncryptionMode::Never,
         connect_timeout_secs: 2,
         max_retries: 0,
-        ..Default::default()
+        ..WinrmConfig::http()
     };
     let client = WinrmClient::new(config, WinrmCredentials::new("u", "p", "")).unwrap();
 
@@ -1562,7 +1999,8 @@ async fn sealed_ntlm_client(
     let forwarder = RecordingForwarder::start(format!("{host}:{port}")).await;
     let (client, _) = test_client_with(|c| {
         c.auth_method = AuthMethod::Ntlm;
-        c.port = forwarder.addr.port();
+        c.encryption = EncryptionMode::Auto; // the base config is Basic (Never)
+        c.port = Some(forwarder.addr.port());
         tweak(c);
     })
     .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
@@ -1943,7 +2381,7 @@ async fn ntlm_encryption_always_over_https() {
         c.auth_method = AuthMethod::Ntlm;
         c.use_tls = true;
         c.accept_invalid_certs = true; // self-signed listener certificate
-        c.port = https_test_port();
+        c.port = Some(https_test_port());
         c.encryption = EncryptionMode::Always;
     })
     .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
@@ -1990,12 +2428,16 @@ async fn silent_command_completes_over_credssp() {
     let config = WinrmConfig {
         auth_method: AuthMethod::CredSsp,
         use_tls: true,
-        accept_invalid_certs: true,
-        port: https_test_port(),
+        accept_invalid_certs: false,
+        port: Some(https_test_port()),
         operation_timeout_secs: SILENT_OP_SECS,
         ..Default::default()
     };
-    let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
+    let client = WinrmClient::builder(config)
+        .pin_server_certificate_sha256(&bench_https_pin().expect("WINRM_TEST_HTTPS_CERT_SHA256"))
+        .credentials(WinrmCredentials::new(user, pass, ""))
+        .build()
+        .unwrap();
     assert_silent_command_completes(&client, &host).await;
 }
 
@@ -2014,9 +2456,10 @@ async fn shell_with_idle_timeout_works() {
 
     let config = WinrmConfig {
         auth_method: AuthMethod::Basic,
-        port,
+        encryption: EncryptionMode::Never,
+        port: Some(port),
         idle_timeout_secs: Some(300),
-        ..Default::default()
+        ..WinrmConfig::http()
     };
     let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
     let output = client
@@ -2041,9 +2484,10 @@ async fn custom_user_agent_does_not_break() {
 
     let config = WinrmConfig {
         auth_method: AuthMethod::Basic,
-        port,
+        encryption: EncryptionMode::Never,
+        port: Some(port),
         user_agent: Some("winrm-rs-test/0.1".into()),
-        ..Default::default()
+        ..WinrmConfig::http()
     };
     let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
     let output = client
@@ -2068,9 +2512,10 @@ async fn invalid_proxy_returns_http_error() {
 
     let config = WinrmConfig {
         auth_method: AuthMethod::Basic,
-        port,
-        proxy: Some("http://127.0.0.1:19999".into()),
-        ..Default::default()
+        encryption: EncryptionMode::Never,
+        port: Some(port),
+        proxy: Some(SecretString::from("http://127.0.0.1:19999")),
+        ..WinrmConfig::http()
     };
     let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
     let result = client.run_command(&host, "whoami", &[]).await;
@@ -2285,7 +2730,8 @@ async fn http_proxy_carries_ntlm_over_http() {
     let proxy_url = format!("http://{}", proxy.addr);
     let (client, host) = test_client_with(|c| {
         c.auth_method = AuthMethod::Ntlm;
-        c.proxy = Some(proxy_url);
+        c.encryption = EncryptionMode::Auto; // the base config is Basic (Never)
+        c.proxy = Some(SecretString::from(proxy_url));
     })
     .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
 
@@ -2314,14 +2760,24 @@ async fn http_proxy_connect_carries_https() {
     }
     let proxy = TestProxy::http().await;
     let proxy_url = format!("http://{}", proxy.addr);
-    let (client, host) = test_client_with(|c| {
-        c.auth_method = AuthMethod::Basic;
-        c.use_tls = true;
-        c.accept_invalid_certs = true; // self-signed cert
-        c.port = https_test_port();
-        c.proxy = Some(proxy_url);
-    })
-    .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    let pass = std::env::var("WINRM_TEST_PASS").expect("WINRM_TEST_PASS");
+    // Basic sends the password: the self-signed listener certificate is
+    // pinned, since `accept_invalid_certs = true` is refused for it.
+    let config = WinrmConfig {
+        auth_method: AuthMethod::Basic,
+        use_tls: true,
+        accept_invalid_certs: false,
+        port: Some(https_test_port()),
+        proxy: Some(SecretString::from(proxy_url)),
+        ..Default::default()
+    };
+    let client = WinrmClient::builder(config)
+        .pin_server_certificate_sha256(&bench_https_pin().expect("WINRM_TEST_HTTPS_CERT_SHA256"))
+        .credentials(WinrmCredentials::new(user, pass, ""))
+        .build()
+        .unwrap();
 
     let out = client
         .run_command(&host, "cmd.exe", &["/c", "echo via-proxy"])
@@ -2343,7 +2799,8 @@ async fn socks5_proxy_carries_ntlm() {
     let proxy_url = format!("socks5://{}", proxy.addr);
     let (client, host) = test_client_with(|c| {
         c.auth_method = AuthMethod::Ntlm;
-        c.proxy = Some(proxy_url);
+        c.encryption = EncryptionMode::Auto; // the base config is Basic (Never)
+        c.proxy = Some(SecretString::from(proxy_url));
     })
     .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
 
@@ -2437,7 +2894,7 @@ fn test_client_https_ntlm() -> Option<(WinrmClient, String)> {
         auth_method: AuthMethod::Ntlm,
         use_tls: true,
         accept_invalid_certs: true, // self-signed cert
-        port,
+        port: Some(port),
         ..Default::default()
     };
     let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).ok()?;
@@ -2467,8 +2924,8 @@ async fn enable_credssp_server() {
 async fn enable_cbt_hardening_strict() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let script = r"
-        Set-Item -Path WSMan:\localhost\Service\CbtHardeningLevel -Value Strict
-        (Get-Item WSMan:\localhost\Service\CbtHardeningLevel).Value
+        Set-Item -Path WSMan:\localhost\Service\Auth\CbtHardeningLevel -Value Strict
+        (Get-Item WSMan:\localhost\Service\Auth\CbtHardeningLevel).Value
     ";
     let output = client
         .run_powershell(&host, script)
@@ -2540,7 +2997,7 @@ async fn dump_winrm_service_config() {
         $auth = Get-ChildItem WSMan:\localhost\Service\Auth | ForEach-Object { @{Name=$_.Name; Value=$_.Value} }
         @{
             AllowUnencrypted = (Get-Item WSMan:\localhost\Service\AllowUnencrypted).Value
-            CbtHardeningLevel = (Get-Item WSMan:\localhost\Service\CbtHardeningLevel -ErrorAction SilentlyContinue).Value
+            CbtHardeningLevel = (Get-Item WSMan:\localhost\Service\Auth\CbtHardeningLevel -ErrorAction SilentlyContinue).Value
             Auth = $auth
         } | ConvertTo-Json -Compress -Depth 3
     ";
@@ -2575,11 +3032,17 @@ async fn basic_over_https_works() {
     let config = WinrmConfig {
         auth_method: AuthMethod::Basic,
         use_tls: true,
-        accept_invalid_certs: true,
-        port,
+        accept_invalid_certs: false,
+        port: Some(port),
         ..Default::default()
     };
-    let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
+    // Basic sends the password: the listener certificate is pinned, since
+    // `accept_invalid_certs = true` is refused for it.
+    let client = WinrmClient::builder(config)
+        .pin_server_certificate_sha256(&bench_https_pin().expect("WINRM_TEST_HTTPS_CERT_SHA256"))
+        .credentials(WinrmCredentials::new(user, pass, ""))
+        .build()
+        .unwrap();
     let output = client
         .run_command(&host, "whoami", &[])
         .await
@@ -2594,9 +3057,9 @@ async fn credssp_run_command_whoami() {
     // Full MS-CSSP handshake against a live host. 2012 R2 is skipped below:
     // it has no cipher suite rustls will take, so the HTTPS leg never gets
     // this far. Passes against Server 2025 since the SPNEGO mechListMIC RC4
-    // reset fix (`NtlmSession::sign_mech_list_mic`); before it the server
-    // answered the pubKeyAuth TSRequest with a bare 401. `CREDSSP_DUMP=1`
-    // (debug builds) dumps every intermediate value if it regresses.
+    // reset fix; before it the server answered the pubKeyAuth TSRequest with
+    // a bare 401. `CREDSSP_DUMP=1` dumps every intermediate value if it
+    // regresses; it needs a debug build with `--features credssp,__internal`.
     if is_server_2012_r2().await {
         eprintln!(
             "SKIP credssp_run_command_whoami: Server 2012 R2 SCHANNEL pairs GCM only with static-RSA \
@@ -2617,11 +3080,15 @@ async fn credssp_run_command_whoami() {
     let config = WinrmConfig {
         auth_method: AuthMethod::CredSsp,
         use_tls: true,
-        accept_invalid_certs: true,
-        port,
+        accept_invalid_certs: false,
+        port: Some(port),
         ..Default::default()
     };
-    let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
+    let client = WinrmClient::builder(config)
+        .pin_server_certificate_sha256(&bench_https_pin().expect("WINRM_TEST_HTTPS_CERT_SHA256"))
+        .credentials(WinrmCredentials::new(user, pass, ""))
+        .build()
+        .unwrap();
     let output = client
         .run_command(&host, "whoami", &[])
         .await
@@ -2629,6 +3096,123 @@ async fn credssp_run_command_whoami() {
     assert_eq!(output.exit_code, 0);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!stdout.trim().is_empty());
+}
+
+/// `whoami` over CredSSP with `proxy_url` as `WinrmConfig::proxy`, on the
+/// bench HTTPS listener with its certificate pinned. `None` when the host is
+/// Server 2012 R2 (see `credssp_run_command_whoami`).
+#[cfg(feature = "credssp")]
+async fn credssp_whoami_through(test: &str, proxy_url: String) -> Option<()> {
+    if is_server_2012_r2().await {
+        eprintln!("SKIP {test}: no TLS cipher suite shared with Server 2012 R2");
+        return None;
+    }
+    let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    let pass = std::env::var("WINRM_TEST_PASS").expect("WINRM_TEST_PASS");
+    let config = WinrmConfig {
+        auth_method: AuthMethod::CredSsp,
+        use_tls: true,
+        accept_invalid_certs: false,
+        port: Some(https_test_port()),
+        proxy: Some(SecretString::from(proxy_url)),
+        ..Default::default()
+    };
+    let client = WinrmClient::builder(config)
+        .pin_server_certificate_sha256(&bench_https_pin().expect("WINRM_TEST_HTTPS_CERT_SHA256"))
+        .credentials(WinrmCredentials::new(user, pass, ""))
+        .build()
+        .unwrap();
+    let output = client
+        .run_command(&host, "whoami", &[])
+        .await
+        .expect("credssp whoami through the proxy");
+    assert_eq!(output.exit_code, 0);
+    assert!(!String::from_utf8_lossy(&output.stdout).trim().is_empty());
+    Some(())
+}
+
+/// CredSSP through an HTTP `CONNECT` proxy: each CredSSP connection is one
+/// tunnel.
+#[cfg(feature = "credssp")]
+#[tokio::test]
+#[ignore]
+async fn credssp_through_http_proxy() {
+    let proxy = TestProxy::http().await;
+    let url = format!("http://{}", proxy.addr);
+    if credssp_whoami_through("credssp_through_http_proxy", url)
+        .await
+        .is_none()
+    {
+        return;
+    }
+    assert!(
+        proxy.connections() > 0,
+        "the request did not go through the proxy"
+    );
+    assert_eq!(
+        proxy.connect_requests(),
+        proxy.connections(),
+        "every CredSSP connection is one CONNECT tunnel"
+    );
+}
+
+/// CredSSP through a SOCKS5 proxy.
+#[cfg(feature = "credssp")]
+#[tokio::test]
+#[ignore]
+async fn credssp_through_socks5_proxy() {
+    let proxy = TestProxy::socks5().await;
+    let url = format!("socks5://{}", proxy.addr);
+    if credssp_whoami_through("credssp_through_socks5_proxy", url)
+        .await
+        .is_none()
+    {
+        return;
+    }
+    assert!(
+        proxy.connections() > 0,
+        "the request did not go through the proxy"
+    );
+}
+
+/// A response body of several hundred kilobytes, read over CredSSP strictly
+/// by its `Content-Length` (identity coding, no chunked framing).
+#[cfg(feature = "credssp")]
+#[tokio::test]
+#[ignore]
+async fn credssp_reads_a_large_framed_response() {
+    if is_server_2012_r2().await {
+        eprintln!(
+            "SKIP credssp_reads_a_large_framed_response: no TLS cipher suite shared \
+             with Server 2012 R2 (see credssp_run_command_whoami)"
+        );
+        return;
+    }
+    let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    let pass = std::env::var("WINRM_TEST_PASS").expect("WINRM_TEST_PASS");
+    let config = WinrmConfig {
+        auth_method: AuthMethod::CredSsp,
+        use_tls: true,
+        accept_invalid_certs: false,
+        port: Some(https_test_port()),
+        ..Default::default()
+    };
+    let client = WinrmClient::builder(config)
+        .pin_server_certificate_sha256(&bench_https_pin().expect("WINRM_TEST_HTTPS_CERT_SHA256"))
+        .credentials(WinrmCredentials::new(user, pass, ""))
+        .build()
+        .unwrap();
+    let output = client
+        .run_powershell(&host, "'x' * 300000")
+        .await
+        .expect("credssp large output");
+    assert_eq!(output.exit_code, 0);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = stdout.trim();
+    assert_eq!(stdout.len(), 300_000);
+    assert!(stdout.bytes().all(|b| b == b'x'));
 }
 
 #[tokio::test]
@@ -2924,9 +3508,10 @@ async fn small_max_envelope_size() {
 
     let config = WinrmConfig {
         auth_method: AuthMethod::Basic,
-        port,
+        encryption: EncryptionMode::Never,
+        port: Some(port),
         max_envelope_size: 8192,
-        ..Default::default()
+        ..WinrmConfig::http()
     };
     let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
     let output = client
@@ -2955,9 +3540,9 @@ async fn ntlm_encryption_always() {
 
     let config = WinrmConfig {
         auth_method: AuthMethod::Ntlm,
-        port,
+        port: Some(port),
         encryption: EncryptionMode::Always,
-        ..Default::default()
+        ..WinrmConfig::http()
     };
     let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
     let output = client
@@ -2981,9 +3566,9 @@ async fn ntlm_encryption_never() {
 
     let config = WinrmConfig {
         auth_method: AuthMethod::Ntlm,
-        port,
+        port: Some(port),
         encryption: EncryptionMode::Never,
-        ..Default::default()
+        ..WinrmConfig::http()
     };
     let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
     let output = client
@@ -3007,9 +3592,9 @@ async fn ntlm_encryption_auto_over_http() {
 
     let config = WinrmConfig {
         auth_method: AuthMethod::Ntlm,
-        port,
+        port: Some(port),
         encryption: EncryptionMode::Auto,
-        ..Default::default()
+        ..WinrmConfig::http()
     };
     let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
     let output = client
@@ -3035,8 +3620,9 @@ async fn builder_pattern_works() {
 
     let config = WinrmConfig {
         auth_method: AuthMethod::Basic,
-        port,
-        ..Default::default()
+        encryption: EncryptionMode::Never,
+        port: Some(port),
+        ..WinrmConfig::http()
     };
     let client = WinrmClient::builder(config)
         .credentials(WinrmCredentials::new(user, pass, ""))
@@ -3103,6 +3689,424 @@ async fn command_on_deleted_shell_returns_error() {
     );
 }
 
+// === Host command line (command-line probes) ===
+//
+// How Windows runs a WinRS command line is not settled by the spec or by the
+// reference clients. These probes measure it against the bench, with harmless
+// payloads only (`whoami`, `Write-Output` markers). They use the public API
+// alone. Run them with
+// `cargo test --test integration_real -- --ignored --test-threads=1 --nocapture probe_`.
+// When a probe shows a different behaviour from the one asserted, change its
+// assertion to the observed value and say so in its doc comment.
+
+/// Full path of the 64-bit Windows PowerShell, with the variable left for the
+/// host to expand.
+const FULL_POWERSHELL: &str = r"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe";
+
+/// Scratch directory a probe writes to (and removes), unique per run.
+fn probe_dir() -> String {
+    format!(
+        r"C:\Users\Public\winrm-rs-probe-{}",
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+/// Encode a script for `-EncodedCommand`.
+fn ps(script: &str) -> String {
+    winrm_rs::encode_powershell_command(script)
+}
+
+/// Remove the scratch directory `dir`; the result is ignored.
+async fn probe_cleanup(client: &WinrmClient, host: &str, dir: &str) {
+    let _ = client
+        .run_powershell(
+            host,
+            &format!(
+                "Remove-Item -LiteralPath '{dir}' -Recurse -Force -ErrorAction SilentlyContinue"
+            ),
+        )
+        .await;
+}
+
+/// Standard output as CRLF-split, trimmed lines.
+fn probe_lines(stdout: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(stdout)
+        .split("\r\n")
+        .map(|l| l.trim().to_string())
+        .collect()
+}
+
+/// Standard output (or error) as lossy text.
+fn probe_text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// The full path with `%SystemRoot%` runs the 64-bit System32 PowerShell.
+#[tokio::test]
+#[ignore]
+async fn probe_full_powershell_path_runs_system32() {
+    let Some((client, host)) = test_client() else {
+        eprintln!(
+            "SKIP probe_full_powershell_path_runs_system32: set WINRM_TEST_HOST and WINRM_TEST_PASS"
+        );
+        return;
+    };
+    let out = client
+        .run_command(
+            &host,
+            FULL_POWERSHELL,
+            &[
+                "-NoProfile",
+                "-NonInteractive",
+                "-EncodedCommand",
+                &ps("[Environment]::Is64BitProcess; $PSHOME"),
+            ],
+        )
+        .await
+        .expect("run the full-path PowerShell");
+    let stdout = probe_text(&out.stdout);
+    let stderr = probe_text(&out.stderr);
+    assert_eq!(out.exit_code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let lines: Vec<String> = probe_lines(&out.stdout)
+        .into_iter()
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(lines.len(), 2, "unexpected stdout: {stdout}");
+    assert_eq!(lines[0], "True", "stdout: {stdout}");
+    assert!(
+        lines[1].eq_ignore_ascii_case(r"C:\Windows\System32\WindowsPowerShell\v1.0"),
+        "unexpected $PSHOME: {}",
+        lines[1]
+    );
+}
+
+/// A bare command name resolves from the shell's working directory before the
+/// search path, whereas the full path runs the real PowerShell.
+#[tokio::test]
+#[ignore]
+async fn probe_bare_name_resolves_from_the_working_directory() {
+    let Some((client, host)) = test_client() else {
+        eprintln!(
+            "SKIP probe_bare_name_resolves_from_the_working_directory: set WINRM_TEST_HOST and WINRM_TEST_PASS"
+        );
+        return;
+    };
+    let dir = probe_dir();
+    probe_cleanup(&client, &host, &dir).await;
+    let setup = client
+        .run_powershell(
+            &host,
+            &format!(
+                "New-Item -ItemType Directory -Force -Path '{dir}' | Out-Null; Copy-Item C:\\Windows\\System32\\whoami.exe '{dir}\\powershell.exe'"
+            ),
+        )
+        .await;
+
+    let Some((planted, _)) = test_client_with(|c| c.working_directory = Some(dir.clone())) else {
+        probe_cleanup(&client, &host, &dir).await;
+        eprintln!("SKIP probe_bare_name_resolves_from_the_working_directory: no client");
+        return;
+    };
+    let bare = planted
+        .run_command(
+            &host,
+            "powershell.exe",
+            &["-EncodedCommand", &ps("Write-Output PS-RAN")],
+        )
+        .await;
+    let full = planted
+        .run_command(
+            &host,
+            FULL_POWERSHELL,
+            &[
+                "-NoProfile",
+                "-NonInteractive",
+                "-EncodedCommand",
+                &ps("Write-Output PS-RAN"),
+            ],
+        )
+        .await;
+    probe_cleanup(&client, &host, &dir).await;
+
+    // Record every outcome before asserting, so one surprise hides nothing.
+    let setup = setup.expect("plant the copy");
+    let bare = bare.expect("run the bare name");
+    let full = full.expect("run the full path");
+    let bare_stdout = probe_text(&bare.stdout);
+    let bare_stderr = probe_text(&bare.stderr);
+    let full_stdout = probe_text(&full.stdout);
+    let full_stderr = probe_text(&full.stderr);
+    let clip = |t: &str| t.chars().take(500).collect::<String>();
+    eprintln!(
+        "setup: exit {}, stdout {:?}, stderr {:?}",
+        setup.exit_code,
+        clip(&probe_text(&setup.stdout)),
+        clip(&probe_text(&setup.stderr))
+    );
+    eprintln!(
+        "bare name: exit {}, stdout {:?}, stderr {:?}",
+        bare.exit_code,
+        clip(&bare_stdout),
+        clip(&bare_stderr)
+    );
+    eprintln!(
+        "full path: exit {}, stdout {:?}, stderr {:?}",
+        full.exit_code,
+        clip(&full_stdout),
+        clip(&full_stderr)
+    );
+    assert_eq!(
+        setup.exit_code,
+        0,
+        "plant failed: {}",
+        clip(&probe_text(&setup.stderr))
+    );
+    assert!(
+        !bare_stdout.contains("PS-RAN"),
+        "the bare name ran the real PowerShell: {}",
+        clip(&bare_stdout)
+    );
+    // The planted binary either ran (`domain\user`) or refused the argument.
+    assert!(
+        bare_stdout.contains('\\') || bare.exit_code != 0 || !bare_stderr.is_empty(),
+        "the bare name neither ran the planted copy nor refused its argument: {}",
+        clip(&bare_stdout)
+    );
+    assert!(
+        full_stdout.contains("PS-RAN"),
+        "the full path did not run PowerShell: {}\nstderr: {}",
+        clip(&full_stdout),
+        clip(&full_stderr)
+    );
+}
+
+/// `-NoProfile` keeps the profile's output out of the command's stdout, and
+/// `run_powershell` passes it by default. The leg that shows the profile does
+/// run launches PowerShell itself, without `-NoProfile`.
+///
+/// It mutates a per-user profile file, so it must not run in parallel with
+/// other live tests (`--test-threads=1`).
+#[tokio::test]
+#[ignore]
+async fn probe_noprofile_skips_profile_output() {
+    let Some((client, host)) = test_client() else {
+        eprintln!(
+            "SKIP probe_noprofile_skips_profile_output: set WINRM_TEST_HOST and WINRM_TEST_PASS"
+        );
+        return;
+    };
+    // Save the current profile (as base64, so the bytes come back exactly).
+    let saved = client
+        .run_powershell(
+            &host,
+            "if (Test-Path $PROFILE.CurrentUserAllHosts) { [Convert]::ToBase64String([IO.File]::ReadAllBytes($PROFILE.CurrentUserAllHosts)) }",
+        )
+        .await
+        .expect("read the current profile");
+    let saved_b64 = probe_text(&saved.stdout).trim().to_string();
+    // Whether the profile directory exists: `New-Item -Force` creates it when
+    // it does not, and the restore must then remove it too.
+    let dir_existed = client
+        .run_powershell(
+            &host,
+            "Test-Path -LiteralPath (Split-Path -Parent $PROFILE.CurrentUserAllHosts)",
+        )
+        .await
+        .expect("check the profile directory");
+    let dir_existed = probe_text(&dir_existed.stdout).trim() == "True";
+
+    let write = client
+        .run_powershell(
+            &host,
+            "New-Item -Force -Path $PROFILE.CurrentUserAllHosts -Value 'Write-Output PROFILE-MARKER' | Out-Null",
+        )
+        .await;
+    // Collect every output, restore, then assert.
+    let with_profile = client
+        .run_command(
+            &host,
+            FULL_POWERSHELL,
+            &[
+                "-NonInteractive",
+                "-EncodedCommand",
+                &ps("Write-Output body"),
+            ],
+        )
+        .await;
+    let by_default = client.run_powershell(&host, "Write-Output body").await;
+    let without_profile = client
+        .run_command(
+            &host,
+            FULL_POWERSHELL,
+            &[
+                "-NoProfile",
+                "-NonInteractive",
+                "-EncodedCommand",
+                &ps("Write-Output body"),
+            ],
+        )
+        .await;
+    let restore_script = if saved_b64.is_empty() {
+        "Remove-Item -LiteralPath $PROFILE.CurrentUserAllHosts -Force -ErrorAction SilentlyContinue"
+            .to_string()
+    } else {
+        format!(
+            "[IO.File]::WriteAllBytes($PROFILE.CurrentUserAllHosts, [Convert]::FromBase64String('{saved_b64}'))"
+        )
+    };
+    let restore = client.run_powershell(&host, &restore_script).await;
+    if !dir_existed {
+        // Best effort: removes the directory only if it is empty.
+        let _ = client
+            .run_powershell(
+                &host,
+                "Remove-Item -LiteralPath (Split-Path -Parent $PROFILE.CurrentUserAllHosts) -ErrorAction SilentlyContinue",
+            )
+            .await;
+    }
+
+    let write = write.expect("write the profile");
+    assert_eq!(
+        write.exit_code,
+        0,
+        "write failed: {}",
+        probe_text(&write.stderr)
+    );
+    let with_profile = probe_text(&with_profile.expect("run with the profile").stdout);
+    let by_default = probe_text(&by_default.expect("run run_powershell").stdout);
+    let without_profile = probe_text(&without_profile.expect("run with -NoProfile").stdout);
+    let restore = restore.expect("restore the profile");
+    assert_eq!(
+        restore.exit_code,
+        0,
+        "restore failed: {}",
+        probe_text(&restore.stderr)
+    );
+    assert!(
+        with_profile.contains("PROFILE-MARKER"),
+        "the profile did not run without -NoProfile: {with_profile}"
+    );
+    assert!(
+        !without_profile.contains("PROFILE-MARKER"),
+        "-NoProfile still ran the profile: {without_profile}"
+    );
+    assert!(
+        by_default.contains("body"),
+        "run_powershell did not run the script: {by_default}"
+    );
+    assert!(
+        !by_default.contains("PROFILE-MARKER"),
+        "run_powershell ran the profile by default: {by_default}"
+    );
+}
+
+/// Measures the longest command line the host accepts. `L` is the largest `n`
+/// of the list whose row has `exit_code == 0` and no "too long" in stderr, that
+/// is, the character count of the longest probe line that ran.
+#[tokio::test]
+#[ignore]
+async fn probe_command_line_limit() {
+    let Some((client, host)) = test_client() else {
+        eprintln!("SKIP probe_command_line_limit: set WINRM_TEST_HOST and WINRM_TEST_PASS");
+        return;
+    };
+    // WinRS joins the command and its arguments with one space each, so the
+    // line is `cmd.exe /c echo ` (16 characters) plus `n - 16` times `x`.
+    let mut rows: Vec<(usize, bool)> = Vec::new();
+    for n in [8000_usize, 8100, 8150, 8191, 8200] {
+        let filler = "x".repeat(n - 16);
+        let result = client
+            .run_command(&host, "cmd.exe", &["/c", "echo", &filler])
+            .await;
+        let ok = match result {
+            Ok(out) => {
+                let too_long = probe_text(&out.stderr).contains("too long");
+                eprintln!("n={n} exit_code={} too_long={too_long}", out.exit_code);
+                out.exit_code == 0 && !too_long
+            }
+            Err(e) => {
+                eprintln!(
+                    "n={n} error={e} too_long={}",
+                    e.to_string().contains("too long")
+                );
+                false
+            }
+        };
+        rows.push((n, ok));
+    }
+    let l = rows.iter().filter(|(_, ok)| *ok).map(|(n, _)| *n).max();
+    eprintln!("L = {l:?}");
+    assert!(
+        rows.iter().any(|&(n, ok)| n == 8000 && ok),
+        "the 8000 row should succeed: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|&(n, ok)| n == 8200 && !ok),
+        "the 8200 row should fail: {rows:?}"
+    );
+}
+
+/// The arguments reach `cmd.exe` as one command line, so an `&` inside one
+/// argument is an operator.
+#[tokio::test]
+#[ignore]
+async fn probe_arguments_are_one_cmd_line() {
+    let Some((client, host)) = test_client() else {
+        eprintln!("SKIP probe_arguments_are_one_cmd_line: set WINRM_TEST_HOST and WINRM_TEST_PASS");
+        return;
+    };
+    let out = client
+        .run_command(&host, "cmd.exe", &["/c", "echo", "a&echo", "PROBE-MARKER"])
+        .await
+        .expect("run cmd.exe");
+    let lines = probe_lines(&out.stdout);
+    assert!(
+        lines.iter().any(|l| l == "a") && lines.iter().any(|l| l == "PROBE-MARKER"),
+        "expected separate lines `a` and `PROBE-MARKER`, got: {lines:?}"
+    );
+}
+
+/// A `PATH` set through `env_vars` steers the bare `powershell.exe`, while the
+/// full path is unaffected.
+#[tokio::test]
+#[ignore]
+async fn probe_path_env_steers_bare_powershell() {
+    let Some((client, host)) = test_client_with(|c| {
+        c.env_vars = vec![(
+            "PATH".into(),
+            r"C:\Windows\SysWOW64\WindowsPowerShell\v1.0;C:\Windows\System32".into(),
+        )];
+    }) else {
+        eprintln!(
+            "SKIP probe_path_env_steers_bare_powershell: set WINRM_TEST_HOST and WINRM_TEST_PASS"
+        );
+        return;
+    };
+    let bare = client
+        .run_command(
+            &host,
+            "powershell.exe",
+            &["-EncodedCommand", &ps("[Environment]::Is64BitProcess")],
+        )
+        .await
+        .expect("run the bare name");
+    let full = client
+        .run_command(
+            &host,
+            FULL_POWERSHELL,
+            &[
+                "-NoProfile",
+                "-NonInteractive",
+                "-EncodedCommand",
+                &ps("[Environment]::Is64BitProcess"),
+            ],
+        )
+        .await
+        .expect("run the full path");
+    assert_eq!(probe_text(&bare.stdout).trim(), "False", "bare name");
+    assert_eq!(probe_text(&full.stdout).trim(), "True", "full path");
+}
+
 // === Certificate authentication (TLS client certificate) ===
 //
 // Prepare the bench with `tests/scripts/make-client-cert.sh` (eval its output),
@@ -3135,7 +4139,7 @@ fn cert_client_from_env(
         auth_method: AuthMethod::Certificate,
         use_tls: true,
         accept_invalid_certs: true, // self-signed listener certificate
-        port: https_test_port(),
+        port: Some(https_test_port()),
         client_cert_pem: Some(cert),
         client_key_pem: Some(key),
         ..Default::default()
@@ -3406,13 +4410,30 @@ fn kerberos_client_from_env(tweak: impl FnOnce(&mut WinrmConfig)) -> (WinrmClien
     let pass = std::env::var("WINRM_TEST_KRB_PASS").expect(HINT);
     let mut config = WinrmConfig {
         auth_method: AuthMethod::Kerberos,
-        port,
-        ..Default::default()
+        port: Some(port),
+        ..WinrmConfig::http()
     };
     tweak(&mut config);
     let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, ""))
         .expect("build Kerberos client");
     (client, host)
+}
+
+/// NTLM credentials for the DC bench, from the variables `vm-connect-dc.sh`
+/// exports: `WINRM_TEST_KRB_USER` is the Kerberos principal
+/// (`vagrant@WINRM.TEST`), so the account is the part before `@` and the
+/// domain is the first label of the realm (`WINRM`). A missing variable
+/// panics, like the Kerberos tests; no password is ever defaulted.
+#[cfg(feature = "kerberos")]
+fn krb_bench_ntlm_credentials() -> WinrmCredentials {
+    const HINT: &str = "eval \"$(tests/scripts/vm-connect-dc.sh)\" and kinit vagrant@WINRM.TEST";
+    let principal = std::env::var("WINRM_TEST_KRB_USER").expect(HINT);
+    let pass = std::env::var("WINRM_TEST_KRB_PASS").expect(HINT);
+    let (account, realm) = principal
+        .split_once('@')
+        .expect("WINRM_TEST_KRB_USER must be a principal such as vagrant@WINRM.TEST");
+    let domain = realm.split('.').next().unwrap_or(realm);
+    WinrmCredentials::new(account, pass, domain)
 }
 
 /// `AuthMethod::Kerberos` end to end against a domain controller: the
@@ -3469,6 +4490,39 @@ async fn kerberos_two_commands_on_one_client() {
     }
 }
 
+/// Sealed answers of several sizes over Kerberos, to read the framing the
+/// server really sends. The client ties each answer's security header length
+/// to the token's rotation count (RRC) and requires a zero extra count (EC):
+/// `header_len = 32 + RRC`, so a genuine answer shows `ec=0 rrc=28
+/// header_len=60` whatever its size. Run it alone to read the trace events:
+///
+/// ```text
+/// cargo test --test integration_real --features kerberos kerberos_sealed_answer_sizes \
+///     -- --ignored --nocapture 2>&1 | grep 'sealed answer framing'
+/// ```
+///
+/// If a genuine answer shows `rrc != header_len - 32`, the RRC check in
+/// `check_acceptor_sealed` has to go (the EC check stays).
+#[cfg(feature = "kerberos")]
+#[tokio::test]
+#[ignore]
+async fn kerberos_sealed_answer_sizes() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("winrm_rs::kerberos::sealed=trace")
+        .with_test_writer()
+        .try_init();
+    let (client, host) = kerberos_client_from_env(|c| c.encryption = EncryptionMode::Auto);
+    for n in [0usize, 1, 15, 16, 17, 4096, 204_800] {
+        let output = client
+            .run_powershell(&host, &format!("Write-Output ('x' * {n})"))
+            .await
+            .unwrap_or_else(|e| panic!("sealed answer of {n} characters: {e}"));
+        assert_eq!(output.exit_code, 0, "n = {n}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(stdout.trim(), "x".repeat(n), "n = {n}");
+    }
+}
+
 // === Kerberos over HTTPS (DC bench) ===
 //
 // Needs the DC's HTTPS listener (`setup_dc_https_listener`, once) and the
@@ -3522,14 +4576,15 @@ fn kerberos_https_client_from_env(tweak: impl FnOnce(&mut WinrmConfig)) -> (Winr
     kerberos_client_from_env(|c| {
         c.use_tls = true;
         c.accept_invalid_certs = true;
-        c.port = port;
+        c.port = Some(port);
         tweak(c);
     })
 }
 
-/// `AuthMethod::Kerberos` over HTTPS: TLS protects the messages, the
-/// Kerberos token authenticates the request (SPN `HTTP/dc.winrm.test`, the
-/// same as over HTTP).
+/// `AuthMethod::Kerberos` over HTTPS: the Kerberos token authenticates the
+/// request (SPN `HTTP/dc.winrm.test`, the same as over HTTP). The listener
+/// certificate is not verified here, so `EncryptionMode::Auto` also seals
+/// the messages inside TLS.
 #[cfg(feature = "kerberos")]
 #[tokio::test]
 #[ignore]
@@ -3598,11 +4653,10 @@ fn dc_ntlm_sealed_client() -> (WinrmClient, String) {
     let config = WinrmConfig {
         auth_method: AuthMethod::Ntlm,
         encryption: EncryptionMode::Always,
-        port,
-        ..Default::default()
+        port: Some(port),
+        ..WinrmConfig::http()
     };
-    let client = WinrmClient::new(config, WinrmCredentials::new("vagrant", "vagrant", "WINRM"))
-        .expect("build NTLM client");
+    let client = WinrmClient::new(config, krb_bench_ntlm_credentials()).expect("build NTLM client");
     (client, host)
 }
 
@@ -3685,7 +4739,7 @@ async fn sealed_kerberos_client(
     let forwarder = RecordingForwarder::start(format!("127.0.0.1:{dc_port}")).await;
     let port = forwarder.addr.port();
     let (client, host) = kerberos_client_from_env(|c| {
-        c.port = port;
+        c.port = Some(port);
         tweak(c);
     });
     (client, forwarder, host)
@@ -3943,7 +4997,7 @@ impl TlsRecordingRelay {
         use std::io::Write;
         use std::sync::{Arc, Mutex};
 
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
@@ -3953,6 +5007,10 @@ impl TlsRecordingRelay {
         ));
         std::fs::create_dir_all(&dir).expect("relay temp dir");
         let (cert_path, key_path) = (dir.join("cert.pem"), dir.join("key.pem"));
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test-only certificate generation with openssl"
+        )]
         let status = std::process::Command::new("openssl")
             .args([
                 "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
@@ -3970,16 +5028,21 @@ impl TlsRecordingRelay {
         let _ = std::fs::remove_dir_all(&dir);
 
         let server_config = Arc::new(
-            rustls::ServerConfig::builder()
+            rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
+                .with_safe_default_protocol_versions()
+                .expect("relay server protocol versions")
                 .with_no_client_auth()
                 .with_single_cert(vec![cert], key)
                 .expect("relay server config"),
         );
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
         let client_config = Arc::new(
-            rustls::ClientConfig::builder()
+            rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+                .with_safe_default_protocol_versions()
+                .expect("relay client protocol versions")
                 .dangerous()
-                .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert(provider)))
+                .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert(Arc::clone(
+                    &provider,
+                ))))
                 .with_no_client_auth(),
         );
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind relay");
@@ -4168,7 +5231,7 @@ fn kerberos_client_through_relay(
     encryption: EncryptionMode,
 ) -> (WinrmClient, String) {
     kerberos_https_client_from_env(|c| {
-        c.port = relay.port;
+        c.port = Some(relay.port);
         c.encryption = encryption;
     })
 }
@@ -4177,7 +5240,9 @@ fn kerberos_client_through_relay(
 /// connection: through a TLS-terminating relay they name the relay's
 /// certificate, and the DC (`CbtHardeningLevel = Relaxed`, which checks
 /// bindings that are present) refuses the authentication. No SOAP body
-/// reaches the relay: the AP-REQ request has none.
+/// reaches the relay: the AP-REQ request has none. `Never` covers the
+/// unsealed route, `Auto` (the certificate is not verified) and `Always`
+/// the sealed one.
 #[cfg(feature = "kerberos")]
 #[tokio::test]
 #[ignore]
@@ -4187,7 +5252,11 @@ async fn kerberos_channel_binding_through_a_tls_relay_is_refused() {
         .parse()
         .expect("port");
     let relay = TlsRecordingRelay::start(https_port);
-    for mode in [EncryptionMode::Auto, EncryptionMode::Always] {
+    for mode in [
+        EncryptionMode::Never,
+        EncryptionMode::Auto,
+        EncryptionMode::Always,
+    ] {
         let (client, host) = kerberos_client_through_relay(&relay, mode.clone());
         let err = client
             .run_command(&host, "whoami", &[])
@@ -4212,14 +5281,19 @@ async fn kerberos_channel_binding_through_a_tls_relay_is_refused() {
 /// connection, which would carry the AP-REQ, is terminated by the relay with
 /// its own certificate. The dedicated client's verifier is pinned to the
 /// probe's certificate, so that handshake fails and nothing is sent on it:
-/// the relay records no request at all.
+/// the relay records no request at all. Checked unsealed (`Never`) and
+/// sealed (`Auto` without certificate verification, `Always`).
 #[cfg(feature = "kerberos")]
 async fn assert_split_relay_fails_at_the_handshake() {
     let https_port: u16 = std::env::var("WINRM_TEST_KRB_HTTPS_PORT")
         .expect("WINRM_TEST_KRB_HTTPS_PORT")
         .parse()
         .expect("port");
-    for mode in [EncryptionMode::Auto, EncryptionMode::Always] {
+    for mode in [
+        EncryptionMode::Never,
+        EncryptionMode::Auto,
+        EncryptionMode::Always,
+    ] {
         let relay = TlsRecordingRelay::start_with(https_port, true);
         let (client, host) = kerberos_client_through_relay(&relay, mode.clone());
         let err = client
@@ -4249,8 +5323,9 @@ async fn kerberos_channel_binding_split_relay_fails_at_the_handshake() {
 
 /// With `CbtHardeningLevel = None` the DC ignores channel bindings, so the
 /// relay can watch the traffic inside TLS: `EncryptionMode::Always` sends
-/// every SOAP body sealed (Kerberos and NTLM), `Auto` sends them as is
-/// (TLS only), which shows the relay would see plaintext.
+/// every SOAP body sealed (Kerberos and NTLM), and so does `Auto` here, since
+/// the certificate is not verified (`accept_invalid_certs`); `Never` sends
+/// them as is (TLS only), which shows the relay would see plaintext.
 #[cfg(feature = "kerberos")]
 #[tokio::test]
 #[ignore]
@@ -4280,40 +5355,59 @@ async fn always_seals_inside_tls_seen_by_a_relay_with_dc_cbt_none() {
             .expect("Kerberos Auto through the relay");
         let (with_body, sealed) = relay.bodies();
         assert!(with_body >= 4, "expected the command's requests");
-        assert_eq!(sealed, 0, "Kerberos Auto over HTTPS does not seal");
+        assert_eq!(
+            sealed, with_body,
+            "Kerberos Auto without certificate verification: a body went unsealed"
+        );
 
         let relay = TlsRecordingRelay::start(https_port);
-        let config = WinrmConfig {
-            auth_method: AuthMethod::Ntlm,
-            encryption: EncryptionMode::Always,
-            use_tls: true,
-            accept_invalid_certs: true,
-            port: relay.port,
-            ..Default::default()
-        };
-        let ntlm = WinrmClient::new(config, WinrmCredentials::new("vagrant", "vagrant", "WINRM"))
-            .expect("NTLM client");
-        let host = std::env::var("WINRM_TEST_KRB_HOST").expect("WINRM_TEST_KRB_HOST");
-        ntlm.run_command(&host, "whoami", &[])
+        let (client, host) = kerberos_client_through_relay(&relay, EncryptionMode::Never);
+        client
+            .run_command(&host, "whoami", &[])
             .await
-            .expect("NTLM Always through the relay");
+            .expect("Kerberos Never through the relay");
         let (with_body, sealed) = relay.bodies();
         assert!(with_body >= 4, "expected the command's requests");
-        assert_eq!(sealed, with_body, "NTLM Always: a body went unsealed");
+        assert_eq!(sealed, 0, "Kerberos Never over HTTPS does not seal");
+
+        let host = std::env::var("WINRM_TEST_KRB_HOST").expect("WINRM_TEST_KRB_HOST");
+        for mode in [EncryptionMode::Always, EncryptionMode::Auto] {
+            let relay = TlsRecordingRelay::start(https_port);
+            let config = WinrmConfig {
+                auth_method: AuthMethod::Ntlm,
+                encryption: mode.clone(),
+                use_tls: true,
+                accept_invalid_certs: true,
+                port: Some(relay.port),
+                ..Default::default()
+            };
+            let ntlm = WinrmClient::new(config, krb_bench_ntlm_credentials()).expect("NTLM client");
+            ntlm.run_command(&host, "whoami", &[])
+                .await
+                .unwrap_or_else(|e| panic!("NTLM {mode:?} through the relay: {e}"));
+            let (with_body, sealed) = relay.bodies();
+            assert!(with_body >= 4, "expected the command's requests");
+            assert_eq!(sealed, with_body, "NTLM {mode:?}: a body went unsealed");
+        }
     })
     .await;
 }
 
 /// `CbtHardeningLevel = Strict` requires channel bindings: Kerberos over
-/// HTTPS still works, unsealed (`Auto`) and sealed (`Always`), since the
-/// AP-REQ carries them; through the relay it is refused, and the split relay
-/// fails at the handshake as under `Relaxed`.
+/// HTTPS still works, unsealed (`Never`) and sealed (`Auto` without
+/// certificate verification, `Always`), since the AP-REQ carries them;
+/// through the relay it is refused, and the split relay fails at the
+/// handshake as under `Relaxed`.
 #[cfg(feature = "kerberos")]
 #[tokio::test]
 #[ignore]
 async fn kerberos_over_https_with_dc_cbt_strict() {
     with_dc_cbt_hardening("Strict", || async {
-        for mode in [EncryptionMode::Auto, EncryptionMode::Always] {
+        for mode in [
+            EncryptionMode::Never,
+            EncryptionMode::Auto,
+            EncryptionMode::Always,
+        ] {
             let (client, host) = kerberos_https_client_from_env(|c| c.encryption = mode.clone());
             let out = client
                 .run_command(&host, "whoami", &[])
@@ -4345,9 +5439,11 @@ async fn kerberos_over_https_with_dc_cbt_strict() {
 /// `AllowUnencrypted = false` on the DC and a current-thread runtime (this
 /// test's), a 200 KB download right after a small upload sent a sealed
 /// request on a fresh, unauthenticated connection (HTTP 401) in 10 runs out
-/// of 10, for Kerberos and NTLM alike, before the dedicated exchange yielded
-/// to the runtime first. Three rounds per method must now pass on one
-/// connection each.
+/// of 10, for Kerberos and NTLM alike, when the dedicated exchange did not
+/// yield to the runtime first. The connection gate now prevents it: once the
+/// handshake has completed, the dedicated client opens no new connection,
+/// so the request waits for the authenticated one. Three rounds per method
+/// must now pass on one connection each.
 #[cfg(feature = "kerberos")]
 #[tokio::test]
 #[ignore]
@@ -4362,11 +5458,11 @@ async fn sealed_download_after_upload_stays_on_its_connection_allow_unencrypted_
                     let forwarder = RecordingForwarder::start(format!("127.0.0.1:{dc_port}")).await;
                     let config = WinrmConfig {
                         auth_method: AuthMethod::Ntlm,
-                        port: forwarder.addr.port(),
-                        ..Default::default()
+                        port: Some(forwarder.addr.port()),
+                        ..WinrmConfig::http()
                     };
                     let client =
-                        WinrmClient::new(config, WinrmCredentials::new("vagrant", "vagrant", "WINRM"))
+                        WinrmClient::new(config, krb_bench_ntlm_credentials())
                             .expect("NTLM client");
                     (client, forwarder, "dc.winrm.test".to_string())
                 };
@@ -4480,8 +5576,9 @@ fn gated_client(
         .unwrap_or(5985);
     let mut config = WinrmConfig {
         auth_method: AuthMethod::Basic,
-        port,
-        ..Default::default()
+        encryption: EncryptionMode::Never,
+        port: Some(port),
+        ..WinrmConfig::http()
     };
     tweak(&mut config);
     let hook = std::sync::Arc::clone(gate);
@@ -4574,7 +5671,8 @@ async fn before_send_refusal_leaves_a_sealed_ntlm_session_usable() {
     let forwarder = RecordingForwarder::start(format!("{host}:{port}")).await;
     let (client, _) = gated_client(&gate, |c| {
         c.auth_method = AuthMethod::Ntlm;
-        c.port = forwarder.addr.port();
+        c.encryption = EncryptionMode::Auto; // the base config is Basic (Never)
+        c.port = Some(forwarder.addr.port());
     });
 
     assert_refusal_leaves_session_usable(&client, SEALED_HOST, &gate).await;
@@ -4594,23 +5692,48 @@ async fn before_send_refusal_leaves_a_sealed_ntlm_session_usable() {
     );
 }
 
-#[tokio::test]
-#[ignore]
-async fn before_send_refusal_leaves_an_ntlm_https_session_usable() {
+/// NTLM over HTTPS under a hook refusal, with `encryption` set to `mode`.
+/// The certificate is not verified, so `Auto` seals inside TLS and `Never`
+/// does not.
+async fn assert_ntlm_https_refusal_leaves_session_usable(test: &str, mode: EncryptionMode) {
     if is_server_2012_r2().await {
         eprintln!(
-            "SKIP before_send_refusal_leaves_an_ntlm_https_session_usable: HTTPS against a default Server 2012 R2 listener has no shared cipher suite with rustls"
+            "SKIP {test}: HTTPS against a default Server 2012 R2 listener has no shared cipher suite with rustls"
         );
         return;
     }
     let gate = Gate::open();
     let (client, host) = gated_client(&gate, |c| {
         c.auth_method = AuthMethod::Ntlm;
+        c.encryption = mode; // the base config is Basic (Never)
         c.use_tls = true;
         c.accept_invalid_certs = true;
-        c.port = https_test_port();
+        c.port = Some(https_test_port());
     });
     assert_refusal_leaves_session_usable(&client, &host, &gate).await;
+}
+
+/// Sealed NTLM over HTTPS (`Auto` without certificate verification).
+#[tokio::test]
+#[ignore]
+async fn before_send_refusal_leaves_an_ntlm_https_session_usable() {
+    assert_ntlm_https_refusal_leaves_session_usable(
+        "before_send_refusal_leaves_an_ntlm_https_session_usable",
+        EncryptionMode::Auto,
+    )
+    .await;
+}
+
+/// Unsealed NTLM over HTTPS (`Never`): TLS alone, each message carried by
+/// its own Negotiate and Authenticate.
+#[tokio::test]
+#[ignore]
+async fn before_send_refusal_leaves_an_unsealed_ntlm_https_session_usable() {
+    assert_ntlm_https_refusal_leaves_session_usable(
+        "before_send_refusal_leaves_an_unsealed_ntlm_https_session_usable",
+        EncryptionMode::Never,
+    )
+    .await;
 }
 
 #[cfg(feature = "credssp")]
@@ -4623,13 +5746,23 @@ async fn before_send_refusal_leaves_a_credssp_session_usable() {
         );
         return;
     }
+    let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    let pass = std::env::var("WINRM_TEST_PASS").expect("WINRM_TEST_PASS");
     let gate = Gate::open();
-    let (client, host) = gated_client(&gate, |c| {
-        c.auth_method = AuthMethod::CredSsp;
-        c.use_tls = true;
-        c.accept_invalid_certs = true;
-        c.port = https_test_port();
-    });
+    let hook = std::sync::Arc::clone(&gate);
+    let client = WinrmClient::builder(WinrmConfig {
+        auth_method: AuthMethod::CredSsp,
+        use_tls: true,
+        accept_invalid_certs: false,
+        port: Some(https_test_port()),
+        ..Default::default()
+    })
+    .pin_server_certificate_sha256(&bench_https_pin().expect("WINRM_TEST_HTTPS_CERT_SHA256"))
+    .credentials(WinrmCredentials::new(user, pass, ""))
+    .before_send(move || hook.check())
+    .build()
+    .expect("build the gated CredSSP client");
     assert_refusal_leaves_session_usable(&client, &host, &gate).await;
 }
 
@@ -4653,12 +5786,344 @@ async fn before_send_refusal_leaves_a_kerberos_session_usable() {
     let hook = std::sync::Arc::clone(&gate);
     let client = WinrmClient::builder(WinrmConfig {
         auth_method: AuthMethod::Kerberos,
-        port,
-        ..Default::default()
+        port: Some(port),
+        ..WinrmConfig::http()
     })
     .credentials(WinrmCredentials::new(user, pass, ""))
     .before_send(move || hook.check())
     .build()
     .expect("build Kerberos client");
     assert_refusal_leaves_session_usable(&client, &host, &gate).await;
+}
+
+// --- Poll pacing ---
+//
+// Run each test alone, so that its debug lines are its own:
+// `cargo test --test integration_real <name> -- --ignored --nocapture 2>&1 | grep -c "pacing a quick empty poll"`
+// The count must be 0 for every test but the last, which decides one doc line.
+
+fn init_debug_log() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("winrm_rs=debug")
+        .with_test_writer()
+        .try_init();
+}
+
+#[tokio::test]
+#[ignore]
+async fn poll_pacing_bench_cmd_ping() {
+    init_debug_log();
+    let Some((client, host)) = test_client_with(|c| c.operation_timeout_secs = 60) else {
+        eprintln!("SKIP poll_pacing_bench_cmd_ping: set WINRM_TEST_HOST and WINRM_TEST_PASS");
+        return;
+    };
+    let out = client
+        .run_command(&host, "cmd", &["/c", "ping -n 30 127.0.0.1"])
+        .await
+        .expect("run ping");
+    assert_eq!(out.exit_code, 0);
+}
+
+#[tokio::test]
+#[ignore]
+async fn poll_pacing_bench_powershell_times_out_once() {
+    init_debug_log();
+    let Some((client, host)) = test_client_with(|c| c.operation_timeout_secs = 60) else {
+        eprintln!(
+            "SKIP poll_pacing_bench_powershell_times_out_once: set WINRM_TEST_HOST and WINRM_TEST_PASS"
+        );
+        return;
+    };
+    // The 70 s sleep outlasts one 60 s OperationTimeout: one TimedOut fault.
+    let out = client
+        .run_powershell(&host, "Start-Sleep 70; Write-Output done")
+        .await
+        .expect("run sleep");
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "done");
+}
+
+#[tokio::test]
+#[ignore]
+async fn poll_pacing_bench_stderr_trickle() {
+    init_debug_log();
+    let Some((client, host)) = test_client_with(|c| c.operation_timeout_secs = 60) else {
+        eprintln!("SKIP poll_pacing_bench_stderr_trickle: set WINRM_TEST_HOST and WINRM_TEST_PASS");
+        return;
+    };
+    // `[Threading.Thread]::Sleep`, not `Start-Sleep`: the first `Start-Sleep`
+    // loads its module, and Windows PowerShell 5.1 then writes a "Preparing
+    // modules for first use." progress record to stderr, which this probe of
+    // poll pacing is not about.
+    let out = client
+        .run_powershell(
+            &host,
+            "1..5 | % { [Console]::Error.WriteLine('e'); [Threading.Thread]::Sleep(1000) }",
+        )
+        .await
+        .expect("run stderr trickle");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let lines: Vec<&str> = stderr.lines().collect();
+    assert_eq!(lines, vec!["e"; 5], "stderr: {stderr:?}");
+}
+
+#[tokio::test]
+#[ignore]
+async fn poll_pacing_bench_wql_pages() {
+    init_debug_log();
+    let Some((client, host)) = test_client_with(|c| {
+        c.operation_timeout_secs = 60;
+        c.max_envelope_size = 8192;
+    }) else {
+        eprintln!("SKIP poll_pacing_bench_wql_pages: set WINRM_TEST_HOST and WINRM_TEST_PASS");
+        return;
+    };
+    let items = client
+        .run_wql(&host, "SELECT * FROM Win32_Process", None)
+        .await
+        .expect("run wql");
+    // Each item ends with a closing `...:Win32_Process>` tag.
+    assert!(
+        items.matches(":Win32_Process>").count() > 1,
+        "expected more than one item"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn poll_pacing_bench_zero_operation_timeout() {
+    init_debug_log();
+    let Some((client, host)) = test_client_with(|c| c.operation_timeout_secs = 0) else {
+        eprintln!(
+            "SKIP poll_pacing_bench_zero_operation_timeout: set WINRM_TEST_HOST and WINRM_TEST_PASS"
+        );
+        return;
+    };
+    match client
+        .run_command(&host, "cmd", &["/c", "ping -n 5 127.0.0.1"])
+        .await
+    {
+        Ok(o) => {
+            assert_eq!(o.exit_code, 0);
+            println!("PT0S accepted");
+        }
+        Err(WinrmError::Soap(e)) => println!("PT0S refused: {e}"),
+        Err(e) => panic!("unexpected error: {e}"),
+    }
+}
+
+/// HTTPS to a listener whose certificate chains to a custom CA, with
+/// `accept_invalid_certs = false` and `add_root_certificates_pem`.
+///
+/// Needs `WINRM_TEST_CA_PEM` (path of the CA certificate, or of the listener
+/// certificate when it is not a CA certificate) and `WINRM_TEST_CA_HOST` (a
+/// host name present in the listener certificate's SAN, resolvable from the
+/// client, for example through `/etc/hosts`), plus the usual
+/// `WINRM_TEST_USER` / `WINRM_TEST_PASS`. The port is `https_test_port()`.
+/// When `WINRM_TEST_HOST` is an IP address, the same client must refuse it:
+/// the host name is still checked.
+#[tokio::test]
+#[ignore]
+async fn custom_ca_https_listener_authenticates() {
+    let (Ok(ca_pem), Ok(ca_host)) = (
+        std::env::var("WINRM_TEST_CA_PEM"),
+        std::env::var("WINRM_TEST_CA_HOST"),
+    ) else {
+        eprintln!(
+            "SKIP custom_ca_https_listener_authenticates: set WINRM_TEST_CA_PEM and WINRM_TEST_CA_HOST"
+        );
+        return;
+    };
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    let pass = std::env::var("WINRM_TEST_PASS").expect("WINRM_TEST_PASS");
+
+    #[cfg(feature = "credssp")]
+    let methods = [AuthMethod::Basic, AuthMethod::Ntlm, AuthMethod::CredSsp];
+    #[cfg(not(feature = "credssp"))]
+    let methods = [AuthMethod::Basic, AuthMethod::Ntlm];
+
+    for method in methods {
+        let label = format!("{method:?}");
+        let config = WinrmConfig {
+            auth_method: method,
+            use_tls: true,
+            accept_invalid_certs: false,
+            port: Some(https_test_port()),
+            ..Default::default()
+        };
+        let client = WinrmClient::builder(config)
+            .add_root_certificates_pem(&ca_pem)
+            .credentials(WinrmCredentials::new(user.clone(), pass.clone(), ""))
+            .build()
+            .unwrap_or_else(|e| panic!("{label}: build: {e}"));
+        let output = client
+            .run_command(&ca_host, "whoami", &[])
+            .await
+            .unwrap_or_else(|e| panic!("{label}: run_command on {ca_host}: {e}"));
+        assert_eq!(output.exit_code, 0, "{label}");
+
+        // The name check still applies: an IP address is not in the SAN.
+        if let Ok(ip_host) = std::env::var("WINRM_TEST_HOST")
+            && ip_host.parse::<std::net::IpAddr>().is_ok()
+        {
+            let refused = client.run_command(&ip_host, "whoami", &[]).await;
+            assert!(refused.is_err(), "{label}: {ip_host} must be refused");
+        }
+    }
+}
+
+/// SHA-256 fingerprint of the bench's HTTPS listener certificate, from
+/// `WINRM_TEST_HTTPS_CERT_SHA256` (64 hex digits, `:` separators allowed).
+/// On the server:
+///
+/// ```powershell
+/// $c = Get-Item Cert:\LocalMachine\My\<thumbprint>
+/// -join ([Security.Cryptography.SHA256]::Create().ComputeHash($c.RawData) | % { $_.ToString('x2') })
+/// ```
+fn bench_https_pin() -> Option<String> {
+    std::env::var("WINRM_TEST_HTTPS_CERT_SHA256")
+        .ok()
+        .filter(|pin| !pin.trim().is_empty())
+}
+
+/// A client for `config` with `accept_invalid_certs = false` and `pin`.
+fn pinned_client(
+    mut config: WinrmConfig,
+    pin: &str,
+    user: String,
+    pass: String,
+) -> Result<WinrmClient, WinrmError> {
+    config.accept_invalid_certs = false;
+    WinrmClient::builder(config)
+        .pin_server_certificate_sha256(pin)
+        .credentials(WinrmCredentials::new(user, pass, ""))
+        .build()
+}
+
+/// `whoami` through `client` on `host`, which must exit with 0.
+async fn assert_whoami(client: &WinrmClient, host: &str, label: &str) {
+    let output = client
+        .run_command(host, "whoami", &[])
+        .await
+        .unwrap_or_else(|e| panic!("{label}: run_command on {host}: {e}"));
+    assert_eq!(output.exit_code, 0, "{label}");
+}
+
+/// HTTPS with the listener certificate pinned (`WINRM_TEST_HTTPS_CERT_SHA256`)
+/// and `accept_invalid_certs = false`: the self-signed bench listener, reached
+/// by IP address, is accepted on `https_test_port()` for Basic, NTLM,
+/// Certificate (when `WINRM_TEST_CLIENT_CERT` is set), CredSSP (`credssp`
+/// feature) and Kerberos on the DC (`kerberos` feature, when
+/// `WINRM_TEST_KRB_HOST` and `WINRM_TEST_KRB_HTTPS_CERT_SHA256` are set).
+#[tokio::test]
+#[ignore]
+async fn pinned_https_listener_authenticates() {
+    let Some(pin) = bench_https_pin() else {
+        eprintln!("SKIP pinned_https_listener_authenticates: set WINRM_TEST_HTTPS_CERT_SHA256");
+        return;
+    };
+    let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    let pass = std::env::var("WINRM_TEST_PASS").expect("WINRM_TEST_PASS");
+
+    #[cfg(feature = "credssp")]
+    let methods = [AuthMethod::Basic, AuthMethod::Ntlm, AuthMethod::CredSsp];
+    #[cfg(not(feature = "credssp"))]
+    let methods = [AuthMethod::Basic, AuthMethod::Ntlm];
+
+    for method in methods {
+        let label = format!("{method:?}");
+        let config = WinrmConfig {
+            auth_method: method,
+            use_tls: true,
+            port: Some(https_test_port()),
+            ..Default::default()
+        };
+        let client = pinned_client(config, &pin, user.clone(), pass.clone())
+            .unwrap_or_else(|e| panic!("{label}: build: {e}"));
+        assert_whoami(&client, &host, &label).await;
+    }
+
+    // Configured as `certificate_auth_whoami`.
+    if let (Ok(cert), Ok(key)) = (
+        std::env::var("WINRM_TEST_CLIENT_CERT"),
+        std::env::var("WINRM_TEST_CLIENT_KEY"),
+    ) {
+        let config = WinrmConfig {
+            auth_method: AuthMethod::Certificate,
+            use_tls: true,
+            port: Some(https_test_port()),
+            client_cert_pem: Some(cert),
+            client_key_pem: Some(key),
+            ..Default::default()
+        };
+        let client = pinned_client(config, &pin, user.clone(), pass.clone())
+            .unwrap_or_else(|e| panic!("Certificate: build: {e}"));
+        assert_whoami(&client, &host, "Certificate").await;
+    } else {
+        eprintln!(
+            "pinned_https_listener_authenticates: Certificate skipped (no WINRM_TEST_CLIENT_CERT)"
+        );
+    }
+
+    // Configured as `kerberos_over_https_whoami`, with the DC's own pin.
+    #[cfg(feature = "kerberos")]
+    if let (Ok(krb_host), Ok(krb_pin)) = (
+        std::env::var("WINRM_TEST_KRB_HOST"),
+        std::env::var("WINRM_TEST_KRB_HTTPS_CERT_SHA256"),
+    ) {
+        let port: u16 = std::env::var("WINRM_TEST_KRB_HTTPS_PORT")
+            .expect("WINRM_TEST_KRB_HTTPS_PORT")
+            .parse()
+            .expect("WINRM_TEST_KRB_HTTPS_PORT must be a port number");
+        let config = WinrmConfig {
+            auth_method: AuthMethod::Kerberos,
+            use_tls: true,
+            port: Some(port),
+            ..Default::default()
+        };
+        let client = pinned_client(
+            config,
+            &krb_pin,
+            std::env::var("WINRM_TEST_KRB_USER").expect("WINRM_TEST_KRB_USER"),
+            std::env::var("WINRM_TEST_KRB_PASS").expect("WINRM_TEST_KRB_PASS"),
+        )
+        .unwrap_or_else(|e| panic!("Kerberos: build: {e}"));
+        assert_whoami(&client, &krb_host, "Kerberos").await;
+    } else {
+        eprintln!(
+            "pinned_https_listener_authenticates: Kerberos skipped (set WINRM_TEST_KRB_HOST and \
+             WINRM_TEST_KRB_HTTPS_CERT_SHA256)"
+        );
+    }
+}
+
+/// A pin that matches no certificate refuses the bench listener, for Basic
+/// and NTLM.
+#[tokio::test]
+#[ignore]
+async fn pinned_https_listener_refuses_a_wrong_pin() {
+    if bench_https_pin().is_none() {
+        eprintln!(
+            "SKIP pinned_https_listener_refuses_a_wrong_pin: set WINRM_TEST_HTTPS_CERT_SHA256"
+        );
+        return;
+    }
+    let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    let pass = std::env::var("WINRM_TEST_PASS").expect("WINRM_TEST_PASS");
+    let wrong = "00".repeat(32);
+    for method in [AuthMethod::Basic, AuthMethod::Ntlm] {
+        let label = format!("{method:?}");
+        let config = WinrmConfig {
+            auth_method: method,
+            use_tls: true,
+            port: Some(https_test_port()),
+            ..Default::default()
+        };
+        let client = pinned_client(config, &wrong, user.clone(), pass.clone())
+            .unwrap_or_else(|e| panic!("{label}: build: {e}"));
+        let refused = client.run_command(&host, "whoami", &[]).await;
+        assert!(refused.is_err(), "{label}: a wrong pin must be refused");
+    }
 }

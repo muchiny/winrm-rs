@@ -20,6 +20,8 @@
 #   FUZZ_RSS_MB     per-process memory cap              (default 2048)
 #   FUZZ_SANITIZER  address | none | leak | thread      (default address)
 #   FUZZ_MAX_LEN    maximum input length in bytes       (default 8192)
+#   FUZZ_TIMEOUT    libFuzzer per-input timeout in seconds (default: libFuzzer's)
+#   FUZZ_LEN_CONTROL  0 tries inputs up to FUZZ_MAX_LEN at once (default: libFuzzer's)
 #
 set -euo pipefail
 
@@ -31,6 +33,8 @@ FUZZ_JOBS="${FUZZ_JOBS:-1}"
 FUZZ_RSS_MB="${FUZZ_RSS_MB:-2048}"
 FUZZ_SANITIZER="${FUZZ_SANITIZER:-address}"
 FUZZ_MAX_LEN="${FUZZ_MAX_LEN:-8192}"
+FUZZ_TIMEOUT="${FUZZ_TIMEOUT:-}"
+FUZZ_LEN_CONTROL="${FUZZ_LEN_CONTROL:-}"
 
 # `create_authenticate_message_full` reads this in debug-assertion builds and
 # uses it instead of the CSPRNG for the client challenge. Fuzz builds keep
@@ -60,6 +64,7 @@ TARGETS=(
   "fuzz_asn1_ts_request:asn1"
   "fuzz_asn1_spnego:asn1"
   "fuzz_asn1_cert:asn1"
+  "fuzz_credssp_http:http"
 )
 
 target_names() { printf '%s\n' "${TARGETS[@]}" | cut -d: -f1; }
@@ -92,6 +97,20 @@ select_targets() {
   fi
 }
 
+# The two optional numeric knobs end up in libFuzzer flags, so they are
+# checked before any cargo call. Empty means "leave libFuzzer's default".
+check_optional_flags() {
+  if [[ -n "$FUZZ_TIMEOUT" ]] && ! [[ "$FUZZ_TIMEOUT" =~ ^[1-9][0-9]{0,4}$ ]]; then
+    echo "FUZZ_TIMEOUT must be a positive integer (got '$FUZZ_TIMEOUT')" >&2
+    return 2
+  fi
+  if [[ -n "$FUZZ_LEN_CONTROL" ]] && ! [[ "$FUZZ_LEN_CONTROL" =~ ^(0|[1-9][0-9]{0,5})$ ]]; then
+    echo "FUZZ_LEN_CONTROL must be a non-negative integer (got '$FUZZ_LEN_CONTROL')" >&2
+    return 2
+  fi
+  return 0
+}
+
 # libFuzzer flags shared by `run` and `smoke`.
 common_flags() {
   local target="$1"
@@ -101,6 +120,13 @@ common_flags() {
     "-malloc_limit_mb=${FUZZ_RSS_MB}" \
     "-max_len=${FUZZ_MAX_LEN}" \
     "-print_final_stats=1"
+  if [[ -n "$FUZZ_TIMEOUT" ]]; then
+    printf '%s\n' "-timeout=${FUZZ_TIMEOUT}"
+  fi
+  if [[ -n "$FUZZ_LEN_CONTROL" ]]; then
+    printf '%s\n' "-len_control=${FUZZ_LEN_CONTROL}"
+  fi
+  return 0
 }
 
 corpus_dirs() {
@@ -127,6 +153,7 @@ cmd_build() {
 # known input has started to crash.
 cmd_smoke() {
   local rc=0
+  check_optional_flags || return $?
   for target in $(select_targets "${1:-}"); do
     echo "=== smoke $target"
     # shellcheck disable=SC2046
@@ -140,6 +167,12 @@ cmd_run() {
   local only="${1:-}"
   local seconds="${2:-$FUZZ_TIME}"
   local rc=0
+  # Checked before any cargo call: the value ends up in a libFuzzer flag.
+  [[ "$seconds" =~ ^[1-9][0-9]{0,5}$ ]] || {
+    echo "seconds must be a positive integer (got '$seconds')" >&2
+    return 2
+  }
+  check_optional_flags || return $?
   for target in $(select_targets "$only"); do
     echo "=== run $target (${seconds}s, sanitizer=$FUZZ_SANITIZER)"
     # shellcheck disable=SC2046
@@ -178,8 +211,9 @@ cmd_coverage() {
   echo "  rustup component add llvm-tools --toolchain nightly)"
 }
 
+# Prints the header comment: the comment lines before the `set` line.
 usage() {
-  sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,/^set /{/^#/p;}' "$0" | sed 's/^# \{0,1\}//'
   exit 1
 }
 

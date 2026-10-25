@@ -3,7 +3,15 @@
 // Manages the reqwest HTTP client, authentication dispatch, and retry logic.
 // Extracted from client.rs.
 
+#![warn(clippy::arithmetic_side_effects)]
+
+pub(crate) mod proxy;
+
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use reqwest::header::CONTENT_TYPE;
@@ -17,17 +25,19 @@ use crate::auth::AuthTransport;
 use crate::auth::basic::BasicAuth;
 use crate::auth::certificate::CertificateAuth;
 #[cfg(feature = "credssp")]
-use crate::auth::credssp::CredSspAuth;
+use crate::auth::credssp::{CredSspAuth, CredSspConnOptions, CredSspTls};
 use crate::auth::kerberos::KerberosAuth;
 #[cfg(feature = "kerberos")]
 use crate::auth::kerberos::KerberosSession;
 use crate::auth::ntlm::{self as ntlm_auth, NtlmAuth};
-use crate::config::{AuthMethod, EncryptionMode, WinrmConfig, WinrmCredentials};
+use crate::config::{AuthMethod, EncryptionMode, ProxySessionAuth, WinrmConfig, WinrmCredentials};
 use crate::error::{SoapError, WinrmError};
-use crate::ntlm::NtlmSession;
+use crate::ntlm::SealingSession;
+use crate::request::{OutgoingRequest, RequestKind};
 use crate::soap;
-use crate::tls::{CertHandle, ClientAuthCert};
+use crate::tls::{CertHandle, ClientAuthCert, TlsOptions};
 use rustls::client::danger::ServerCertVerifier;
+use rustls::crypto::CryptoProvider;
 
 /// A dedicated connection: a `reqwest` client that keeps at most one TCP
 /// connection, the certificate handle of its own TLS verifier (HTTPS), and,
@@ -43,16 +53,23 @@ use rustls::client::danger::ServerCertVerifier;
 /// The pool holds boxes, so checking a connection in and out moves a pointer,
 /// not the session's key material.
 struct AuthConn {
+    /// [`host_key`] of the host this connection was opened for.
     host: String,
     http: reqwest::Client,
     /// Certificates this client's verifier accepted (HTTPS). TLS session
     /// resumption is off, so every new connection of this client is
-    /// verified; the client normally has one connection, but hyper may open
-    /// another while an idle one is checked out, so the record is trusted
-    /// only while it holds a single certificate. Used for channel binding
-    /// when the response does not report its TLS details (connections
-    /// through a proxy).
+    /// verified. Once [`Self::gate`] is locked (after the handshake has
+    /// completed) the client opens no new connection; while it is open (the
+    /// handshake legs, such as the Kerberos-over-HTTPS probe and AP-REQ, or
+    /// NTLM over TLS, which never locks it) it may open several, so the
+    /// record is trusted only while it holds a single certificate. Used for
+    /// channel binding when the response does not report its TLS details
+    /// (connections through a proxy).
     cert: Option<CertHandle>,
+    /// Gate on the client's connector: open during the handshake, locked
+    /// once it has completed, after which the client opens no new
+    /// connection (see [`ConnGate`]).
+    gate: Option<Arc<ConnGate>>,
     /// Sealing session (sealed connections only).
     session: Option<Sealer>,
     idle_since: Instant,
@@ -61,39 +78,279 @@ struct AuthConn {
     closing: bool,
 }
 
-/// Idle dedicated connections a transport keeps for reuse. Each holds one
-/// TCP connection (and, sealed, one NTLM or Kerberos session on the server):
-/// eight covers a client running several shells in parallel (each concurrent
-/// request needs its own connection) without holding many idle sockets on the
-/// host. Extra
-/// connections are opened as needed and the oldest idle ones closed.
-const MAX_IDLE_CONNS: usize = 8;
+/// Error type of the boxed connector services `reqwest` layers.
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Gate on a dedicated client's connector. Open, it lets every connect
+/// through; locked ([`Self::lock`]), it refuses every connect without
+/// running the inner connector (no TCP, proxy or TLS handshake).
+///
+/// `hyper` races a pool checkout against a new connect when a request finds
+/// no idle connection, which happens when the previous answer has been read
+/// but the connection is not back in the pool yet. A new connection carries
+/// no session, and a successful background connect would also take the
+/// single idle slot from the authenticated one. Once the dedicated
+/// connection is authenticated, the gate is locked, so the request waits for
+/// the authenticated connection instead.
+struct ConnGate {
+    locked: AtomicBool,
+    /// How long a refused connect waits before failing, so that the pool
+    /// checkout wins when the authenticated connection comes back.
+    wait: Duration,
+}
+
+impl ConnGate {
+    /// An open gate whose refusals wait `min(1 s, connect_timeout_secs)`.
+    fn new(config: &WinrmConfig) -> Self {
+        Self {
+            locked: AtomicBool::new(false),
+            wait: Duration::from_secs(config.connect_timeout_secs.min(1)),
+        }
+    }
+
+    /// Refuse every later connect of this client.
+    fn lock(&self) {
+        self.locked.store(true, Ordering::SeqCst);
+    }
+
+    fn is_locked(&self) -> bool {
+        self.locked.load(Ordering::SeqCst)
+    }
+}
+
+/// Error of a connect refused by a locked [`ConnGate`].
+#[derive(Debug)]
+struct ConnGateRefused;
+
+impl std::fmt::Display for ConnGateRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "the dedicated connection is already authenticated; not opening another connection",
+        )
+    }
+}
+
+impl std::error::Error for ConnGateRefused {}
+
+/// `tower` layer putting a [`ConnGate`] in front of a client's connector.
+#[derive(Clone)]
+struct ConnGateLayer(Arc<ConnGate>);
+
+impl<S> tower_layer::Layer<S> for ConnGateLayer {
+    type Service = GatedConnector<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        GatedConnector {
+            inner,
+            gate: Arc::clone(&self.0),
+        }
+    }
+}
+
+/// A connector behind a [`ConnGate`]. Generic over the request type:
+/// `reqwest`'s connector request and connection types cannot be named.
+#[derive(Clone)]
+struct GatedConnector<S> {
+    inner: S,
+    gate: Arc<ConnGate>,
+}
+
+impl<S, R> tower_service::Service<R> for GatedConnector<S>
+where
+    S: tower_service::Service<R, Error = BoxError> + Clone + Send + Sync + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = BoxError;
+    type Future = Pin<Box<dyn Future<Output = Result<S::Response, BoxError>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: R) -> Self::Future {
+        if self.gate.is_locked() {
+            let wait = self.gate.wait;
+            return Box::pin(async move {
+                tokio::time::sleep(wait).await;
+                let refused: BoxError = Box::new(ConnGateRefused);
+                Err(refused)
+            });
+        }
+        Box::pin(self.inner.call(req))
+    }
+}
+
+/// Idle dedicated connections a transport keeps for reuse, per host. Each
+/// holds one TCP connection (and, sealed, one NTLM or Kerberos session on the
+/// server): eight covers a client running several shells in parallel (each
+/// concurrent request needs its own connection) without holding many idle
+/// sockets on the host. Extra connections are opened as needed and the
+/// oldest idle ones closed. Hosts are keyed by [`host_key`]. With
+/// [`MAX_IDLE_TOTAL`]: 8 per host, as a single-host client had before, and 32
+/// per client, each closed after 60 s idle ([`CONN_MAX_IDLE`], below
+/// HTTP.sys's 120 s).
+const MAX_IDLE_PER_HOST: usize = 8;
+
+/// Idle dedicated connections a transport keeps for reuse, all hosts
+/// together (see [`MAX_IDLE_PER_HOST`]). Past this, the oldest idle ones are
+/// closed.
+const MAX_IDLE_TOTAL: usize = 32;
 
 /// A dedicated connection idle longer than this is not reused but closed: it
 /// stays below the 90 s idle timeout of the `reqwest` pool and the 120 s of
 /// HTTP.sys, so a reused connection is normally still the authenticated one.
 const CONN_MAX_IDLE: Duration = Duration::from_secs(60);
 
-/// Exchanges a transport runs at once on dedicated connections (sealed, or
-/// NTLM over TLS): a bound on the sockets and server sessions one client can
-/// open. Further requests wait for a slot, within the request timeout.
-const MAX_CONNS_IN_FLIGHT: usize = 32;
+/// Dedicated-connection exchanges (sealed, NTLM over TLS, Kerberos over TLS,
+/// CredSSP) in flight: 32 per host and 128 per client. Signal and Delete use their own
+/// lane of 8 slots per host, outside both limits, so clean-up never queues
+/// behind data requests. At most 128 + 8 × hosts sockets are in use at once;
+/// the idle pooled connections ([`MAX_IDLE_PER_HOST`]: 8 per host,
+/// [`MAX_IDLE_TOTAL`]: 32 in total) come on top. Hosts are keyed by
+/// their string, ASCII case aside: `win01` and its address get separate
+/// budgets. Further requests wait for a slot, within the request timeout. A
+/// CredSSP request holds its slot for its whole exchange (usually five
+/// rounds on its own connection), so the cap also caps concurrent CredSSP
+/// logons.
+/// A request takes its slot before the `before_send` hook is consulted.
+const MAX_CONNS_PER_HOST: usize = 32;
 
-/// Times a sealed exchange yields to the runtime before sending, so the
-/// dedicated client's connection is back in its pool (see
-/// [`HttpTransport::send_sealed_body`]).
-const POOL_RETURN_YIELDS: usize = 4;
+/// Clean-up (Signal, Delete) exchanges in flight per host, on top of
+/// [`MAX_CONNS_PER_HOST`] (see there). As many as [`MAX_IDLE_PER_HOST`], so a
+/// burst of Signal and Delete requests after many concurrent calls drains
+/// quickly.
+const CLEANUP_SLOTS_PER_HOST: usize = 8;
+
+/// Kerberos ticket requests in flight per client, each on a thread of
+/// tokio's blocking pool.
+const MAX_KDC_IN_FLIGHT: usize = 32;
+
+/// Data exchanges in flight per client, all hosts together (see
+/// [`MAX_CONNS_PER_HOST`]).
+const MAX_CONNS_IN_FLIGHT_TOTAL: usize = 128;
+
+/// The construction error of a CredSSP client with `accept_invalid_certs`.
+const CREDSSP_UNAUTHENTICATED_TLS: &str = "CredSSP refuses accept_invalid_certs = true. Set it \
+     to false and either pin the listener certificate with pin_server_certificate_sha256 or \
+     trust its CA with add_root_certificates_pem: the delegated password and every SOAP body \
+     would otherwise cross an unauthenticated HTTPS connection";
+
+/// The construction error of a Basic client over HTTPS with
+/// `accept_invalid_certs`.
+const BASIC_UNVERIFIED_TLS: &str = "Basic sends the password to a server whose certificate is not \
+     verified: set accept_invalid_certs = false and pin the certificate with \
+     pin_server_certificate_sha256 or add a root with add_root_certificates_pem";
+
+/// Which slots an exchange on a dedicated connection takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Lane {
+    /// Every request but clean-up: a slot of the host and one of the client.
+    Data,
+    /// Signal and Delete: a clean-up slot of the host only.
+    Cleanup,
+}
+
+/// The slot semaphores of one host.
+struct HostSlots {
+    data: Arc<tokio::sync::Semaphore>,
+    cleanup: Arc<tokio::sync::Semaphore>,
+}
+
+/// Slots held for one exchange, released on drop: the host's data or
+/// clean-up permit, and for data exchanges the client's.
+#[derive(Debug)]
+pub(crate) struct SlotGuard {
+    _host: tokio::sync::OwnedSemaphorePermit,
+    _all: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+/// Key of `host` in the slot map: [`sanitize_host`], ASCII-lowercased.
+pub(crate) fn host_key(host: &str) -> String {
+    sanitize_host(host).to_ascii_lowercase()
+}
+
+/// How [`HttpTransport::send_soap`] sends a request, from the configuration
+/// alone. [`Route::needs_conn_slot`] is the only place that decides which
+/// requests queue for a connection slot ([`MAX_CONNS_PER_HOST`] per host,
+/// [`MAX_CONNS_IN_FLIGHT_TOTAL`] per client).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+    /// Basic on the shared client.
+    Basic,
+    /// Client certificate on the shared client.
+    Certificate,
+    /// CredSSP, on its own connection per request, which holds a connection
+    /// slot for its whole exchange.
+    CredSsp,
+    /// NTLM unsealed over plain HTTP, a handshake per request on the shared
+    /// client.
+    NtlmPlain,
+    /// NTLM unsealed over HTTPS, on a dedicated connection.
+    NtlmOverTls,
+    /// NTLM or Kerberos sealed, on a dedicated connection.
+    Sealed,
+    /// Kerberos unsealed over HTTPS, on a dedicated connection.
+    KerberosOverTls,
+    /// Kerberos unsealed over plain HTTP on the shared client; without the
+    /// `kerberos` feature, every Kerberos request (its error says the feature
+    /// is needed).
+    KerberosPlain,
+}
+
+impl Route {
+    /// The route of every request under `config`.
+    fn for_config(config: &WinrmConfig) -> Route {
+        let seals = seals_for(config);
+        match config.auth_method {
+            AuthMethod::Basic => Route::Basic,
+            AuthMethod::Certificate => Route::Certificate,
+            AuthMethod::CredSsp => Route::CredSsp,
+            AuthMethod::Ntlm if seals => Route::Sealed,
+            AuthMethod::Ntlm if config.use_tls => Route::NtlmOverTls,
+            AuthMethod::Ntlm => Route::NtlmPlain,
+            AuthMethod::Kerberos if !cfg!(feature = "kerberos") => Route::KerberosPlain,
+            AuthMethod::Kerberos if seals => Route::Sealed,
+            AuthMethod::Kerberos if config.use_tls => Route::KerberosOverTls,
+            AuthMethod::Kerberos => Route::KerberosPlain,
+        }
+    }
+
+    /// Whether a request on this route runs on a dedicated connection, and
+    /// so first takes a connection slot.
+    fn needs_conn_slot(self) -> bool {
+        matches!(
+            self,
+            Route::Sealed | Route::NtlmOverTls | Route::KerberosOverTls | Route::CredSsp
+        )
+    }
+}
+
+/// Whether requests under `config` are sealed (NTLM and Kerberos only):
+/// `EncryptionMode::Auto` seals over plain HTTP, and over HTTPS when the
+/// certificate is not verified (`accept_invalid_certs`: the server is not
+/// authenticated, so TLS alone does not keep the bodies from whoever
+/// answers); `Always` seals over HTTPS too, `Never` never.
+fn seals_for(config: &WinrmConfig) -> bool {
+    matches!(config.auth_method, AuthMethod::Ntlm | AuthMethod::Kerberos)
+        && match config.encryption {
+            EncryptionMode::Always => true,
+            EncryptionMode::Never => false,
+            EncryptionMode::Auto => !config.use_tls || config.accept_invalid_certs,
+        }
+}
+
+/// The slot a dedicated route was given: always `Some` from
+/// [`HttpTransport::send_soap_with_retry`], else an internal error.
+fn dedicated_slot(slot: Option<SlotGuard>) -> Result<SlotGuard, WinrmError> {
+    slot.ok_or_else(|| {
+        WinrmError::AuthFailed("internal: dedicated path without a connection slot".into())
+    })
+}
 
 /// The security context that seals a connection's messages.
-#[cfg_attr(
-    feature = "kerberos",
-    expect(
-        clippy::large_enum_variant,
-        reason = "held in a boxed AuthConn; another box would add a heap copy of NTLM keys"
-    )
-)]
 enum Sealer {
-    Ntlm(NtlmSession),
+    Ntlm(Box<SealingSession>),
     #[cfg(feature = "kerberos")]
     Kerberos(KerberosSession),
 }
@@ -126,7 +383,7 @@ impl Sealer {
     /// Seal `body`: the HTTP `Content-Type` and the framed body.
     fn seal(&mut self, body: &str) -> Result<(String, Vec<u8>), WinrmError> {
         match self {
-            Self::Ntlm(session) => Ok(ntlm_auth::seal_body(session, body)),
+            Self::Ntlm(session) => ntlm_auth::seal_body(session, body),
             #[cfg(feature = "kerberos")]
             Self::Kerberos(session) => session.seal_body(body),
         }
@@ -186,23 +443,6 @@ fn check_pinned_certificate(
     }
 }
 
-/// Give `hyper` the chance to hand a dedicated client's connection back to
-/// that client's pool before the next request on it.
-///
-/// `hyper` returns a connection to the pool from a task of its own once the
-/// previous answer is fully read; a request sent before that task runs opens
-/// a new TCP connection, which carries no session and gets a 401 (see the
-/// measurements in `docs/validation/live-matrix.md`). Yielding first lets
-/// that task run; [`POOL_RETURN_YIELDS`] is empirical. This narrows the
-/// window, it does not close it: the request then still fails closed (401
-/// error, not resent). Pinning one `hyper` connection per [`AuthConn`]
-/// would close it.
-async fn let_pool_take_back_connection() {
-    for _ in 0..POOL_RETURN_YIELDS {
-        tokio::task::yield_now().await;
-    }
-}
-
 /// How a sealed exchange failed.
 enum SealedFailure {
     /// HTTP 401: the connection no longer carries its sealing session.
@@ -214,7 +454,12 @@ enum SealedFailure {
 }
 
 /// Gate checked before each request attempt: `true` sends, `false` refuses.
-pub(crate) type BeforeSend = Arc<dyn Fn() -> bool + Send + Sync>;
+pub(crate) type BeforeSend = Arc<dyn Fn(&OutgoingRequest<'_>) -> bool + Send + Sync>;
+
+/// A [`BeforeSend`] gate from a hook that does not look at the request.
+pub(crate) fn legacy_hook(hook: impl Fn() -> bool + Send + Sync + 'static) -> BeforeSend {
+    Arc::new(move |_: &OutgoingRequest<'_>| hook())
+}
 
 /// HTTP transport for WinRM SOAP requests.
 ///
@@ -223,9 +468,26 @@ pub(crate) struct HttpTransport {
     http: reqwest::Client,
     config: WinrmConfig,
     credentials: WinrmCredentials,
-    /// rustls configuration of [`Self::http`] and its server certificate
-    /// verifier (HTTPS only), the base of the dedicated clients.
-    tls_config: Option<(rustls::ClientConfig, Arc<dyn ServerCertVerifier>)>,
+    /// rustls configuration of [`Self::http`] (HTTPS, or plain HTTP, where
+    /// it serves only the leg to an `https://` proxy), on the client's crypto
+    /// provider: the base of the dedicated clients.
+    client_tls: rustls::ClientConfig,
+    /// Server certificate verifier of [`Self::client_tls`], `Some` only over
+    /// HTTPS: the base of each dedicated client's capturing verifier.
+    server_verifier: Option<Arc<dyn ServerCertVerifier>>,
+    /// CredSSP TLS contexts, built once from [`Self::client_tls`]. `Some` only
+    /// for [`AuthMethod::CredSsp`].
+    #[cfg(feature = "credssp")]
+    credssp_tls: Option<Arc<CredSspTls>>,
+    /// How [`AuthMethod::CredSsp`] reaches the host when the environment is
+    /// not read: through the proxy of [`WinrmConfig::proxy`], else directly.
+    /// Resolved at construction ([`proxy::ProxyRoute::credssp_dial`]), so an
+    /// explicit proxy CredSSP cannot use fails there. With
+    /// [`TransportOptions::use_env_proxy`] and no explicit proxy, each
+    /// request computes its own dial instead ([`Self::credssp_dial_for`]).
+    /// [`proxy::CredSspDial::Direct`] for the other methods.
+    #[cfg(feature = "credssp")]
+    credssp_dial: Arc<proxy::CredSspDial>,
     /// Idle dedicated connections. The lock is only held to check one
     /// out or back in, never across an HTTP exchange.
     #[expect(
@@ -233,14 +495,80 @@ pub(crate) struct HttpTransport {
         reason = "boxed so pool moves copy a pointer, not key material"
     )]
     conn_pool: Mutex<Vec<Box<AuthConn>>>,
-    /// Slots for exchanges in flight on dedicated connections.
-    conn_slots: tokio::sync::Semaphore,
+    /// Per-host slots for exchanges in flight on dedicated connections,
+    /// keyed by [`host_key`]. The lock is only held to look up, insert or
+    /// prune an entry, never across an await.
+    conn_slots: Mutex<std::collections::HashMap<String, HostSlots>>,
+    /// Client-wide slots for data exchanges on dedicated connections.
+    all_slots: Arc<tokio::sync::Semaphore>,
+    /// Kerberos ticket requests in flight for this client, each on a thread
+    /// of tokio's blocking pool (see `auth::kerberos::run_blocking_bounded`).
+    kdc_slots: Arc<tokio::sync::Semaphore>,
     /// `wsmv:SessionId` value stamped on every request (`uuid:<UPPERCASE>`),
     /// one per transport. See [`crate::soap::envelope::with_session_id`].
     session_id: String,
     /// Called before each attempt of [`Self::send_soap_with_retry`]; `false`
     /// refuses the request.
     before_send: Option<BeforeSend>,
+    /// Log the SOAP bodies at `trace` (target `winrm_rs::wire`); otherwise
+    /// only their lengths. Off by default.
+    log_soap_bodies: bool,
+    /// With `pin_server_certificate_sha256` or
+    /// `danger_accept_invalid_proxy_certs` over HTTPS, the server names of
+    /// the `https://` proxy of [`Self::route`]
+    /// ([`proxy::ProxyRoute::https_proxy_server_names`]): their handshakes
+    /// get the proxy's verification, not the endpoint's (see
+    /// [`crate::tls::ProxyRoutingVerifier`]), so a host with one of these
+    /// names is refused (see [`Self::checked_endpoint`]). Empty otherwise.
+    shared_proxy_names: Vec<rustls::pki_types::ServerName<'static>>,
+    /// The proxy route of every client of this transport, resolved once at
+    /// construction.
+    route: proxy::ProxyRoute,
+    /// The options this transport was built with.
+    options: TransportOptions,
+    /// The endpoint URLs whose proxy has been logged for not announcing
+    /// session-based authentication (see [`proxy::ProxyGate`]).
+    proxy_warned: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Kerberos: whether the proxy of each endpoint URL announced
+    /// session-based authentication with the server's 401, kept from the
+    /// first such answer for the client's life (see
+    /// [`Self::kerberos_proxy_probe`]).
+    #[cfg(feature = "kerberos")]
+    proxy_probes: Mutex<std::collections::HashMap<String, bool>>,
+}
+
+/// Transport settings chosen through [`crate::WinrmClientBuilder`], beside
+/// [`WinrmConfig`]. Plain data only, so the builder keeps its auto traits
+/// (`UnwindSafe`, `RefUnwindSafe`).
+#[derive(Clone, Debug)]
+pub(crate) struct TransportOptions {
+    /// Whether the proxy environment variables are read when
+    /// [`WinrmConfig::proxy`] is `None` (see [`proxy::ProxyRoute::resolve`]).
+    /// Off by default since 2.0.
+    pub(crate) use_env_proxy: bool,
+    /// TLS settings.
+    pub(crate) tls: TlsOptions,
+    /// What NTLM and Kerberos do through a forwarding proxy that does not
+    /// announce session-based authentication (see [`ProxySessionAuth`]).
+    pub(crate) proxy_session_auth: ProxySessionAuth,
+    /// The NTLM `Workstation` field the caller set (UTF-16LE, reduced by
+    /// `ntlm::sanitize_workstation`); `None` sends the detected name.
+    pub(crate) workstation: Option<Vec<u8>>,
+    /// Whether `run_powershell` starts PowerShell with
+    /// [`NON_INTERACTIVE_FLAGS`](crate::command::NON_INTERACTIVE_FLAGS).
+    pub(crate) non_interactive_powershell: bool,
+}
+
+impl Default for TransportOptions {
+    fn default() -> Self {
+        Self {
+            use_env_proxy: false,
+            tls: TlsOptions::default(),
+            proxy_session_auth: ProxySessionAuth::default(),
+            workstation: None,
+            non_interactive_powershell: true,
+        }
+    }
 }
 
 /// Largest response body read from the server: four times the envelope size
@@ -253,63 +581,33 @@ pub(crate) fn max_response_bytes(config: &WinrmConfig) -> usize {
         .saturating_mul(4)
 }
 
-/// The TLS server name `reqwest` hands the certificate verifier for `url`:
-/// the host of the URL once parsed (`url` normalises it: IDN to punycode,
+/// The host of `url` once parsed (`url` normalises it: IDN to punycode,
 /// short or octal IPv4 forms to dotted quads, `?` or `\\` ending the host),
-/// without IPv6 brackets, as hyper-rustls's default resolver takes it from
-/// the request URI that `reqwest` builds from the same parsed URL. `None`
-/// when the URL has no host that is a valid TLS server name.
-fn url_server_name(url: &str) -> Option<rustls::pki_types::ServerName<'static>> {
+/// without IPv6 brackets. `None` when the URL has no host.
+pub(crate) fn url_host(url: &str) -> Option<String> {
     let parsed = reqwest::Url::parse(url).ok()?;
     let host = parsed.host_str()?;
     let host = host
         .strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(host);
-    rustls::pki_types::ServerName::try_from(host.to_string()).ok()
+    Some(host.to_string())
 }
 
-/// Server names of the `https://` proxies a client built from `config` may
-/// do a TLS handshake with, for the pinned verifier's proxy exception:
-/// [`WinrmConfig::proxy`] when set (reqwest then ignores the environment),
-/// else every `https://` proxy in `HTTPS_PROXY`, `https_proxy`, `ALL_PROXY`
-/// or `all_proxy`, read through `var`.
-///
-/// For the environment this is a superset of what reqwest uses (it takes
-/// the first of each pair, prefers `HTTPS_PROXY` over `ALL_PROXY` for an
-/// `https://` endpoint, and skips the proxy for hosts in `NO_PROXY`): a
-/// name listed here that reqwest does not use is never the name of a
-/// handshake, since the dedicated client only connects to the endpoint (no
-/// redirects) and to its proxy, so the extra exception is inert. `http://`,
-/// scheme-less (taken as `http://`) and SOCKS proxies only relay bytes and
-/// do no TLS of their own. A proxy from system settings (reqwest's
-/// `system-proxy` feature, off in this crate's build) is not covered: the
-/// pin refuses its handshake.
-fn proxy_server_names(
-    config: &WinrmConfig,
-    var: impl Fn(&str) -> Option<String>,
-) -> Vec<rustls::pki_types::ServerName<'static>> {
-    if let Some(proxy) = config.proxy.as_deref() {
-        return url_server_name(proxy).into_iter().collect();
-    }
-    ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]
-        .into_iter()
-        .filter_map(var)
-        .filter(|value| {
-            value
-                .trim()
-                .get(..8)
-                .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
-        })
-        .filter_map(|value| url_server_name(value.trim()))
-        .collect()
+/// The TLS server name `reqwest` hands the certificate verifier for `url`:
+/// [`url_host`], as hyper-rustls's default resolver takes it from the
+/// request URI that `reqwest` builds from the same parsed URL. `None` when
+/// the URL has no host that is a valid TLS server name.
+pub(crate) fn url_server_name(url: &str) -> Option<rustls::pki_types::ServerName<'static>> {
+    rustls::pki_types::ServerName::try_from(url_host(url)?).ok()
 }
 
 /// Strip scheme, userinfo, port, and path from a host string.
 ///
-/// Defensive: callers are supposed to pass `"hostname"` or `"10.0.0.1"`,
-/// but if they accidentally pass `"http://evil.com/path"` we keep just
-/// `"evil.com"` and log the deviation. IPv6 literals (`[::1]`) are
+/// Callers must pass `"hostname"` or `"10.0.0.1"`: [`validate_host`] refuses
+/// any host this function would change (`"http://evil.com/path"` would be cut
+/// to `"evil.com"`), so the stripped form is never the one a request goes
+/// to. IPv6 literals (`[::1]`) are
 /// preserved as-is because `:` inside brackets is part of the address; a
 /// port after the closing bracket (`[::1]:5985`) is dropped like any other.
 ///
@@ -368,8 +666,19 @@ pub(crate) fn redact_userinfo(host: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-/// Refuse a host that, once [`sanitize_host`] has stripped the scheme,
-/// userinfo, path and port, is still not a host name or address.
+/// `host` as a log field: [`redact_userinfo`] first (it relies on the raw
+/// `@`), then [`crate::error::quote_server_text`], so a line break or an ANSI
+/// sequence in the string cannot start a new log line or recolour one.
+pub(crate) fn log_host(host: &str) -> String {
+    crate::error::quote_server_text(&redact_userinfo(host), 256)
+}
+
+/// Refuse a host that is not a bare host name or address.
+///
+/// A host that [`sanitize_host`] would change (it has a scheme, user info, a
+/// path or a port) is refused first: the caller's string is what an
+/// allowlist or a log line saw, so it must be what the request goes to. The
+/// port is [`WinrmConfig::port`].
 ///
 /// The endpoint URL is built by formatting the host into
 /// `scheme://HOST:PORT/wsman`, so a host such as `win01?x` or `win01\x`
@@ -379,9 +688,24 @@ pub(crate) fn redact_userinfo(host: &str) -> std::borrow::Cow<'_, str> {
 /// name made of ASCII letters, digits, `-`, `_` and `.` and of any non-ASCII
 /// character that is not whitespace or a control character (internationalised
 /// names, converted to punycode by the URL parser).
+///
+/// The host must also be the form the URL parser keeps (lowercase aside), so
+/// the host on the wire is the string the caller checked: `10.1`,
+/// `010.0.0.1`, `167772161`, fullwidth characters, an ideographic full stop,
+/// decomposed accents and an IPv6 literal not in its RFC 5952 form
+/// (`[0:0::1]`, `[2001:0db8::1]`) are refused, and the error names the form
+/// the parser reads. An IPv4-mapped (`[::ffff:10.0.0.1]`) or IPv4-compatible
+/// (`[::10.0.0.1]`) literal, in any spelling, is refused too: it reaches an
+/// IPv4 host, and the error names the dotted-quad form to pass instead.
 pub(crate) fn validate_host(host: &str) -> Result<(), WinrmError> {
-    let sanitized = sanitize_host(host);
-    let valid = if let Some(inner) = sanitized
+    if sanitize_host(host) != host {
+        return Err(WinrmError::AuthFailed(format!(
+            "invalid host {:?}: pass a bare host name or address, without scheme, user info, \
+             path or port (the port is WinrmConfig::port)",
+            crate::error::excerpt_chars(&redact_userinfo(host), 64)
+        )));
+    }
+    let valid = if let Some(inner) = host
         .strip_prefix('[')
         .and_then(|rest| rest.strip_suffix(']'))
     {
@@ -390,8 +714,8 @@ pub(crate) fn validate_host(host: &str) -> Result<(), WinrmError> {
                 .bytes()
                 .all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.')
     } else {
-        !sanitized.is_empty()
-            && sanitized.chars().all(|c| {
+        !host.is_empty()
+            && host.chars().all(|c| {
                 if c.is_ascii() {
                     c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')
                 } else {
@@ -399,39 +723,114 @@ pub(crate) fn validate_host(host: &str) -> Result<(), WinrmError> {
                 }
             })
     };
-    if valid {
-        Ok(())
-    } else {
-        Err(WinrmError::AuthFailed(format!(
-            // Debug form: shows whitespace and control characters. Userinfo
-            // is already stripped.
+    if !valid {
+        return Err(WinrmError::AuthFailed(format!(
+            // Debug form: shows whitespace and control characters.
             "invalid host {:?}: expected a host name, an IPv4 address or a bracketed IPv6 \
              literal (letters, digits, '-', '_' and '.')",
-            crate::error::excerpt_chars(&sanitized, 64)
-        )))
+            crate::error::excerpt_chars(host, 64)
+        )));
     }
+    check_parser_keeps_host(host)
+}
+
+/// The IPv4 address an IPv6 address stands for: an IPv4-mapped address
+/// (`::ffff:a.b.c.d`), or an IPv4-compatible one (`::a.b.c.d`, other than
+/// `::` and `::1`). `None` for any other address.
+fn embedded_ipv4(addr: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    if let Some(v4) = addr.to_ipv4_mapped() {
+        return Some(v4);
+    }
+    let compatible = matches!(addr.segments(), [0, 0, 0, 0, 0, 0, _, _])
+        && !addr.is_unspecified()
+        && !addr.is_loopback();
+    if compatible { addr.to_ipv4() } else { None }
+}
+
+/// Refuse a host the URL parser would rewrite, so the host on the wire is
+/// the string the caller checked, and an IPv6 literal that stands for an
+/// IPv4 address ([`embedded_ipv4`]).
+///
+/// The parser reads `10.1`, `0x0a.0.0.1`, `167772161` and fullwidth digits as
+/// `10.0.0.1`, maps fullwidth letters, `U+3002` and decomposed accents to
+/// other characters, and writes an IPv6 literal in its RFC 5952 form
+/// (`[0:0::1]` as `[::1]`, `[::ffff:10.0.0.1]` as `[::ffff:a00:1]`). An ASCII
+/// host (a bracketed literal included) must come back as its lowercase self.
+/// A non-ASCII host must not become an IPv4 address, and must equal the
+/// Unicode form of what the parser produced (lowercase, composed). The IPv6
+/// check reads the address the parser produced, so no spelling of the input
+/// can avoid it.
+fn check_parser_keeps_host(host: &str) -> Result<(), WinrmError> {
+    let refuse = |read_as: &str| {
+        WinrmError::AuthFailed(format!(
+            "invalid host {:?}: the URL parser reads it as {:?}; pass that form",
+            crate::error::excerpt_chars(host, 64),
+            crate::error::excerpt_chars(read_as, 64)
+        ))
+    };
+    let parsed = reqwest::Url::parse(&endpoint_url(false, host, 1))
+        .map_err(|e| refuse(&format!("an unparsable URL ({e})")))?;
+    let read_as = parsed.host_str().unwrap_or_default();
+    if let Some(literal) = read_as
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    {
+        // Fails closed: the parser's own output must read back as an address.
+        let addr = literal
+            .parse::<std::net::Ipv6Addr>()
+            .map_err(|_| refuse(read_as))?;
+        if let Some(v4) = embedded_ipv4(addr) {
+            return Err(WinrmError::AuthFailed(format!(
+                "invalid host {:?}: an IPv6 literal that stands for the IPv4 address {v4}; \
+                 pass {:?}",
+                crate::error::excerpt_chars(host, 64),
+                v4.to_string()
+            )));
+        }
+    }
+    let kept = if host.is_ascii() {
+        read_as == host.to_ascii_lowercase()
+    } else {
+        let (unicode, result) = idna::domain_to_unicode(read_as);
+        read_as.parse::<std::net::Ipv4Addr>().is_err()
+            && result.is_ok()
+            && unicode == host.to_lowercase()
+    };
+    if kept { Ok(()) } else { Err(refuse(read_as)) }
 }
 
 /// Build the `reqwest` client for `config`: timeouts, redirects off, user
-/// agent, proxy, TLS details on responses and, over HTTPS, the prepared
-/// rustls configuration. At most `max_idle_per_host` idle connections are
+/// agent, the proxies of `route` and no other (the operating system's proxy
+/// settings are never read), TLS details on responses and the prepared
+/// rustls configuration `tls_config` (HTTPS, or the plain-HTTP one that
+/// serves an `https://` proxy). At most `max_idle_per_host` idle connections are
 /// kept per host: 10 for the transport's shared client, 1 for the client of
-/// a dedicated NTLM connection (sealed, or NTLM over TLS), so its requests
-/// stay on the authenticated connection.
+/// a dedicated connection (sealed, Kerberos over TLS, or NTLM over TLS).
+///
+/// `gate` is `None` for the shared client and set for a dedicated one: its
+/// connector then sits behind the [`ConnGate`]. The gate is open during the
+/// handshake legs, which may open more than one connection; once it is
+/// locked (after the handshake has completed), the client opens no new
+/// connection, so its requests stay on the authenticated one.
 fn build_http_client(
     config: &WinrmConfig,
-    tls_config: Option<rustls::ClientConfig>,
+    route: &proxy::ProxyRoute,
+    tls_config: rustls::ClientConfig,
     max_idle_per_host: usize,
+    gate: Option<Arc<ConnGate>>,
 ) -> Result<reqwest::Client, WinrmError> {
     // The WinRM endpoint is fixed by the caller (host:port/wsman); a
     // server returning a 30x is unexpected and any cross-origin redirect
     // would risk forwarding the Authorization header. Disable redirects
     // entirely.
     let mut builder = reqwest::Client::builder()
-        .danger_accept_invalid_certs(config.accept_invalid_certs)
+        // Every TLS setting (verifier, provider) lives in `tls_config`.
+        .tls_backend_preconfigured(tls_config)
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
-        .timeout(Duration::from_secs(config.operation_timeout_secs + 10))
+        .timeout(Duration::from_secs(
+            config.operation_timeout_secs.saturating_add(10),
+        ))
         .http1_only()
         // Exposes each response's TLS peer certificate: NTLM channel
         // binding is computed from the connection that carried the challenge.
@@ -444,44 +843,129 @@ fn build_http_client(
                 .user_agent
                 .as_deref()
                 .unwrap_or(concat!("winrm-rs/", env!("CARGO_PKG_VERSION"))),
-        );
-    if let Some(ref proxy_url) = config.proxy {
-        let proxy = reqwest::Proxy::all(proxy_url).map_err(WinrmError::Http)?;
+        )
+        // Drops `reqwest`'s own proxy lookup (the environment and, when a
+        // crate in the build enables it, the operating system's settings):
+        // the route is the only source of proxies.
+        .no_proxy();
+    for proxy in route.reqwest_proxies()? {
         builder = builder.proxy(proxy);
-    } else if cfg!(test) {
-        // Unit tests talk to loopback servers: keep `HTTP(S)_PROXY` from the
-        // environment out of them. Builds outside tests keep reqwest's
-        // system-proxy behaviour.
-        builder = builder.no_proxy();
     }
-    if let Some(tls_config) = tls_config {
-        builder = builder.tls_backend_preconfigured(tls_config);
+    if let Some(gate) = gate {
+        builder = builder.connector_layer(ConnGateLayer(gate));
     }
     builder.build().map_err(WinrmError::Http)
 }
 
+/// The construction WARNs for a certificate that is not verified: the
+/// server's (`accept_invalid_certs`), and an `https://` proxy's
+/// (`danger_accept_invalid_proxy_certs`) when the route has such a proxy for
+/// the endpoints' scheme.
+fn warn_unverified_tls(config: &WinrmConfig, opts: &TransportOptions, route: &proxy::ProxyRoute) {
+    if config.accept_invalid_certs {
+        tracing::warn!(
+            "TLS certificate verification disabled (accept_invalid_certs=true) — \
+             TEST USE ONLY, do not use in production"
+        );
+    }
+    if opts.tls.accept_invalid_proxy_certs
+        && let Some(proxy) = route.tls_proxy(config.use_tls)
+    {
+        tracing::warn!(
+            proxy = %log_host(proxy),
+            "https:// proxy certificate verification disabled \
+             (danger_accept_invalid_proxy_certs=true): whoever answers on the proxy leg \
+             receives the proxy credentials, and with use_tls = false every request — TEST \
+             USE ONLY; add the proxy's CA with add_root_certificates_pem"
+        );
+    }
+}
+
 impl HttpTransport {
-    /// Create a new HTTP transport from the given configuration and credentials.
-    ///
-    /// Builds the underlying HTTP client with the configured timeouts and TLS
-    /// settings. Returns [`WinrmError::Http`] if the HTTP client cannot be
-    /// constructed (e.g. invalid TLS configuration).
-    #[tracing::instrument(level = "debug", skip(config, credentials))]
+    /// Create a new HTTP transport from the given configuration and
+    /// credentials, with the default options: [`Self::new_with`]. The client
+    /// goes through [`Self::new_with`] directly; the tests use this.
+    #[cfg(test)]
     pub(crate) fn new(
         config: WinrmConfig,
         credentials: WinrmCredentials,
     ) -> Result<Self, WinrmError> {
-        if config.accept_invalid_certs {
-            tracing::warn!(
-                "TLS certificate verification disabled (accept_invalid_certs=true) — \
-                 TEST USE ONLY, do not use in production"
-            );
-        }
+        Self::new_with(config, credentials, TransportOptions::default())
+    }
 
-        // `reqwest` is built with `rustls-no-provider`, so a provider must be
-        // installed before ANY client is built, plain HTTP included
-        // (idempotent: an already-installed provider is kept).
-        let _ = rustls::crypto::ring::default_provider().install_default();
+    /// Create a new HTTP transport from the given configuration, credentials
+    /// and options, reading the proxy environment of the process
+    /// ([`proxy::env_var`]): [`Self::new_with_env`].
+    pub(crate) fn new_with(
+        config: WinrmConfig,
+        credentials: WinrmCredentials,
+        opts: TransportOptions,
+    ) -> Result<Self, WinrmError> {
+        Self::new_with_env(config, credentials, opts, proxy::env_var)
+    }
+
+    /// Create a new HTTP transport whose proxy environment is read through
+    /// `var`: [`Self::with_provider`] on the crypto provider
+    /// `opts.tls.provider` selects ([`crate::tls::crypto_provider`]).
+    pub(crate) fn new_with_env(
+        config: WinrmConfig,
+        credentials: WinrmCredentials,
+        opts: TransportOptions,
+        var: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self, WinrmError> {
+        let provider = crate::tls::crypto_provider(opts.tls.provider)?;
+        Self::with_provider(config, credentials, opts, provider, var)
+    }
+
+    /// Create a new HTTP transport whose every TLS configuration (the shared
+    /// client, the dedicated clients, the CredSSP outer TLS) uses `provider`,
+    /// and whose proxy route ([`proxy::ProxyRoute::resolve`]) reads the
+    /// environment through `var`.
+    ///
+    /// Builds the underlying HTTP client with the configured timeouts and TLS
+    /// settings. Returns [`WinrmError::Http`] if the HTTP client cannot be
+    /// constructed, and [`WinrmError::AuthFailed`] if the authentication
+    /// method cannot be set up: Certificate or CredSSP without HTTPS, CredSSP
+    /// or Basic over HTTPS with `accept_invalid_certs`, Certificate auth
+    /// without a usable certificate and key, a crypto
+    /// provider, TLS verifier or client certificate that rustls rejects, an
+    /// invalid [`WinrmConfig::proxy`], or, with the `credssp` feature, the
+    /// CredSSP TLS contexts, and a [`WinrmConfig::proxy`] CredSSP cannot
+    /// tunnel through ([`proxy::ProxyRoute::credssp_dial`]).
+    #[tracing::instrument(level = "debug", skip_all)]
+    fn with_provider(
+        config: WinrmConfig,
+        credentials: WinrmCredentials,
+        opts: TransportOptions,
+        provider: Arc<CryptoProvider>,
+        var: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self, WinrmError> {
+        debug!(tls_provider = ?opts.tls.provider, "TLS crypto provider choice");
+
+        // Refused before anything else is read or built. Basic over plain
+        // HTTP puts the password and every body on the wire in cleartext, so
+        // `Never` is the caller's explicit consent to that.
+        if matches!(config.auth_method, AuthMethod::Basic)
+            && !config.use_tls
+            && config.encryption != EncryptionMode::Never
+        {
+            return Err(WinrmError::AuthFailed(
+                "Basic auth over HTTP sends the password and every SOAP body in cleartext: use \
+                 HTTPS (use_tls = true), or set encryption = EncryptionMode::Never to accept \
+                 plaintext"
+                    .into(),
+            ));
+        }
+        if config.encryption == EncryptionMode::Always
+            && !matches!(config.auth_method, AuthMethod::Ntlm | AuthMethod::Kerberos)
+        {
+            return Err(WinrmError::AuthFailed(format!(
+                "EncryptionMode::Always: winrm-rs seals SOAP bodies only with NTLM and \
+                 Kerberos and does not seal {}; use EncryptionMode::Auto, where HTTPS protects \
+                 the bodies",
+                method_name(&config.auth_method)
+            )));
+        }
 
         // Load the client certificate for Certificate auth here, so a bad path
         // or PEM fails at construction. It is presented through the rustls
@@ -508,18 +992,19 @@ impl HttpTransport {
 
         if matches!(config.auth_method, AuthMethod::Basic) && !config.use_tls {
             tracing::warn!(
-                "Basic auth over HTTP transmits credentials in cleartext — use HTTPS in production"
+                "Basic auth over HTTP transmits credentials in cleartext (EncryptionMode::Never) — \
+                 use HTTPS in production"
             );
         }
 
-        if config.encryption == EncryptionMode::Always
-            && !matches!(config.auth_method, AuthMethod::Ntlm | AuthMethod::Kerberos)
-        {
+        if matches!(config.auth_method, AuthMethod::Ntlm) && !config.use_tls {
             tracing::warn!(
-                auth_method = method_name(&config.auth_method),
-                use_tls = config.use_tls,
-                "EncryptionMode::Always has no effect with this auth method: only NTLM and \
-                 Kerberos seal SOAP bodies, so nothing is sealed"
+                target: "winrm_rs::ntlm_over_http",
+                sealed = config.encryption != EncryptionMode::Never,
+                "NTLM over plain HTTP: the handshake does not authenticate the server and is \
+                 not bound to the connection, so a party on the network path can relay it, \
+                 or record it to guess the password offline; sealing protects only the SOAP \
+                 bodies. Use HTTPS (the default, WinrmConfig::https()) or Kerberos"
             );
         }
 
@@ -532,21 +1017,59 @@ impl HttpTransport {
         // NTLM channel binding takes the server certificate of the connection
         // that carried the challenge: from the response (`tls_info`), or from
         // the verifier of a dedicated single-connection client (see `AuthConn`).
-        let tls_config = if config.use_tls {
-            let root_store =
-                rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            let inner_verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
-                if config.accept_invalid_certs {
-                    Arc::new(crate::tls::NoVerifier)
-                } else {
-                    rustls::client::WebPkiServerVerifier::builder(Arc::new(root_store))
-                        .build()
-                        .map_err(|e| WinrmError::AuthFailed(format!("TLS verifier error: {e}")))?
-                };
-            let tls_builder = rustls::ClientConfig::builder()
+        let route = proxy::ProxyRoute::resolve(&config, opts.use_env_proxy, var)?;
+        debug!(route = ?route, "proxy route");
+        // The host is not known here, hence "may": it depends on `NO_PROXY`.
+        // Only a client that opted in reads the environment, so only such a
+        // client gets this WARN.
+        if !config.use_tls
+            && let Some(proxy) = route.env_http_proxy()
+        {
+            tracing::warn!(
+                proxy = %log_host(proxy),
+                "plain-HTTP WinRM traffic may follow a proxy from the environment \
+                 (HTTP_PROXY / ALL_PROXY) for every host not in NO_PROXY; set \
+                 WinrmConfig::proxy or leave use_env_proxy off to choose"
+            );
+        }
+        let proxy_names = route.https_proxy_server_names();
+        let crate::tls::ServerVerifiers { origin, proxy } = crate::tls::server_verifiers(
+            &opts.tls,
+            config.use_tls,
+            config.accept_invalid_certs,
+            &proxy_names,
+            &provider,
+        )?;
+        // CredSSP has no channel binding on the outer TLS (MS-CSSP), so it
+        // runs only behind a verifier that authenticates the server.
+        let outer_authenticated = !config.accept_invalid_certs;
+        if matches!(config.auth_method, AuthMethod::CredSsp) && !outer_authenticated {
+            return Err(WinrmError::AuthFailed(CREDSSP_UNAUTHENTICATED_TLS.into()));
+        }
+        // Basic sends the password itself: over HTTPS it goes only to a
+        // server whose certificate is verified. Over plain HTTP the
+        // encryption rule above applies unchanged.
+        if matches!(config.auth_method, AuthMethod::Basic)
+            && config.use_tls
+            && config.accept_invalid_certs
+        {
+            return Err(WinrmError::AuthFailed(BASIC_UNVERIFIED_TLS.into()));
+        }
+        // The names whose handshakes do not get the endpoint's own
+        // verification (see `ProxyRoutingVerifier`): a host with one of them
+        // is refused where that would weaken the endpoint's verification.
+        let pinned = !opts.tls.pins.is_empty();
+        let shared_proxy_names =
+            if config.use_tls && (pinned || opts.tls.accept_invalid_proxy_certs) {
+                proxy_names
+            } else {
+                Vec::new()
+            };
+        let (client_tls, server_verifier) = if config.use_tls {
+            let tls_builder = crate::tls::client_config_builder(&provider)?
                 .dangerous()
-                .with_custom_certificate_verifier(Arc::clone(&inner_verifier));
-            let tls_config = match client_auth {
+                .with_custom_certificate_verifier(Arc::clone(&origin));
+            let client_tls = match client_auth {
                 Some(ClientAuthCert { chain, key }) => {
                     tls_builder.with_client_auth_cert(chain, key).map_err(|e| {
                         WinrmError::AuthFailed(format!("client certificate and key rejected: {e}"))
@@ -554,23 +1077,76 @@ impl HttpTransport {
                 }
                 None => tls_builder.with_no_client_auth(),
             };
-            Some((tls_config, inner_verifier))
+            (client_tls, Some(origin))
+        } else {
+            // Plain HTTP: TLS only on the leg to an `https://` proxy.
+            (crate::tls::plain_http_config(proxy, &provider)?, None)
+        };
+
+        #[cfg(feature = "credssp")]
+        let credssp_tls = if matches!(config.auth_method, AuthMethod::CredSsp) && config.use_tls {
+            Some(Arc::new(CredSspTls::new(&client_tls)?))
         } else {
             None
         };
+        // Checks `WinrmConfig::proxy` for CredSSP when the client is built, so
+        // an explicit proxy CredSSP cannot use (`https://`, `socks4://`) is
+        // refused here. That proxy serves every host, so the placeholder
+        // host of the URL named here does not change the result. The
+        // environment is not read here (`use_env` false): its proxy depends
+        // on the host through `NO_PROXY`, so with `use_env_proxy` and no
+        // explicit proxy each request computes its own dial
+        // (`credssp_dial_for`).
+        #[cfg(feature = "credssp")]
+        let credssp_dial = Arc::new(if matches!(config.auth_method, AuthMethod::CredSsp) {
+            route.credssp_dial(
+                &endpoint_url(true, "localhost", config.effective_port()),
+                false,
+            )?
+        } else {
+            proxy::CredSspDial::Direct
+        });
 
-        let http = build_http_client(&config, tls_config.as_ref().map(|(c, _)| c.clone()), 10)?;
+        let http = build_http_client(&config, &route, client_tls.clone(), 10, None)?;
+        // Logged once every refusal above has passed: a refused build logs
+        // none of them.
+        warn_unverified_tls(&config, &opts, &route);
 
         Ok(Self {
             http,
             config,
             credentials,
-            tls_config,
+            client_tls,
+            server_verifier,
+            #[cfg(feature = "credssp")]
+            credssp_tls,
+            #[cfg(feature = "credssp")]
+            credssp_dial,
             conn_pool: Mutex::new(Vec::new()),
-            conn_slots: tokio::sync::Semaphore::new(MAX_CONNS_IN_FLIGHT),
+            conn_slots: Mutex::new(std::collections::HashMap::new()),
+            all_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONNS_IN_FLIGHT_TOTAL)),
+            kdc_slots: Arc::new(tokio::sync::Semaphore::new(MAX_KDC_IN_FLIGHT)),
             session_id: format!("uuid:{}", uuid::Uuid::new_v4().to_string().to_uppercase()),
             before_send: None,
+            log_soap_bodies: false,
+            shared_proxy_names,
+            route,
+            options: opts,
+            proxy_warned: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            #[cfg(feature = "kerberos")]
+            proxy_probes: Mutex::new(std::collections::HashMap::new()),
         })
+    }
+
+    /// The proxy route of this transport, for tests.
+    #[cfg(test)]
+    fn proxy_route(&self) -> &proxy::ProxyRoute {
+        &self.route
+    }
+
+    /// The options this transport was built with.
+    pub(crate) fn options(&self) -> &TransportOptions {
+        &self.options
     }
 
     /// Install the gate checked before every request attempt.
@@ -578,34 +1154,65 @@ impl HttpTransport {
         self.before_send = Some(hook);
     }
 
+    /// Turn the plaintext trace logging of SOAP bodies on or off.
+    pub(crate) fn set_log_soap_bodies(&mut self, on: bool) {
+        self.log_soap_bodies = on;
+    }
+
+    /// The rustls configuration of the shared client, for tests.
+    #[cfg(test)]
+    pub(crate) fn client_tls(&self) -> &rustls::ClientConfig {
+        &self.client_tls
+    }
+
     /// Build the WinRM endpoint URL for a given host.
     ///
-    /// `host` is expected to be a bare hostname or IP literal — no scheme,
-    /// no port, no userinfo. If suspect characters (`/`, `@`, `://`) are
-    /// detected they are stripped and a WARN is logged so the call still
-    /// produces a syntactically valid URL but the operator notices the
-    /// misuse instead of silently sending credentials to a forged host.
+    /// `host` must be a bare host name or address (see [`validate_host`]):
+    /// no scheme, no user info, no path, no port. This formats the
+    /// [`sanitize_host`] form of `host`, which for a valid host is `host`
+    /// itself.
     ///
-    /// Infallible, so that envelopes can embed it; every request goes
-    /// through [`Self::checked_endpoint`], which refuses a host that is not
-    /// a host name (see [`validate_host`]) before anything is sent.
+    /// Infallible, so that envelopes can embed it. For a host
+    /// [`validate_host`] refuses, the result is never sent: every request
+    /// goes through [`Self::checked_endpoint`], which refuses it first.
     pub(crate) fn endpoint(&self, host: &str) -> String {
-        let sanitized = sanitize_host(host);
-        if sanitized != host {
-            tracing::warn!(
-                original = %redact_userinfo(host),
-                sanitized = %sanitized,
-                "host string contained scheme/path/userinfo; using sanitized form"
-            );
-        }
-        endpoint_url(self.config.use_tls, &sanitized, self.config.port)
+        endpoint_url(
+            self.config.use_tls,
+            &sanitize_host(host),
+            self.config.effective_port(),
+        )
     }
 
     /// [`Self::endpoint`] for a host that [`validate_host`] accepts, else
     /// the error that says why not.
+    ///
+    /// Every request takes its URL here, whatever the auth method (the
+    /// shared client, the dedicated connections and CredSSP, which takes its
+    /// TLS server name from this URL). While a pin is set, or the proxy's
+    /// certificate is not verified, a host whose TLS server name is that of
+    /// an `https://` proxy is refused: its handshake would be verified as the
+    /// proxy's, without the pin or without any check.
     fn checked_endpoint(&self, host: &str) -> Result<String, WinrmError> {
         validate_host(host)?;
-        Ok(self.endpoint(host))
+        let url = self.endpoint(host);
+        if !self.shared_proxy_names.is_empty()
+            && url_server_name(&url).is_some_and(|name| self.shared_proxy_names.contains(&name))
+        {
+            let host = log_host(host);
+            let pinned = !self.options.tls.pins.is_empty();
+            return Err(WinrmError::AuthFailed(if pinned {
+                format!(
+                    "pin_server_certificate_sha256: host {host} has the name of an https:// \
+                     proxy; the pin cannot be applied to it, refusing"
+                )
+            } else {
+                format!(
+                    "danger_accept_invalid_proxy_certs: host {host} has the name of an https:// \
+                     proxy; it would not be verified, refusing"
+                )
+            }));
+        }
+        Ok(url)
     }
 
     /// Access the transport configuration.
@@ -620,21 +1227,44 @@ impl HttpTransport {
 
     /// Send an authenticated SOAP request and return the response body.
     ///
-    /// Dispatches to Basic or NTLM transport depending on the configured
-    /// [`AuthMethod`]. The response is checked for SOAP faults before
-    /// returning.
+    /// Dispatches by [`Route`]. A dedicated route runs under `slot`, which
+    /// the caller took ([`Self::send_soap_with_retry`]); a plain route drops
+    /// a slot it is given. With Kerberos through a forwarding proxy, the
+    /// proxy probe (`kerberos_proxy_probe`) runs first. The response is
+    /// checked for SOAP faults before returning.
     #[tracing::instrument(
         level = "debug",
-        skip(self, host, body),
-        fields(host = %redact_userinfo(host))
+        skip(self, host, body, slot),
+        fields(host = %log_host(host))
     )]
-    async fn send_soap(&self, host: &str, body: String) -> Result<String, WinrmError> {
-        let url = self.checked_endpoint(host)?;
-        debug!(url = %url, "sending WinRM SOAP request");
-        trace!(body = %body, "SOAP request body");
+    async fn send_soap(
+        &self,
+        host: &str,
+        body: String,
+        slot: Option<SlotGuard>,
+    ) -> Result<String, WinrmError> {
+        let route = self.route();
+        let slot = slot.filter(|_| route.needs_conn_slot());
+        let url = self
+            .checked_endpoint(host)
+            .inspect_err(|e| debug!(error = %e, "request not sent: host refused"))?;
+        debug!(
+            url = %crate::error::quote_server_text(&url, 256),
+            "sending WinRM SOAP request"
+        );
+        if self.log_soap_bodies {
+            trace!(target: "winrm_rs::wire", body = %body, "SOAP request body");
+        } else {
+            trace!(body_len = body.len(), "SOAP request body");
+        }
 
-        let response_text: String = match &self.config.auth_method {
-            AuthMethod::Basic => {
+        #[cfg(feature = "kerberos")]
+        if matches!(self.config.auth_method, AuthMethod::Kerberos) {
+            self.kerberos_proxy_probe(&url).await?;
+        }
+
+        let response_text: String = match route {
+            Route::Basic => {
                 let auth = BasicAuth::new(
                     &self.credentials.username,
                     self.credentials.password.expose_secret(),
@@ -642,123 +1272,249 @@ impl HttpTransport {
                 );
                 auth.send_authenticated(&self.http, &url, body).await?
             }
-            AuthMethod::Ntlm => {
-                if self.seals() {
-                    self.send_sealed(host, &url, &body).await?
-                } else if self.config.use_tls {
-                    self.send_ntlm_over_tls(host, &url, &body).await?
-                } else {
-                    self.ntlm_auth()
-                        .send_authenticated(&self.http, &url, body)
-                        .await?
-                }
+            Route::Sealed => {
+                self.send_sealed(host, &url, &body, dedicated_slot(slot)?)
+                    .await?
             }
-            AuthMethod::Kerberos => self.send_kerberos(host, &url, body).await?,
-            AuthMethod::Certificate => {
+            Route::NtlmOverTls => {
+                self.send_ntlm_over_tls(host, &url, &body, dedicated_slot(slot)?)
+                    .await?
+            }
+            Route::KerberosOverTls => {
+                self.send_kerberos_over_tls(host, &url, &body, dedicated_slot(slot)?)
+                    .await?
+            }
+            Route::NtlmPlain => {
+                self.ntlm_auth_for(&url)
+                    .send_authenticated(&self.http, &url, body)
+                    .await?
+            }
+            Route::KerberosPlain => {
+                self.kerberos_auth(&url)?
+                    .send_authenticated(&self.http, &url, body)
+                    .await?
+            }
+            Route::Certificate => {
                 let auth = CertificateAuth {
                     max_response_bytes: self.max_response_bytes(),
                 };
                 auth.send_authenticated(&self.http, &url, body).await?
             }
             #[cfg(feature = "credssp")]
-            AuthMethod::CredSsp => {
+            Route::CredSsp => {
+                // Held until the exchange ends (dropped at the end of this arm).
+                let _slot = dedicated_slot(slot)?;
                 let auth = CredSspAuth {
                     username: self.credentials.username.clone(),
                     password: Zeroizing::new(self.credentials.password.expose_secret().to_string()),
                     domain: self.credentials.domain.clone(),
-                    accept_invalid_certs: self.config.accept_invalid_certs,
-                    max_response_bytes: self.max_response_bytes(),
+                    tls: Arc::clone(self.credssp_tls.as_ref().ok_or_else(|| {
+                        WinrmError::AuthFailed("CredSSP requires HTTPS (set use_tls = true)".into())
+                    })?),
+                    opts: CredSspConnOptions::from_config(&self.config),
+                    dial: self.credssp_dial_for(&url)?,
                 };
                 auth.send_authenticated(&self.http, &url, body).await?
             }
             #[cfg(not(feature = "credssp"))]
-            AuthMethod::CredSsp => {
+            Route::CredSsp => {
                 return Err(WinrmError::AuthFailed(
                     "CredSSP authentication requires the `credssp` cargo feature".into(),
                 ));
             }
         };
 
-        trace!(response = %response_text, "SOAP response body");
+        if self.log_soap_bodies {
+            trace!(target: "winrm_rs::wire", response = %response_text, "SOAP response body");
+        } else {
+            trace!(response_len = response_text.len(), "SOAP response body");
+        }
         soap::check_soap_fault(&response_text).map_err(WinrmError::Soap)?;
         Ok(response_text)
     }
 
-    /// Kerberos dispatch: sealed ([`Self::seals`]); unsealed over HTTPS on an
-    /// authenticated dedicated connection; unsealed over HTTP
-    /// (`EncryptionMode::Never`) with a context per request.
-    #[cfg(feature = "kerberos")]
-    async fn send_kerberos(
+    /// The [`Route`] of every request of this transport.
+    fn route(&self) -> Route {
+        Route::for_config(&self.config)
+    }
+
+    /// How CredSSP reaches the endpoint `url`: the dial resolved at
+    /// construction when the route does not depend on the URL (the
+    /// environment is not read, or [`WinrmConfig::proxy`] is set, which
+    /// serves every endpoint and leaves the environment unread), else the
+    /// route's dial for this URL ([`proxy::ProxyRoute::credssp_dial`] with
+    /// `use_env`): the environment's proxy for `https://` endpoints, subject
+    /// to `NO_PROXY` for the URL's host. An `https://` or `socks4://` proxy
+    /// from the environment is refused here ([`WinrmError::AuthFailed`]),
+    /// before anything is sent.
+    ///
+    /// The stored dial is shared, not copied, so the proxy credentials it
+    /// may hold are not duplicated per request.
+    #[cfg(feature = "credssp")]
+    pub(crate) fn credssp_dial_for(
         &self,
-        host: &str,
         url: &str,
-        body: String,
-    ) -> Result<String, WinrmError> {
-        if self.seals() {
-            self.send_sealed(host, url, &body).await
-        } else if self.config.use_tls {
-            self.send_kerberos_over_tls(host, url, &body).await
-        } else {
-            self.kerberos_auth(url)
-                .send_authenticated(&self.http, url, body)
-                .await
+    ) -> Result<Arc<proxy::CredSspDial>, WinrmError> {
+        if !self.options.use_env_proxy || self.config.proxy.is_some() {
+            return Ok(Arc::clone(&self.credssp_dial));
         }
+        self.route.credssp_dial(url, true).map(Arc::new)
     }
 
-    /// Without the feature, the stub's error says it is needed (nothing is
-    /// sent, sealed or not).
-    #[cfg(not(feature = "kerberos"))]
-    async fn send_kerberos(
+    /// The CredSSP TLS contexts and dial of this transport, for the tests of
+    /// `auth::credssp` that drive a connection themselves.
+    #[cfg(all(test, feature = "credssp"))]
+    pub(crate) fn credssp_tls_and_dial(
         &self,
-        _host: &str,
-        url: &str,
-        body: String,
-    ) -> Result<String, WinrmError> {
-        self.kerberos_auth(url)
-            .send_authenticated(&self.http, url, body)
-            .await
+    ) -> (Option<&Arc<CredSspTls>>, &Arc<proxy::CredSspDial>) {
+        (self.credssp_tls.as_ref(), &self.credssp_dial)
     }
 
-    /// Whether requests are sealed (NTLM and Kerberos only):
-    /// `EncryptionMode::Auto` seals over plain HTTP only, `Always` over HTTPS
-    /// too, `Never` never.
+    /// [`seals_for`] this transport's configuration.
+    #[cfg(test)]
     fn seals(&self) -> bool {
-        matches!(
-            self.config.auth_method,
-            AuthMethod::Ntlm | AuthMethod::Kerberos
-        ) && match self.config.encryption {
-            EncryptionMode::Always => true,
-            EncryptionMode::Never => false,
-            EncryptionMode::Auto => !self.config.use_tls,
-        }
+        seals_for(&self.config)
     }
 
     /// Kerberos authenticator for the endpoint `url` (service principal
-    /// `HTTP/<host>`, the host of the URL without its port).
-    fn kerberos_auth(&self, url: &str) -> KerberosAuth {
+    /// `HTTP/<host>`, the host of the URL without its port). The host is the
+    /// one the connection goes to ([`url_host`]); when the host as written in
+    /// `url` is that host up to ASCII case, its spelling is kept, so a
+    /// principal registered in a particular case is still named.
+    fn kerberos_auth(&self, url: &str) -> Result<KerberosAuth, WinrmError> {
         let authority = url
             .split_once("://")
             .map_or(url, |(_, rest)| rest)
             .split('/')
             .next()
             .unwrap_or_default();
-        let host = authority
+        let written = authority
             .rsplit_once(':')
             .map_or(authority, |(host, _)| host);
-        KerberosAuth {
+        let parsed = url_host(url).ok_or_else(|| {
+            WinrmError::AuthFailed(
+                "Kerberos: the endpoint URL has no host to name the service principal".into(),
+            )
+        })?;
+        let host = if written.eq_ignore_ascii_case(&parsed) {
+            written
+        } else {
+            parsed.as_str()
+        };
+        Ok(KerberosAuth {
             service_principal: format!("HTTP/{host}"),
             max_response_bytes: self.max_response_bytes(),
-        }
+            kdc_timeout: self.request_budget(),
+            kdc_slots: Arc::clone(&self.kdc_slots),
+        })
     }
 
-    /// NTLM authenticator for this transport's credentials.
+    /// NTLM authenticator for this transport's credentials, without a proxy
+    /// check.
     fn ntlm_auth(&self) -> NtlmAuth {
         NtlmAuth {
             username: self.credentials.username.clone(),
             password: Zeroizing::new(self.credentials.password.expose_secret().to_string()),
             domain: self.credentials.domain.clone(),
             max_response_bytes: self.max_response_bytes(),
+            proxy_gate: None,
+            workstation: self.options.workstation.clone(),
         }
+    }
+
+    /// [`Self::ntlm_auth`] for the endpoint `url`, with the proxy check of
+    /// [`Self::proxy_gate`].
+    fn ntlm_auth_for(&self, url: &str) -> NtlmAuth {
+        NtlmAuth {
+            proxy_gate: self.proxy_gate(url),
+            ..self.ntlm_auth()
+        }
+    }
+
+    /// The proxy a request to `url` is forwarded by: `Some` only for an
+    /// `http://` endpoint whose route goes through an `http://` or
+    /// `https://` proxy, which sends the request in absolute form and owns
+    /// the server connection. A SOCKS proxy relays bytes, and an `https://`
+    /// endpoint goes through a `CONNECT` tunnel: both keep the server
+    /// connection this client's own.
+    fn forwarding_proxy(&self, url: &str) -> Option<reqwest::Url> {
+        if reqwest::Url::parse(url).ok()?.scheme() != "http" {
+            return None;
+        }
+        self.route
+            .proxy_for(url)
+            .filter(|proxy| matches!(proxy.scheme(), "http" | "https"))
+    }
+
+    /// The check of [`ProxySessionAuth`] for NTLM or Kerberos to `url`:
+    /// `None` without a forwarding proxy ([`Self::forwarding_proxy`]) or
+    /// under [`ProxySessionAuth::Allow`]. It refuses under
+    /// [`ProxySessionAuth::Require`], and under
+    /// [`ProxySessionAuth::RequireWhenUnsealed`] when requests are not sealed.
+    fn proxy_gate(&self, url: &str) -> Option<proxy::ProxyGate> {
+        let refuse = match self.options.proxy_session_auth {
+            ProxySessionAuth::Allow => return None,
+            ProxySessionAuth::Require => true,
+            ProxySessionAuth::RequireWhenUnsealed => !seals_for(&self.config),
+        };
+        let forwarder = self.forwarding_proxy(url)?;
+        Some(proxy::ProxyGate {
+            refuse,
+            proxy: log_host(forwarder.as_str()),
+            key: url.to_string(),
+            warned: Arc::clone(&self.proxy_warned),
+        })
+    }
+
+    /// Kerberos, before any AP-REQ to `url`: when [`Self::proxy_gate`]
+    /// applies, whether the proxy announces session-based authentication is
+    /// read from an unauthenticated empty POST on the shared client and
+    /// checked ([`proxy::ProxyGate::check_answer`]). The answer is kept for
+    /// the client's life only when it is the server's 401, so the POST is
+    /// sent at most once per request until then. Kerberos has no 401 of its
+    /// own to read it from: its AP-REQ goes on the first request.
+    #[cfg(feature = "kerberos")]
+    async fn kerberos_proxy_probe(&self, url: &str) -> Result<(), WinrmError> {
+        // Only a gated URL is ever kept, so a kept answer is read before the
+        // route's matcher is built: a proxy that announced it needs nothing
+        // more.
+        let known = self
+            .proxy_probes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(url)
+            .copied();
+        if known == Some(true) {
+            return Ok(());
+        }
+        let Some(gate) = self.proxy_gate(url) else {
+            return Ok(());
+        };
+        if let Some(supports) = known {
+            return gate.check(supports);
+        }
+        let resp = self
+            .http
+            .post(url)
+            .header(CONTENT_TYPE, "application/soap+xml;charset=UTF-8")
+            .header("Content-Length", "0")
+            .send()
+            .await
+            .map_err(crate::auth::send_error)?;
+        let status = resp.status();
+        let outcome = gate.check_answer(status, resp.headers());
+        // Only the server's 401 carries the proxy's announcement: another
+        // answer (a proxy error, a server that is down) is not kept, and the
+        // next request probes again.
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            let supports = proxy::proxy_supports_session_auth(resp.headers());
+            self.proxy_probes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(url.to_string(), supports);
+        }
+        let _ = crate::auth::read_body_capped(resp, self.max_response_bytes()).await;
+        outcome
     }
 
     #[expect(
@@ -773,74 +1529,150 @@ impl HttpTransport {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Number of idle connections the pool holds for `host`.
+    #[cfg(test)]
+    fn idle_count(&self, host: &str) -> usize {
+        let key = host_key(host);
+        self.conn_pool().iter().filter(|c| c.host == key).count()
+    }
+
     /// Check out the most recently used idle dedicated connection to `host`
     /// (sealed or not), closing those idle for longer than
     /// [`CONN_MAX_IDLE`].
     fn take_conn(&self, host: &str, sealed: bool) -> Option<Box<AuthConn>> {
+        let key = host_key(host);
         let mut pool = self.conn_pool();
         pool.retain(|c| c.idle_since.elapsed() < CONN_MAX_IDLE);
         let at = pool
             .iter()
-            .rposition(|c| c.host == host && c.session.is_some() == sealed)?;
+            .rposition(|c| c.host == key && c.session.is_some() == sealed)?;
         Some(pool.remove(at))
     }
 
-    /// Return a dedicated connection after a clean exchange, closing the oldest
-    /// idle ones beyond [`MAX_IDLE_CONNS`].
+    /// Return a dedicated connection after a clean exchange. The pool is kept
+    /// in age order, oldest first. The oldest idle connection of this host
+    /// beyond [`MAX_IDLE_PER_HOST`] is closed, then the oldest ones beyond
+    /// [`MAX_IDLE_TOTAL`]. A closed connection drops its sealing session
+    /// with it.
     fn return_conn(&self, mut conn: Box<AuthConn>) {
         if conn.closing {
             return;
         }
         conn.idle_since = Instant::now();
+        let key = conn.host.clone();
         let mut pool = self.conn_pool();
         pool.push(conn);
-        let excess = pool.len().saturating_sub(MAX_IDLE_CONNS);
+        if pool.iter().filter(|c| c.host == key).count() > MAX_IDLE_PER_HOST
+            && let Some(at) = pool.iter().position(|c| c.host == key)
+        {
+            pool.remove(at);
+        }
+        let excess = pool.len().saturating_sub(MAX_IDLE_TOTAL);
         pool.drain(..excess);
     }
 
-    /// Wait for a slot to run an exchange on a dedicated connection, at
-    /// most as long as one request may take.
-    async fn conn_slot(&self) -> Result<tokio::sync::SemaphorePermit<'_>, WinrmError> {
-        let wait = self.config.operation_timeout_secs.saturating_add(10);
-        match tokio::time::timeout(Duration::from_secs(wait), self.conn_slots.acquire()).await {
-            Ok(Ok(permit)) => Ok(permit),
-            // The semaphore is never closed.
-            Ok(Err(_)) | Err(_) => Err(WinrmError::Timeout(wait)),
+    /// How long one request may take: the operation timeout plus 10 s.
+    fn request_budget(&self) -> Duration {
+        Duration::from_secs(self.config.operation_timeout_secs.saturating_add(10))
+    }
+
+    fn slot_map(&self) -> MutexGuard<'_, std::collections::HashMap<String, HostSlots>> {
+        // The guard is only held for map operations, which do not leave the
+        // map inconsistent if they panic.
+        self.conn_slots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The data and clean-up semaphores of `host` (keyed by [`host_key`]),
+    /// cloned under the map lock. Adding a new host first drops the entries
+    /// nobody uses: no permit out and no waiter (each holds a clone of a
+    /// semaphore, so a used entry has a count above 1).
+    pub(crate) fn host_slots(
+        &self,
+        host: &str,
+    ) -> (Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>) {
+        let key = host_key(host);
+        let mut map = self.slot_map();
+        if !map.contains_key(&key) {
+            map.retain(|_, slots| {
+                Arc::strong_count(&slots.data) > 1 || Arc::strong_count(&slots.cleanup) > 1
+            });
+        }
+        let slots = map.entry(key).or_insert_with(|| HostSlots {
+            data: Arc::new(tokio::sync::Semaphore::new(MAX_CONNS_PER_HOST)),
+            cleanup: Arc::new(tokio::sync::Semaphore::new(CLEANUP_SLOTS_PER_HOST)),
+        });
+        (Arc::clone(&slots.data), Arc::clone(&slots.cleanup))
+    }
+
+    /// Hosts in the slot map.
+    #[cfg(test)]
+    fn host_slot_entries(&self) -> usize {
+        self.slot_map().len()
+    }
+
+    /// Wait for the slots to run an exchange on a dedicated connection to
+    /// `host`, at most [`Self::request_budget`]. [`Lane::Data`] takes a slot
+    /// of the host, then one of the client: a request queued for a busy host
+    /// holds no client slot. [`Lane::Cleanup`] takes a clean-up slot of the
+    /// host only. Dropped while waiting, it leaves no slot taken.
+    async fn conn_slot(&self, host: &str, lane: Lane) -> Result<SlotGuard, WinrmError> {
+        let budget = self.request_budget();
+        let (data, cleanup) = self.host_slots(host);
+        let acquire = async move {
+            match lane {
+                Lane::Data => {
+                    drop(cleanup);
+                    let host_permit = data.acquire_owned().await?;
+                    let all = Arc::clone(&self.all_slots).acquire_owned().await?;
+                    Ok::<_, tokio::sync::AcquireError>(SlotGuard {
+                        _host: host_permit,
+                        _all: Some(all),
+                    })
+                }
+                Lane::Cleanup => {
+                    drop(data);
+                    Ok(SlotGuard {
+                        _host: cleanup.acquire_owned().await?,
+                        _all: None,
+                    })
+                }
+            }
+        };
+        match tokio::time::timeout(budget, acquire).await {
+            Ok(Ok(guard)) => Ok(guard),
+            // The semaphores are never closed.
+            Ok(Err(_)) | Err(_) => Err(WinrmError::Timeout(budget.as_secs())),
         }
     }
 
     /// A dedicated connection to `host`, not yet used: a client keeping
-    /// one connection, and over HTTPS its own capturing verifier with TLS
-    /// session resumption off.
+    /// one connection behind an open [`ConnGate`], and over HTTPS its own
+    /// capturing verifier with TLS session resumption off.
     fn new_conn(&self, host: &str) -> Result<Box<AuthConn>, WinrmError> {
-        let (tls, cert) = match &self.tls_config {
-            Some((base, verifier)) => {
+        let mut tls = self.client_tls.clone();
+        let cert = match &self.server_verifier {
+            Some(verifier) => {
                 let capturing = crate::tls::CertCapturingVerifier::new(
                     Arc::clone(verifier),
                     url_server_name(&self.endpoint(host)),
                 )
-                .with_proxies(proxy_server_names(&self.config, |name| {
-                    // Tests build their clients without environment proxies.
-                    if cfg!(test) {
-                        None
-                    } else {
-                        std::env::var(name).ok()
-                    }
-                }));
+                .with_proxies(self.route.https_proxy_server_names());
                 let handle = capturing.cert_handle();
-                let mut config = base.clone();
-                config
-                    .dangerous()
+                tls.dangerous()
                     .set_certificate_verifier(Arc::new(capturing));
-                config.resumption = rustls::client::Resumption::disabled();
-                (Some(config), Some(handle))
+                tls.resumption = rustls::client::Resumption::disabled();
+                Some(handle)
             }
-            None => (None, None),
+            None => None,
         };
+        let gate = Arc::new(ConnGate::new(&self.config));
         Ok(Box::new(AuthConn {
-            host: host.to_string(),
-            http: build_http_client(&self.config, tls, 1)?,
+            host: host_key(host),
+            http: build_http_client(&self.config, &self.route, tls, 1, Some(Arc::clone(&gate)))?,
             cert,
+            gate: Some(gate),
             session: None,
             idle_since: Instant::now(),
             closing: false,
@@ -855,35 +1687,54 @@ impl HttpTransport {
     /// session is bound to before any sealed request: that connection is
     /// dropped and a new one authenticated, once; a server that closes again
     /// cannot carry sealed messages and gets an error.
+    ///
+    /// The connection's [`ConnGate`] stays open through the handshake (the
+    /// Kerberos-over-HTTPS probe and AP-REQ legitimately use two
+    /// connections) and is locked once it has completed: from then on the
+    /// client opens no new connection.
+    ///
+    /// The whole handshake, retry included, is bounded by `budget`: a slower
+    /// one fails with [`WinrmError::Timeout`], and nothing has been sent at
+    /// that point. A Kerberos ticket request already in progress keeps running
+    /// on its blocking-pool thread (and its KDC slot) after the budget fires.
     async fn open_authenticated_conn(
         &self,
         host: &str,
         url: &str,
+        budget: Duration,
     ) -> Result<Box<AuthConn>, WinrmError> {
         let method = &self.config.auth_method;
-        for _ in 0..2 {
-            let mut conn = self.new_conn(host)?;
-            let (session, closing) = self
-                .sealing_handshake(&conn.http, conn.cert.as_ref(), url)
-                .await?;
-            if closing {
-                debug!(
-                    method = method_name(method),
-                    "server closed the connection after authentication; authenticating a new one"
-                );
-                continue;
+        let handshake = async {
+            for _ in 0..2 {
+                let mut conn = self.new_conn(host)?;
+                let (session, closing) = self
+                    .sealing_handshake(&conn.http, conn.cert.as_ref(), url)
+                    .await?;
+                if closing {
+                    debug!(
+                        method = method_name(method),
+                        "server closed the connection after authentication; authenticating a new one"
+                    );
+                    continue;
+                }
+                if let Some(gate) = &conn.gate {
+                    gate.lock();
+                }
+                conn.session = Some(session);
+                return Ok(conn);
             }
-            conn.session = Some(session);
-            return Ok(conn);
-        }
-        Err(method_error(
-            method,
-            format!(
-                "the server closes the connection right after {} authentication, so no \
-                 message can use the session bound to it",
-                method_name(method)
-            ),
-        ))
+            Err(method_error(
+                method,
+                format!(
+                    "the server closes the connection right after {} authentication, so no \
+                     message can use the session bound to it",
+                    method_name(method)
+                ),
+            ))
+        };
+        tokio::time::timeout(budget, handshake)
+            .await
+            .unwrap_or_else(|_| Err(WinrmError::Timeout(budget.as_secs())))
     }
 
     /// The handshake of [`Self::open_authenticated_conn`] on the dedicated client
@@ -898,15 +1749,19 @@ impl HttpTransport {
     ) -> Result<(Sealer, bool), WinrmError> {
         match self.config.auth_method {
             AuthMethod::Ntlm => {
-                let (session_key, closing) = self.ntlm_auth().authenticate(http, cert, url).await?;
-                // The session (keys, RC4 S-boxes) is built on the stack and
-                // then moved into the boxed connection: that stack copy is not
-                // wiped.
-                Ok((Sealer::Ntlm(NtlmSession::from_auth(&session_key)), closing))
+                let (session_key, closing) = self
+                    .ntlm_auth_for(url)
+                    .authenticate(http, cert, url)
+                    .await?;
+                Ok((
+                    Sealer::Ntlm(SealingSession::boxed_from_auth(&session_key)),
+                    closing,
+                ))
             }
             #[cfg(feature = "kerberos")]
             AuthMethod::Kerberos => {
-                let (session, closing) = self.kerberos_auth(url).establish(http, cert, url).await?;
+                let (session, closing) =
+                    self.kerberos_auth(url)?.establish(http, cert, url).await?;
                 Ok((Sealer::Kerberos(session), closing))
             }
             _ => Err(WinrmError::AuthFailed(
@@ -918,22 +1773,28 @@ impl HttpTransport {
     /// Send a request sealed (NTLM or Kerberos), failing closed: no request
     /// body is ever sent unsealed, and no request is ever sent twice (see
     /// [`Self::send_on_dedicated`]).
-    async fn send_sealed(&self, host: &str, url: &str, body: &str) -> Result<String, WinrmError> {
-        self.send_on_dedicated(host, url, body, true).await
+    async fn send_sealed(
+        &self,
+        host: &str,
+        url: &str,
+        body: &str,
+        slot: SlotGuard,
+    ) -> Result<String, WinrmError> {
+        self.send_on_dedicated(host, url, body, true, slot).await
     }
 
     /// Send a request with Kerberos over HTTPS, unsealed (TLS protects it),
     /// on a dedicated connection authenticated once with channel binding and
-    /// the server's AP-REP (see [`KerberosAuth::establish`]); later requests
+    /// the server's AP-REP (see `KerberosAuth::establish`); later requests
     /// on that connection carry no `Authorization` header.
-    #[cfg(feature = "kerberos")]
     async fn send_kerberos_over_tls(
         &self,
         host: &str,
         url: &str,
         body: &str,
+        slot: SlotGuard,
     ) -> Result<String, WinrmError> {
-        self.send_on_dedicated(host, url, body, false).await
+        self.send_on_dedicated(host, url, body, false, slot).await
     }
 
     /// Run one exchange on a dedicated authenticated connection to `host`:
@@ -944,34 +1805,41 @@ impl HttpTransport {
     /// A SOAP fault (sealed by the server when sealing) is returned as
     /// [`WinrmError::Soap`] and the connection kept. Any other failure
     /// discards the connection and is returned, a 401 included: the
-    /// connection no longer carries its session, which a connection the
-    /// server closed or a fresh one opened by the client's pool explains, but
+    /// connection no longer carries its session (typically the server closed
+    /// it; a locked [`ConnGate`] keeps the client off new connections), but
     /// an active attacker can also forward the request to the server and
     /// answer 401 itself, so the request may have run and is not resent.
+    ///
+    /// One failure is retried, because nothing was sent: a reused
+    /// connection that can no longer be used and a client that cannot
+    /// connect (its locked gate refuses), as when the server closed the idle
+    /// connection. That connection is dropped, a new one authenticated, and
+    /// the request sealed with the new session and sent on it, once, under
+    /// the same slot.
     async fn send_on_dedicated(
         &self,
         host: &str,
         url: &str,
         body: &str,
         sealed: bool,
+        slot: SlotGuard,
     ) -> Result<String, WinrmError> {
-        let _slot = self.conn_slot().await?;
-        let mut conn = match self.take_conn(host, sealed) {
-            Some(conn) => conn,
-            None => {
-                let mut conn = self.open_authenticated_conn(host, url).await?;
-                if !sealed {
-                    conn.session = None;
-                }
-                conn
-            }
+        let _slot = slot;
+        let (mut conn, reused) = match self.take_conn(host, sealed) {
+            Some(conn) => (conn, true),
+            None => (self.open_dedicated_conn(host, url, sealed).await?, false),
         };
         let cap = self.max_response_bytes();
-        let outcome = if sealed {
-            Self::send_sealed_body(&mut conn, url, body, cap).await
-        } else {
-            Self::send_plain_body(&mut conn, url, body, cap).await
-        };
+        let mut outcome = Self::exchange_on(&mut conn, url, body, sealed, cap).await;
+        if reused && matches!(&outcome, Err(SealedFailure::Error(e)) if Self::is_retryable(e)) {
+            debug!(
+                method = method_name(&self.config.auth_method),
+                "reused dedicated connection is gone and nothing was sent; authenticating a new one"
+            );
+            drop(conn);
+            conn = self.open_dedicated_conn(host, url, sealed).await?;
+            outcome = Self::exchange_on(&mut conn, url, body, sealed, cap).await;
+        }
         match outcome {
             Ok(text) => {
                 self.return_conn(conn);
@@ -990,14 +1858,44 @@ impl HttpTransport {
                     format!(
                         "HTTP 401 to a {kind}{name} request on an authenticated connection: the \
                          connection no longer carries the {name} session (usually the server \
-                         closed an idle connection, or the client's pool sent the request on a \
-                         fresh, unauthenticated connection right after a large answer), but a \
-                         401 does not prove the request did not run; it was NOT resent: retry \
-                         the call if it is safe to run again"
+                         closed an idle connection), but a 401 does not prove the request did \
+                         not run; it was NOT resent: retry the call if it is safe to run again"
                     ),
                 ))
             }
             Err(SealedFailure::Error(e)) => Err(e),
+        }
+    }
+
+    /// A new authenticated dedicated connection for [`Self::send_on_dedicated`]:
+    /// its sealing session is kept only when `sealed`.
+    async fn open_dedicated_conn(
+        &self,
+        host: &str,
+        url: &str,
+        sealed: bool,
+    ) -> Result<Box<AuthConn>, WinrmError> {
+        let mut conn = self
+            .open_authenticated_conn(host, url, self.request_budget())
+            .await?;
+        if !sealed {
+            conn.session = None;
+        }
+        Ok(conn)
+    }
+
+    /// One exchange on `conn`: sealed when `sealed`, else plain inside TLS.
+    async fn exchange_on(
+        conn: &mut AuthConn,
+        url: &str,
+        body: &str,
+        sealed: bool,
+        max_response_bytes: usize,
+    ) -> Result<String, SealedFailure> {
+        if sealed {
+            Self::send_sealed_body(conn, url, body, max_response_bytes).await
+        } else {
+            Self::send_plain_body(conn, url, body, max_response_bytes).await
         }
     }
 
@@ -1027,7 +1925,6 @@ impl HttpTransport {
             )));
         }
         let (content_type, sealed) = session.seal(body).map_err(SealedFailure::Error)?;
-        let_pool_take_back_connection().await;
         let resp = conn
             .http
             .post(url)
@@ -1104,7 +2001,6 @@ impl HttpTransport {
         body: &str,
         max_response_bytes: usize,
     ) -> Result<String, SealedFailure> {
-        let_pool_take_back_connection().await;
         let resp = conn
             .http
             .post(url)
@@ -1156,8 +2052,9 @@ impl HttpTransport {
         host: &str,
         url: &str,
         body: &str,
+        slot: SlotGuard,
     ) -> Result<String, WinrmError> {
-        let _slot = self.conn_slot().await?;
+        let _slot = slot;
         let conn = match self.take_conn(host, false) {
             Some(conn) => conn,
             None => self.new_conn(host)?,
@@ -1188,36 +2085,85 @@ impl HttpTransport {
     /// [`Self::is_retryable`]) are retried; any other error is returned
     /// immediately.
     ///
-    /// The `before_send` hook, when set, runs at the start of every attempt,
-    /// before anything is authenticated, sealed or sent; a refusal returns
-    /// [`WinrmError::Cancelled`] and is never retried.
+    /// The `before_send` hook, when set, runs once per attempt: after the
+    /// host is validated and, on a route that [`Route::needs_conn_slot`],
+    /// after the attempt holds its connection slot; before anything is
+    /// authenticated, sealed or sent. A refusal returns
+    /// [`WinrmError::Cancelled`] and is never retried; a slot timeout returns
+    /// [`WinrmError::Timeout`] without calling it.
     pub(crate) async fn send_soap_with_retry(
         &self,
         host: &str,
         body: String,
     ) -> Result<String, WinrmError> {
+        self.send_soap_with_retry_on(host, body, Lane::Data).await
+    }
+
+    /// [`Self::send_soap_with_retry`] on the clean-up lane (Signal, Delete):
+    /// on a dedicated connection it takes a clean-up slot of the host, so it
+    /// does not wait behind data requests.
+    pub(crate) async fn send_soap_cleanup(
+        &self,
+        host: &str,
+        body: String,
+    ) -> Result<String, WinrmError> {
+        self.send_soap_with_retry_on(host, body, Lane::Cleanup)
+            .await
+    }
+
+    /// [`Self::send_soap_with_retry`], taking the slots of `lane` on a
+    /// dedicated connection.
+    async fn send_soap_with_retry_on(
+        &self,
+        host: &str,
+        body: String,
+        lane: Lane,
+    ) -> Result<String, WinrmError> {
         let body = crate::soap::envelope::with_session_id(&body, &self.session_id);
+        // An invalid host fails here, before the hook: nothing could be sent.
+        if let Err(e) = validate_host(host) {
+            debug!(host = %log_host(host), error = %e, "request not sent: host refused");
+            return Err(e);
+        }
+        let route = self.route();
+        let action = crate::soap::envelope::request_action(&body).unwrap_or("");
+        let kind = RequestKind::from_action(action);
         let max = self.config.max_retries;
         for attempt in 0..=max {
+            // Take the slot first, so that an approval does not go stale
+            // during the slot wait. On a retryable error the slot was moved
+            // into `send_soap`, so it is released before the backoff sleep.
+            let slot = if route.needs_conn_slot() {
+                Some(self.conn_slot(host, lane).await?)
+            } else {
+                None
+            };
+            // `host` passed `validate_host`: it is the bare host the URL uses.
             if let Some(hook) = &self.before_send
-                && !hook()
+                && !hook(&OutgoingRequest::new(host, action, kind, attempt))
             {
-                debug!("request refused by the before_send hook");
+                debug!(?kind, attempt, "request refused by the before_send hook");
                 return Err(WinrmError::Cancelled);
             }
-            match self.send_soap(host, body.clone()).await {
+            match self.send_soap(host, body.clone(), slot).await {
                 Ok(r) => return Ok(r),
                 Err(e) if attempt < max && Self::is_retryable(&e) => {
                     let delay = retry_delay(attempt);
                     tracing::warn!(
-                        attempt = attempt + 1,
+                        attempt = attempt.saturating_add(1),
                         max_retries = max,
                         delay_ms = delay.as_millis() as u64,
                         "retrying after transient HTTP error"
                     );
                     tokio::time::sleep(delay).await;
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    let proxied = self.route.proxy_for(&self.endpoint(host)).is_some();
+                    if let Some(hint) = connect_hint(&self.config, proxied, &e) {
+                        tracing::warn!(host = %log_host(host), "{hint}");
+                    }
+                    return Err(e);
+                }
             }
         }
         unreachable!()
@@ -1245,18 +2191,139 @@ fn retry_delay(attempt: u32) -> Duration {
     Duration::from_millis(100u64.saturating_mul(2u64.saturating_pow(attempt)))
 }
 
+/// The WARN logged when a connection to the defaulted HTTPS port fails.
+const CONNECT_HINT: &str = "could not connect to the host on the default HTTPS port 5986: check \
+                            the host name; a host with only the stock HTTP listener \
+                            (Enable-PSRemoting creates none on 5986) needs WinrmConfig::http() \
+                            for port 5985";
+
+/// [`CONNECT_HINT`] when `err` is a failed connection and `config` left the
+/// port to its HTTPS default (`port: None`, `use_tls: true`): the 1.x
+/// default was HTTP on 5985, the stock listener of a Windows host. `None`
+/// for any other error or configuration. A host name that does not resolve
+/// is a failed connection too, so a mistyped host name also gets the hint.
+///
+/// With a proxy there is no hint either, whether set in
+/// [`WinrmConfig::proxy`] or taken from the environment (`proxied`: the
+/// request went through a proxy of the route): a failed connection is then
+/// the proxy's (unreachable, or a name it could not resolve), and
+/// `WinrmConfig::http()` would not fix it.
+///
+/// The hint is also silent when `connect_timeout_secs >=
+/// operation_timeout_secs + 10`: the client's total timeout, which is
+/// `operation_timeout_secs + 10`, then expires no later than the connect
+/// timeout, so a connection that hangs ends as a timeout and not as a
+/// connect error. A refused connection still gets the hint.
+///
+/// A failure that rustls reports (an untrusted or mismatched certificate, a
+/// pin, no shared cipher suite) gets no hint: a TLS listener answered on
+/// 5986, and plain HTTP is not the fix for it.
+///
+/// Never fires for CredSSP: its connection failures are reported as
+/// [`WinrmError::AuthFailed`] or [`WinrmError::Timeout`], not
+/// [`WinrmError::Http`].
+fn connect_hint(config: &WinrmConfig, proxied: bool, err: &WinrmError) -> Option<&'static str> {
+    let connect_failed = matches!(err, WinrmError::Http(e) if e.is_connect() && !is_tls_failure(e));
+    let direct = config.proxy.is_none() && !proxied;
+    (config.port.is_none() && config.use_tls && direct && connect_failed).then_some(CONNECT_HINT)
+}
+
+/// Whether a [`rustls::Error`] is in the cause chain of `err`. An
+/// `io::Error`'s `source()` skips the error it wraps, so the walk goes
+/// through `get_ref()` there.
+fn is_tls_failure(err: &reqwest::Error) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = current {
+        if e.is::<rustls::Error>() {
+            return true;
+        }
+        current = match e.downcast_ref::<std::io::Error>() {
+            Some(io) => io
+                .get_ref()
+                .map(|w| w as &(dyn std::error::Error + 'static)),
+            None => e.source(),
+        };
+    }
+    false
+}
+
 /// `reqwest::Client` for unit tests that bypass [`HttpTransport::new`]:
 /// `rustls-no-provider` panics at build time unless a provider is installed.
 #[cfg(test)]
 pub(crate) fn test_http_client() -> reqwest::Client {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    crate::test_pki::install_test_provider();
     // No proxy from the environment: the tests talk to loopback servers.
     reqwest::Client::builder().no_proxy().build().unwrap()
 }
 
+/// Test-only log sink: the formatted output of every event and span of the
+/// thread that holds the guard of [`capture_logs`].
 #[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct LogBuf(Arc<Mutex<Vec<u8>>>);
+
+#[cfg(test)]
+impl LogBuf {
+    /// Everything written so far.
+    pub(crate) fn text(&self) -> String {
+        let bytes = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+#[cfg(test)]
+impl std::io::Write for LogBuf {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+    type Writer = LogBuf;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Route the logs of the current thread into a [`LogBuf`], unfiltered by span
+/// (unlike `tracing_test`, a line outside the test's span is kept). A
+/// `#[tokio::test]` runs on one thread, so the default covers every await.
+#[cfg(test)]
+pub(crate) fn capture_logs() -> (LogBuf, tracing::subscriber::DefaultGuard) {
+    let buf = LogBuf::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(buf.clone())
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .finish();
+    (buf, tracing::subscriber::set_default(subscriber))
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "test fixtures do arithmetic on small constants"
+)]
 mod tests {
+    //! Host state these tests rely on: `localhost` resolves to the loopback
+    //! address (the proxy and TLS tests name servers `localhost`); the
+    //! re-exec tests run a copy of this test binary (`current_exe`), and
+    //! `plain_http_client_builds_without_system_roots` also relies on
+    //! `rustls-native-certs` reading `SSL_CERT_FILE` / `SSL_CERT_DIR`
+    //! (Linux only).
     use super::*;
+    use crate::tls::NoVerifier;
+    use secrecy::SecretString;
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1264,12 +2331,38 @@ mod tests {
     fn basic_transport(port: u16) -> HttpTransport {
         let config = WinrmConfig {
             auth_method: AuthMethod::Basic,
-            port,
+            port: Some(port),
             use_tls: false,
+            encryption: EncryptionMode::Never,
             ..Default::default()
         };
         let creds = WinrmCredentials::new("admin", "pass", "");
         HttpTransport::new(config, creds).unwrap()
+    }
+
+    /// By default the transport logs body lengths, never the bodies.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn soap_bodies_are_not_logged_by_default() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("<s:Envelope><s:Body>SECRET-OUT</s:Body></s:Envelope>"),
+            )
+            .mount(&server)
+            .await;
+        let transport = basic_transport(server.address().port());
+        let body = "<s:Envelope><s:Body>SECRET-IN</s:Body></s:Envelope>";
+        let answer = transport
+            .send_soap_with_retry("127.0.0.1", body.into())
+            .await
+            .unwrap();
+        assert!(answer.contains("SECRET-OUT"));
+        assert!(!logs_contain("SECRET-IN"));
+        assert!(!logs_contain("SECRET-OUT"));
+        assert!(logs_contain(&format!("body_len={}", body.len())));
+        assert!(logs_contain(&format!("response_len={}", answer.len())));
     }
 
     #[test]
@@ -1303,25 +2396,184 @@ mod tests {
         assert_eq!(sanitize_host("win01:5985"), "win01");
     }
 
+    /// Hosts `validate_host` accepts.
+    const VALID_HOSTS: &[&str] = &[
+        "win01",
+        "win-01.corp.local",
+        "WIN_01",
+        "10.0.0.5",
+        "[::1]",
+        "[fe80::1]",
+        "[2001:db8::1]",
+        "bücher.example",
+    ];
+
     #[test]
-    fn validate_host_accepts_names_addresses_and_the_forms_sanitize_strips() {
+    fn validate_host_accepts_names_and_addresses() {
+        for host in VALID_HOSTS {
+            assert!(validate_host(host).is_ok(), "{host:?} should be accepted");
+        }
+    }
+
+    #[test]
+    fn validate_host_refuses_anything_sanitize_would_strip() {
+        for host in [
+            "http://win01/wsman",
+            "https://user:s3cret@win01:5986/wsman",
+            "user:s3cret@win01",
+            "win01:5985",
+            "[fe80::1]:5985",
+            "evil.example/.corp.local",
+            "win01.corp.local@evil.example",
+            // Boundaries: each of these leaves a valid host once stripped.
+            "win01/",
+            "/win01",
+            "@win01",
+            "win01@",
+            "://win01",
+            "win01:",
+            ":5985",
+            "[fe80::1]:",
+        ] {
+            let err = validate_host(host).unwrap_err().to_string();
+            assert!(
+                err.contains("invalid host") && err.contains("WinrmConfig::port"),
+                "{host:?}: {err}"
+            );
+            assert!(!err.contains("s3cret"), "{host:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn validate_host_refuses_non_canonical_ipv4_forms() {
+        // Each form with the address the URL parser reads it as, which the
+        // error must name.
+        for (host, read_as) in [
+            ("10.1", "10.0.0.1"),
+            ("0x0a.0.0.1", "10.0.0.1"),
+            ("167772161", "10.0.0.1"),
+            ("010.0.0.1", "8.0.0.1"),
+            ("10.0.0.1.", "10.0.0.1"),
+            ("\u{ff11}\u{ff10}.0.0.1", "10.0.0.1"),
+        ] {
+            let err = validate_host(host).unwrap_err().to_string();
+            assert!(
+                err.contains("invalid host") && err.contains("reads it as"),
+                "{host:?}: {err}"
+            );
+            assert!(err.contains(&format!("as {read_as:?}")), "{host:?}: {err}");
+        }
+    }
+
+    /// A host the character check lets through but the URL parser cannot
+    /// parse at all (a last label that looks numeric but is not an address;
+    /// an IPv6 literal with nine groups) is refused with the parser's error.
+    #[test]
+    fn validate_host_refuses_a_host_that_makes_an_unparsable_url() {
+        for host in ["999.1.1.1", "1.2.3.4.5.6", "[1:2:3:4:5:6:7:8:9]"] {
+            let err = validate_host(host).unwrap_err().to_string();
+            assert!(
+                err.contains("invalid host") && err.contains("an unparsable URL ("),
+                "{host:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_host_refuses_names_the_url_parser_would_rewrite() {
+        for host in [
+            "\u{ff57}\u{ff49}\u{ff4e}01.example",
+            "win01\u{3002}example",
+            "e\u{301}cole.example",
+        ] {
+            assert!(validate_host(host).is_err(), "{host:?}");
+        }
+    }
+
+    #[test]
+    fn validate_host_keeps_canonical_names() {
         for host in [
             "win01",
+            "WIN01",
             "win-01.corp.local",
             "WIN_01",
             "10.0.0.5",
-            "10.1",
+            "bücher.example",
+            "BÜCHER.example",
+            "xn--bcher-kva.example",
+            "win01.",
             "[::1]",
             "[fe80::1]",
-            "[::ffff:10.0.0.1]",
-            "bücher.example",
-            // Stripped by sanitize_host, so what is left is a valid name.
-            "win01:5985",
-            "http://win01/wsman",
-            "https://user:pw@win01:5986/wsman",
-            "[fe80::1]:5985",
+            "[2001:db8::1]",
+            "[2001:DB8::1]",
+            "[::]",
+            "[64:ff9b::a00:1]",
         ] {
-            assert!(validate_host(host).is_ok(), "{host:?} should be accepted");
+            assert!(validate_host(host).is_ok(), "{host:?}");
+        }
+    }
+
+    #[test]
+    fn validate_host_refuses_ipv6_literals_that_stand_for_an_ipv4_address() {
+        for (host, v4) in [
+            ("[::ffff:169.254.169.254]", "169.254.169.254"),
+            ("[::ffff:a9fe:a9fe]", "169.254.169.254"),
+            ("[::FFFF:A9FE:A9FE]", "169.254.169.254"),
+            ("[0:0:0:0:0:ffff:a9fe:a9fe]", "169.254.169.254"),
+            ("[::ffff:10.0.0.1]", "10.0.0.1"),
+            ("[::169.254.169.254]", "169.254.169.254"),
+            ("[::a9fe:a9fe]", "169.254.169.254"),
+            ("[0::0.0.0.2]", "0.0.0.2"),
+        ] {
+            let err = validate_host(host).unwrap_err();
+            assert!(
+                matches!(&err, WinrmError::AuthFailed(m)
+                    if m.contains("invalid host") && m.contains(&format!("pass \"{v4}\""))),
+                "{host:?}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_host_refuses_ipv6_literals_the_url_parser_would_rewrite() {
+        for (host, read_as) in [
+            ("[0:0::1]", "[::1]"),
+            ("[2001:0db8::1]", "[2001:db8::1]"),
+            ("[2001:db8:0:0:0:0:0:1]", "[2001:db8::1]"),
+            ("[FE80:0::1]", "[fe80::1]"),
+        ] {
+            let err = validate_host(host).unwrap_err().to_string();
+            assert!(
+                err.contains("invalid host") && err.contains(&format!("reads it as {read_as:?}")),
+                "{host:?}: {err}"
+            );
+        }
+        // Not an address: refused, never accepted as written.
+        for host in ["[1::2::3]", "[:::]", "[1:2:3:4:5:6:7:8:9]", "[::1.2.3]"] {
+            assert!(validate_host(host).is_err(), "{host:?}");
+        }
+    }
+
+    #[test]
+    fn embedded_ipv4_covers_the_mapped_and_compatible_ranges_only() {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+        let v6 = |s: &str| s.parse::<Ipv6Addr>().unwrap();
+        assert_eq!(embedded_ipv4(Ipv6Addr::UNSPECIFIED), None);
+        assert_eq!(embedded_ipv4(Ipv6Addr::LOCALHOST), None);
+        assert_eq!(embedded_ipv4(v6("::2")), Some(Ipv4Addr::new(0, 0, 0, 2)));
+        assert_eq!(
+            embedded_ipv4(v6("::ffff:0.0.0.1")),
+            Some(Ipv4Addr::new(0, 0, 0, 1))
+        );
+        assert_eq!(embedded_ipv4(v6("::ffff:0:0")), Some(Ipv4Addr::UNSPECIFIED));
+        for other in [
+            "::1:0:0",
+            "1::a00:1",
+            "64:ff9b::a00:1",
+            "::fffe:a00:1",
+            "fe80::1",
+        ] {
+            assert_eq!(embedded_ipv4(v6(other)), None, "{other}");
         }
     }
 
@@ -1359,8 +2611,8 @@ mod tests {
     }
 
     #[test]
-    fn invalid_host_error_quotes_the_stripped_host_only() {
-        // Userinfo is stripped before the host is quoted: no password leaks.
+    fn invalid_host_error_never_quotes_the_userinfo() {
+        // Userinfo is redacted before the host is quoted: no password leaks.
         let err = validate_host("user:s3cret@win01?x")
             .unwrap_err()
             .to_string();
@@ -1388,22 +2640,26 @@ mod tests {
         }
         let requests = server.received_requests().await.unwrap_or_default();
         assert!(requests.is_empty(), "{} request(s) sent", requests.len());
-        // A well-formed host with the port glued on still reaches the server.
+        // A host with the port glued on is refused too: the port is
+        // `WinrmConfig::port`.
         let host = format!("127.0.0.1:{}", server.address().port());
-        assert_eq!(
-            transport
-                .send_soap_raw(&host, "<env/>".into())
-                .await
-                .unwrap(),
-            "<ok/>"
+        let err = transport
+            .send_soap_raw(&host, "<env/>".into())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, WinrmError::AuthFailed(m) if m.contains("WinrmConfig::port")),
+            "{err:?}"
         );
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert!(requests.is_empty(), "{} request(s) sent", requests.len());
     }
 
     #[test]
     fn endpoint_https() {
         let config = WinrmConfig {
             use_tls: true,
-            port: 5986,
+            port: Some(5986),
             accept_invalid_certs: true,
             ..Default::default()
         };
@@ -1418,7 +2674,7 @@ mod tests {
     #[test]
     fn config_accessor() {
         let transport = basic_transport(5985);
-        assert_eq!(transport.config().port, 5985);
+        assert_eq!(transport.config().port, Some(5985));
         assert!(matches!(transport.config().auth_method, AuthMethod::Basic));
     }
 
@@ -1467,6 +2723,41 @@ mod tests {
             Err(WinrmError::AuthFailed(_)) => {}
             Err(e) => panic!("expected AuthFailed, got: {e}"),
             Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    /// A `user_agent` that is not a valid header value is refused when the
+    /// client is built, for CredSSP too, which writes it into a request head
+    /// by hand.
+    #[test]
+    fn user_agent_with_a_line_break_is_refused() {
+        let mut methods = vec![(AuthMethod::Basic, false), (AuthMethod::Ntlm, false)];
+        if cfg!(feature = "credssp") {
+            methods.push((AuthMethod::CredSsp, true));
+        }
+        for (auth_method, use_tls) in methods {
+            let build = |user_agent: &str| {
+                let config = WinrmConfig {
+                    auth_method: auth_method.clone(),
+                    use_tls,
+                    // Basic over plain HTTP needs `Never`; the others keep `Auto`.
+                    encryption: if matches!(auth_method, AuthMethod::Basic) {
+                        EncryptionMode::Never
+                    } else {
+                        EncryptionMode::Auto
+                    },
+                    user_agent: Some(user_agent.into()),
+                    ..Default::default()
+                };
+                HttpTransport::new(config, WinrmCredentials::new("u", "p", ""))
+            };
+            for bad in ["agent\r\nX-Extra: 1", "agent\rx", "agent\nx"] {
+                assert!(
+                    matches!(build(bad), Err(WinrmError::Http(_))),
+                    "{auth_method:?} accepted {bad:?}"
+                );
+            }
+            assert!(build("ops-tool/2").is_ok(), "{auth_method:?}");
         }
     }
 
@@ -1599,6 +2890,62 @@ mod tests {
         let msg = cert_auth_failed(cert_tls_config(&files));
         assert!(msg.contains("no private key"), "{msg}");
         assert!(msg.contains(&files.key), "names the file: {msg}");
+    }
+
+    /// The private key of `EC_KEY_PKCS8_PEM` as one base64 line, without armor.
+    fn one_line_key_body() -> String {
+        crate::test_pki::EC_KEY_PKCS8_PEM
+            .lines()
+            .filter(|l| !l.starts_with("-----"))
+            .collect()
+    }
+
+    fn assert_key_material_not_echoed(msg: &str, value: &str) {
+        assert!(!msg.contains("BEGIN"), "{msg}");
+        assert!(!msg.contains(&value[..24]), "{msg}");
+        assert!(!msg.contains("IvSE2eFVFQPSvWUFhXFxIaP6"), "{msg}");
+        assert!(msg.contains("this field takes a file path"), "{msg}");
+    }
+
+    #[test]
+    fn certificate_auth_key_material_in_key_path_is_never_echoed() {
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
+        let files = pem_files("redactkey", EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        for value in [EC_KEY_PKCS8_PEM.to_string(), one_line_key_body()] {
+            let msg = cert_auth_failed(WinrmConfig {
+                client_key_pem: Some(value.clone()),
+                ..cert_tls_config(&files)
+            });
+            assert_key_material_not_echoed(&msg, &value);
+        }
+    }
+
+    #[test]
+    fn certificate_auth_key_material_in_cert_path_is_never_echoed() {
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
+        let files = pem_files("redactcert", EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        for value in [
+            format!("{EC_CERT_PEM}{EC_KEY_PKCS8_PEM}"),
+            one_line_key_body(),
+        ] {
+            // The cert file is read first, so that read fails.
+            let msg = cert_auth_failed(WinrmConfig {
+                client_cert_pem: Some(value.clone()),
+                ..cert_tls_config(&files)
+            });
+            assert_key_material_not_echoed(&msg, &value);
+        }
+    }
+
+    #[test]
+    fn certificate_auth_missing_path_is_still_named() {
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
+        let files = pem_files("namedpath", EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let msg = cert_auth_failed(WinrmConfig {
+            client_key_pem: Some("/nonexistent/winrm-rs/client.key".into()),
+            ..cert_tls_config(&files)
+        });
+        assert!(msg.contains("/nonexistent/winrm-rs/client.key"), "{msg}");
     }
 
     #[test]
@@ -1858,7 +3205,7 @@ mod tests {
         use rustls::pki_types::{CertificateDer, PrivateKeyDer};
         use std::io::{Read, Write};
 
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        crate::test_pki::install_test_provider();
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let chain =
             vec![CertificateDer::from_pem_slice(crate::test_pki::EC_CERT_PEM.as_bytes()).unwrap()];
@@ -1941,8 +3288,8 @@ mod tests {
         let (port, server) = spawn_mtls_server();
         let files = pem_files("mtls", RSA_CERT_PEM, RSA_KEY_PKCS1_PEM);
         let config = WinrmConfig {
-            port,
-            proxy: Some(format!("http://127.0.0.1:{port}")),
+            port: Some(port),
+            proxy: Some(SecretString::from(format!("http://127.0.0.1:{port}"))),
             connect_timeout_secs: 5,
             operation_timeout_secs: 5,
             ..cert_tls_config(&files)
@@ -2055,8 +3402,9 @@ mod tests {
         let addr = server.address();
         let config = WinrmConfig {
             auth_method: AuthMethod::Basic,
-            port: addr.port(),
+            port: Some(addr.port()),
             use_tls: false,
+            encryption: EncryptionMode::Never,
             max_retries: 3,
             ..Default::default()
         };
@@ -2080,8 +3428,9 @@ mod tests {
         let addr = server.address();
         let config = WinrmConfig {
             auth_method: AuthMethod::Basic,
-            port: addr.port(),
+            port: Some(addr.port()),
             use_tls: false,
+            encryption: EncryptionMode::Never,
             max_retries: 3,
             ..Default::default()
         };
@@ -2097,7 +3446,8 @@ mod tests {
         let config = WinrmConfig {
             auth_method: AuthMethod::Basic,
             use_tls: false,
-            proxy: Some("http://proxy:8080".into()),
+            encryption: EncryptionMode::Never,
+            proxy: Some(SecretString::from("http://proxy:8080")),
             ..Default::default()
         };
         let creds = WinrmCredentials::new("admin", "pass", "");
@@ -2110,12 +3460,12 @@ mod tests {
         let config = WinrmConfig {
             use_tls: true,
             accept_invalid_certs: true,
-            port: 5986,
+            port: Some(5986),
             ..Default::default()
         };
         let creds = WinrmCredentials::new("admin", "pass", "");
         let transport = HttpTransport::new(config, creds).unwrap();
-        assert!(transport.tls_config.is_some());
+        assert!(transport.server_verifier.is_some());
     }
 
     #[test]
@@ -2123,24 +3473,234 @@ mod tests {
         let config = WinrmConfig {
             use_tls: true,
             accept_invalid_certs: false,
-            port: 5986,
+            port: Some(5986),
             ..Default::default()
         };
         let creds = WinrmCredentials::new("admin", "pass", "");
         let transport = HttpTransport::new(config, creds).unwrap();
-        assert!(transport.tls_config.is_some());
+        assert!(transport.server_verifier.is_some());
     }
 
     #[test]
     fn no_tls_has_no_tls_config() {
         let transport = basic_transport(5985);
-        assert!(transport.tls_config.is_none());
+        assert!(transport.server_verifier.is_none());
+    }
+
+    /// Printed on its own line by the inner tests that a parent test re-runs in
+    /// a child process, once they have run to their end: the exit status alone
+    /// cannot tell a test that ran from one the name filter did not match.
+    const CHILD_RAN: &str = "winrm-rs-child-ran";
+
+    /// A plain-HTTP client builds on a host whose OS certificate store is
+    /// empty. Run by [`plain_http_client_builds_without_system_roots`] in a
+    /// child process whose environment empties that store; on its own it
+    /// checks nothing more than any plain-HTTP construction.
+    #[test]
+    #[ignore = "run in a child process by plain_http_client_builds_without_system_roots"]
+    fn plain_http_client_builds_without_system_roots_inner() {
+        let result = HttpTransport::new(WinrmConfig::http(), WinrmCredentials::new(USER, PASS, ""));
+        assert!(result.is_ok(), "{:?}", result.err());
+        println!("{CHILD_RAN}");
+    }
+
+    /// Runs [`plain_http_client_builds_without_system_roots_inner`] in a child
+    /// copy of this test binary with `SSL_CERT_DIR` removed and
+    /// `SSL_CERT_FILE=/nonexistent`, so the OS store (read by
+    /// rustls-native-certs from those variables when set) is empty. It runs in
+    /// a child because `cargo test` itself sets both variables to the system
+    /// bundle in the environment of the tests it starts.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn plain_http_client_builds_without_system_roots() {
+        let exe = std::env::current_exe().unwrap();
+        #[expect(clippy::disallowed_methods, reason = "test-only subprocess")]
+        let output = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "transport::tests::plain_http_client_builds_without_system_roots_inner",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env_remove("SSL_CERT_DIR")
+            .env("SSL_CERT_FILE", "/nonexistent")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "child failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains(CHILD_RAN),
+            "the inner test did not run to its end:\n{stdout}"
+        );
+    }
+
+    /// A loopback HTTP server that records the request line of each request
+    /// and answers `500` with an empty body. Returns its port and the lines.
+    fn spawn_request_line_recorder() -> (u16, Arc<Mutex<Vec<String>>>) {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            while let Ok(mut tcp) = accept_with_deadline(&listener) {
+                if let Ok((head, _)) = read_http_head(&mut tcp) {
+                    let line = head.lines().next().unwrap_or_default().to_string();
+                    recorded.lock().unwrap().push(line);
+                    let _ = tcp.write_all(
+                        b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n",
+                    );
+                }
+            }
+        });
+        (port, seen)
+    }
+
+    /// A transport whose route is empty sends direct even when `HTTP_PROXY`
+    /// is set: `reqwest`'s own proxy lookup is off. Run by
+    /// [`an_empty_route_ignores_reqwest_s_own_proxy_lookup`] in a child
+    /// process whose environment sets `HTTP_PROXY` (here `proxy::env_var`
+    /// reads nothing, so the route is empty).
+    #[tokio::test]
+    #[ignore = "run in a child process by an_empty_route_ignores_reqwest_s_own_proxy_lookup"]
+    async fn an_empty_route_ignores_reqwest_s_own_proxy_lookup_inner() {
+        assert!(
+            std::env::var_os("HTTP_PROXY").is_some(),
+            "run by the parent"
+        );
+        let (port, seen) = spawn_request_line_recorder();
+        let transport = basic_transport(port);
+        assert_eq!(transport.proxy_route().proxy_for("http://127.0.0.1/"), None);
+        let _ = transport
+            .send_soap_with_retry("127.0.0.1", "<soap/>".into())
+            .await;
+        assert_eq!(
+            seen.lock().unwrap().first().map(String::as_str),
+            Some("POST /wsman HTTP/1.1"),
+            "the request did not go direct"
+        );
+        println!("{CHILD_RAN}");
+    }
+
+    /// Runs [`an_empty_route_ignores_reqwest_s_own_proxy_lookup_inner`] in a
+    /// child copy of this test binary with `HTTP_PROXY` pointing at a
+    /// recorder, which must see nothing.
+    #[test]
+    fn an_empty_route_ignores_reqwest_s_own_proxy_lookup() {
+        let (proxy_port, proxy_seen) = spawn_request_line_recorder();
+        let exe = std::env::current_exe().unwrap();
+        #[expect(clippy::disallowed_methods, reason = "test-only subprocess")]
+        let mut command = std::process::Command::new(exe);
+        command.args([
+            "--exact",
+            "transport::tests::an_empty_route_ignores_reqwest_s_own_proxy_lookup_inner",
+            "--ignored",
+            "--nocapture",
+        ]);
+        for name in [
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "NO_PROXY",
+            "no_proxy",
+            "REQUEST_METHOD",
+        ] {
+            command.env_remove(name);
+        }
+        let output = command
+            .env("HTTP_PROXY", format!("http://127.0.0.1:{proxy_port}"))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "child failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains(CHILD_RAN),
+            "the inner test did not run to its end:\n{stdout}"
+        );
+        assert!(proxy_seen.lock().unwrap().is_empty());
+    }
+
+    /// Every TLS configuration of a transport (shared client, dedicated
+    /// clients' base, CredSSP outer TLS) uses the provider it was given.
+    #[test]
+    fn every_tls_config_uses_the_chosen_provider() {
+        let p = Arc::new(rustls::crypto::ring::default_provider());
+        for (use_tls, accept_invalid_certs) in
+            [(true, true), (true, false), (false, true), (false, false)]
+        {
+            let t = HttpTransport::with_provider(
+                WinrmConfig {
+                    use_tls,
+                    accept_invalid_certs,
+                    port: Some(5986),
+                    ..Default::default()
+                },
+                WinrmCredentials::new(USER, PASS, ""),
+                TransportOptions::default(),
+                Arc::clone(&p),
+                proxy::env_var,
+            )
+            .unwrap();
+            assert!(
+                Arc::ptr_eq(t.client_tls.crypto_provider(), &p),
+                "{use_tls} {accept_invalid_certs}"
+            );
+            assert_eq!(t.server_verifier.is_some(), use_tls);
+        }
+        #[cfg(feature = "credssp")]
+        {
+            let t = HttpTransport::with_provider(
+                WinrmConfig {
+                    auth_method: AuthMethod::CredSsp,
+                    use_tls: true,
+                    port: Some(5986),
+                    ..Default::default()
+                },
+                WinrmCredentials::new(USER, PASS, ""),
+                TransportOptions::default(),
+                Arc::clone(&p),
+                proxy::env_var,
+            )
+            .unwrap();
+            let o = &t.credssp_tls.as_ref().unwrap().outer;
+            assert!(Arc::ptr_eq(o.crypto_provider(), &p));
+            assert!(o.alpn_protocols.is_empty());
+        }
+    }
+
+    #[test]
+    fn proxy_named_after_its_scheme_is_refused_at_construction() {
+        // The second has a scheme no proxy supports.
+        for proxy in ["socks5h:/proxy.corp:1080", "ftp://proxy:21"] {
+            let config = WinrmConfig {
+                proxy: Some(SecretString::from(proxy)),
+                ..Default::default()
+            };
+            let err = HttpTransport::new(config, WinrmCredentials::new("u", "p", ""))
+                .err()
+                .expect("refused");
+            assert!(
+                matches!(&err, WinrmError::AuthFailed(m) if m.contains("invalid proxy URL")),
+                "{proxy}: {err:?}"
+            );
+        }
     }
 
     #[test]
     fn invalid_proxy_url_returns_error() {
         let config = WinrmConfig {
-            proxy: Some("not a url".into()),
+            proxy: Some(SecretString::from("not a url")),
             ..Default::default()
         };
         let creds = WinrmCredentials::new("u", "p", "");
@@ -2148,64 +3708,103 @@ mod tests {
         assert!(result.is_err(), "expected error for invalid proxy URL");
     }
 
-    /// The pinned verifier's proxy exception covers the configured proxy,
-    /// else the `https://` proxies of the environment (reqwest uses them
-    /// when `WinrmConfig::proxy` is `None`); proxies without TLS of their
-    /// own add nothing.
-    #[test]
-    fn proxy_server_names_cover_the_configured_or_environment_https_proxies() {
-        use rustls::pki_types::ServerName;
-        let name = |n: &str| ServerName::try_from(n.to_string()).unwrap();
-        let env = |vars: &'static [(&'static str, &'static str)]| {
-            move |key: &str| {
-                vars.iter()
-                    .find(|(k, _)| *k == key)
-                    .map(|(_, v)| (*v).to_string())
-            }
-        };
-        let none = WinrmConfig::default();
-        assert_eq!(
-            proxy_server_names(
-                &none,
-                env(&[
-                    ("HTTPS_PROXY", "https://user:pw@proxy.corp:3128"),
-                    ("all_proxy", " HTTPS://All.Corp/ "),
-                    ("https_proxy", "http://plain.corp:3128"),
-                    ("ALL_PROXY", "socks5://socks.corp:1080"),
-                ])
-            ),
-            vec![name("proxy.corp"), name("all.corp")]
-        );
-        assert!(proxy_server_names(&none, env(&[("HTTPS_PROXY", "proxy.corp:3128")])).is_empty());
-        assert!(proxy_server_names(&none, env(&[])).is_empty());
-        let explicit = WinrmConfig {
-            proxy: Some("http://explicit.corp:8080".into()),
-            ..Default::default()
-        };
-        assert_eq!(
-            proxy_server_names(&explicit, env(&[("HTTPS_PROXY", "https://proxy.corp")])),
-            vec![name("explicit.corp")],
-            "an explicit proxy makes reqwest ignore the environment"
-        );
-    }
-
-    /// `Always` with a method that never seals is accepted (SemVer), but
-    /// says so at construction.
+    /// Basic over plain HTTP sends the password and every body in cleartext:
+    /// it is refused unless `Never` says so.
     #[tracing_test::traced_test]
     #[test]
-    fn always_with_a_method_that_never_seals_is_accepted_with_a_warning() {
-        let transport = HttpTransport::new(
-            WinrmConfig {
-                auth_method: AuthMethod::Basic,
+    fn basic_over_http_is_refused_unless_encryption_is_never() {
+        let basic = |use_tls: bool, encryption: EncryptionMode| {
+            HttpTransport::new(
+                WinrmConfig {
+                    auth_method: AuthMethod::Basic,
+                    use_tls,
+                    encryption,
+                    ..Default::default()
+                },
+                WinrmCredentials::new("admin", "pass", ""),
+            )
+        };
+        for mode in [EncryptionMode::Auto, EncryptionMode::Always] {
+            let err = basic(false, mode.clone()).err().expect("refused");
+            assert!(
+                matches!(&err, WinrmError::AuthFailed(m) if m.contains("EncryptionMode::Never") && m.contains("use_tls")),
+                "{mode:?}: {err:?}"
+            );
+        }
+        assert!(basic(false, EncryptionMode::Never).is_ok());
+        assert!(logs_contain("cleartext"));
+        assert!(basic(true, EncryptionMode::Auto).is_ok());
+    }
+
+    /// `Always` with a method that winrm-rs cannot seal is refused, before
+    /// any certificate file is read.
+    #[test]
+    fn always_with_a_method_that_never_seals_is_refused() {
+        let creds = || WinrmCredentials::new("admin", "pass", "");
+        for (method, name) in [
+            (AuthMethod::Basic, "Basic"),
+            (AuthMethod::Certificate, "Certificate"),
+            (AuthMethod::CredSsp, "CredSSP"),
+        ] {
+            let config = WinrmConfig {
+                auth_method: method,
+                use_tls: true,
+                port: Some(5986),
                 encryption: EncryptionMode::Always,
                 ..Default::default()
-            },
-            WinrmCredentials::new("admin", "pass", ""),
-        );
-        assert!(transport.is_ok());
-        assert!(!transport.unwrap().seals());
-        assert!(logs_contain("EncryptionMode::Always has no effect"));
-        assert!(logs_contain("auth_method=\"Basic\""));
+            };
+            let err = HttpTransport::new(config, creds()).err().expect("refused");
+            assert!(
+                matches!(&err, WinrmError::AuthFailed(m) if m.contains("EncryptionMode::Always") && m.contains(&format!("does not seal {name}"))),
+                "{err:?}"
+            );
+        }
+        let ntlm = WinrmConfig {
+            auth_method: AuthMethod::Ntlm,
+            use_tls: true,
+            port: Some(5986),
+            encryption: EncryptionMode::Always,
+            ..Default::default()
+        };
+        assert!(HttpTransport::new(ntlm, creds()).is_ok());
+    }
+
+    /// NTLM over plain HTTP (`WinrmConfig::http()`) is accepted but says at
+    /// construction what it leaves unprotected, under its own target.
+    #[tracing_test::traced_test]
+    #[test]
+    fn ntlm_over_plain_http_is_accepted_with_a_warning() {
+        let creds = || WinrmCredentials::new("admin", "pass", "");
+        assert!(HttpTransport::new(WinrmConfig::http(), creds()).is_ok());
+        assert!(logs_contain("NTLM over plain HTTP"));
+        assert!(logs_contain("winrm_rs::ntlm_over_http"));
+        assert!(logs_contain("sealed=true"));
+        let never = WinrmConfig {
+            encryption: EncryptionMode::Never,
+            ..WinrmConfig::http()
+        };
+        assert!(HttpTransport::new(never, creds()).is_ok());
+        assert!(logs_contain("sealed=false"));
+    }
+
+    /// Guard: neither NTLM over HTTPS nor Basic over HTTP logs it.
+    #[tracing_test::traced_test]
+    #[test]
+    fn plain_http_warning_is_for_ntlm_over_http_only() {
+        let creds = || WinrmCredentials::new("admin", "pass", "");
+        let https = WinrmConfig {
+            use_tls: true,
+            port: Some(5986),
+            ..Default::default()
+        };
+        assert!(HttpTransport::new(https, creds()).is_ok());
+        let basic = WinrmConfig {
+            auth_method: AuthMethod::Basic,
+            encryption: EncryptionMode::Never,
+            ..WinrmConfig::http()
+        };
+        assert!(HttpTransport::new(basic, creds()).is_ok());
+        assert!(!logs_contain("NTLM over plain HTTP"));
     }
 
     #[test]
@@ -2226,7 +3825,7 @@ mod tests {
         );
     }
 
-    /// The WARN about a polluted host string, and the span of the request,
+    /// The refusal of a host with userinfo, and the span of the request,
     /// never carry the userinfo.
     #[tracing_test::traced_test]
     #[tokio::test]
@@ -2238,8 +3837,9 @@ mod tests {
         let transport = HttpTransport::new(
             WinrmConfig {
                 auth_method: AuthMethod::Basic,
-                port,
+                port: Some(port),
                 use_tls: false,
+                encryption: EncryptionMode::Never,
                 max_retries: 0,
                 connect_timeout_secs: 2,
                 ..Default::default()
@@ -2248,24 +3848,28 @@ mod tests {
         )
         .unwrap();
         let host = "admin:hunter2@127.0.0.1";
-        assert_eq!(
-            transport.endpoint(host),
-            format!("http://127.0.0.1:{port}/wsman")
+        let sent = transport
+            .send_soap(host, "<s:Envelope/>".into(), None)
+            .await;
+        assert!(
+            matches!(&sent, Err(WinrmError::AuthFailed(m)) if m.contains("invalid host")),
+            "{sent:?}"
         );
-        let sent = transport.send_soap(host, "<s:Envelope/>".into()).await;
-        assert!(sent.is_err(), "nothing listens on port {port}");
         assert!(logs_contain("<redacted>@127.0.0.1"));
-        assert!(logs_contain("sending WinRM SOAP request"));
+        assert!(logs_contain("request not sent: host refused"));
+        assert!(!logs_contain("sending WinRM SOAP request"));
         assert!(!logs_contain("hunter2"));
     }
 
+    #[tracing_test::traced_test]
     #[test]
     fn endpoint_strips_scheme_and_path_silently() {
         let transport = basic_transport(5985);
-        // Caller passed a polluted host string; sanitize_host pulls just
-        // the hostname and the URL is rebuilt with the configured scheme.
+        // `endpoint` is infallible (envelopes embed it) and never sent for a
+        // host `validate_host` refuses; it formats the stripped host, silently.
         let url = transport.endpoint("http://evil.com/path");
         assert_eq!(url, "http://evil.com:5985/wsman");
+        assert!(!logs_contain("using sanitized form"));
     }
 
     /// Every request of a session carries the same `wsmv:SessionId`; without
@@ -2340,7 +3944,7 @@ mod tests {
         let fake = FakeNtlmServer::mount(&server).await;
         let mut config = WinrmConfig {
             auth_method: AuthMethod::Ntlm,
-            port: server.address().port(),
+            port: Some(server.address().port()),
             use_tls: false,
             operation_timeout_secs: 10,
             ..Default::default()
@@ -2375,7 +3979,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let c = Arc::clone(&calls);
         (
-            Arc::new(move || c.fetch_add(1, Ordering::SeqCst) < allow),
+            legacy_hook(move || c.fetch_add(1, Ordering::SeqCst) < allow),
             calls,
         )
     }
@@ -2384,8 +3988,9 @@ mod tests {
     fn basic_transport_retrying(port: u16, max_retries: u32) -> HttpTransport {
         let config = WinrmConfig {
             auth_method: AuthMethod::Basic,
-            port,
+            port: Some(port),
             use_tls: false,
+            encryption: EncryptionMode::Never,
             max_retries,
             ..Default::default()
         };
@@ -2401,6 +4006,157 @@ mod tests {
         (socket, port)
     }
 
+    /// The hint names `WinrmConfig::http()` only when a connection to the
+    /// defaulted HTTPS port failed.
+    #[tokio::test]
+    async fn connect_hint_only_for_a_connect_failure_on_the_default_https_port() {
+        let (_socket, closed) = refused_port();
+        let err = basic_transport(closed)
+            .send_soap_with_retry("127.0.0.1", "<s:Envelope/>".into())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, WinrmError::Http(e) if e.is_connect()),
+            "{err:?}"
+        );
+        assert!(connect_hint(&WinrmConfig::default(), false, &err).is_some());
+        let explicit = WinrmConfig {
+            port: Some(5986),
+            ..Default::default()
+        };
+        assert!(connect_hint(&explicit, false, &err).is_none());
+        assert!(connect_hint(&WinrmConfig::http(), false, &err).is_none());
+        let plain_default_port = WinrmConfig {
+            use_tls: false,
+            ..Default::default()
+        };
+        assert!(connect_hint(&plain_default_port, false, &err).is_none());
+        assert!(connect_hint(&WinrmConfig::default(), false, &WinrmError::Timeout(1)).is_none());
+    }
+
+    /// With a proxy set, a connect failure is the proxy's (unreachable, or
+    /// a DNS failure through it): `WinrmConfig::http()` would not fix it.
+    #[tokio::test]
+    async fn no_connect_hint_when_a_proxy_is_set() {
+        let (_socket, closed) = refused_port();
+        let err = basic_transport(closed)
+            .send_soap_with_retry("127.0.0.1", "<s:Envelope/>".into())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, WinrmError::Http(e) if e.is_connect()),
+            "{err:?}"
+        );
+        assert!(connect_hint(&WinrmConfig::default(), false, &err).is_some());
+        let proxied = WinrmConfig {
+            proxy: Some(SecretString::from("http://127.0.0.1:1")),
+            ..Default::default()
+        };
+        assert!(connect_hint(&proxied, false, &err).is_none());
+    }
+
+    /// A client that opted in to the environment's proxies and whose request
+    /// goes through `HTTPS_PROXY` gets no hint either: the failed connection
+    /// is the proxy's.
+    #[tokio::test]
+    async fn no_connect_hint_when_an_environment_proxy_applies() {
+        let (_socket, closed) = refused_port();
+        let (logs, _guard) = capture_logs();
+        let env = move |n: &str| (n == "HTTPS_PROXY").then(|| format!("http://127.0.0.1:{closed}"));
+        let transport = HttpTransport::new_with_env(
+            WinrmConfig {
+                connect_timeout_secs: 5,
+                ..Default::default()
+            },
+            WinrmCredentials::new("admin", "hint-secret", ""),
+            TransportOptions {
+                use_env_proxy: true,
+                ..Default::default()
+            },
+            env,
+        )
+        .unwrap();
+        let err = transport
+            .send_soap_with_retry("win01.test", "<s:Envelope/>".into())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, WinrmError::Http(e) if e.is_connect()),
+            "{err:?}"
+        );
+        let text = logs.text();
+        assert!(!text.contains(CONNECT_HINT), "{text}");
+        // The same error on a direct route would get the hint.
+        assert!(connect_hint(&WinrmConfig::default(), false, &err).is_some());
+        assert!(connect_hint(&WinrmConfig::default(), true, &err).is_none());
+    }
+
+    /// A host name that does not resolve fails as a connect error too, so
+    /// it also gets the hint.
+    #[tokio::test]
+    async fn an_unresolvable_host_gets_the_connect_hint() {
+        let transport = HttpTransport::new(
+            WinrmConfig {
+                connect_timeout_secs: 5,
+                ..Default::default()
+            },
+            WinrmCredentials::new("admin", "pass", ""),
+        )
+        .unwrap();
+        let err = transport
+            .send_soap_with_retry("no-such-host.invalid", "<s:Envelope/>".into())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, WinrmError::Http(e) if e.is_connect()),
+            "{err:?}"
+        );
+        assert!(connect_hint(&WinrmConfig::default(), false, &err).is_some());
+    }
+
+    /// A default client whose connection to port 5986 fails logs the hint
+    /// once, with the host and no credentials.
+    #[tokio::test]
+    async fn a_failed_connection_to_the_default_https_port_logs_the_connect_hint() {
+        // A local listener that closes every connection before the TLS
+        // handshake completes: a connect error that no other service on
+        // this host can answer. If port 5986 is taken here, the failure
+        // cannot be arranged.
+        let Ok(listener) = tokio::net::TcpListener::bind("127.0.0.1:5986").await else {
+            eprintln!("127.0.0.1:5986 is in use here: leg not checked");
+            return;
+        };
+        let closer = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        let (logs, _guard) = capture_logs();
+        let transport = HttpTransport::new(
+            WinrmConfig {
+                connect_timeout_secs: 5,
+                ..Default::default()
+            },
+            WinrmCredentials::new("admin", "hint-secret", ""),
+        )
+        .unwrap();
+        let err = transport
+            .send_soap_with_retry("127.0.0.1", "<s:Envelope/>".into())
+            .await
+            .unwrap_err();
+        closer.abort();
+        assert!(
+            matches!(&err, WinrmError::Http(e) if e.is_connect()),
+            "{err:?}"
+        );
+        let text = logs.text();
+        let hint_lines: Vec<&str> = text.lines().filter(|l| l.contains(CONNECT_HINT)).collect();
+        assert_eq!(hint_lines.len(), 1, "{text}");
+        assert!(hint_lines[0].contains("WARN"), "{text}");
+        assert!(hint_lines[0].contains("host=127.0.0.1"), "{text}");
+        assert!(!text.contains("hint-secret"), "{text}");
+    }
+
     async fn mount_ok_expecting(server: &MockServer, times: u64) {
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_string("<ok/>"))
@@ -2410,11 +4166,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn host_log_fields_escape_control_characters() {
+        let (logs, _guard) = capture_logs();
+        let server = MockServer::start().await;
+        mount_ok_expecting(&server, 0).await;
+        let transport = basic_transport(server.address().port());
+        // A control character makes validate_host refuse the host; the refusal is logged.
+        let err = transport
+            .send_soap_raw("x\u{1b}[31m\r\nFORGED-LINE two", "<a/>".into())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, WinrmError::AuthFailed(m) if m.contains("invalid host")),
+            "{err:?}"
+        );
+        let text = logs.text();
+        assert!(text.contains("x\\u{1b}[31m FORGED-LINE two"), "{text}");
+        assert!(
+            !text.contains("\nFORGED-LINE") && !text.contains("\rFORGED-LINE"),
+            "{text}"
+        );
+        assert!(!text.contains('\u{1b}'), "{text}");
+    }
+
+    /// The URL parser refuses a bidi override character in a host, so
+    /// `validate_host` refuses it too; the refusal is logged with the host
+    /// escaped like the host field is.
+    #[tokio::test]
+    async fn bidi_characters_in_a_host_are_refused_and_logged_escaped() {
+        let (logs, _guard) = capture_logs();
+        let (_socket, port) = refused_port();
+        let transport = basic_transport_retrying(port, 0);
+        let err = transport
+            .send_soap_raw("win\u{202E}01.test", "<a/>".into())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, WinrmError::AuthFailed(m) if m.contains("invalid host")),
+            "{err:?}"
+        );
+        let text = logs.text();
+        assert!(text.contains("win\\u{202e}01.test"), "{text}");
+        assert!(!text.contains('\u{202E}'), "{text}");
+    }
+
+    #[tokio::test]
     async fn before_send_refusal_sends_nothing() {
         let server = MockServer::start().await;
         mount_ok_expecting(&server, 0).await;
         let mut transport = basic_transport(server.address().port());
-        transport.set_before_send(Arc::new(|| false));
+        transport.set_before_send(legacy_hook(|| false));
         let result = transport
             .send_soap_with_retry("127.0.0.1", "<a/>".into())
             .await;
@@ -2424,7 +4225,7 @@ mod tests {
 
     #[tokio::test]
     async fn before_send_runs_before_every_attempt() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        crate::test_pki::install_test_provider();
         let (_socket, port) = refused_port();
         let mut transport = basic_transport_retrying(port, 2);
         let (hook, calls) = counting_hook(usize::MAX);
@@ -2438,7 +4239,7 @@ mod tests {
 
     #[tokio::test]
     async fn before_send_refusal_stops_the_retries() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        crate::test_pki::install_test_provider();
         let (_socket, port) = refused_port();
         let mut transport = basic_transport_retrying(port, 2);
         let (hook, calls) = counting_hook(1);
@@ -2484,7 +4285,7 @@ mod tests {
         let server = MockServer::start().await;
         mount_ok_expecting(&server, 0).await;
         let mut transport = basic_transport(server.address().port());
-        transport.set_before_send(Arc::new(|| -> bool { panic!("hook") }));
+        transport.set_before_send(legacy_hook(|| -> bool { panic!("hook") }));
         let join_handle = tokio::spawn(async move {
             transport
                 .send_soap_with_retry("127.0.0.1", "<a/>".into())
@@ -2492,6 +4293,77 @@ mod tests {
         });
         assert!(join_handle.await.unwrap_err().is_panic());
         assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn before_send_with_sees_host_action_kind_and_attempt() {
+        use crate::request::{OutgoingRequest, RequestKind};
+        use crate::soap::namespaces::ACTION_RECEIVE;
+        crate::test_pki::install_test_provider();
+        let (_socket, port) = refused_port();
+        let mut transport = basic_transport_retrying(port, 1);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let s = Arc::clone(&seen);
+        transport.set_before_send(Arc::new(move |req: &OutgoingRequest<'_>| {
+            let row = (
+                req.host().to_string(),
+                req.action().to_string(),
+                req.kind(),
+                req.attempt(),
+            );
+            s.lock().unwrap().push(row);
+            true
+        }));
+        let envelope = crate::soap::envelope::receive_output_request(
+            &transport.endpoint("127.0.0.1"),
+            "S",
+            "C",
+            60,
+            153_600,
+        );
+        let result = transport.send_soap_with_retry("127.0.0.1", envelope).await;
+        assert!(
+            matches!(&result, Err(WinrmError::Http(e)) if e.is_connect()),
+            "{result:?}"
+        );
+        let receive = |attempt| {
+            (
+                "127.0.0.1".to_string(),
+                ACTION_RECEIVE.to_string(),
+                RequestKind::Receive,
+                attempt,
+            )
+        };
+        assert_eq!(*seen.lock().unwrap(), [receive(0), receive(1)]);
+    }
+
+    /// A decorated host string never reaches the hook: `validate_host`
+    /// refuses it first, so `host()` only ever holds a bare host.
+    #[tokio::test]
+    async fn before_send_with_is_not_called_for_a_decorated_host() {
+        use crate::request::OutgoingRequest;
+        crate::test_pki::install_test_provider();
+        let (_socket, port) = refused_port();
+        let mut transport = basic_transport_retrying(port, 0);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let s = Arc::clone(&seen);
+        transport.set_before_send(Arc::new(move |req: &OutgoingRequest<'_>| {
+            s.lock().unwrap().push(req.host().to_string());
+            true
+        }));
+        let err = transport
+            .send_soap_with_retry("admin:pw@127.0.0.1:5985/x", "<a/>".into())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, WinrmError::AuthFailed(m) if m.contains("invalid host")),
+            "{err:?}"
+        );
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "the hook was called: {:?}",
+            seen.lock().unwrap()
+        );
     }
 
     /// A refusal happens before anything is sealed, so the cached NTLM session
@@ -2502,7 +4374,7 @@ mod tests {
         let (_server, fake, mut transport, host) = sealed_setup().await;
         let refuse = Arc::new(AtomicBool::new(false));
         let r = Arc::clone(&refuse);
-        transport.set_before_send(Arc::new(move || !r.load(Ordering::SeqCst)));
+        transport.set_before_send(legacy_hook(move || !r.load(Ordering::SeqCst)));
 
         assert!(
             transport
@@ -2829,7 +4701,7 @@ mod tests {
     /// error (here a timeout) is not retried, whatever the auth method.
     #[tokio::test]
     async fn requests_are_retried_only_on_connection_errors() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        crate::test_pki::install_test_provider();
         let refused = {
             // Bound but not listening: refused, and the port stays ours.
             let socket = tokio::net::TcpSocket::new_v4().unwrap();
@@ -2890,9 +4762,10 @@ mod tests {
         });
         let config = WinrmConfig {
             auth_method: AuthMethod::Basic,
-            port,
+            port: Some(port),
+            encryption: EncryptionMode::Never,
             max_retries: 2,
-            ..Default::default()
+            ..WinrmConfig::http()
         };
         let transport = HttpTransport::new(config, WinrmCredentials::new("u", "p", "")).unwrap();
         let err = transport
@@ -2914,11 +4787,19 @@ mod tests {
     /// the requested `127.0.0.1` port. Pointing the transport at it as an
     /// explicit proxy keeps `HTTP(S)_PROXY` from the environment out.
     fn spawn_connect_proxy() -> u16 {
+        spawn_connect_proxy_counting().0
+    }
+
+    /// [`spawn_connect_proxy`], with the number of `CONNECT`s it served.
+    fn spawn_connect_proxy_counting() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
         use std::io::Write;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
+        let connects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let served = Arc::clone(&connects);
         std::thread::spawn(move || {
             while let Ok(mut client) = accept_with_deadline(&listener) {
+                let served = Arc::clone(&served);
                 std::thread::spawn(move || -> Result<(), String> {
                     let (head, _) = read_http_head(&mut client)?;
                     let target = head
@@ -2928,6 +4809,7 @@ mod tests {
                         .to_string();
                     let upstream =
                         std::net::TcpStream::connect(&target).map_err(|e| e.to_string())?;
+                    served.fetch_add(1, Ordering::SeqCst);
                     client
                         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                         .map_err(|e| e.to_string())?;
@@ -2942,7 +4824,7 @@ mod tests {
                 });
             }
         });
-        port
+        (port, connects)
     }
 
     /// An HTTPS endpoint presenting `cert_pem` that answers NTLM: a Type 1
@@ -3044,13 +4926,633 @@ mod tests {
         crate::ntlm::crypto::compute_channel_bindings(&der).unwrap()
     }
 
+    /// Config for a CredSSP transport aimed at a loopback test server on `port`.
+    #[cfg(feature = "credssp")]
+    fn credssp_test_config(port: u16) -> WinrmConfig {
+        WinrmConfig {
+            auth_method: AuthMethod::CredSsp,
+            use_tls: true,
+            accept_invalid_certs: false,
+            port: Some(port),
+            connect_timeout_secs: 1,
+            operation_timeout_secs: 5,
+            ..Default::default()
+        }
+    }
+
+    /// CredSSP transport aimed at a loopback test server on `port`, with the
+    /// certificate of the test servers (`EC_CERT_PEM`) pinned.
+    #[cfg(feature = "credssp")]
+    fn credssp_test_transport(port: u16) -> HttpTransport {
+        HttpTransport::new_with(
+            credssp_test_config(port),
+            WinrmCredentials::new(USER, PASS, ""),
+            TransportOptions {
+                tls: TlsOptions {
+                    pins: vec![sha256_hex(crate::test_pki::EC_CERT_PEM)],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    /// The CredSSP TLS contexts exist for CredSSP clients only.
+    #[cfg(feature = "credssp")]
+    #[test]
+    fn credssp_tls_is_built_for_credssp_only() {
+        assert!(credssp_test_transport(5986).credssp_tls.is_some());
+        let ntlm = HttpTransport::new(
+            WinrmConfig {
+                auth_method: AuthMethod::Ntlm,
+                use_tls: true,
+                accept_invalid_certs: true,
+                ..Default::default()
+            },
+            WinrmCredentials::new(USER, PASS, ""),
+        )
+        .unwrap();
+        assert!(ntlm.credssp_tls.is_none());
+    }
+
+    /// A CredSSP request to a host that never answers the TLS handshake ends
+    /// at `connect_timeout_secs`.
+    #[cfg(feature = "credssp")]
+    #[tokio::test]
+    async fn credssp_transport_request_is_bounded_by_connect_timeout() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); // never accepted
+        let port = listener.local_addr().unwrap().port();
+        let transport = credssp_test_transport(port);
+        let start = std::time::Instant::now();
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            transport.send_soap_raw("127.0.0.1", "<a/>".into()),
+        )
+        .await
+        .expect("CredSSP request is not bounded")
+        .unwrap_err();
+        assert!(matches!(err, WinrmError::Timeout(1)), "{err:?}");
+        assert!(start.elapsed() < Duration::from_secs(5));
+        drop(listener);
+    }
+
+    /// A CredSSP request to a bracketed IPv6 host reaches the TLS handshake.
+    #[cfg(feature = "credssp")]
+    #[tokio::test]
+    async fn credssp_reaches_a_bracketed_ipv6_endpoint() {
+        let Ok(listener) = std::net::TcpListener::bind("[::1]:0") else {
+            eprintln!("SKIP credssp_reaches_a_bracketed_ipv6_endpoint: no IPv6 loopback");
+            return;
+        };
+        let port = listener.local_addr().unwrap().port();
+        // Accept once and close: the client's TLS handshake then fails.
+        let accepted =
+            std::thread::spawn(move || accept_with_deadline(&listener).map(drop).is_ok());
+        let transport = credssp_test_transport(port);
+        let err = tokio::time::timeout(
+            Duration::from_secs(20),
+            transport.send_soap_raw("[::1]", "<a/>".into()),
+        )
+        .await
+        .expect("bounded")
+        .unwrap_err();
+        assert!(err.to_string().contains("CredSSP outer TLS"), "{err}");
+        assert!(accepted.join().unwrap(), "no TCP connection reached [::1]");
+    }
+
+    #[cfg(feature = "credssp")]
+    fn creds() -> WinrmCredentials {
+        WinrmCredentials::new(USER, PASS, "")
+    }
+
+    /// One request through the retry loop, bounded at 20 s.
+    #[cfg(feature = "credssp")]
+    async fn send_bounded(t: &HttpTransport) -> Result<String, WinrmError> {
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            t.send_soap_with_retry("127.0.0.1", "<s:Envelope/>".into()),
+        )
+        .await
+        .expect("bounded")
+    }
+
+    /// CredSSP has no channel binding on the outer TLS: a client that does
+    /// not verify the server is refused when it is built.
+    #[cfg(feature = "credssp")]
+    #[test]
+    fn credssp_with_accept_invalid_certs_is_refused() {
+        let config = WinrmConfig {
+            accept_invalid_certs: true,
+            ..credssp_test_config(5986)
+        };
+        let err = HttpTransport::new(config, creds())
+            .err()
+            .expect("must refuse");
+        assert!(
+            matches!(&err, WinrmError::AuthFailed(m) if m == CREDSSP_UNAUTHENTICATED_TLS),
+            "{err}"
+        );
+    }
+
+    const UNVERIFIED_SERVER_WARN: &str = "TLS certificate verification disabled";
+    const UNVERIFIED_PROXY_WARN: &str = "https:// proxy certificate verification disabled";
+
+    /// Build a transport reading the proxy environment `env` (opted in).
+    fn transport_in_env(
+        config: WinrmConfig,
+        tls: TlsOptions,
+        env: &'static [(&'static str, &'static str)],
+    ) -> Result<HttpTransport, WinrmError> {
+        HttpTransport::new_with_env(
+            config,
+            WinrmCredentials::new(USER, PASS, ""),
+            TransportOptions {
+                tls,
+                use_env_proxy: true,
+                ..Default::default()
+            },
+            move |k: &str| {
+                env.iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| (*v).to_string())
+            },
+        )
+    }
+
+    /// Basic over HTTPS sends the password to the server: a client that does
+    /// not verify that server is refused when it is built.
+    #[test]
+    fn basic_with_accept_invalid_certs_is_refused() {
+        let config = WinrmConfig {
+            accept_invalid_certs: true,
+            ..tls_config(AuthMethod::Basic, 5986)
+        };
+        let err = HttpTransport::new(config, WinrmCredentials::new(USER, PASS, ""))
+            .err()
+            .expect("must refuse");
+        assert!(
+            matches!(&err, WinrmError::AuthFailed(m) if m == BASIC_UNVERIFIED_TLS),
+            "{err}"
+        );
+    }
+
+    /// The refusal needs both Basic over HTTPS and an unverified server: a
+    /// verified Basic client, and NTLM or Basic over plain HTTP with
+    /// `accept_invalid_certs`, are built.
+    #[test]
+    fn basic_is_refused_only_over_https_without_verification() {
+        let verified = tls_config(AuthMethod::Basic, 5986);
+        HttpTransport::new(verified, WinrmCredentials::new(USER, PASS, "")).unwrap();
+        let ntlm = WinrmConfig {
+            accept_invalid_certs: true,
+            ..tls_config(AuthMethod::Ntlm, 5986)
+        };
+        HttpTransport::new(ntlm, WinrmCredentials::new(USER, PASS, "")).unwrap();
+        // Plain HTTP: the encryption rule decides, not this one.
+        let plain = WinrmConfig {
+            accept_invalid_certs: true,
+            use_tls: false,
+            encryption: EncryptionMode::Never,
+            ..tls_config(AuthMethod::Basic, 5985)
+        };
+        HttpTransport::new(plain, WinrmCredentials::new(USER, PASS, "")).unwrap();
+    }
+
+    /// A build refused for CredSSP with `accept_invalid_certs` logs no
+    /// "verification disabled" WARN: nothing was built.
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_refused_credssp_build_logs_no_verification_warn() {
+        let config = WinrmConfig {
+            accept_invalid_certs: true,
+            ..tls_config(AuthMethod::CredSsp, 5986)
+        };
+        let err = transport_in_env(config, TlsOptions::default(), &[])
+            .err()
+            .expect("must refuse");
+        assert!(
+            matches!(&err, WinrmError::AuthFailed(m) if m == CREDSSP_UNAUTHENTICATED_TLS),
+            "{err}"
+        );
+        assert!(!logs_contain(UNVERIFIED_SERVER_WARN));
+    }
+
+    /// `danger_accept_invalid_proxy_certs` WARNs when an `https://` proxy can
+    /// apply: explicit, or from the environment for the endpoints' scheme. The
+    /// proxy is logged without its user info.
+    #[test]
+    #[tracing_test::traced_test]
+    fn accepting_invalid_proxy_certs_warns_when_an_https_proxy_applies() {
+        let danger = TlsOptions {
+            accept_invalid_proxy_certs: true,
+            ..Default::default()
+        };
+        let explicit = WinrmConfig {
+            proxy: Some(SecretString::from("https://user:s3cret@explicit.corp:8443")),
+            ..tls_config(AuthMethod::Ntlm, 5986)
+        };
+        transport_in_env(explicit, danger.clone(), &[]).unwrap();
+        assert!(logs_contain(UNVERIFIED_PROXY_WARN));
+        assert!(logs_contain("explicit.corp"));
+        assert!(!logs_contain("s3cret"));
+
+        let plain = WinrmConfig {
+            use_tls: false,
+            ..tls_config(AuthMethod::Ntlm, 5985)
+        };
+        transport_in_env(plain, danger, &[("HTTP_PROXY", "https://env.corp:3128")]).unwrap();
+        assert!(logs_contain("env.corp"));
+    }
+
+    /// No proxy WARN without the flag, or without an `https://` proxy for the
+    /// endpoints' scheme.
+    #[test]
+    #[tracing_test::traced_test]
+    fn no_proxy_warn_when_no_https_proxy_applies() {
+        let danger = TlsOptions {
+            accept_invalid_proxy_certs: true,
+            ..Default::default()
+        };
+        let config = tls_config(AuthMethod::Ntlm, 5986);
+        transport_in_env(config.clone(), danger.clone(), &[]).unwrap();
+        transport_in_env(
+            config.clone(),
+            danger.clone(),
+            &[("HTTP_PROXY", "https://http-only.corp:3128")],
+        )
+        .unwrap();
+        let socks = WinrmConfig {
+            proxy: Some(SecretString::from("socks5://socks.corp:1080")),
+            ..config.clone()
+        };
+        transport_in_env(socks, danger, &[]).unwrap();
+        let https_proxy = WinrmConfig {
+            proxy: Some(SecretString::from("https://explicit.corp:8443")),
+            ..config
+        };
+        transport_in_env(https_proxy, TlsOptions::default(), &[]).unwrap();
+        assert!(!logs_contain(UNVERIFIED_PROXY_WARN));
+    }
+
+    /// The pinned listener completes the exchange and receives the password.
+    #[cfg(feature = "credssp")]
+    #[tokio::test]
+    async fn credssp_pin_accepts_pinned_listener() {
+        use crate::auth::credssp::test_server::{self, Fault};
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
+        let (port, log) = test_server::spawn(Fault::Honest, EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let t = credssp_test_transport(port);
+        let reply = send_bounded(&t).await.unwrap();
+        assert_eq!(reply, test_server::MOCK_REPLY);
+        assert_eq!(test_server::delegations(&log.lock().unwrap()), 1);
+    }
+
+    /// A CredSSP request waits for a connection slot of its host before it
+    /// opens a socket, and holds it for the whole exchange.
+    #[cfg(feature = "credssp")]
+    #[tokio::test]
+    async fn credssp_requests_take_a_connection_slot() {
+        use crate::auth::credssp::test_server::{self, Fault};
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
+        let (port, log) = test_server::spawn(Fault::Honest, EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let t = Arc::new(credssp_test_transport(port));
+        let held = t
+            .host_slots("127.0.0.1")
+            .0
+            .try_acquire_many_owned(MAX_CONNS_PER_HOST as u32)
+            .unwrap();
+        let task = tokio::spawn({
+            let t = Arc::clone(&t);
+            // Through the retry loop, the only caller that takes slots.
+            async move {
+                t.send_soap_with_retry("127.0.0.1", "<s:Envelope/>".into())
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!task.is_finished(), "the request did not wait for a slot");
+        assert!(
+            test_server::rounds(&log.lock().unwrap()).is_empty(),
+            "a round reached the server without a slot"
+        );
+        drop(held);
+        let out = tokio::time::timeout(Duration::from_secs(20), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(out, test_server::MOCK_REPLY);
+        assert_eq!(test_server::delegations(&log.lock().unwrap()), 1);
+        // The slot went back when the exchange ended.
+        assert_eq!(
+            t.host_slots("127.0.0.1").0.available_permits(),
+            MAX_CONNS_PER_HOST
+        );
+    }
+
+    /// A relay presenting another certificate in front of the real server is
+    /// refused at the outer TLS handshake, before any request reaches it.
+    #[cfg(feature = "credssp")]
+    #[tokio::test]
+    async fn credssp_pin_refuses_a_listener_with_another_certificate() {
+        use crate::auth::credssp::test_server::{self, Fault};
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM, RSA_CERT_PEM, RSA_KEY_PKCS1_PEM};
+        let (port, log) = test_server::spawn(Fault::Honest, EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let relay = test_server::spawn_tls_relay(port, RSA_CERT_PEM, RSA_KEY_PKCS1_PEM);
+        let t = credssp_test_transport(relay);
+        let err = send_bounded(&t).await.unwrap_err();
+        assert!(
+            matches!(&err, WinrmError::AuthFailed(m) if m.starts_with("CredSSP outer TLS")),
+            "{err}"
+        );
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "the real server saw a request"
+        );
+    }
+
+    /// The relay forwards a whole exchange when the client pins the relay's
+    /// own certificate, so the refusal above comes from the pin alone.
+    #[cfg(feature = "credssp")]
+    #[tokio::test]
+    async fn credssp_tls_relay_forwards_the_exchange() {
+        use crate::auth::credssp::test_server::{self, Fault};
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM, RSA_CERT_PEM, RSA_KEY_PKCS1_PEM};
+        let (port, log) = test_server::spawn(Fault::Honest, EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let relay = test_server::spawn_tls_relay(port, RSA_CERT_PEM, RSA_KEY_PKCS1_PEM);
+        let t = HttpTransport::new_with(
+            credssp_test_config(relay),
+            creds(),
+            TransportOptions {
+                tls: TlsOptions {
+                    pins: vec![sha256_hex(RSA_CERT_PEM)],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let reply = send_bounded(&t).await.unwrap();
+        assert_eq!(reply, test_server::MOCK_REPLY);
+        assert_eq!(test_server::delegations(&log.lock().unwrap()), 1);
+    }
+
+    /// [`credssp_test_transport`] with `proxy` as [`WinrmConfig::proxy`].
+    #[cfg(feature = "credssp")]
+    fn credssp_proxied_transport(port: u16, proxy: String) -> Result<HttpTransport, WinrmError> {
+        HttpTransport::new_with(
+            WinrmConfig {
+                proxy: Some(SecretString::from(proxy)),
+                ..credssp_test_config(port)
+            },
+            WinrmCredentials::new(USER, PASS, ""),
+            TransportOptions {
+                tls: TlsOptions {
+                    pins: vec![sha256_hex(crate::test_pki::EC_CERT_PEM)],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+    }
+
+    #[cfg(feature = "credssp")]
+    #[tokio::test]
+    async fn credssp_runs_through_an_http_connect_proxy() {
+        use crate::auth::credssp::test_server::{self, Fault};
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
+        let (port, log) = test_server::spawn(Fault::Honest, EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let (pport, heads) = crate::test_proxy::spawn_connect_proxy_answering(
+            "HTTP/1.1 200 Connection established\r\n\r\n",
+        )
+        .await;
+        let t =
+            credssp_proxied_transport(port, format!("http://user:pw@127.0.0.1:{pport}")).unwrap();
+        let reply = send_bounded(&t).await.unwrap();
+        assert_eq!(reply, test_server::MOCK_REPLY);
+        assert_eq!(test_server::delegations(&log.lock().unwrap()), 1);
+        let heads = heads.lock().unwrap().clone();
+        assert_eq!(heads.len(), 1, "{heads:?}");
+        assert!(
+            heads[0].starts_with(&format!("CONNECT 127.0.0.1:{port} HTTP/1.1")),
+            "{heads:?}"
+        );
+        assert!(heads[0].contains("Proxy-Authorization: Basic dXNlcjpwdw==\r\n"));
+    }
+
+    #[cfg(feature = "credssp")]
+    #[tokio::test]
+    async fn credssp_runs_through_a_socks5_proxy() {
+        use crate::auth::credssp::test_server::{self, Fault};
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
+        let (port, log) = test_server::spawn(Fault::Honest, EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let (pport, records) = crate::test_proxy::spawn_socks5_proxy(false).await;
+        let t = credssp_proxied_transport(port, format!("socks5://127.0.0.1:{pport}")).unwrap();
+        let reply = send_bounded(&t).await.unwrap();
+        assert_eq!(reply, test_server::MOCK_REPLY);
+        assert_eq!(test_server::delegations(&log.lock().unwrap()), 1);
+        let [hi, lo] = port.to_be_bytes();
+        let connects: Vec<_> = records
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.get(..2) == Some(&[5, 1][..]) && r.len() == 10)
+            .cloned()
+            .collect();
+        assert_eq!(connects, vec![vec![5, 1, 0, 1, 127, 0, 0, 1, hi, lo]]);
+    }
+
+    /// Through a proxy, the outer TLS still runs end-to-end with the host
+    /// under the pin: a listener with another certificate behind the proxy
+    /// is refused before any request reaches the real server.
+    #[cfg(feature = "credssp")]
+    #[tokio::test]
+    async fn credssp_through_a_proxy_keeps_the_pin() {
+        use crate::auth::credssp::test_server::{self, Fault};
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM, RSA_CERT_PEM, RSA_KEY_PKCS1_PEM};
+        let (port, log) = test_server::spawn(Fault::Honest, EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let relay = test_server::spawn_tls_relay(port, RSA_CERT_PEM, RSA_KEY_PKCS1_PEM);
+        let (pport, heads) = crate::test_proxy::spawn_connect_proxy_answering(
+            "HTTP/1.1 200 Connection established\r\n\r\n",
+        )
+        .await;
+        let t = credssp_proxied_transport(relay, format!("http://127.0.0.1:{pport}")).unwrap();
+        let err = send_bounded(&t).await.unwrap_err();
+        assert!(
+            matches!(&err, WinrmError::AuthFailed(m) if m.starts_with("CredSSP outer TLS")
+                && m.contains("matches no pin_server_certificate_sha256 fingerprint")),
+            "{err}"
+        );
+        assert_eq!(heads.lock().unwrap().len(), 1, "the proxy was not used");
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "the real server saw a request"
+        );
+    }
+
+    /// [`credssp_test_transport`] reading `HTTPS_PROXY=proxy` from the
+    /// environment, which `use_env_proxy` opts in or out of.
+    #[cfg(feature = "credssp")]
+    fn credssp_env_proxy_transport(port: u16, use_env_proxy: bool, proxy: String) -> HttpTransport {
+        HttpTransport::new_with_env(
+            credssp_test_config(port),
+            WinrmCredentials::new(USER, PASS, ""),
+            TransportOptions {
+                tls: TlsOptions {
+                    pins: vec![sha256_hex(crate::test_pki::EC_CERT_PEM)],
+                    ..Default::default()
+                },
+                use_env_proxy,
+                ..Default::default()
+            },
+            move |n: &str| (n == "HTTPS_PROXY").then(|| proxy.clone()),
+        )
+        .unwrap()
+    }
+
+    /// A client that opted in reaches the host through the environment's
+    /// proxy: the request computes its dial, so the proxy sees one CONNECT
+    /// for the host and the exchange completes through it.
+    #[cfg(feature = "credssp")]
+    #[tokio::test]
+    async fn credssp_request_goes_through_the_env_proxy_when_opted_in() {
+        use crate::auth::credssp::test_server::{self, Fault};
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
+        let (port, log) = test_server::spawn(Fault::Honest, EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let (pport, heads) = crate::test_proxy::spawn_connect_proxy_answering(
+            "HTTP/1.1 200 Connection established\r\n\r\n",
+        )
+        .await;
+        let t = credssp_env_proxy_transport(port, true, format!("http://127.0.0.1:{pport}"));
+        let reply = send_bounded(&t).await.unwrap();
+        assert_eq!(reply, test_server::MOCK_REPLY);
+        assert_eq!(test_server::delegations(&log.lock().unwrap()), 1);
+        let heads = heads.lock().unwrap().clone();
+        assert_eq!(heads.len(), 1, "{heads:?}");
+        assert!(
+            heads[0].starts_with(&format!("CONNECT 127.0.0.1:{port} HTTP/1.1")),
+            "{heads:?}"
+        );
+    }
+
+    /// An `https://` proxy in the environment is refused for the request,
+    /// before anything is sent, when the client opted in.
+    #[cfg(feature = "credssp")]
+    #[tokio::test]
+    async fn credssp_request_refuses_an_https_env_proxy_when_opted_in() {
+        let t = credssp_env_proxy_transport(5986, true, "https://proxy.test:3128".into());
+        let err = send_bounded(&t).await.unwrap_err();
+        assert!(
+            matches!(&err, WinrmError::AuthFailed(m)
+                if m.starts_with("CredSSP: an https:// proxy is not supported")),
+            "{err}"
+        );
+    }
+
+    /// Without the opt-in the environment's proxy is not used: the request
+    /// reaches the host directly and the proxy sees no connection.
+    #[cfg(feature = "credssp")]
+    #[tokio::test]
+    async fn credssp_request_ignores_the_env_proxy_unless_opted_in() {
+        use crate::auth::credssp::test_server::{self, Fault};
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
+        let (port, log) = test_server::spawn(Fault::Honest, EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let (pport, heads) = crate::test_proxy::spawn_connect_proxy_answering(
+            "HTTP/1.1 200 Connection established\r\n\r\n",
+        )
+        .await;
+        let t = credssp_env_proxy_transport(port, false, format!("http://127.0.0.1:{pport}"));
+        let reply = send_bounded(&t).await.unwrap();
+        assert_eq!(reply, test_server::MOCK_REPLY);
+        assert_eq!(test_server::delegations(&log.lock().unwrap()), 1);
+        assert!(
+            heads.lock().unwrap().is_empty(),
+            "the proxy saw a connection"
+        );
+    }
+
+    #[cfg(feature = "credssp")]
+    #[test]
+    fn credssp_refuses_an_https_proxy_at_construction() {
+        let err = credssp_proxied_transport(5986, "https://127.0.0.1:1".into())
+            .err()
+            .expect("must refuse");
+        assert!(
+            matches!(
+                &err,
+                WinrmError::AuthFailed(m) if m == "CredSSP: an https:// proxy is not supported; \
+                    use an http:// or socks5:// proxy, or connect directly"
+            ),
+            "{err}"
+        );
+        // The other methods keep their https:// proxy.
+        let ntlm = HttpTransport::new(
+            WinrmConfig {
+                auth_method: AuthMethod::Ntlm,
+                use_tls: true,
+                proxy: Some(SecretString::from("https://127.0.0.1:1")),
+                ..Default::default()
+            },
+            creds(),
+        );
+        assert!(ntlm.is_ok(), "{:?}", ntlm.err());
+    }
+
+    /// Without a pin or an extra root, the default verifier (the built-in
+    /// Mozilla roots) refuses the self-signed test listener.
+    #[cfg(feature = "credssp")]
+    #[tokio::test]
+    async fn credssp_default_verifier_refuses_untrusted_listener() {
+        use crate::auth::credssp::test_server::{self, Fault};
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
+        let (port, log) = test_server::spawn(Fault::Honest, EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let t = HttpTransport::new(credssp_test_config(port), creds()).unwrap();
+        let err = send_bounded(&t).await.unwrap_err();
+        assert!(
+            matches!(&err, WinrmError::AuthFailed(m) if m.starts_with("CredSSP outer TLS")),
+            "{err}"
+        );
+        assert!(log.lock().unwrap().is_empty(), "the server saw a request");
+    }
+
+    /// The CredSSP outer TLS offers no ALPN protocol.
+    #[cfg(feature = "credssp")]
+    #[test]
+    fn credssp_tls_outer_offers_no_alpn() {
+        let t = credssp_test_transport(5986);
+        assert!(
+            t.credssp_tls
+                .as_ref()
+                .unwrap()
+                .outer
+                .alpn_protocols
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn url_host_is_the_bracket_free_host_of_the_parsed_url() {
+        assert_eq!(url_host("https://[::1]:5986/wsman").as_deref(), Some("::1"));
+        assert_eq!(
+            url_host("https://bücher.example:5986/wsman").as_deref(),
+            Some("xn--bcher-kva.example")
+        );
+        assert_eq!(
+            url_host("https://Host.Example/x").as_deref(),
+            Some("host.example")
+        );
+        assert_eq!(url_host("not a url"), None);
+        assert_eq!(url_host("mailto:a@b"), None);
+    }
+
     fn ntlm_tls_transport(port: u16, proxy_port: u16) -> HttpTransport {
         let config = WinrmConfig {
             auth_method: AuthMethod::Ntlm,
             use_tls: true,
             accept_invalid_certs: true,
-            port,
-            proxy: Some(format!("http://127.0.0.1:{proxy_port}")),
+            port: Some(port),
+            proxy: Some(SecretString::from(format!("http://127.0.0.1:{proxy_port}"))),
             connect_timeout_secs: 5,
             operation_timeout_secs: 5,
             ..Default::default()
@@ -3078,9 +5580,10 @@ mod tests {
             ("127.0.0.1", port_a),
         ] {
             let url = format!("https://{host}:{port}/wsman");
+            let slot = transport.conn_slot(host, Lane::Data).await.unwrap();
             let reply = tokio::time::timeout(
                 Duration::from_secs(20),
-                transport.send_ntlm_over_tls(host, &url, "<soap/>"),
+                transport.send_ntlm_over_tls(host, &url, "<soap/>", slot),
             )
             .await
             .expect("NTLM exchange did not finish in 20 s")
@@ -3106,6 +5609,111 @@ mod tests {
         );
     }
 
+    /// The AV pairs of the NTLMv2 blob of a Type 3, read as
+    /// [`type3_channel_bindings`] reads them, up to and excluding `MsvAvEOL`.
+    fn parse_type3_av_pairs(type3: &[u8]) -> Vec<(u16, Vec<u8>)> {
+        let u16_at = |at: usize| u16::from_le_bytes([type3[at], type3[at + 1]]) as usize;
+        let (nt_len, nt_off) = (u16_at(20), u16_at(24) | (u16_at(26) << 16));
+        let nt = &type3[nt_off..nt_off + nt_len];
+        // NTProofStr (16) + blob header (28), then the AV pairs.
+        let mut pairs = &nt[16 + 28..];
+        let mut out = Vec::new();
+        while pairs.len() >= 4 {
+            let id = u16::from_le_bytes([pairs[0], pairs[1]]);
+            let len = u16::from_le_bytes([pairs[2], pairs[3]]) as usize;
+            if id == 0 {
+                break;
+            }
+            out.push((id, pairs[4..4 + len].to_vec()));
+            pairs = &pairs[4 + len..];
+        }
+        out
+    }
+
+    fn from_utf16le(bytes: &[u8]) -> String {
+        String::from_utf16(
+            &bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_le_bytes(*c))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+    }
+
+    /// Over TLS the Type 3 now carries a MIC, MsvAvFlags 0x2, the target name,
+    /// a zero LM response and the channel binding — as the plain-HTTP path does.
+    #[tokio::test]
+    async fn ntlm_over_tls_type3_carries_mic_flags_target_name_and_zero_lm() {
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
+        let (port, seen) = spawn_ntlm_tls_server(EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let transport = ntlm_tls_transport(port, spawn_connect_proxy());
+        let url = format!("https://127.0.0.1:{port}/wsman");
+        // Driven exactly like ntlm_cbt_binds_the_certificate_of_its_own_connection.
+        let slot = transport.conn_slot("127.0.0.1", Lane::Data).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            transport.send_ntlm_over_tls("127.0.0.1", &url, "<soap/>", slot),
+        )
+        .await
+        .expect("did not finish in 20 s")
+        .unwrap();
+        let type3 = seen.lock().unwrap().remove(0);
+        // LM security buffer (offset 12) is 24 bytes, all zero.
+        let lm_len = u16::from_le_bytes([type3[12], type3[13]]) as usize;
+        let lm_off = u32::from_le_bytes(type3[16..20].try_into().unwrap()) as usize;
+        assert_eq!(lm_len, 24);
+        // 64-byte header, 8-byte version, 16-byte MIC.
+        assert_eq!(lm_off, 88);
+        assert!(type3[lm_off..lm_off + 24].iter().all(|&b| b == 0));
+        // MIC (bytes 72..88 after the version field) is non-zero.
+        assert!(type3[72..88].iter().any(|&b| b != 0));
+        // AV pairs: MsvAvFlags has 0x2, MsvAvTargetName equals the SPN, CB equals cbt_of(cert).
+        let avs = parse_type3_av_pairs(&type3);
+        let av = |id: u16| avs.iter().find(|(i, _)| *i == id).map(|(_, v)| v.clone());
+        assert_eq!(
+            av(0x0006).map(|v| u32::from_le_bytes(v[..4].try_into().unwrap())),
+            Some(0x2)
+        );
+        assert_eq!(
+            av(0x0009).map(|v| from_utf16le(&v)),
+            Some(format!("http/127.0.0.1:{port}"))
+        );
+        assert_eq!(av(0x000A), Some(cbt_of(EC_CERT_PEM).to_vec()));
+    }
+
+    /// The MIC covers Type1 || Type2 || Type3 (with the MIC field zeroed).
+    #[tokio::test]
+    async fn ntlm_over_tls_mic_covers_type1_type2_type3() {
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
+        use base64::Engine as _;
+        let (port, seen) = spawn_ntlm_tls_server(EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let transport = ntlm_tls_transport(port, spawn_connect_proxy());
+        let url = format!("https://127.0.0.1:{port}/wsman");
+        let slot = transport.conn_slot("127.0.0.1", Lane::Data).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            transport.send_ntlm_over_tls("127.0.0.1", &url, "<soap/>", slot),
+        )
+        .await
+        .expect("did not finish in 20 s")
+        .unwrap();
+        let type3 = seen.lock().unwrap().remove(0);
+        // The client's Type 1 is deterministic; the server sent challenge_header().
+        let type1 = crate::ntlm::messages::create_negotiate_message();
+        let header = crate::test_ntlm_server::challenge_header();
+        let type2 = base64::engine::general_purpose::STANDARD
+            .decode(header.strip_prefix("Negotiate ").unwrap())
+            .unwrap();
+        let mut zeroed = type3.clone();
+        zeroed[72..88].fill(0);
+        let key = crate::test_ntlm_server::exported_session_key(&type3);
+        let mic =
+            crate::ntlm::crypto::hmac_md5(&key, &[type1.as_slice(), &type2, &zeroed].concat());
+        assert_eq!(&type3[72..88], &mic[..]);
+    }
+
     /// Over TLS, a handshake whose connection reports no server certificate
     /// fails instead of authenticating without channel binding.
     #[tokio::test]
@@ -3115,10 +5723,14 @@ mod tests {
         let proxy = spawn_connect_proxy();
         let transport = ntlm_tls_transport(port, proxy);
         // A client that does not report TLS details on its responses.
-        let tls = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(crate::tls::NoVerifier))
-            .with_no_client_auth();
+        let tls =
+            crate::tls::client_config_builder(&Arc::new(rustls::crypto::ring::default_provider()))
+                .unwrap()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(crate::tls::NoVerifier::new(
+                    &rustls::crypto::ring::default_provider(),
+                )))
+                .with_no_client_auth();
         let http = reqwest::Client::builder()
             .proxy(reqwest::Proxy::all(format!("http://127.0.0.1:{proxy}")).unwrap())
             .tls_backend_preconfigured(tls)
@@ -3147,10 +5759,14 @@ mod tests {
         use crate::test_pki::{RSA_CERT_PEM, RSA_KEY_PKCS1_PEM};
         let (port, seen) = spawn_ntlm_tls_server(RSA_CERT_PEM, RSA_KEY_PKCS1_PEM);
         let transport = ntlm_tls_transport(port, spawn_connect_proxy());
-        let tls = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(crate::tls::NoVerifier))
-            .with_no_client_auth();
+        let tls =
+            crate::tls::client_config_builder(&Arc::new(rustls::crypto::ring::default_provider()))
+                .unwrap()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(crate::tls::NoVerifier::new(
+                    &rustls::crypto::ring::default_provider(),
+                )))
+                .with_no_client_auth();
         let http = reqwest::Client::builder()
             .no_proxy()
             .tls_info(true)
@@ -3187,15 +5803,21 @@ mod tests {
         let send = async {
             if via_proxy {
                 // Dedicated connection: CertCapturingVerifier -> NoVerifier.
+                let slot = transport.conn_slot("127.0.0.1", Lane::Data).await.unwrap();
                 transport
-                    .send_ntlm_over_tls("127.0.0.1", &url, "<soap/>")
+                    .send_ntlm_over_tls("127.0.0.1", &url, "<soap/>", slot)
                     .await
             } else {
                 // Direct, as in `ntlm_cbt_comes_from_the_response_tls_details`.
-                let tls = rustls::ClientConfig::builder()
-                    .dangerous()
-                    .with_custom_certificate_verifier(Arc::new(crate::tls::NoVerifier))
-                    .with_no_client_auth();
+                let tls = crate::tls::client_config_builder(&Arc::new(
+                    rustls::crypto::ring::default_provider(),
+                ))
+                .unwrap()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(crate::tls::NoVerifier::new(
+                    &rustls::crypto::ring::default_provider(),
+                )))
+                .with_no_client_auth();
                 let http = reqwest::Client::builder()
                     .no_proxy()
                     .tls_info(true)
@@ -3238,9 +5860,12 @@ mod tests {
         assert_impostor_refused(&[&rustls::version::TLS12], false).await;
     }
 
-    /// The production shared client (`HttpTransport::new`: `build_http_client`
+    /// The production shared client (`WinrmClient::with_options` →
+    /// `HttpTransport::with_provider`: `build_http_client`
     /// with the preconfigured rustls config, no proxy) refuses the impostor
-    /// before any HTTP byte, so no Basic `Authorization` header leaves.
+    /// before any HTTP byte, so no Basic `Authorization` header leaves. The
+    /// impostor presents the pinned certificate (Basic refuses
+    /// `accept_invalid_certs`) and signs with another key.
     #[tokio::test]
     async fn impostor_is_refused_basic_shared_client() {
         for (label, versions) in [
@@ -3249,18 +5874,12 @@ mod tests {
         ] {
             let (port, read) =
                 crate::test_pki::spawn_tls_sink(crate::test_pki::impostor_server_config(versions));
-            let config = WinrmConfig {
-                auth_method: AuthMethod::Basic,
-                use_tls: true,
-                accept_invalid_certs: true,
-                port,
-                max_retries: 0,
-                connect_timeout_secs: 5,
-                operation_timeout_secs: 5,
-                ..Default::default()
-            };
-            let transport =
-                HttpTransport::new(config, WinrmCredentials::new(USER, PASS, "")).unwrap();
+            let config = tls_config(AuthMethod::Basic, port);
+            let transport = transport_with(
+                config,
+                &pinned(&[&sha256_hex(crate::test_pki::EC_CERT_PEM)]),
+            )
+            .unwrap();
             let result = tokio::time::timeout(
                 Duration::from_secs(20),
                 transport.send_soap_with_retry("127.0.0.1", "<soap/>".into()),
@@ -3304,8 +5923,8 @@ mod tests {
                 WinrmConfig {
                     auth_method: AuthMethod::Kerberos,
                     encryption: encryption.clone(),
-                    port,
-                    ..Default::default()
+                    port: Some(port),
+                    ..WinrmConfig::http()
                 },
                 WinrmCredentials::new("u", "p", ""),
             )
@@ -3332,7 +5951,76 @@ mod tests {
                 "HTTP/srv.corp.example",
             ),
         ] {
-            assert_eq!(transport.kerberos_auth(url).service_principal, spn);
+            assert_eq!(transport.kerberos_auth(url).unwrap().service_principal, spn);
+        }
+    }
+
+    #[test]
+    fn kerberos_kdc_timeout_is_the_request_budget() {
+        for secs in [0, 5] {
+            let config = WinrmConfig {
+                auth_method: AuthMethod::Basic,
+                use_tls: false,
+                encryption: EncryptionMode::Never,
+                operation_timeout_secs: secs,
+                ..Default::default()
+            };
+            let transport =
+                HttpTransport::new(config, WinrmCredentials::new("admin", "pass", "")).unwrap();
+            let auth = transport
+                .kerberos_auth("http://dc.winrm.test:5985/wsman")
+                .unwrap();
+            assert_eq!(auth.kdc_timeout, transport.request_budget(), "{secs}");
+            assert_eq!(auth.kdc_timeout, Duration::from_secs(secs + 10), "{secs}");
+        }
+    }
+
+    #[test]
+    fn kerberos_spn_uses_the_parsed_endpoint_host() {
+        let transport = basic_transport(5985);
+        for (url, spn) in [
+            (
+                "http://bücher.example:5985/wsman",
+                "HTTP/xn--bcher-kva.example",
+            ),
+            ("http://10.1:5985/wsman", "HTTP/10.0.0.1"),
+            ("http://0x7f.1:5985/wsman", "HTTP/127.0.0.1"),
+            // The configured spelling is kept: it is the parsed host up to
+            // ASCII case.
+            (
+                "http://WIN01.Corp.Local:5985/wsman",
+                "HTTP/WIN01.Corp.Local",
+            ),
+            ("http://[::1]:5985/wsman", "HTTP/::1"),
+            (
+                "https://srv.corp.example:5986/wsman",
+                "HTTP/srv.corp.example",
+            ),
+        ] {
+            assert_eq!(
+                transport.kerberos_auth(url).unwrap().service_principal,
+                spn,
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn kerberos_spn_host_is_the_tls_server_name_host() {
+        let transport = basic_transport(5986);
+        for host in VALID_HOSTS {
+            let url = endpoint_url(true, host, 5986);
+            let parsed = url_host(&url).unwrap();
+            let spn = transport.kerberos_auth(&url).unwrap().service_principal;
+            let spn_host = spn.strip_prefix("HTTP/").unwrap();
+            assert!(spn_host.eq_ignore_ascii_case(&parsed), "{url}: {spn}");
+            if let Some(name) = url_server_name(&url) {
+                assert_eq!(
+                    name,
+                    rustls::pki_types::ServerName::try_from(parsed).unwrap(),
+                    "{url}"
+                );
+            }
         }
     }
 
@@ -3412,32 +6100,342 @@ mod tests {
                 https,
                 "{mode:?} Kerberos HTTPS"
             );
+        }
+        // Basic never seals: over HTTP only `Never` builds, and over HTTPS
+        // only the modes that do not demand sealing.
+        assert!(!seals(AuthMethod::Basic, EncryptionMode::Never, false));
+        assert!(!seals(AuthMethod::Basic, EncryptionMode::Auto, true));
+        assert!(!seals(AuthMethod::Basic, EncryptionMode::Never, true));
+    }
+
+    /// Over HTTPS without certificate verification the server is not
+    /// authenticated, so `Auto` seals NTLM and Kerberos as over plain HTTP:
+    /// whoever answers never receives a body in clear. `Never` still does
+    /// not seal, and the methods that never seal are unchanged.
+    #[test]
+    fn auto_seals_over_https_when_the_certificate_is_not_verified() {
+        let config = |auth_method, encryption, use_tls, accept_invalid_certs| WinrmConfig {
+            auth_method,
+            encryption,
+            use_tls,
+            accept_invalid_certs,
+            ..Default::default()
+        };
+        let seals = |auth_method, encryption, use_tls, accept_invalid_certs| {
+            HttpTransport::new(
+                config(auth_method, encryption, use_tls, accept_invalid_certs),
+                WinrmCredentials::new("u", "p", ""),
+            )
+            .unwrap()
+            .seals()
+        };
+        for method in [AuthMethod::Ntlm, AuthMethod::Kerberos] {
+            let name = format!("{method:?}");
+            // HTTPS, certificate not verified: sealed under Auto and Always.
             assert!(
-                !seals(AuthMethod::Basic, mode.clone(), false),
-                "{mode:?} Basic"
+                seals(method.clone(), EncryptionMode::Auto, true, true),
+                "{name}"
+            );
+            assert!(
+                seals(method.clone(), EncryptionMode::Always, true, true),
+                "{name}"
+            );
+            // HTTPS, certificate verified: TLS alone under Auto.
+            assert!(
+                !seals(method.clone(), EncryptionMode::Auto, true, false),
+                "{name}"
+            );
+            // Plain HTTP: sealed under Auto, with or without the flag.
+            assert!(
+                seals(method.clone(), EncryptionMode::Auto, false, true),
+                "{name}"
+            );
+            assert!(
+                seals(method.clone(), EncryptionMode::Auto, false, false),
+                "{name}"
+            );
+            // `Never` is still accepted over HTTPS without verification, and
+            // still does not seal.
+            assert!(
+                !seals(method.clone(), EncryptionMode::Never, true, true),
+                "{name}"
             );
         }
+        assert_eq!(
+            Route::for_config(&config(AuthMethod::Ntlm, EncryptionMode::Auto, true, true)),
+            Route::Sealed
+        );
+        assert_eq!(
+            Route::for_config(&config(AuthMethod::Ntlm, EncryptionMode::Auto, true, false)),
+            Route::NtlmOverTls
+        );
+        if cfg!(feature = "kerberos") {
+            assert_eq!(
+                Route::for_config(&config(
+                    AuthMethod::Kerberos,
+                    EncryptionMode::Auto,
+                    true,
+                    true
+                )),
+                Route::Sealed
+            );
+        }
+        // Certificate auth never seals, verified or not.
+        assert!(!seals_for(&config(
+            AuthMethod::Certificate,
+            EncryptionMode::Auto,
+            true,
+            true
+        )));
     }
 
     // --- Bounded in-flight NTLM connections ---
 
     #[tokio::test]
-    async fn conn_slots_default_to_32() {
-        let (_server, _fake, transport, _host) = sealed_setup().await;
+    async fn slot_limits_are_32_per_host_8_cleanup_and_128_per_client() {
         assert_eq!(
-            transport.conn_slots.available_permits(),
-            MAX_CONNS_IN_FLIGHT
+            (
+                MAX_CONNS_PER_HOST,
+                CLEANUP_SLOTS_PER_HOST,
+                MAX_CONNS_IN_FLIGHT_TOTAL
+            ),
+            (32, 8, 128)
         );
-        assert_eq!(MAX_CONNS_IN_FLIGHT, 32);
+        let (_server, _fake, transport, host) = sealed_setup().await;
+        let (data, cleanup) = transport.host_slots(&host);
+        assert_eq!(
+            (data.available_permits(), cleanup.available_permits()),
+            (32, 8)
+        );
+        assert_eq!(transport.all_slots.available_permits(), 128);
     }
 
-    /// With every slot taken, a request waits, and gets a slot once one is
-    /// released.
+    #[tokio::test]
+    async fn slots_of_one_host_do_not_block_another_host() {
+        let (_server, _fake, transport, _host) = sealed_setup().await;
+        let _held = transport
+            .host_slots("a")
+            .0
+            .try_acquire_many_owned(32)
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            transport.conn_slot("b", Lane::Data),
+        )
+        .await
+        .expect("host b waited for host a")
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cleanup_requests_do_not_wait_behind_data_exchanges() {
+        let (_server, _fake, transport, _host) = sealed_setup().await;
+        let _host_full = transport
+            .host_slots("a")
+            .0
+            .try_acquire_many_owned(32)
+            .unwrap();
+        let _client_full = Arc::clone(&transport.all_slots)
+            .try_acquire_many_owned(128)
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            transport.conn_slot("a", Lane::Cleanup),
+        )
+        .await
+        .expect("clean-up waited behind data")
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn eight_cleanup_requests_to_one_host_proceed_at_once() {
+        let (_server, _fake, transport, _host) = sealed_setup().await;
+        let mut held = Vec::new();
+        for _ in 0..CLEANUP_SLOTS_PER_HOST {
+            held.push(
+                tokio::time::timeout(
+                    Duration::from_millis(100),
+                    transport.conn_slot("a", Lane::Cleanup),
+                )
+                .await
+                .expect("a clean-up request waited with all data slots free")
+                .unwrap(),
+            );
+        }
+        assert_eq!(held.len(), 8);
+        // The 9th waits for one of the 8.
+        let ninth = tokio::time::timeout(
+            Duration::from_millis(100),
+            transport.conn_slot("a", Lane::Cleanup),
+        )
+        .await;
+        assert!(ninth.is_err(), "a 9th clean-up request did not wait");
+        // The data slots of the host and the client are untouched.
+        assert_eq!(transport.host_slots("a").0.available_permits(), 32);
+        assert_eq!(transport.all_slots.available_permits(), 128);
+        // A freed slot lets the next one in.
+        held.pop();
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            transport.conn_slot("a", Lane::Cleanup),
+        )
+        .await
+        .expect("a freed clean-up slot was not reusable")
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn waiters_for_a_full_host_take_no_client_slot() {
+        let (_server, _fake, transport, _host) = sealed_setup().await;
+        let transport = Arc::new(transport);
+        let _held = transport
+            .host_slots("a")
+            .0
+            .try_acquire_many_owned(32)
+            .unwrap();
+        let waiters: Vec<_> = (0..10)
+            .map(|_| {
+                let t = Arc::clone(&transport);
+                tokio::spawn(async move { t.conn_slot("a", Lane::Data).await.map(drop) })
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            transport.all_slots.available_permits(),
+            128,
+            "queued waiters hold client slots"
+        );
+        waiters.iter().for_each(|w| w.abort());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn waiting_for_the_client_cap_respects_the_request_timeout() {
+        let config = WinrmConfig {
+            auth_method: AuthMethod::Ntlm,
+            operation_timeout_secs: 5,
+            ..Default::default()
+        };
+        let transport = HttpTransport::new(config, WinrmCredentials::new(USER, PASS, "")).unwrap();
+        let _full = Arc::clone(&transport.all_slots)
+            .try_acquire_many_owned(128)
+            .unwrap();
+        let err = transport
+            .conn_slot("c", Lane::Data)
+            .await
+            .expect_err("timed out");
+        assert!(matches!(err, WinrmError::Timeout(15)), "{err:?}");
+        assert_eq!(
+            transport.host_slots("c").0.available_permits(),
+            32,
+            "the host permit is released"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_pool_keeps_each_hosts_connections() {
+        let (_server, _fake, transport, _host) = sealed_setup().await;
+        transport.return_conn(transport.new_conn("b").unwrap());
+        for _ in 0..9 {
+            transport.return_conn(transport.new_conn("a").unwrap());
+        }
+        assert_eq!(transport.idle_count("a"), 8);
+        assert!(
+            transport.take_conn("b", false).is_some(),
+            "host a's traffic evicted host b"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_pool_drops_the_oldest_beyond_32_in_total() {
+        let (_server, _fake, transport, _host) = sealed_setup().await;
+        for h in ["h0", "h1", "h2", "h3", "h4"] {
+            for _ in 0..8 {
+                transport.return_conn(transport.new_conn(h).unwrap());
+            }
+        }
+        assert_eq!(transport.conn_pool().len(), 32);
+        assert_eq!(
+            (transport.idle_count("h0"), transport.idle_count("h4")),
+            (0, 8)
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_pool_matches_hosts_ignoring_ascii_case() {
+        let (_server, _fake, transport, _host) = sealed_setup().await;
+        transport.return_conn(transport.new_conn("WIN01").unwrap());
+        assert_eq!(transport.idle_count("win01"), 1);
+        assert!(transport.take_conn("win01", false).is_some());
+        transport.return_conn(transport.new_conn("win02").unwrap());
+        assert!(transport.take_conn("WIN02", false).is_some());
+    }
+
+    #[tokio::test]
+    async fn idle_pool_still_expires_connections_idle_too_long() {
+        let (_server, _fake, transport, _host) = sealed_setup().await;
+        let mut old = transport.new_conn("a").unwrap();
+        old.idle_since = Instant::now()
+            .checked_sub(CONN_MAX_IDLE + Duration::from_secs(1))
+            .expect("monotonic clock far enough from its origin");
+        transport.conn_pool().push(old);
+        transport.return_conn(transport.new_conn("a").unwrap());
+        assert!(transport.take_conn("a", false).is_some());
+        assert!(
+            transport.take_conn("a", false).is_none(),
+            "the old one expired"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_host_slot_entries_are_pruned() {
+        let (_server, _fake, transport, _host) = sealed_setup().await;
+        for h in ["h0", "h1", "h2"] {
+            drop(transport.conn_slot(h, Lane::Data).await.unwrap());
+        }
+        let held = transport.conn_slot("h3", Lane::Data).await.unwrap();
+        assert_eq!(
+            transport.host_slot_entries(),
+            1,
+            "h0..h2 pruned when the next host came in"
+        );
+        drop(transport.conn_slot("h4", Lane::Data).await.unwrap());
+        assert_eq!(
+            transport.host_slot_entries(),
+            2,
+            "h3 has a permit out and is kept"
+        );
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn cleanup_lane_carries_a_sealed_request_while_data_slots_are_full() {
+        let (_server, fake, transport, host) = sealed_setup().await;
+        let _held = transport
+            .host_slots(&host)
+            .0
+            .try_acquire_many_owned(32)
+            .unwrap();
+        let reply = tokio::time::timeout(
+            Duration::from_secs(2),
+            transport.send_soap_cleanup(&host, "<signal/>".into()),
+        )
+        .await
+        .expect("clean-up queued behind data")
+        .unwrap();
+        assert_eq!(reply, "<ok/>");
+        assert_eq!(fake.plaintext_bodies(), 0, "log: {:?}", fake.log());
+    }
+
+    /// With every slot of the host taken, a request waits, and gets a slot
+    /// once they are released.
     #[tokio::test]
     async fn a_request_waits_for_a_free_conn_slot() {
-        let (_server, fake, mut transport, host) = sealed_setup().await;
-        transport.conn_slots = tokio::sync::Semaphore::new(1);
-        let held = transport.conn_slots.try_acquire().unwrap();
+        let (_server, fake, transport, host) = sealed_setup().await;
+        let held = transport
+            .host_slots(&host)
+            .0
+            .try_acquire_many_owned(32)
+            .unwrap();
         let start = std::time::Instant::now();
         let (reply, ()) = tokio::join!(
             transport.send_soap_with_retry(&host, "<a/>".into()),
@@ -3460,24 +6458,216 @@ mod tests {
             operation_timeout_secs: 5,
             ..Default::default()
         };
-        let mut transport =
-            HttpTransport::new(config, WinrmCredentials::new(USER, PASS, "")).unwrap();
-        transport.conn_slots = tokio::sync::Semaphore::new(1);
-        let _held = transport.conn_slots.try_acquire().unwrap();
-        let err = transport.conn_slot().await.unwrap_err();
+        let transport = HttpTransport::new(config, WinrmCredentials::new(USER, PASS, "")).unwrap();
+        let _held = transport
+            .host_slots("h")
+            .0
+            .try_acquire_many_owned(32)
+            .unwrap();
+        let err = transport.conn_slot("h", Lane::Data).await.unwrap_err();
         assert!(matches!(err, WinrmError::Timeout(15)), "{err:?}");
     }
 
     /// A waiting request dropped (cancelled) leaves no slot taken.
     #[tokio::test]
     async fn a_cancelled_wait_for_a_conn_slot_takes_no_slot() {
-        let (_server, _fake, mut transport, _host) = sealed_setup().await;
-        transport.conn_slots = tokio::sync::Semaphore::new(1);
-        let held = transport.conn_slots.try_acquire().unwrap();
-        let waited = tokio::time::timeout(Duration::from_millis(50), transport.conn_slot()).await;
+        let (_server, _fake, transport, host) = sealed_setup().await;
+        let held = transport
+            .host_slots(&host)
+            .0
+            .try_acquire_many_owned(32)
+            .unwrap();
+        let waited = tokio::time::timeout(
+            Duration::from_millis(50),
+            transport.conn_slot(&host, Lane::Data),
+        )
+        .await;
         assert!(waited.is_err(), "the wait should still be pending");
         drop(held);
-        assert_eq!(transport.conn_slots.available_permits(), 1);
+        assert_eq!(transport.host_slots(&host).0.available_permits(), 32);
+        assert_eq!(transport.all_slots.available_permits(), 128);
+        // A slot can still be taken, and taking one costs exactly one permit
+        // of each kind.
+        let slot = tokio::time::timeout(
+            Duration::from_millis(100),
+            transport.conn_slot(&host, Lane::Data),
+        )
+        .await
+        .expect("a slot is available after the cancelled wait")
+        .unwrap();
+        assert_eq!(transport.host_slots(&host).0.available_permits(), 31);
+        assert_eq!(transport.all_slots.available_permits(), 127);
+        drop(slot);
+        assert_eq!(transport.host_slots(&host).0.available_permits(), 32);
+        assert_eq!(transport.all_slots.available_permits(), 128);
+    }
+
+    /// The hook is consulted once the request holds its slot: a switch turned
+    /// off while the request waited refuses it, and nothing reaches the host.
+    #[tokio::test]
+    async fn a_hook_flipped_during_the_slot_wait_refuses_the_request() {
+        let (_server, fake, mut transport, host) = sealed_setup().await;
+        let refuse = Arc::new(AtomicBool::new(false));
+        let r = Arc::clone(&refuse);
+        transport.set_before_send(legacy_hook(move || !r.load(Ordering::SeqCst)));
+        let held = transport
+            .host_slots(&host)
+            .0
+            .try_acquire_many_owned(32)
+            .unwrap();
+        let (result, ()) = tokio::join!(
+            transport.send_soap_with_retry(&host, "<a/>".into()),
+            async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                refuse.store(true, Ordering::SeqCst);
+                drop(held);
+            }
+        );
+        assert!(matches!(result, Err(WinrmError::Cancelled)), "{result:?}");
+        assert_eq!(fake.handshakes(), 0, "log: {:?}", fake.log());
+        assert!(fake.sealed().is_empty());
+    }
+
+    /// No slot within the request timeout: `Timeout`, and the hook is never
+    /// called (time is paused, so the wait is instant).
+    #[tokio::test(start_paused = true)]
+    async fn the_hook_is_not_called_when_the_slot_wait_times_out() {
+        let config = WinrmConfig {
+            auth_method: AuthMethod::Ntlm,
+            operation_timeout_secs: 5,
+            ..Default::default()
+        };
+        let mut transport =
+            HttpTransport::new(config, WinrmCredentials::new(USER, PASS, "")).unwrap();
+        let (hook, calls) = counting_hook(usize::MAX);
+        transport.set_before_send(hook);
+        let _held = transport
+            .host_slots("127.0.0.1")
+            .0
+            .try_acquire_many_owned(32)
+            .unwrap();
+        let err = transport
+            .send_soap_with_retry("127.0.0.1", "<a/>".into())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WinrmError::Timeout(15)), "{err:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// A hook that panics while its attempt holds a slot releases the slot
+    /// (the permit's Drop runs on unwind).
+    #[tokio::test]
+    async fn a_panicking_hook_releases_its_conn_slot() {
+        let (_server, fake, mut transport, host) = sealed_setup().await;
+        // The hook records the free data slots of the host when it runs: one
+        // fewer than the maximum shows the attempt already holds its slot.
+        let data = transport.host_slots(&host).0;
+        let seen = Arc::new(AtomicUsize::new(usize::MAX));
+        let s = Arc::clone(&seen);
+        transport.set_before_send(legacy_hook(move || -> bool {
+            s.store(data.available_permits(), Ordering::SeqCst);
+            panic!("hook")
+        }));
+        let transport = Arc::new(transport);
+        let (t, h) = (Arc::clone(&transport), host.clone());
+        let joined =
+            tokio::spawn(async move { t.send_soap_with_retry(&h, "<a/>".into()).await }).await;
+        assert!(joined.unwrap_err().is_panic());
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            MAX_CONNS_PER_HOST - 1,
+            "the hook ran while the attempt held its slot"
+        );
+        assert_eq!(
+            transport.host_slots(&host).0.available_permits(),
+            MAX_CONNS_PER_HOST
+        );
+        assert_eq!(
+            transport.all_slots.available_permits(),
+            MAX_CONNS_IN_FLIGHT_TOTAL
+        );
+        assert_eq!(fake.handshakes(), 0);
+    }
+
+    /// An invalid host fails before the hook: it uses up no approval.
+    #[tokio::test]
+    async fn the_hook_is_not_called_for_an_invalid_host() {
+        let mut transport = basic_transport(5985);
+        let (hook, calls) = counting_hook(usize::MAX);
+        transport.set_before_send(hook);
+        let err = transport
+            .send_soap_with_retry("bad host", "<a/>".into())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, WinrmError::AuthFailed(m) if m.contains("invalid host")),
+            "{err:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// One route drives both the dispatch and the slot decision.
+    #[test]
+    fn route_follows_method_mode_and_scheme() {
+        use EncryptionMode::{Always, Auto, Never};
+        let route = |auth_method, encryption, use_tls| {
+            Route::for_config(&WinrmConfig {
+                auth_method,
+                encryption,
+                use_tls,
+                ..Default::default()
+            })
+        };
+        // (mode, use_tls, NTLM, Kerberos with the `kerberos` feature)
+        for (mode, tls, ntlm, krb) in [
+            (Auto, false, Route::Sealed, Route::Sealed),
+            (Auto, true, Route::NtlmOverTls, Route::KerberosOverTls),
+            (Always, false, Route::Sealed, Route::Sealed),
+            (Always, true, Route::Sealed, Route::Sealed),
+            (Never, false, Route::NtlmPlain, Route::KerberosPlain),
+            (Never, true, Route::NtlmOverTls, Route::KerberosOverTls),
+        ] {
+            let krb = if cfg!(feature = "kerberos") {
+                krb
+            } else {
+                Route::KerberosPlain
+            };
+            assert_eq!(
+                route(AuthMethod::Ntlm, mode.clone(), tls),
+                ntlm,
+                "NTLM {mode:?} tls={tls}"
+            );
+            assert_eq!(
+                route(AuthMethod::Kerberos, mode.clone(), tls),
+                krb,
+                "Kerberos {mode:?} tls={tls}"
+            );
+            assert_eq!(route(AuthMethod::Basic, mode.clone(), tls), Route::Basic);
+            assert_eq!(
+                route(AuthMethod::Certificate, mode.clone(), tls),
+                Route::Certificate
+            );
+            assert_eq!(
+                route(AuthMethod::CredSsp, mode.clone(), tls),
+                Route::CredSsp
+            );
+        }
+        for r in [
+            Route::Sealed,
+            Route::NtlmOverTls,
+            Route::KerberosOverTls,
+            Route::CredSsp,
+        ] {
+            assert!(r.needs_conn_slot(), "{r:?}");
+        }
+        for r in [
+            Route::Basic,
+            Route::Certificate,
+            Route::NtlmPlain,
+            Route::KerberosPlain,
+        ] {
+            assert!(!r.needs_conn_slot(), "{r:?}");
+        }
     }
 
     /// Through a proxy (no TLS details on the response), a dedicated NTLM
@@ -3526,10 +6716,14 @@ mod tests {
         use rustls::pki_types::pem::PemObject;
         let (port, seen) = spawn_ntlm_tls_server(EC_CERT_PEM, EC_KEY_PKCS8_PEM);
         let transport = ntlm_tls_transport(port, spawn_connect_proxy());
-        let tls = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(crate::tls::NoVerifier))
-            .with_no_client_auth();
+        let tls =
+            crate::tls::client_config_builder(&Arc::new(rustls::crypto::ring::default_provider()))
+                .unwrap()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(crate::tls::NoVerifier::new(
+                    &rustls::crypto::ring::default_provider(),
+                )))
+                .with_no_client_auth();
         let http = reqwest::Client::builder()
             .no_proxy()
             .tls_info(true)
@@ -3555,7 +6749,8 @@ mod tests {
         assert_eq!(type3_channel_bindings(&seen[0]), Some(cbt_of(EC_CERT_PEM)));
     }
 
-    /// End to end through `HttpTransport::new` on a direct connection, with
+    /// End to end through the transport (`HttpTransport::new`, the default
+    /// options of `WinrmClient::with_options`) on a direct connection, with
     /// a P-384 certificate signed with ECDSA-SHA384: the CBT hashes the
     /// certificate with SHA-384 (known answer computed with Python
     /// `cryptography`, see `test_pki.rs`).
@@ -3567,7 +6762,10 @@ mod tests {
             auth_method: AuthMethod::Ntlm,
             use_tls: true,
             accept_invalid_certs: true,
-            port,
+            // The unsealed route over HTTPS, which this server speaks: `Auto`
+            // seals when the certificate is not verified.
+            encryption: EncryptionMode::Never,
+            port: Some(port),
             connect_timeout_secs: 5,
             operation_timeout_secs: 5,
             ..Default::default()
@@ -3589,6 +6787,121 @@ mod tests {
                 0xc4, 0x64
             ])
         );
+    }
+
+    /// The transport's provider, not the process-wide one, runs every
+    /// handshake. The server offers one TLS 1.3 suite: a client provider
+    /// limited to another suite fails on every client before any Type 3, one
+    /// limited to the server's suite succeeds.
+    #[tokio::test]
+    async fn explicit_provider_is_used_for_every_handshake() {
+        use rustls::crypto::ring::cipher_suite::{
+            TLS13_AES_128_GCM_SHA256, TLS13_CHACHA20_POLY1305_SHA256,
+        };
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+        let only = |s| {
+            Arc::new(CryptoProvider {
+                cipher_suites: vec![s],
+                ..rustls::crypto::ring::default_provider()
+            })
+        };
+        let chain =
+            vec![CertificateDer::from_pem_slice(crate::test_pki::EC_CERT_PEM.as_bytes()).unwrap()];
+        let key =
+            PrivateKeyDer::from_pem_slice(crate::test_pki::EC_KEY_PKCS8_PEM.as_bytes()).unwrap();
+        let (port, seen) = spawn_ntlm_tls_server_with(Arc::new(
+            rustls::ServerConfig::builder_with_provider(only(TLS13_AES_128_GCM_SHA256))
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(chain, key)
+                .unwrap(),
+        ));
+        let url = format!("https://127.0.0.1:{port}/wsman");
+        let transport = |auth_method: AuthMethod, proxy: Option<SecretString>, suite| {
+            // Basic refuses `accept_invalid_certs`: it pins the certificate.
+            let basic = matches!(auth_method, AuthMethod::Basic);
+            HttpTransport::with_provider(
+                WinrmConfig {
+                    auth_method,
+                    use_tls: true,
+                    accept_invalid_certs: !basic,
+                    // The unsealed NTLM route over HTTPS, which this server
+                    // speaks: `Auto` seals when the certificate is not
+                    // verified.
+                    encryption: EncryptionMode::Never,
+                    port: Some(port),
+                    proxy,
+                    connect_timeout_secs: 5,
+                    operation_timeout_secs: 5,
+                    ..Default::default()
+                },
+                WinrmCredentials::new(USER, PASS, ""),
+                TransportOptions {
+                    tls: if basic {
+                        pinned(&[&sha256_hex(crate::test_pki::EC_CERT_PEM)])
+                    } else {
+                        TlsOptions::default()
+                    },
+                    ..Default::default()
+                },
+                only(suite),
+                proxy::env_var,
+            )
+            .unwrap()
+        };
+        for (suite, handshakes) in [
+            (TLS13_CHACHA20_POLY1305_SHA256, false),
+            (TLS13_AES_128_GCM_SHA256, true),
+        ] {
+            let direct = transport(AuthMethod::Ntlm, None, suite);
+            let proxied = transport(
+                AuthMethod::Ntlm,
+                Some(SecretString::from(format!(
+                    "http://127.0.0.1:{}",
+                    spawn_connect_proxy()
+                ))),
+                suite,
+            );
+            let results = [
+                direct
+                    .send_soap_with_retry("127.0.0.1", "<soap/>".into())
+                    .await,
+                proxied
+                    .send_ntlm_over_tls(
+                        "127.0.0.1",
+                        &url,
+                        "<soap/>",
+                        proxied.conn_slot("127.0.0.1", Lane::Data).await.unwrap(),
+                    )
+                    .await,
+            ];
+            // Basic goes through the transport's shared client: the server
+            // answers it 400 once TLS is up.
+            let shared = transport(AuthMethod::Basic, None, suite)
+                .send_soap_with_retry("127.0.0.1", "<soap/>".into())
+                .await;
+            if handshakes {
+                for result in results {
+                    assert_eq!(result.unwrap(), "<ok/>");
+                }
+                assert!(
+                    matches!(&shared, Err(WinrmError::AuthFailed(m)) if m.starts_with("HTTP 400")),
+                    "shared client: {shared:?}"
+                );
+            } else {
+                for result in results {
+                    assert!(result.is_err(), "{result:?}");
+                }
+                assert!(
+                    matches!(&shared, Err(WinrmError::Http(e)) if e.is_connect()),
+                    "shared client: {shared:?}"
+                );
+                assert!(seen.lock().unwrap().is_empty(), "no Type 3 may be sent");
+            }
+        }
     }
 
     /// An answer carrying `Connection: close` ends that connection: the
@@ -3625,7 +6938,7 @@ mod tests {
         use rustls::pki_types::{CertificateDer, PrivateKeyDer};
         use std::io::{ErrorKind, Read, Write};
 
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        crate::test_pki::install_test_provider();
         let chain = vec![CertificateDer::from_pem_slice(cert_pem.as_bytes()).unwrap()];
         let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).unwrap();
         let config = Arc::new(
@@ -3693,6 +7006,9 @@ mod tests {
     /// with a copy of the client's TLS configuration, so the capturing
     /// verifier also sees the proxy's certificate. Only certificates of the
     /// target count: the handshake succeeds and binds the target's.
+    ///
+    /// The proxy's RSA self-signed certificate is not trusted, so this test
+    /// builds with `accept_invalid_proxy_certs`.
     #[tokio::test]
     async fn ntlm_cbt_through_an_https_proxy_binds_the_target_certificate() {
         use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM, RSA_CERT_PEM, RSA_KEY_PKCS1_PEM};
@@ -3702,18 +7018,26 @@ mod tests {
             auth_method: AuthMethod::Ntlm,
             use_tls: true,
             accept_invalid_certs: true,
-            port,
+            port: Some(port),
             // "localhost" for the proxy, "127.0.0.1" for the target: two names.
-            proxy: Some(format!("https://localhost:{proxy}")),
+            proxy: Some(SecretString::from(format!("https://localhost:{proxy}"))),
             connect_timeout_secs: 5,
             operation_timeout_secs: 5,
             ..Default::default()
         };
-        let transport = HttpTransport::new(config, WinrmCredentials::new(USER, PASS, "")).unwrap();
+        let transport = transport_with(
+            config,
+            &TlsOptions {
+                accept_invalid_proxy_certs: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let url = format!("https://127.0.0.1:{port}/wsman");
+        let slot = transport.conn_slot("127.0.0.1", Lane::Data).await.unwrap();
         let reply = tokio::time::timeout(
             Duration::from_secs(20),
-            transport.send_ntlm_over_tls("127.0.0.1", &url, "<soap/>"),
+            transport.send_ntlm_over_tls("127.0.0.1", &url, "<soap/>", slot),
         )
         .await
         .expect("did not finish in 20 s")
@@ -3721,6 +7045,1001 @@ mod tests {
         assert_eq!(reply, "<ok/>");
         let seen = seen.lock().unwrap().clone();
         assert_eq!(type3_channel_bindings(&seen[0]), Some(cbt_of(EC_CERT_PEM)));
+    }
+
+    /// An https endpoint reached through an HTTPS_PROXY from the environment:
+    /// reqwest's real proxy selection tunnels it, and the Type 3 still binds
+    /// the endpoint's certificate.
+    #[tokio::test]
+    async fn env_https_proxy_tunnel_keeps_ntlm_cbt() {
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
+        let (port, seen) = spawn_ntlm_tls_server(EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let (proxy_port, connects) = spawn_connect_proxy_counting();
+        let config = WinrmConfig {
+            auth_method: AuthMethod::Ntlm,
+            use_tls: true,
+            accept_invalid_certs: true,
+            port: Some(port),
+            connect_timeout_secs: 5,
+            operation_timeout_secs: 5,
+            ..Default::default()
+        };
+        let env =
+            move |n: &str| (n == "HTTPS_PROXY").then(|| format!("http://127.0.0.1:{proxy_port}"));
+        let transport = HttpTransport::new_with_env(
+            config,
+            WinrmCredentials::new(USER, PASS, ""),
+            TransportOptions {
+                use_env_proxy: true,
+                ..Default::default()
+            },
+            env,
+        )
+        .unwrap();
+        let url = format!("https://127.0.0.1:{port}/wsman");
+        assert_eq!(
+            transport.proxy_route().proxy_for(&url).map(|u| u.port()),
+            Some(Some(proxy_port))
+        );
+        let slot = transport.conn_slot("127.0.0.1", Lane::Data).await.unwrap();
+        let reply = transport
+            .send_ntlm_over_tls("127.0.0.1", &url, "<soap/>", slot)
+            .await
+            .unwrap();
+        assert_eq!(reply, "<ok/>");
+        assert!(
+            connects.load(Ordering::SeqCst) >= 1,
+            "the environment proxy was not used"
+        );
+        assert_eq!(
+            type3_channel_bindings(&seen.lock().unwrap()[0]),
+            Some(cbt_of(EC_CERT_PEM))
+        );
+    }
+
+    /// Plain HTTP that may follow a proxy from the environment is logged when
+    /// a client that reads the environment is built, with the proxy's
+    /// userinfo redacted.
+    #[tracing_test::traced_test]
+    #[test]
+    fn env_proxy_for_plain_http_is_logged_redacted() {
+        let env =
+            |n: &str| (n == "HTTP_PROXY").then(|| "http://user:s3cret@p.corp:3128".to_string());
+        let config = WinrmConfig {
+            auth_method: AuthMethod::Ntlm,
+            ..WinrmConfig::http()
+        };
+        HttpTransport::new_with_env(
+            config,
+            WinrmCredentials::new("u", "p", ""),
+            TransportOptions {
+                use_env_proxy: true,
+                ..Default::default()
+            },
+            env,
+        )
+        .unwrap();
+        assert!(logs_contain("may follow a proxy from the environment"));
+        assert!(logs_contain("<redacted>@p.corp:3128"));
+        assert!(!logs_contain("s3cret"));
+    }
+
+    /// No such WARN over HTTPS (the bodies are protected there and the proxy
+    /// only tunnels), nor when `WinrmConfig::proxy` is set, nor for a client
+    /// that does not read the environment (the default).
+    #[tracing_test::traced_test]
+    #[test]
+    fn no_env_proxy_warning_over_https_or_with_an_explicit_proxy() {
+        let env = |n: &str| (n == "HTTP_PROXY").then(|| "http://p.corp:3128".to_string());
+        let opted_in = TransportOptions {
+            use_env_proxy: true,
+            ..Default::default()
+        };
+        let https = WinrmConfig {
+            auth_method: AuthMethod::Ntlm,
+            use_tls: true,
+            port: Some(5986),
+            ..Default::default()
+        };
+        // The other two legs are plain HTTP, where the WARN would apply.
+        let explicit = WinrmConfig {
+            auth_method: AuthMethod::Ntlm,
+            proxy: Some(SecretString::from("http://explicit.corp:1")),
+            ..WinrmConfig::http()
+        };
+        let plain = WinrmConfig {
+            auth_method: AuthMethod::Ntlm,
+            ..WinrmConfig::http()
+        };
+        for (config, opts) in [
+            (https, opted_in.clone()),
+            (explicit, opted_in),
+            (plain, TransportOptions::default()),
+        ] {
+            HttpTransport::new_with_env(config, WinrmCredentials::new("u", "p", ""), opts, env)
+                .unwrap();
+        }
+        assert!(!logs_contain("may follow a proxy"));
+    }
+
+    /// Without `use_env_proxy` (the default), no variable is read and no
+    /// proxy applies.
+    #[test]
+    fn without_use_env_proxy_no_variable_is_read() {
+        let t = HttpTransport::new_with_env(
+            WinrmConfig::default(),
+            WinrmCredentials::new("u", "p", ""),
+            TransportOptions::default(),
+            |n: &str| -> Option<String> { panic!("{n} was read") },
+        )
+        .unwrap();
+        assert_eq!(t.proxy_route().proxy_for("http://win01:5985/wsman"), None);
+        assert!(!t.options().use_env_proxy);
+    }
+
+    /// Environment proxies are off by default: a transport built with the
+    /// default options takes no proxy from an environment that sets one.
+    #[test]
+    fn env_proxies_are_off_by_default() {
+        let env = |n: &str| {
+            (n == "HTTP_PROXY" || n == "HTTPS_PROXY").then(|| "http://10.0.0.1:3128".to_string())
+        };
+        let t = HttpTransport::new_with_env(
+            WinrmConfig::default(),
+            WinrmCredentials::new("u", "p", ""),
+            TransportOptions::default(),
+            env,
+        )
+        .unwrap();
+        assert_eq!(t.proxy_route().proxy_for("http://h:5985/wsman"), None);
+        assert_eq!(t.proxy_route().proxy_for("https://h:5986/wsman"), None);
+    }
+
+    /// CredSSP follows the environment's proxies once they are opted in, per
+    /// request: `HTTPS_PROXY` for one host, a direct connection for a host in
+    /// `NO_PROXY`, and an `https://` proxy refused for the request it applies
+    /// to. Without the opt-in both hosts are reached directly.
+    #[cfg(feature = "credssp")]
+    #[test]
+    fn credssp_follows_env_proxies_when_opted_in() {
+        fn build(use_env_proxy: bool, proxy: &'static str) -> HttpTransport {
+            HttpTransport::new_with_env(
+                tls_config(AuthMethod::CredSsp, 5986),
+                WinrmCredentials::new(USER, PASS, ""),
+                TransportOptions {
+                    use_env_proxy,
+                    ..Default::default()
+                },
+                move |n: &str| match n {
+                    "HTTPS_PROXY" => Some(proxy.to_string()),
+                    "NO_PROXY" => Some("excluded.test".to_string()),
+                    _ => None,
+                },
+            )
+            .unwrap()
+        }
+        let h = "https://h:5986/wsman";
+        let excluded = "https://excluded.test:5986/wsman";
+
+        let t = build(true, "http://10.0.0.1:3128");
+        assert!(t.options().use_env_proxy);
+        match &*t.credssp_dial_for(h).unwrap() {
+            proxy::CredSspDial::HttpConnect { proxy, .. } => assert_eq!(proxy, "10.0.0.1:3128"),
+            other => panic!("expected HttpConnect, got {other:?}"),
+        }
+        assert!(matches!(
+            *t.credssp_dial_for(excluded).unwrap(),
+            proxy::CredSspDial::Direct
+        ));
+
+        let t = build(false, "http://10.0.0.1:3128");
+        for url in [h, excluded] {
+            assert!(
+                matches!(
+                    *t.credssp_dial_for(url).unwrap(),
+                    proxy::CredSspDial::Direct
+                ),
+                "{url}"
+            );
+        }
+
+        // An https:// proxy from the environment is refused for the request
+        // it applies to, not when the client is built.
+        let t = build(true, "https://10.0.0.1:3128");
+        match t.credssp_dial_for(h) {
+            Err(WinrmError::AuthFailed(m)) => {
+                assert!(
+                    m.starts_with("CredSSP: an https:// proxy is not supported"),
+                    "{m}"
+                );
+            }
+            other => panic!("expected AuthFailed, got {other:?}"),
+        }
+        assert!(matches!(
+            *t.credssp_dial_for(excluded).unwrap(),
+            proxy::CredSspDial::Direct
+        ));
+
+        // `WinrmConfig::proxy` serves every endpoint, even when opted in:
+        // every request shares the dial resolved at construction.
+        let t = HttpTransport::new_with_env(
+            WinrmConfig {
+                proxy: Some(SecretString::from("http://user:pw@10.0.0.2:3128")),
+                ..tls_config(AuthMethod::CredSsp, 5986)
+            },
+            WinrmCredentials::new(USER, PASS, ""),
+            TransportOptions {
+                use_env_proxy: true,
+                ..Default::default()
+            },
+            |_: &str| -> Option<String> { panic!("the environment was read") },
+        )
+        .unwrap();
+        let first = t.credssp_dial_for(h).unwrap();
+        let second = t.credssp_dial_for(excluded).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        match &*first {
+            proxy::CredSspDial::HttpConnect { proxy, .. } => assert_eq!(proxy, "10.0.0.2:3128"),
+            other => panic!("expected HttpConnect, got {other:?}"),
+        }
+    }
+
+    // --- `Proxy-Support: Session-Based-Authentication` (RFC 4559 section 6) ---
+
+    /// Read the rest of an HTTP message body: `have` (bytes already read
+    /// past the head) completed from `rd` up to `len` bytes.
+    fn read_body_by_length(
+        rd: &mut impl std::io::Read,
+        mut have: Vec<u8>,
+        len: usize,
+    ) -> Result<Vec<u8>, String> {
+        let mut chunk = [0u8; 4096];
+        while have.len() < len {
+            let n = rd.read(&mut chunk).map_err(|e| e.to_string())?;
+            if n == 0 {
+                return Err("connection closed inside an HTTP body".into());
+            }
+            have.extend_from_slice(&chunk[..n]);
+        }
+        have.truncate(len);
+        Ok(have)
+    }
+
+    /// The `Content-Length` of an HTTP head, 0 when absent.
+    fn head_content_length(head: &str) -> usize {
+        head.lines()
+            .find_map(|l| {
+                let (name, value) = l.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse().ok())?
+            })
+            .unwrap_or(0)
+    }
+
+    /// A forwarding `http://` proxy on loopback, as a plain-HTTP endpoint
+    /// sees one: each request arrives in absolute form, is recorded (request
+    /// line), rewritten to origin form and sent on one upstream connection
+    /// per client connection (a 1:1 relay, so the NTLM handshake stays on
+    /// one server connection). Bodies are read by `Content-Length`. With
+    /// `session_support`, every 401 gets `Proxy-Support:
+    /// Session-Based-Authentication` and `Connection: Proxy-support` after
+    /// its status line, as Squid adds them.
+    fn spawn_forwarding_proxy(session_support: bool) -> (u16, Arc<Mutex<Vec<String>>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            while let Ok(client) = accept_with_deadline(&listener) {
+                let recorded = Arc::clone(&recorded);
+                std::thread::spawn(move || relay_forwarded(client, session_support, &recorded));
+            }
+        });
+        (port, seen)
+    }
+
+    /// One client connection of [`spawn_forwarding_proxy`].
+    fn relay_forwarded(
+        mut client: std::net::TcpStream,
+        session_support: bool,
+        seen: &Mutex<Vec<String>>,
+    ) -> Result<(), String> {
+        use std::io::Write;
+        let mut upstream: Option<std::net::TcpStream> = None;
+        loop {
+            let Ok((head, rest)) = read_http_head(&mut client) else {
+                return Ok(());
+            };
+            let body = read_body_by_length(&mut client, rest, head_content_length(&head))?;
+            let (line, headers) = head.split_once("\r\n").ok_or("no request line")?;
+            seen.lock().unwrap().push(line.to_string());
+            let mut parts = line.splitn(3, ' ');
+            let (verb, target, version) = (
+                parts.next().ok_or("no method")?,
+                parts.next().ok_or("no target")?,
+                parts.next().ok_or("no version")?,
+            );
+            let rest_of_target = target
+                .strip_prefix("http://")
+                .ok_or("not an absolute-form target")?;
+            let (authority, path) = rest_of_target
+                .split_once('/')
+                .map_or((rest_of_target, String::from("/")), |(a, p)| {
+                    (a, format!("/{p}"))
+                });
+            if upstream.is_none() {
+                let tcp = std::net::TcpStream::connect(authority).map_err(|e| e.to_string())?;
+                tcp.set_read_timeout(Some(MTLS_SERVER_DEADLINE))
+                    .map_err(|e| e.to_string())?;
+                upstream = Some(tcp);
+            }
+            let up = upstream.as_mut().ok_or("no upstream")?;
+            up.write_all(format!("{verb} {path} {version}\r\n{headers}").as_bytes())
+                .map_err(|e| e.to_string())?;
+            up.write_all(&body).map_err(|e| e.to_string())?;
+
+            let (resp_head, resp_rest) = read_http_head(up)?;
+            let resp_body = read_body_by_length(up, resp_rest, head_content_length(&resp_head))?;
+            let (status_line, resp_headers) =
+                resp_head.split_once("\r\n").ok_or("no status line")?;
+            let extra = if session_support && status_line.split(' ').nth(1) == Some("401") {
+                "Proxy-Support: Session-Based-Authentication\r\nConnection: Proxy-support\r\n"
+            } else {
+                ""
+            };
+            client
+                .write_all(format!("{status_line}\r\n{extra}{resp_headers}").as_bytes())
+                .map_err(|e| e.to_string())?;
+            client.write_all(&resp_body).map_err(|e| e.to_string())?;
+            let closes = resp_headers.lines().any(|l| {
+                l.split_once(':').is_some_and(|(n, v)| {
+                    n.trim().eq_ignore_ascii_case("connection")
+                        && v.to_ascii_lowercase().contains("close")
+                })
+            });
+            if closes {
+                return Ok(());
+            }
+        }
+    }
+
+    /// An NTLM transport for the fake endpoint `server`, through the
+    /// forwarding proxy on `proxy_port`, with `encryption` and `policy`.
+    fn ntlm_via_proxy(
+        proxy_port: u16,
+        server: &MockServer,
+        encryption: EncryptionMode,
+        policy: ProxySessionAuth,
+    ) -> HttpTransport {
+        let config = WinrmConfig {
+            auth_method: AuthMethod::Ntlm,
+            port: Some(server.address().port()),
+            use_tls: false,
+            encryption,
+            proxy: Some(SecretString::from(format!("http://127.0.0.1:{proxy_port}"))),
+            operation_timeout_secs: 10,
+            ..Default::default()
+        };
+        HttpTransport::new_with_env(
+            config,
+            WinrmCredentials::new(USER, PASS, ""),
+            TransportOptions {
+                proxy_session_auth: policy,
+                ..Default::default()
+            },
+            |_| None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn proxy_session_auth_defaults_to_allow() {
+        assert_eq!(ProxySessionAuth::default(), ProxySessionAuth::Allow);
+        assert_eq!(
+            TransportOptions::default().proxy_session_auth,
+            ProxySessionAuth::Allow
+        );
+    }
+
+    #[tokio::test]
+    async fn never_through_a_proxy_without_session_auth_is_refused_before_type3() {
+        let server = MockServer::start().await;
+        let fake = FakeNtlmServer::mount(&server).await;
+        let (proxy, _seen) = spawn_forwarding_proxy(false);
+        let t = ntlm_via_proxy(
+            proxy,
+            &server,
+            EncryptionMode::Never,
+            ProxySessionAuth::RequireWhenUnsealed,
+        );
+        let err = t
+            .send_soap_raw(&server.address().ip().to_string(), "<a/>".into())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, WinrmError::AuthFailed(m) if m.contains("Session-Based-Authentication") && m.contains("proxy_session_auth")),
+            "{err:?}"
+        );
+        assert_eq!(fake.log(), vec![Event::Negotiate], "no Type 3 may follow");
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn sealed_through_a_proxy_without_session_auth_warns_once_per_host() {
+        let server = MockServer::start().await;
+        let fake = FakeNtlmServer::mount(&server).await;
+        fake.close_after_auth(1); // two handshakes
+        let (proxy, _seen) = spawn_forwarding_proxy(false);
+        let t = ntlm_via_proxy(
+            proxy,
+            &server,
+            EncryptionMode::Auto,
+            ProxySessionAuth::RequireWhenUnsealed,
+        );
+        t.send_soap_raw(&server.address().ip().to_string(), "<a/>".into())
+            .await
+            .unwrap();
+        assert_eq!(fake.handshakes(), 2);
+        logs_assert(|lines| {
+            match lines
+                .iter()
+                .filter(|l| l.contains("did not announce"))
+                .count()
+            {
+                1 => Ok(()),
+                n => Err(format!("{n} warnings")),
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn proxy_announcing_session_auth_is_accepted_even_under_require() {
+        let server = MockServer::start().await;
+        let _fake = FakeNtlmServer::mount(&server).await;
+        let (proxy, seen) = spawn_forwarding_proxy(true);
+        let t = ntlm_via_proxy(
+            proxy,
+            &server,
+            EncryptionMode::Never,
+            ProxySessionAuth::Require,
+        );
+        let reply = t
+            .send_soap_raw(&server.address().ip().to_string(), "<a/>".into())
+            .await
+            .unwrap();
+        assert_eq!(reply, "<ok/>");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "Type 1 and Type 3 through the proxy");
+        assert!(
+            seen.iter().all(|l| l.starts_with("POST http://")),
+            "absolute form through the proxy"
+        );
+    }
+
+    #[tokio::test]
+    async fn allow_skips_the_check() {
+        let server = MockServer::start().await;
+        let fake = FakeNtlmServer::mount(&server).await;
+        let (proxy, seen) = spawn_forwarding_proxy(false);
+        let t = ntlm_via_proxy(
+            proxy,
+            &server,
+            EncryptionMode::Never,
+            ProxySessionAuth::Allow,
+        );
+        let reply = t
+            .send_soap_raw(&server.address().ip().to_string(), "<a/>".into())
+            .await
+            .unwrap();
+        assert_eq!(reply, "<ok/>");
+        assert_eq!(fake.handshakes(), 1);
+        assert!(
+            !seen.lock().unwrap().is_empty(),
+            "the request went through the proxy"
+        );
+    }
+
+    #[test]
+    fn only_http_endpoints_through_http_proxies_are_gated() {
+        let creds = || WinrmCredentials::new("u", "p", "");
+        let build = |proxy: Option<&str>,
+                     use_tls: bool,
+                     env: &'static [(&'static str, &'static str)],
+                     policy| {
+            let config = WinrmConfig {
+                auth_method: AuthMethod::Ntlm,
+                use_tls,
+                encryption: EncryptionMode::Never,
+                proxy: proxy.map(SecretString::from),
+                ..Default::default()
+            };
+            let var = move |k: &str| {
+                env.iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| (*v).to_string())
+            };
+            HttpTransport::new_with_env(
+                config,
+                creds(),
+                TransportOptions {
+                    proxy_session_auth: policy,
+                    use_env_proxy: true,
+                    ..Default::default()
+                },
+                var,
+            )
+            .unwrap()
+        };
+        let d = ProxySessionAuth::RequireWhenUnsealed;
+        assert!(
+            build(Some("http://p:3128"), false, &[], d)
+                .proxy_gate("http://win01:5985/wsman")
+                .is_some()
+        );
+        assert!(
+            build(Some("socks5h://s:1080"), false, &[], d)
+                .proxy_gate("http://win01:5985/wsman")
+                .is_none()
+        );
+        assert!(
+            build(Some("http://p:3128"), true, &[], d)
+                .proxy_gate("https://win01:5986/wsman")
+                .is_none()
+        );
+        assert!(
+            build(Some("http://p:3128"), false, &[], ProxySessionAuth::Allow)
+                .proxy_gate("http://win01:5985/wsman")
+                .is_none()
+        );
+        let env = build(
+            None,
+            false,
+            &[("HTTP_PROXY", "http://p:3128"), ("NO_PROXY", "win01")],
+            d,
+        );
+        assert!(env.proxy_gate("http://win01:5985/wsman").is_none());
+        assert!(env.proxy_gate("http://win02:5985/wsman").is_some());
+    }
+
+    #[cfg(feature = "kerberos")]
+    #[tokio::test]
+    async fn kerberos_probe_runs_once_per_host_and_refuses_before_the_ap_req() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401).insert_header("WWW-Authenticate", "Negotiate"))
+            .mount(&server)
+            .await;
+        let (proxy, seen) = spawn_forwarding_proxy(false);
+        let config = WinrmConfig {
+            auth_method: AuthMethod::Kerberos,
+            port: Some(server.address().port()),
+            encryption: EncryptionMode::Never,
+            proxy: Some(SecretString::from(format!("http://127.0.0.1:{proxy}"))),
+            operation_timeout_secs: 5,
+            ..WinrmConfig::http()
+        };
+        let t = HttpTransport::new_with_env(
+            config,
+            WinrmCredentials::new("u", "p", ""),
+            TransportOptions {
+                proxy_session_auth: ProxySessionAuth::RequireWhenUnsealed,
+                ..Default::default()
+            },
+            |_| None,
+        )
+        .unwrap();
+        let host = server.address().ip().to_string();
+        for _ in 0..2 {
+            let err = t.send_soap_raw(&host, "<a/>".into()).await.unwrap_err();
+            assert!(
+                err.to_string().contains("Session-Based-Authentication"),
+                "{err}"
+            );
+        }
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "one probe for the client's life"
+        );
+        let received = server.received_requests().await.unwrap();
+        assert!(
+            received
+                .iter()
+                .all(|r| !r.headers.contains_key("authorization")),
+            "no AP-REQ was sent"
+        );
+    }
+
+    /// A Kerberos transport (`EncryptionMode::Never`) for `server`, through
+    /// the forwarding proxy on `proxy_port`, with `policy`.
+    #[cfg(feature = "kerberos")]
+    fn kerberos_via_proxy(
+        proxy_port: u16,
+        server: &MockServer,
+        policy: ProxySessionAuth,
+    ) -> HttpTransport {
+        let config = WinrmConfig {
+            auth_method: AuthMethod::Kerberos,
+            port: Some(server.address().port()),
+            encryption: EncryptionMode::Never,
+            proxy: Some(SecretString::from(format!("http://127.0.0.1:{proxy_port}"))),
+            operation_timeout_secs: 5,
+            ..WinrmConfig::http()
+        };
+        HttpTransport::new_with_env(
+            config,
+            WinrmCredentials::new("u", "p", ""),
+            TransportOptions {
+                proxy_session_auth: policy,
+                ..Default::default()
+            },
+            |_| None,
+        )
+        .unwrap()
+    }
+
+    /// The probes `server` received: requests without `Authorization` (an
+    /// AP-REQ, if a ticket could be had here, carries one).
+    #[cfg(feature = "kerberos")]
+    async fn probes(server: &MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| !r.headers.contains_key("authorization"))
+            .count()
+    }
+
+    /// Whether `err` is a refusal of the proxy check.
+    #[cfg(feature = "kerberos")]
+    fn is_proxy_refusal(err: &WinrmError) -> bool {
+        err.to_string().contains("proxy_session_auth")
+    }
+
+    /// A probe answered by something other than the server's 401 is not
+    /// kept: the next request probes again, and goes on once a 401 with the
+    /// announcement comes back.
+    #[cfg(feature = "kerberos")]
+    #[tokio::test]
+    async fn kerberos_probe_without_a_401_is_not_kept() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(502))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401).insert_header("WWW-Authenticate", "Negotiate"))
+            .mount(&server)
+            .await;
+        let (proxy, _seen) = spawn_forwarding_proxy(true);
+        let t = kerberos_via_proxy(proxy, &server, ProxySessionAuth::Require);
+        let host = server.address().ip().to_string();
+        let err = t.send_soap_raw(&host, "<a/>".into()).await.unwrap_err();
+        assert!(
+            is_proxy_refusal(&err) && err.to_string().contains("502"),
+            "{err}"
+        );
+        let err = t.send_soap_raw(&host, "<a/>".into()).await.unwrap_err();
+        assert!(!is_proxy_refusal(&err), "the check passed: {err}");
+        assert_eq!(probes(&server).await, 2, "the 502 was not kept");
+    }
+
+    /// A 407 under `Require` is refused with its status named, and not kept.
+    #[cfg(feature = "kerberos")]
+    #[tokio::test]
+    async fn kerberos_probe_answered_407_is_refused_and_not_kept() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(407))
+            .mount(&server)
+            .await;
+        let (proxy, _seen) = spawn_forwarding_proxy(true);
+        let t = kerberos_via_proxy(proxy, &server, ProxySessionAuth::Require);
+        let host = server.address().ip().to_string();
+        for _ in 0..2 {
+            let err = t.send_soap_raw(&host, "<a/>".into()).await.unwrap_err();
+            assert!(
+                is_proxy_refusal(&err)
+                    && err.to_string().contains("407")
+                    && !err.to_string().contains("with the server's 401"),
+                "{err}"
+            );
+        }
+        assert_eq!(probes(&server).await, 2, "the 407 was not kept");
+    }
+
+    /// A kept announcement lets every later request through to the
+    /// Kerberos exchange, with no second probe.
+    #[cfg(feature = "kerberos")]
+    #[tokio::test]
+    async fn kerberos_kept_announcement_lets_the_request_through() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401).insert_header("WWW-Authenticate", "Negotiate"))
+            .mount(&server)
+            .await;
+        let (proxy, _seen) = spawn_forwarding_proxy(true);
+        let t = kerberos_via_proxy(proxy, &server, ProxySessionAuth::Require);
+        let host = server.address().ip().to_string();
+        for _ in 0..2 {
+            if let Err(err) = t.send_soap_raw(&host, "<a/>".into()).await {
+                assert!(!is_proxy_refusal(&err), "the check passed: {err}");
+            }
+        }
+        assert_eq!(probes(&server).await, 1, "one probe, kept");
+    }
+
+    /// Under `Allow` no probe is sent.
+    #[cfg(feature = "kerberos")]
+    #[tokio::test]
+    async fn kerberos_allow_sends_no_probe() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401).insert_header("WWW-Authenticate", "Negotiate"))
+            .mount(&server)
+            .await;
+        let (proxy, _seen) = spawn_forwarding_proxy(false);
+        let t = kerberos_via_proxy(proxy, &server, ProxySessionAuth::Allow);
+        let host = server.address().ip().to_string();
+        for _ in 0..2 {
+            if let Err(err) = t.send_soap_raw(&host, "<a/>".into()).await {
+                assert!(!is_proxy_refusal(&err), "{err}");
+            }
+        }
+        assert_eq!(probes(&server).await, 0);
+    }
+
+    /// Basic over plain HTTP through an `https://` proxy on loopback whose
+    /// certificate is the self-signed CA:TRUE `EC_CERT_PEM`, with the proxy
+    /// credentials in its URL. Returns the result and the application bytes
+    /// the proxy read.
+    async fn basic_through_a_self_signed_https_proxy(
+        accept_invalid_certs: bool,
+        opts: &TlsOptions,
+    ) -> (Result<String, WinrmError>, usize) {
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
+        let (p, read) = crate::test_pki::spawn_tls_sink(crate::test_pki::server_config(
+            EC_CERT_PEM,
+            EC_KEY_PKCS8_PEM,
+        ));
+        let config = WinrmConfig {
+            use_tls: false,
+            encryption: EncryptionMode::Never,
+            accept_invalid_certs,
+            proxy: Some(SecretString::from(format!(
+                "https://proxyuser:proxysecret@localhost:{p}"
+            ))),
+            ..tls_config(AuthMethod::Basic, 5985)
+        };
+        let t = transport_with(config, opts).unwrap();
+        let result = send_basic(&t, "127.0.0.1").await;
+        (result, read.load(Ordering::SeqCst))
+    }
+
+    /// `accept_invalid_certs` does not reach the proxy leg: the untrusted
+    /// proxy is refused before the proxy credentials are sent.
+    #[tokio::test]
+    async fn https_proxy_is_verified_under_accept_invalid_certs_plain_http() {
+        let (result, read) =
+            basic_through_a_self_signed_https_proxy(true, &TlsOptions::default()).await;
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(read, 0, "Proxy-Authorization must not have been sent");
+    }
+
+    /// The same over HTTPS: the origin is accepted under the flag, the
+    /// untrusted proxy is not, and no Type 3 is sent.
+    #[tokio::test]
+    async fn https_proxy_is_verified_under_accept_invalid_certs_over_tls() {
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM, RSA_CERT_PEM, RSA_KEY_PKCS1_PEM};
+        let (port, seen) = spawn_ntlm_tls_server(EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let p = spawn_https_connect_proxy(RSA_CERT_PEM, RSA_KEY_PKCS1_PEM);
+        let config = WinrmConfig {
+            accept_invalid_certs: true,
+            proxy: Some(SecretString::from(format!("https://localhost:{p}"))),
+            ..tls_config(AuthMethod::Ntlm, port)
+        };
+        let url = format!("https://127.0.0.1:{port}/wsman");
+        let t = transport_with(config, &TlsOptions::default()).unwrap();
+        let refused = ntlm_over_tls(&t, &url).await;
+        assert!(refused.is_err(), "{refused:?}");
+        assert!(seen.lock().unwrap().is_empty(), "no Type 3 was sent");
+    }
+
+    /// A proxy that chains to an added root is accepted under the flag, and
+    /// the origin is still accepted (and bound) under it.
+    #[tokio::test]
+    async fn https_proxy_trusted_by_extra_root_is_accepted() {
+        use crate::test_pki::{
+            CA_LEAF_KEY_PEM, CA_LEAF_PEM, EC_CERT_PEM, EC_KEY_PKCS8_PEM, TEST_CA_PEM,
+        };
+        let ca = root_file("ca-proxy-under-flag", TEST_CA_PEM);
+        let (port, seen) = spawn_ntlm_tls_server(EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let p = spawn_https_connect_proxy(CA_LEAF_PEM, CA_LEAF_KEY_PEM);
+        let config = WinrmConfig {
+            accept_invalid_certs: true,
+            proxy: Some(SecretString::from(format!("https://localhost:{p}"))),
+            ..tls_config(AuthMethod::Ntlm, port)
+        };
+        let url = format!("https://127.0.0.1:{port}/wsman");
+        let t = transport_with(config, &roots(&[&ca])).unwrap();
+        assert_eq!(ntlm_over_tls(&t, &url).await.unwrap(), "<ok/>");
+        let recorded = seen.lock().unwrap().clone();
+        assert_eq!(
+            type3_channel_bindings(&recorded[0]),
+            Some(cbt_of(EC_CERT_PEM))
+        );
+    }
+
+    /// The opt-out restores the 1.4 behaviour on the proxy leg.
+    #[tokio::test]
+    async fn danger_accept_invalid_proxy_certs_restores_the_old_behaviour() {
+        let opts = TlsOptions {
+            accept_invalid_proxy_certs: true,
+            ..Default::default()
+        };
+        let (_, read) = basic_through_a_self_signed_https_proxy(true, &opts).await;
+        assert!(read > 0, "the proxy must have been accepted");
+    }
+
+    /// The opt-out concerns the proxy leg only: an untrusted origin is still
+    /// refused.
+    #[tokio::test]
+    async fn accepting_invalid_proxy_certs_still_verifies_the_origin() {
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM, RSA_CERT_PEM, RSA_KEY_PKCS1_PEM};
+        let (port, seen) = spawn_ntlm_tls_server(EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let p = spawn_https_connect_proxy(RSA_CERT_PEM, RSA_KEY_PKCS1_PEM);
+        let config = WinrmConfig {
+            accept_invalid_certs: false,
+            proxy: Some(SecretString::from(format!("https://localhost:{p}"))),
+            ..tls_config(AuthMethod::Ntlm, port)
+        };
+        let opts = TlsOptions {
+            accept_invalid_proxy_certs: true,
+            ..Default::default()
+        };
+        let url = format!("https://127.0.0.1:{port}/wsman");
+        let t = transport_with(config, &opts).unwrap();
+        let refused = ntlm_over_tls(&t, &url).await;
+        assert!(refused.is_err(), "{refused:?}");
+        assert!(seen.lock().unwrap().is_empty(), "no Type 3 was sent");
+
+        // The refusal came from the origin: with the origin pinned, the same
+        // proxy is accepted and the exchange completes.
+        let config = WinrmConfig {
+            proxy: Some(SecretString::from(format!("https://localhost:{p}"))),
+            ..tls_config(AuthMethod::Ntlm, port)
+        };
+        let opts = TlsOptions {
+            accept_invalid_proxy_certs: true,
+            pins: vec![sha256_hex(EC_CERT_PEM)],
+            ..Default::default()
+        };
+        let t = transport_with(config, &opts).unwrap();
+        assert_eq!(ntlm_over_tls(&t, &url).await.unwrap(), "<ok/>");
+    }
+
+    /// A host with the server name of the `https://` proxy would be accepted
+    /// unverified under the opt-out: it is refused before anything is sent.
+    #[tokio::test]
+    async fn accepting_invalid_proxy_certs_refuses_a_host_named_like_the_proxy() {
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
+        let (port, read) = crate::test_pki::spawn_tls_sink(crate::test_pki::server_config(
+            EC_CERT_PEM,
+            EC_KEY_PKCS8_PEM,
+        ));
+        let config = WinrmConfig {
+            proxy: Some(SecretString::from(format!("https://localhost:{port}"))),
+            ..tls_config(AuthMethod::Basic, port)
+        };
+        let opts = TlsOptions {
+            accept_invalid_proxy_certs: true,
+            ..Default::default()
+        };
+        let t = transport_with(config, &opts).unwrap();
+        match send_basic(&t, "localhost").await {
+            Err(WinrmError::AuthFailed(m)) => assert_eq!(
+                m,
+                "danger_accept_invalid_proxy_certs: host localhost has the name of an https:// \
+                 proxy; it would not be verified, refusing"
+            ),
+            other => panic!("expected AuthFailed, got {other:?}"),
+        }
+        assert_eq!(read.load(Ordering::SeqCst), 0);
+    }
+
+    /// `accept_invalid_certs` does not reach a host with the server name of
+    /// the `https://` proxy: the proxy's verifier gets that name, so the
+    /// host's certificate is verified strictly and the request fails with an
+    /// ordinary certificate error (there is no named refusal for this case,
+    /// which the pin and the opt-out have). Any other host name is accepted
+    /// unverified, as the flag says.
+    #[tokio::test]
+    async fn accept_invalid_certs_still_verifies_a_host_named_like_the_https_proxy() {
+        use crate::test_pki::TEST_CA_PEM;
+        use crate::test_pki::{
+            CA_LEAF_KEY_PEM, CA_LEAF_PEM, NON_CA_SELF_SIGNED_KEY_PEM, NON_CA_SELF_SIGNED_PEM,
+        };
+        let ca = root_file("ca-invalid-certs-name", TEST_CA_PEM);
+        // Certificate auth: Basic refuses `accept_invalid_certs`, and this
+        // one also goes through the shared client.
+        let client_files = pem_files(
+            "invalid-certs-name",
+            crate::test_pki::EC_CERT_PEM,
+            crate::test_pki::EC_KEY_PKCS8_PEM,
+        );
+        let p = spawn_https_connect_proxy(CA_LEAF_PEM, CA_LEAF_KEY_PEM);
+        for (host, accepted) in [("localhost", false), ("127.0.0.1", true)] {
+            // The listener's certificate is self-signed and not trusted.
+            let (port, read) = crate::test_pki::spawn_tls_sink(crate::test_pki::server_config(
+                NON_CA_SELF_SIGNED_PEM,
+                NON_CA_SELF_SIGNED_KEY_PEM,
+            ));
+            let config = WinrmConfig {
+                accept_invalid_certs: true,
+                proxy: Some(SecretString::from(format!("https://localhost:{p}"))),
+                ..cert_tls_config(&client_files)
+            };
+            let config = WinrmConfig {
+                port: Some(port),
+                max_retries: 0,
+                connect_timeout_secs: 5,
+                operation_timeout_secs: 5,
+                ..config
+            };
+            let t = transport_with(config, &roots(&[&ca])).unwrap();
+            let result = send_basic(&t, host).await;
+            let read = read.load(Ordering::SeqCst);
+            if accepted {
+                assert!(read > 0, "{host}: accept_invalid_certs applies: {result:?}");
+            } else {
+                let chain = http_error_chain(result);
+                assert!(chain.contains("UnknownIssuer"), "{host}: {chain}");
+                assert_eq!(read, 0, "{host}");
+            }
+        }
+    }
+
+    /// A server that accepts the connection and never answers leaves the
+    /// handshake, retry included, to the budget it was given.
+    #[tokio::test]
+    async fn sealing_handshake_is_bounded_as_a_whole() {
+        // Accepted by the kernel backlog, never answered.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = WinrmConfig {
+            auth_method: AuthMethod::Ntlm,
+            port: Some(port),
+            operation_timeout_secs: 5,
+            ..WinrmConfig::http()
+        };
+        let transport = HttpTransport::new(config, WinrmCredentials::new(USER, PASS, "")).unwrap();
+        let url = transport.endpoint("127.0.0.1");
+        let start = std::time::Instant::now();
+        let err = transport
+            .open_authenticated_conn("127.0.0.1", &url, Duration::from_secs(1))
+            .await
+            .err()
+            .expect("stalled handshake");
+        assert!(matches!(err, WinrmError::Timeout(1)), "{err:?}");
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            start.elapsed()
+        );
+        drop(listener);
+    }
+
+    #[test]
+    fn request_budget_is_the_operation_timeout_plus_10_seconds() {
+        let config = WinrmConfig {
+            operation_timeout_secs: 5,
+            ..Default::default()
+        };
+        let transport = HttpTransport::new(config, WinrmCredentials::new("u", "p", "")).unwrap();
+        assert_eq!(transport.request_budget(), Duration::from_secs(15));
     }
 
     /// A Type 3 answered with `Connection: close` ends the connection the
@@ -3784,5 +8103,996 @@ mod tests {
             url_server_name("https://proxy.corp:3128"),
             name("proxy.corp")
         );
+    }
+
+    // --- One connection per authenticated client ---
+
+    /// A loopback listener that accepts connections until none arrives for
+    /// [`MTLS_SERVER_DEADLINE`], counts them, and runs `serve` on each, on a
+    /// thread of its own.
+    fn spawn_counting_listener(
+        serve: impl Fn(std::net::TcpStream) + Clone + Send + 'static,
+    ) -> (u16, Arc<AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepts);
+        std::thread::spawn(move || {
+            while let Ok(tcp) = accept_with_deadline(&listener) {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let serve = serve.clone();
+                std::thread::spawn(move || serve(tcp));
+            }
+        });
+        (port, accepts)
+    }
+
+    /// A TCP relay to `127.0.0.1:upstream` that counts the connections it
+    /// accepts. With `idle`, it closes a connection once the upstream has
+    /// been silent for `idle` after sending at least one byte to the client.
+    fn spawn_relay(upstream: u16, idle: Option<Duration>) -> (u16, Arc<AtomicUsize>) {
+        use std::io::{ErrorKind, Read, Write};
+        use std::net::Shutdown;
+        spawn_counting_listener(move |client| {
+            client.set_read_timeout(None).unwrap();
+            let server = std::net::TcpStream::connect(("127.0.0.1", upstream)).unwrap();
+            let mut client_rd = client.try_clone().unwrap();
+            let mut server_wr = server.try_clone().unwrap();
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut client_rd, &mut server_wr);
+                let _ = server_wr.shutdown(Shutdown::Write);
+            });
+            let (mut server_rd, mut client_wr) = (server, client);
+            let Some(idle) = idle else {
+                let _ = std::io::copy(&mut server_rd, &mut client_wr);
+                let _ = client_wr.shutdown(Shutdown::Write);
+                return;
+            };
+            server_rd.set_read_timeout(Some(idle)).unwrap();
+            let mut buf = [0u8; 16 * 1024];
+            let mut sent = false;
+            loop {
+                match server_rd.read(&mut buf) {
+                    Ok(0) => {
+                        let _ = client_wr.shutdown(Shutdown::Write);
+                        return;
+                    }
+                    Ok(n) => {
+                        if client_wr.write_all(&buf[..n]).is_err() {
+                            return;
+                        }
+                        sent = true;
+                    }
+                    Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                        if sent {
+                            let _ = client_wr.shutdown(Shutdown::Both);
+                            let _ = server_rd.shutdown(Shutdown::Both);
+                            return;
+                        }
+                    }
+                    Err(_) => return,
+                }
+            }
+        })
+    }
+
+    /// A TCP relay to `127.0.0.1:upstream` counting the connections it
+    /// accepts.
+    fn spawn_counting_relay(upstream: u16) -> (u16, Arc<AtomicUsize>) {
+        spawn_relay(upstream, None)
+    }
+
+    /// [`spawn_counting_relay`] for a server that silently closes a
+    /// connection idle for `idle`.
+    fn spawn_closing_relay(upstream: u16, idle: Duration) -> (u16, Arc<AtomicUsize>) {
+        spawn_relay(upstream, Some(idle))
+    }
+
+    /// An HTTP server that counts the connections it accepts and answers
+    /// each request head with an empty 200 and `Connection: close`.
+    fn spawn_closing_http_server() -> (u16, Arc<AtomicUsize>) {
+        use std::io::Write;
+        spawn_counting_listener(|mut tcp| {
+            if read_http_head(&mut tcp).is_ok() {
+                let _ = tcp.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+            let _ = tcp.shutdown(std::net::Shutdown::Both);
+        })
+    }
+
+    /// Sealed NTLM transport on plain HTTP, reaching the fake through `relay`.
+    fn relayed_transport(relay: u16) -> HttpTransport {
+        let config = WinrmConfig {
+            auth_method: AuthMethod::Ntlm,
+            port: Some(relay),
+            use_tls: false,
+            max_retries: 0,
+            operation_timeout_secs: 10,
+            ..Default::default()
+        };
+        HttpTransport::new(config, WinrmCredentials::new(USER, PASS, "")).unwrap()
+    }
+
+    /// On a current-thread runtime with no yields, a locked dedicated client
+    /// keeps every sealed exchange on its one authenticated connection.
+    /// Wiremock does not reproduce the pool race (this passes without the
+    /// gate too): it guards against a regression, and the live bench session
+    /// is the real gate for the race.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dedicated_client_never_opens_a_second_connection() {
+        let server = MockServer::start().await;
+        let fake = FakeNtlmServer::mount(&server).await;
+        let (relay, accepts) = spawn_counting_relay(server.address().port());
+        let transport = relayed_transport(relay);
+        let big = "x".repeat(200_000);
+        for _ in 0..20 {
+            fake.push(Reply::ok(&big));
+        }
+        for i in 0..20 {
+            let reply = transport
+                .send_soap_with_retry("127.0.0.1", format!("<r{i}/>"))
+                .await
+                .unwrap();
+            assert_eq!(reply.len(), 200_000, "exchange {i}");
+        }
+        assert_eq!(accepts.load(Ordering::SeqCst), 1, "log: {:?}", fake.log());
+        assert_eq!(fake.handshakes(), 1);
+        assert_eq!(fake.sealed().len(), 20);
+    }
+
+    /// The gate refuses a connect only once locked, and never runs the inner
+    /// connector then.
+    #[tokio::test]
+    async fn locked_gate_refuses_after_handshake_but_not_before() {
+        crate::test_pki::install_test_provider();
+        let (port, accepts) = spawn_closing_http_server();
+        let config = WinrmConfig {
+            connect_timeout_secs: 5,
+            ..WinrmConfig::http()
+        };
+        let gate = Arc::new(ConnGate {
+            locked: AtomicBool::new(false),
+            wait: Duration::from_millis(50),
+        });
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let tls =
+            crate::tls::plain_http_config(Arc::new(NoVerifier::new(&provider)), &provider).unwrap();
+        let route = proxy::ProxyRoute::resolve(&config, false, |_: &str| None).unwrap();
+        let client = build_http_client(&config, &route, tls, 1, Some(Arc::clone(&gate))).unwrap();
+        let url = format!("http://127.0.0.1:{port}/wsman");
+        for _ in 0..2 {
+            assert_eq!(client.get(&url).send().await.unwrap().status(), 200);
+        }
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            2,
+            "an open gate allows the probe and the AP-REQ connections"
+        );
+        gate.lock();
+        let err = client.get(&url).send().await.unwrap_err();
+        assert!(err.is_connect(), "{err:?}");
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            2,
+            "a locked gate opened a connection"
+        );
+    }
+
+    /// A reused connection the server silently closed is re-authenticated once.
+    #[tokio::test]
+    async fn reused_connection_closed_by_the_server_reauthenticates_once() {
+        let server = MockServer::start().await;
+        let fake = FakeNtlmServer::mount(&server).await;
+        let (relay, accepts) =
+            spawn_closing_relay(server.address().port(), Duration::from_millis(500));
+        let transport = relayed_transport(relay);
+        assert_eq!(
+            transport
+                .send_soap_with_retry("127.0.0.1", "<one/>".into())
+                .await
+                .unwrap(),
+            "<ok/>"
+        );
+        // The relay closes the idle connection.
+        tokio::time::sleep(Duration::from_millis(1250)).await;
+        assert_eq!(
+            transport
+                .send_soap_with_retry("127.0.0.1", "<two/>".into())
+                .await
+                .unwrap(),
+            "<ok/>"
+        );
+        assert_eq!(fake.handshakes(), 2, "exactly one new handshake");
+        assert_eq!(
+            fake.sealed(),
+            vec!["<one/>".to_string(), "<two/>".to_string()],
+            "each body seen once"
+        );
+        assert!(
+            !fake
+                .log()
+                .iter()
+                .any(|e| matches!(e, Event::UnknownSession)),
+            "{:?}",
+            fake.log()
+        );
+        assert_eq!(accepts.load(Ordering::SeqCst), 2);
+    }
+
+    // --- Extra trust anchors ---
+
+    /// HTTPS config with strict verification, aimed at loopback `port`.
+    fn tls_config(auth_method: AuthMethod, port: u16) -> WinrmConfig {
+        WinrmConfig {
+            auth_method,
+            use_tls: true,
+            accept_invalid_certs: false,
+            port: Some(port),
+            max_retries: 0,
+            connect_timeout_secs: 5,
+            operation_timeout_secs: 5,
+            ..Default::default()
+        }
+    }
+
+    fn transport_with(config: WinrmConfig, opts: &TlsOptions) -> Result<HttpTransport, WinrmError> {
+        HttpTransport::new_with(
+            config,
+            WinrmCredentials::new(USER, PASS, ""),
+            TransportOptions {
+                tls: opts.clone(),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// A temp directory holding `pem` as the certificate file.
+    fn root_file(tag: &str, pem: &str) -> PemFiles {
+        pem_files(tag, pem, "")
+    }
+
+    /// Options trusting the certificate file of every entry of `files`.
+    fn roots(files: &[&PemFiles]) -> TlsOptions {
+        TlsOptions {
+            root_files: files
+                .iter()
+                .map(|f| std::path::PathBuf::from(&f.cert))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    async fn send_basic(t: &HttpTransport, host: &str) -> Result<String, WinrmError> {
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            t.send_soap_with_retry(host, "<soap/>".into()),
+        )
+        .await
+        .expect("did not finish in 20 s")
+    }
+
+    /// Every `to_string()` down the `source()` chain.
+    fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
+        let mut parts = vec![e.to_string()];
+        let mut source = e.source();
+        while let Some(s) = source {
+            parts.push(s.to_string());
+            source = s.source();
+        }
+        parts.join(": ")
+    }
+
+    /// Basic over HTTPS to a sink presenting `cert`/`key`, with `opts`, at `host`.
+    /// Returns the result and the application bytes the sink read.
+    async fn basic_against_sink(
+        opts: &TlsOptions,
+        cert: &str,
+        key: &str,
+        host: &str,
+    ) -> (Result<String, WinrmError>, usize) {
+        let (port, read) =
+            crate::test_pki::spawn_tls_sink(crate::test_pki::server_config(cert, key));
+        let t = transport_with(tls_config(AuthMethod::Basic, port), opts).unwrap();
+        let result = send_basic(&t, host).await;
+        (result, read.load(Ordering::SeqCst))
+    }
+
+    fn http_error_chain(result: Result<String, WinrmError>) -> String {
+        match result {
+            Err(WinrmError::Http(e)) => error_chain(&e),
+            other => panic!("expected WinrmError::Http, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn extra_root_accepts_a_listener_it_issued() {
+        use crate::test_pki::{CA_LEAF_KEY_PEM, CA_LEAF_PEM, TEST_CA_PEM};
+        let ca = root_file("ca", TEST_CA_PEM);
+        let (_, read) =
+            basic_against_sink(&roots(&[&ca]), CA_LEAF_PEM, CA_LEAF_KEY_PEM, "localhost").await;
+        assert!(read > 0, "the listener must be trusted");
+    }
+
+    /// A certificate the client does not trust is a connect error too, but
+    /// a TLS listener answered: the hint that names plain HTTP stays silent.
+    #[tokio::test]
+    async fn no_connect_hint_when_the_listener_certificate_is_refused() {
+        use crate::test_pki::{CA_LEAF_KEY_PEM, CA_LEAF_PEM, RSA_CERT_PEM};
+        let other = root_file("hint-other-ca", RSA_CERT_PEM);
+        let (result, _) =
+            basic_against_sink(&roots(&[&other]), CA_LEAF_PEM, CA_LEAF_KEY_PEM, "localhost").await;
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, WinrmError::Http(e) if e.is_connect()),
+            "{err:?}"
+        );
+        assert!(
+            matches!(&err, WinrmError::Http(e) if is_tls_failure(e)),
+            "{err:?}"
+        );
+        assert!(connect_hint(&WinrmConfig::default(), false, &err).is_none());
+    }
+
+    #[tokio::test]
+    async fn extra_root_refuses_a_listener_from_another_ca() {
+        use crate::test_pki::{CA_LEAF_KEY_PEM, CA_LEAF_PEM, RSA_CERT_PEM};
+        let other = root_file("other-ca", RSA_CERT_PEM);
+        let (result, read) =
+            basic_against_sink(&roots(&[&other]), CA_LEAF_PEM, CA_LEAF_KEY_PEM, "localhost").await;
+        let chain = http_error_chain(result);
+        assert!(chain.contains("UnknownIssuer"), "{chain}");
+        assert_eq!(read, 0);
+    }
+
+    #[tokio::test]
+    async fn extra_root_still_checks_the_host_name() {
+        use crate::test_pki::{CA_LEAF_KEY_PEM, CA_LEAF_PEM, TEST_CA_PEM};
+        let ca = root_file("ca-name", TEST_CA_PEM);
+        let (result, read) =
+            basic_against_sink(&roots(&[&ca]), CA_LEAF_PEM, CA_LEAF_KEY_PEM, "127.0.0.1").await;
+        let chain = http_error_chain(result);
+        assert!(chain.contains("not valid for name"), "{chain}");
+        assert_eq!(read, 0);
+    }
+
+    #[tokio::test]
+    async fn extra_root_accepts_a_non_ca_self_signed_listener() {
+        use crate::test_pki::{NON_CA_SELF_SIGNED_KEY_PEM, NON_CA_SELF_SIGNED_PEM};
+        let own = root_file("non-ca", NON_CA_SELF_SIGNED_PEM);
+        let (_, read) = basic_against_sink(
+            &roots(&[&own]),
+            NON_CA_SELF_SIGNED_PEM,
+            NON_CA_SELF_SIGNED_KEY_PEM,
+            "localhost",
+        )
+        .await;
+        assert!(
+            read > 0,
+            "a non-CA self-signed listener can be its own root"
+        );
+    }
+
+    #[tokio::test]
+    async fn extra_root_refuses_a_ca_self_signed_listener() {
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
+        let own = root_file("ca-self", EC_CERT_PEM);
+        let (result, read) =
+            basic_against_sink(&roots(&[&own]), EC_CERT_PEM, EC_KEY_PKCS8_PEM, "localhost").await;
+        let chain = http_error_chain(result);
+        assert!(chain.contains("CaUsedAsEndEntity"), "{chain}");
+        assert_eq!(read, 0);
+    }
+
+    /// The per-connection clients (NTLM over HTTPS through a proxy) verify
+    /// with the extra root too, and the channel binding follows.
+    #[tokio::test]
+    async fn extra_root_applies_to_the_dedicated_leg() {
+        use crate::test_pki::{CA_LEAF_KEY_PEM, CA_LEAF_PEM, TEST_CA_PEM};
+        let ca = root_file("ca-dedicated", TEST_CA_PEM);
+        let proxy = Some(SecretString::from(format!(
+            "http://127.0.0.1:{}",
+            spawn_connect_proxy()
+        )));
+        let (port, seen) = spawn_ntlm_tls_server(CA_LEAF_PEM, CA_LEAF_KEY_PEM);
+        let url = format!("https://localhost:{port}/wsman");
+        let config = || WinrmConfig {
+            proxy: proxy.clone(),
+            ..tls_config(AuthMethod::Ntlm, port)
+        };
+
+        let trusting = transport_with(config(), &roots(&[&ca])).unwrap();
+        let slot = trusting.conn_slot("localhost", Lane::Data).await.unwrap();
+        let reply = tokio::time::timeout(
+            Duration::from_secs(20),
+            trusting.send_ntlm_over_tls("localhost", &url, "<soap/>", slot),
+        )
+        .await
+        .expect("did not finish in 20 s")
+        .unwrap();
+        assert_eq!(reply, "<ok/>");
+        let recorded = seen.lock().unwrap().clone();
+        assert_eq!(
+            type3_channel_bindings(&recorded[0]),
+            Some(cbt_of(CA_LEAF_PEM))
+        );
+
+        seen.lock().unwrap().clear();
+        let plain = transport_with(config(), &TlsOptions::default()).unwrap();
+        let slot = plain.conn_slot("localhost", Lane::Data).await.unwrap();
+        let refused = tokio::time::timeout(
+            Duration::from_secs(20),
+            plain.send_ntlm_over_tls("localhost", &url, "<soap/>", slot),
+        )
+        .await
+        .expect("did not finish in 20 s");
+        assert!(refused.is_err(), "{refused:?}");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "no Type 3 without the root"
+        );
+    }
+
+    /// `platform_roots(true)` keeps the extra roots: the OS verifier trusts
+    /// them next to the system store.
+    #[tokio::test]
+    async fn platform_roots_trust_the_extra_root_too() {
+        use crate::test_pki::{CA_LEAF_KEY_PEM, CA_LEAF_PEM, TEST_CA_PEM};
+        let ca = root_file("ca-platform", TEST_CA_PEM);
+        let opts = TlsOptions {
+            platform_roots: true,
+            ..roots(&[&ca])
+        };
+        let (result, read) =
+            basic_against_sink(&opts, CA_LEAF_PEM, CA_LEAF_KEY_PEM, "localhost").await;
+        assert!(read > 0, "the listener must be trusted: {result:?}");
+    }
+
+    /// The options apply to an `https://` proxy over plain HTTP.
+    #[tokio::test]
+    async fn extra_root_applies_to_the_https_proxy_leg_over_plain_http() {
+        use crate::test_pki::{CA_LEAF_KEY_PEM, CA_LEAF_PEM, TEST_CA_PEM};
+        let ca = root_file("ca-proxy", TEST_CA_PEM);
+        for (opts, trusted) in [(roots(&[&ca]), true), (TlsOptions::default(), false)] {
+            let (p, read) = crate::test_pki::spawn_tls_sink(crate::test_pki::server_config(
+                CA_LEAF_PEM,
+                CA_LEAF_KEY_PEM,
+            ));
+            let config = WinrmConfig {
+                use_tls: false,
+                encryption: EncryptionMode::Never,
+                proxy: Some(SecretString::from(format!("https://localhost:{p}"))),
+                ..tls_config(AuthMethod::Basic, 5985)
+            };
+            let t = transport_with(config, &opts).unwrap();
+            let result = send_basic(&t, "127.0.0.1").await;
+            let read = read.load(Ordering::SeqCst);
+            if trusted {
+                assert!(
+                    read > 0,
+                    "the proxy certificate must be trusted: {result:?}"
+                );
+            } else {
+                assert_eq!(read, 0, "without the root the proxy is refused");
+            }
+        }
+    }
+
+    /// CredSSP's outer TLS uses the same verifier.
+    #[cfg(feature = "credssp")]
+    #[tokio::test]
+    async fn credssp_tls_outer_uses_the_extra_root() {
+        use crate::test_pki::{CA_LEAF_KEY_PEM, CA_LEAF_PEM, TEST_CA_PEM};
+        let ca = root_file("ca-credssp", TEST_CA_PEM);
+
+        let (port, read) = crate::test_pki::spawn_tls_sink(crate::test_pki::server_config(
+            CA_LEAF_PEM,
+            CA_LEAF_KEY_PEM,
+        ));
+        let t = transport_with(tls_config(AuthMethod::CredSsp, port), &roots(&[&ca])).unwrap();
+        let _ = send_basic(&t, "localhost").await;
+        assert!(
+            read.load(Ordering::SeqCst) > 0,
+            "the outer TLS must be trusted"
+        );
+
+        let (port, read) = crate::test_pki::spawn_tls_sink(crate::test_pki::server_config(
+            CA_LEAF_PEM,
+            CA_LEAF_KEY_PEM,
+        ));
+        let t = transport_with(
+            tls_config(AuthMethod::CredSsp, port),
+            &TlsOptions::default(),
+        )
+        .unwrap();
+        match send_basic(&t, "localhost").await {
+            Err(WinrmError::AuthFailed(m)) => {
+                assert!(m.starts_with("CredSSP outer TLS:"), "{m}");
+            }
+            other => panic!("expected AuthFailed, got {other:?}"),
+        }
+        assert_eq!(read.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn root_file_without_a_certificate_is_a_clear_error() {
+        use crate::test_pki::EC_KEY_PKCS8_PEM;
+        let keys = root_file("no-cert", EC_KEY_PKCS8_PEM);
+        match transport_with(tls_config(AuthMethod::Basic, 5986), &roots(&[&keys])) {
+            Err(WinrmError::AuthFailed(m)) => {
+                assert!(m.contains(&keys.cert), "{m}");
+                assert!(m.contains("no certificate"), "{m}");
+                assert!(!m.contains("IvSE2eFVFQPSvWUFhXFxIaP6"), "{m}");
+            }
+            other => panic!("expected AuthFailed, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    /// The `AuthFailed` message of building a transport that trusts `pem`.
+    fn root_file_error(tag: &str, pem: &str) -> (PemFiles, String) {
+        let file = root_file(tag, pem);
+        match transport_with(tls_config(AuthMethod::Basic, 5986), &roots(&[&file])) {
+            Err(WinrmError::AuthFailed(m)) => (file, m),
+            other => panic!("expected AuthFailed, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
+    fn root_file_with_malformed_pem_is_a_clear_error() {
+        let pem = "-----BEGIN CERTIFICATE-----\n!!! not base64 !!!\n-----END CERTIFICATE-----\n";
+        let (file, m) = root_file_error("bad-pem", pem);
+        assert!(m.starts_with("invalid PEM in root certificates"), "{m}");
+        assert!(m.contains(&file.cert), "{m}");
+        assert!(
+            !m.contains("not base64"),
+            "the payload must not be echoed: {m}"
+        );
+    }
+
+    /// A well-formed CERTIFICATE section that is not a certificate is
+    /// refused when the roots are loaded, and the message numbers it.
+    #[test]
+    fn root_file_with_an_unusable_trust_anchor_names_its_position() {
+        use crate::test_pki::TEST_CA_PEM;
+        let junk = "-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n";
+        let (file, m) = root_file_error("junk-anchor", junk);
+        assert!(m.contains("root certificate 1 in "), "{m}");
+        assert!(m.contains("is not a usable trust anchor"), "{m}");
+        assert!(m.contains(&file.cert), "{m}");
+
+        let (_, m) = root_file_error("junk-second", &format!("{TEST_CA_PEM}{junk}"));
+        assert!(m.contains("root certificate 2 in "), "{m}");
+    }
+
+    #[test]
+    fn missing_root_file_is_a_clear_error() {
+        let opts = TlsOptions {
+            root_files: vec!["/nonexistent/winrm-rs/ca.pem".into()],
+            ..Default::default()
+        };
+        match transport_with(tls_config(AuthMethod::Basic, 5986), &opts) {
+            Err(WinrmError::AuthFailed(m)) => {
+                assert!(m.contains("/nonexistent/winrm-rs/ca.pem"), "{m}");
+            }
+            other => panic!("expected AuthFailed, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    // --- Server certificate pin ---
+
+    /// Lowercase hex SHA-256 of the DER of a PEM certificate.
+    fn sha256_hex(pem: &str) -> String {
+        use rustls::pki_types::CertificateDer;
+        use rustls::pki_types::pem::PemObject;
+        use sha2::Digest as _;
+        use std::fmt::Write as _;
+        let der = CertificateDer::from_pem_slice(pem.as_bytes()).unwrap();
+        sha2::Sha256::digest(der.as_ref())
+            .iter()
+            .fold(String::new(), |mut hex, b| {
+                write!(hex, "{b:02x}").unwrap();
+                hex
+            })
+    }
+
+    /// Options pinning each of `pins`.
+    fn pinned(pins: &[&str]) -> TlsOptions {
+        TlsOptions {
+            pins: pins.iter().map(ToString::to_string).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// The test helpers agree with `openssl` on the test certificate.
+    #[test]
+    fn sha256_hex_matches_the_openssl_fingerprint() {
+        use crate::test_pki::{EC_CERT_PEM, EC_CERT_SHA256_OPENSSL};
+        let hex = sha256_hex(EC_CERT_PEM);
+        assert_eq!(openssl_form(&hex), EC_CERT_SHA256_OPENSSL.to_uppercase());
+        assert_eq!(hex, EC_CERT_SHA256_OPENSSL.replace(':', ""));
+    }
+
+    /// `hex` in upper case with `:` between bytes, as `openssl x509
+    /// -fingerprint` prints it.
+    fn openssl_form(hex: &str) -> String {
+        hex.to_uppercase()
+            .as_bytes()
+            .chunks(2)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect::<Vec<_>>()
+            .join(":")
+    }
+
+    /// `send_ntlm_over_tls` to `127.0.0.1`, bounded.
+    async fn ntlm_over_tls(t: &HttpTransport, url: &str) -> Result<String, WinrmError> {
+        let slot = t.conn_slot("127.0.0.1", Lane::Data).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            t.send_ntlm_over_tls("127.0.0.1", url, "<soap/>", slot),
+        )
+        .await
+        .expect("did not finish in 20 s")
+    }
+
+    /// A self-signed CA:TRUE listener reached by IP address: neither a root
+    /// nor the name check could accept it, the pin does.
+    #[tokio::test]
+    async fn pin_accepts_a_matching_self_signed_listener_by_ip() {
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
+        let hex = sha256_hex(EC_CERT_PEM);
+        for pin in [hex.clone(), openssl_form(&hex)] {
+            let (_, read) =
+                basic_against_sink(&pinned(&[&pin]), EC_CERT_PEM, EC_KEY_PKCS8_PEM, "127.0.0.1")
+                    .await;
+            assert!(read > 0, "{pin}: the pinned listener must be trusted");
+        }
+    }
+
+    #[tokio::test]
+    async fn pin_refuses_another_certificate() {
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM, RSA_CERT_PEM};
+        let (result, read) = basic_against_sink(
+            &pinned(&[&sha256_hex(RSA_CERT_PEM)]),
+            EC_CERT_PEM,
+            EC_KEY_PKCS8_PEM,
+            "127.0.0.1",
+        )
+        .await;
+        let chain = http_error_chain(result);
+        assert!(chain.contains("pin_server_certificate_sha256"), "{chain}");
+        assert_eq!(read, 0);
+    }
+
+    /// The certificate matches the pin, but the server signs the handshake
+    /// with another key: refused by the signature check, before any byte.
+    #[tokio::test]
+    async fn pin_refuses_an_impostor_holding_the_wrong_key() {
+        use crate::test_pki::EC_CERT_PEM;
+        for (label, versions) in [
+            ("TLS 1.3", &[&rustls::version::TLS13][..]),
+            ("TLS 1.2", &[&rustls::version::TLS12][..]),
+        ] {
+            let (port, read) =
+                crate::test_pki::spawn_tls_sink(crate::test_pki::impostor_server_config(versions));
+            let t = transport_with(
+                tls_config(AuthMethod::Basic, port),
+                &pinned(&[&sha256_hex(EC_CERT_PEM)]),
+            )
+            .unwrap();
+            let result = send_basic(&t, "127.0.0.1").await;
+            assert!(result.is_err(), "{label}: {result:?}");
+            assert_eq!(read.load(Ordering::SeqCst), 0, "{label}");
+        }
+    }
+
+    /// The shared client and the per-connection clients (NTLM over HTTPS
+    /// through a proxy) both apply the pin; the channel binding follows the
+    /// pinned certificate.
+    #[tokio::test]
+    async fn pin_applies_to_shared_and_dedicated_legs() {
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM, RSA_CERT_PEM};
+        let proxy = Some(SecretString::from(format!(
+            "http://127.0.0.1:{}",
+            spawn_connect_proxy()
+        )));
+        let ntlm = |port| WinrmConfig {
+            proxy: proxy.clone(),
+            ..tls_config(AuthMethod::Ntlm, port)
+        };
+
+        let wrong = pinned(&[&sha256_hex(RSA_CERT_PEM)]);
+        let (result, read) =
+            basic_against_sink(&wrong, EC_CERT_PEM, EC_KEY_PKCS8_PEM, "127.0.0.1").await;
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(read, 0);
+        let (port, seen) = spawn_ntlm_tls_server(EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let url = format!("https://127.0.0.1:{port}/wsman");
+        let t = transport_with(ntlm(port), &wrong).unwrap();
+        match ntlm_over_tls(&t, &url).await {
+            Err(WinrmError::AuthFailed(m)) => {
+                assert!(m.contains("pinned certificate check"), "{m}");
+            }
+            other => panic!("expected AuthFailed, got {other:?}"),
+        }
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "no Type 3 on a refused pin"
+        );
+
+        let right = pinned(&[&sha256_hex(EC_CERT_PEM)]);
+        let (_, read) =
+            basic_against_sink(&right, EC_CERT_PEM, EC_KEY_PKCS8_PEM, "127.0.0.1").await;
+        assert!(read > 0);
+        let t = transport_with(ntlm(port), &right).unwrap();
+        assert_eq!(ntlm_over_tls(&t, &url).await.unwrap(), "<ok/>");
+        let recorded = seen.lock().unwrap().clone();
+        assert_eq!(
+            type3_channel_bindings(&recorded[0]),
+            Some(cbt_of(EC_CERT_PEM))
+        );
+    }
+
+    /// The leg to an `https://` proxy is verified with the trusted roots,
+    /// not with the pin: the proxy's certificate is not the pinned one.
+    #[tokio::test]
+    async fn pin_does_not_apply_to_the_https_proxy_leg() {
+        use crate::test_pki::TEST_CA_PEM;
+        use crate::test_pki::{CA_LEAF_KEY_PEM, CA_LEAF_PEM, EC_CERT_PEM, EC_KEY_PKCS8_PEM};
+        let ca = root_file("ca-pin-proxy", TEST_CA_PEM);
+        let (port, seen) = spawn_ntlm_tls_server(EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let p = spawn_https_connect_proxy(CA_LEAF_PEM, CA_LEAF_KEY_PEM);
+        let config = || WinrmConfig {
+            proxy: Some(SecretString::from(format!("https://localhost:{p}"))),
+            ..tls_config(AuthMethod::Ntlm, port)
+        };
+        let url = format!("https://127.0.0.1:{port}/wsman");
+        let pin = sha256_hex(EC_CERT_PEM);
+
+        let opts = TlsOptions {
+            pins: vec![pin.clone()],
+            ..roots(&[&ca])
+        };
+        let t = transport_with(config(), &opts).unwrap();
+        assert_eq!(ntlm_over_tls(&t, &url).await.unwrap(), "<ok/>");
+        let recorded = seen.lock().unwrap().clone();
+        assert_eq!(
+            type3_channel_bindings(&recorded[0]),
+            Some(cbt_of(EC_CERT_PEM))
+        );
+
+        seen.lock().unwrap().clear();
+        let t = transport_with(config(), &pinned(&[&pin])).unwrap();
+        let refused = ntlm_over_tls(&t, &url).await;
+        assert!(refused.is_err(), "{refused:?}");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "no Type 3 when the proxy is not trusted"
+        );
+    }
+
+    /// A host with the server name of the `https://` proxy would be verified
+    /// as the proxy is (trusted roots, no pin): while a pin is set it is
+    /// refused before anything is sent, whatever the auth method, even when
+    /// its certificate chains to a trusted root. CredSSP takes no `https://`
+    /// proxy at all: it is refused when the client is built.
+    #[tokio::test]
+    async fn pin_refuses_a_host_named_like_the_https_proxy() {
+        use crate::test_pki::{CA_LEAF_KEY_PEM, CA_LEAF_PEM, EC_CERT_PEM, TEST_CA_PEM};
+        let ca = root_file("ca-pin-shared-name", TEST_CA_PEM);
+        let p = spawn_https_connect_proxy(CA_LEAF_PEM, CA_LEAF_KEY_PEM);
+        #[cfg(feature = "credssp")]
+        {
+            let config = WinrmConfig {
+                proxy: Some(SecretString::from(format!("https://LOCALHOST:{p}"))),
+                ..tls_config(AuthMethod::CredSsp, 5986)
+            };
+            let opts = TlsOptions {
+                pins: vec![sha256_hex(EC_CERT_PEM)],
+                ..roots(&[&ca])
+            };
+            let err = transport_with(config, &opts).err().expect("must refuse");
+            assert!(
+                matches!(&err, WinrmError::AuthFailed(m) if m.starts_with("CredSSP: an https:// proxy is not supported")),
+                "{err}"
+            );
+
+            // The same https:// proxy from the environment, opted in: it is
+            // checked per request, so the client is built, but the proxy's
+            // name still gets the proxy's verification and a host with that
+            // name is refused before any dial.
+            let (port, read) = crate::test_pki::spawn_tls_sink(crate::test_pki::server_config(
+                CA_LEAF_PEM,
+                CA_LEAF_KEY_PEM,
+            ));
+            let env_proxy = format!("https://LOCALHOST:{p}");
+            let t = HttpTransport::new_with_env(
+                tls_config(AuthMethod::CredSsp, port),
+                WinrmCredentials::new(USER, PASS, ""),
+                TransportOptions {
+                    tls: opts,
+                    use_env_proxy: true,
+                    ..Default::default()
+                },
+                move |n: &str| (n == "HTTPS_PROXY").then(|| env_proxy.clone()),
+            )
+            .unwrap();
+            match send_basic(&t, "localhost").await {
+                Err(WinrmError::AuthFailed(m)) => assert_eq!(
+                    m,
+                    "pin_server_certificate_sha256: host localhost has the name of an https:// \
+                     proxy; the pin cannot be applied to it, refusing"
+                ),
+                other => panic!("CredSsp (environment proxy): expected AuthFailed, got {other:?}"),
+            }
+            assert_eq!(
+                read.load(Ordering::SeqCst),
+                0,
+                "CredSsp (environment proxy)"
+            );
+        }
+        for method in [AuthMethod::Basic, AuthMethod::Ntlm] {
+            let label = format!("{method:?}");
+            let (port, read) = crate::test_pki::spawn_tls_sink(crate::test_pki::server_config(
+                CA_LEAF_PEM,
+                CA_LEAF_KEY_PEM,
+            ));
+            let config = WinrmConfig {
+                proxy: Some(SecretString::from(format!("https://LOCALHOST:{p}"))),
+                ..tls_config(method, port)
+            };
+            // A pin the listener does not match, next to a root it chains to.
+            let opts = TlsOptions {
+                pins: vec![sha256_hex(EC_CERT_PEM)],
+                ..roots(&[&ca])
+            };
+            let t = transport_with(config, &opts).unwrap();
+            match send_basic(&t, "localhost").await {
+                Err(WinrmError::AuthFailed(m)) => assert_eq!(
+                    m,
+                    "pin_server_certificate_sha256: host localhost has the name of an https:// \
+                     proxy; the pin cannot be applied to it, refusing",
+                    "{label}"
+                ),
+                other => panic!("{label}: expected AuthFailed, got {other:?}"),
+            }
+            assert_eq!(read.load(Ordering::SeqCst), 0, "{label}");
+        }
+    }
+
+    /// The same proxy and roots, with a host that is not the proxy's name
+    /// and the listener's own pin: accepted through the proxy.
+    #[tokio::test]
+    async fn pin_accepts_a_host_not_named_like_the_https_proxy() {
+        use crate::test_pki::{CA_LEAF_KEY_PEM, CA_LEAF_PEM, TEST_CA_PEM};
+        let ca = root_file("ca-pin-other-name", TEST_CA_PEM);
+        let p = spawn_https_connect_proxy(CA_LEAF_PEM, CA_LEAF_KEY_PEM);
+        let (port, read) = crate::test_pki::spawn_tls_sink(crate::test_pki::server_config(
+            CA_LEAF_PEM,
+            CA_LEAF_KEY_PEM,
+        ));
+        let config = WinrmConfig {
+            proxy: Some(SecretString::from(format!("https://localhost:{p}"))),
+            ..tls_config(AuthMethod::Basic, port)
+        };
+        let opts = TlsOptions {
+            pins: vec![sha256_hex(CA_LEAF_PEM)],
+            ..roots(&[&ca])
+        };
+        let t = transport_with(config, &opts).unwrap();
+        let _ = send_basic(&t, "127.0.0.1").await;
+        assert!(
+            read.load(Ordering::SeqCst) > 0,
+            "the pinned listener must be reached through the proxy"
+        );
+    }
+
+    /// The build-time refusal of a pin, as `WinrmError::AuthFailed(m)`.
+    fn build_refusal(config: WinrmConfig, opts: &TlsOptions) -> String {
+        match transport_with(config, opts) {
+            Err(WinrmError::AuthFailed(m)) => m,
+            other => panic!("expected AuthFailed, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
+    fn pin_with_accept_invalid_certs_is_refused_at_build() {
+        let config = WinrmConfig {
+            accept_invalid_certs: true,
+            ..tls_config(AuthMethod::Basic, 5986)
+        };
+        assert_eq!(
+            build_refusal(config, &pinned(&[&"00".repeat(32)])),
+            "pin_server_certificate_sha256 replaces accept_invalid_certs: set \
+             accept_invalid_certs = false"
+        );
+    }
+
+    #[test]
+    fn pin_without_tls_is_refused_at_build() {
+        let config = WinrmConfig {
+            use_tls: false,
+            encryption: EncryptionMode::Never,
+            ..tls_config(AuthMethod::Basic, 5985)
+        };
+        assert_eq!(
+            build_refusal(config, &pinned(&[&"00".repeat(32)])),
+            "pin_server_certificate_sha256 needs use_tls = true: over plain HTTP there is no \
+             server certificate to pin"
+        );
+    }
+
+    #[test]
+    fn malformed_pin_is_refused_at_build() {
+        let config = || tls_config(AuthMethod::Basic, 5986);
+        assert_eq!(
+            build_refusal(config(), &pinned(&["xyz"])),
+            "pin_server_certificate_sha256: invalid character 'x'; expected hex digits, \
+             optionally separated by ':'"
+        );
+        assert_eq!(
+            build_refusal(config(), &pinned(&[&"0".repeat(63)])),
+            "pin_server_certificate_sha256: expected 64 hex digits (SHA-256), got 63"
+        );
+        // One malformed pin among valid ones is refused too.
+        let m = build_refusal(config(), &pinned(&[&"00".repeat(32), "00"]));
+        assert!(m.contains("got 2"), "{m}");
+    }
+
+    /// CredSSP's outer TLS applies the pin.
+    #[cfg(feature = "credssp")]
+    #[tokio::test]
+    async fn credssp_tls_outer_honours_the_pin() {
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM, RSA_CERT_PEM, RSA_KEY_PKCS1_PEM};
+        let opts = pinned(&[&sha256_hex(EC_CERT_PEM)]);
+
+        let (port, read) = crate::test_pki::spawn_tls_sink(crate::test_pki::server_config(
+            EC_CERT_PEM,
+            EC_KEY_PKCS8_PEM,
+        ));
+        let t = transport_with(tls_config(AuthMethod::CredSsp, port), &opts).unwrap();
+        let _ = send_basic(&t, "127.0.0.1").await;
+        assert!(
+            read.load(Ordering::SeqCst) > 0,
+            "the pinned outer TLS must be trusted"
+        );
+
+        let (port, read) = crate::test_pki::spawn_tls_sink(crate::test_pki::server_config(
+            RSA_CERT_PEM,
+            RSA_KEY_PKCS1_PEM,
+        ));
+        let t = transport_with(tls_config(AuthMethod::CredSsp, port), &opts).unwrap();
+        match send_basic(&t, "127.0.0.1").await {
+            Err(WinrmError::AuthFailed(m)) => {
+                assert!(m.starts_with("CredSSP outer TLS:"), "{m}");
+            }
+            other => panic!("expected AuthFailed, got {other:?}"),
+        }
+        assert_eq!(read.load(Ordering::SeqCst), 0);
+    }
+
+    /// Kerberos over HTTPS: a wrong pin refuses the unauthenticated probe
+    /// that learns the certificate, reported as the pinned check (no ticket
+    /// is asked for).
+    #[cfg(feature = "kerberos")]
+    #[tokio::test]
+    async fn kerberos_probe_reports_a_wrong_pin_as_such() {
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM, RSA_CERT_PEM};
+        let (port, read) = crate::test_pki::spawn_tls_sink(crate::test_pki::server_config(
+            EC_CERT_PEM,
+            EC_KEY_PKCS8_PEM,
+        ));
+        let t = transport_with(
+            tls_config(AuthMethod::Kerberos, port),
+            &pinned(&[&sha256_hex(RSA_CERT_PEM)]),
+        )
+        .unwrap();
+        match send_basic(&t, "127.0.0.1").await {
+            Err(WinrmError::AuthFailed(m)) => {
+                assert!(m.contains("pinned certificate check"), "{m}");
+            }
+            other => panic!("expected AuthFailed, got {other:?}"),
+        }
+        assert_eq!(read.load(Ordering::SeqCst), 0);
     }
 }

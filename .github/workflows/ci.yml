@@ -451,6 +451,9 @@ jobs:
           name: fuzz-artifacts
           path: fuzz/artifacts/
           if-no-files-found: ignore
+          # The repository is public: anyone signed in can download these
+          # inputs. Keep them only as long as it takes to triage.
+          retention-days: 3
 
   semver:
     name: Semver check

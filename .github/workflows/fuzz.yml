@@ -134,6 +134,9 @@ jobs:
           name: crash-${{ matrix.target }}-${{ matrix.sanitizer }}
           path: fuzz/artifacts/${{ matrix.target }}/
           if-no-files-found: ignore
+          # The repository is public: anyone signed in can download these
+          # inputs. Keep them only as long as it takes to triage.
+          retention-days: 3
 
       - name: Upload corpus
         if: always()
@@ -216,6 +219,8 @@ jobs:
           name: slow-${{ matrix.target }}
           path: fuzz/artifacts/${{ matrix.target }}/
           if-no-files-found: ignore
+          # Public download, like the crash artifacts above: short retention.
+          retention-days: 3
 
       - name: Upload corpus
         if: always()

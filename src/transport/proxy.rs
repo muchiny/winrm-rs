@@ -12,6 +12,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use hyper_util::client::proxy::matcher::{Intercept, Matcher};
+use secrecy::ExposeSecret;
 use zeroize::Zeroizing;
 
 use crate::config::WinrmConfig;
@@ -112,9 +113,11 @@ impl ProxyRoute {
         use_env: bool,
         var: impl Fn(&str) -> Option<String>,
     ) -> Result<Self, WinrmError> {
-        if let Some(raw) = config.proxy.as_deref() {
+        if let Some(secret) = config.proxy.as_ref() {
             return Ok(Self {
-                explicit: Some(Zeroizing::new(String::from(parse_proxy_url(raw)?))),
+                explicit: Some(Zeroizing::new(String::from(parse_proxy_url(
+                    secret.expose_secret(),
+                )?))),
                 ..Self::direct()
             });
         }
@@ -556,6 +559,7 @@ pub(crate) fn parse_proxy_url(raw: &str) -> Result<reqwest::Url, WinrmError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use secrecy::SecretString;
 
     #[test]
     fn malformed_proxy_urls_are_refused_without_echoing_them() {
@@ -780,7 +784,7 @@ mod tests {
     #[test]
     fn explicit_proxy_ignores_the_environment() {
         let config = WinrmConfig {
-            proxy: Some("http://explicit.corp:8080".into()),
+            proxy: Some(SecretString::from("http://explicit.corp:8080")),
             ..Default::default()
         };
         let var = |n: &str| match n {
@@ -815,7 +819,7 @@ mod tests {
     #[test]
     fn explicit_proxy_applies_when_the_environment_is_ignored() {
         let config = WinrmConfig {
-            proxy: Some("http://explicit.corp:8080".into()),
+            proxy: Some(SecretString::from("http://explicit.corp:8080")),
             ..Default::default()
         };
         let route = ProxyRoute::resolve(&config, false, |name: &str| -> Option<String> {
@@ -835,7 +839,7 @@ mod tests {
     #[test]
     fn unsupported_explicit_proxy_scheme_is_refused() {
         let config = WinrmConfig {
-            proxy: Some("ftp://proxy:21".into()),
+            proxy: Some(SecretString::from("ftp://proxy:21")),
             ..Default::default()
         };
         let err = ProxyRoute::resolve(&config, true, |_: &str| None).unwrap_err();
@@ -912,7 +916,7 @@ mod tests {
             .is_empty()
         );
         let explicit = |proxy: &str| WinrmConfig {
-            proxy: Some(proxy.into()),
+            proxy: Some(SecretString::from(proxy)),
             ..Default::default()
         };
         assert_eq!(
@@ -972,7 +976,7 @@ mod tests {
         }
         assert_eq!(tls_proxy(&none, true, &[], true), None);
         let explicit = |proxy: &str| WinrmConfig {
-            proxy: Some(proxy.into()),
+            proxy: Some(SecretString::from(proxy)),
             ..Default::default()
         };
         for use_tls in [false, true] {
@@ -1021,7 +1025,7 @@ mod tests {
     #[cfg(feature = "credssp")]
     fn explicit_route(proxy: &str) -> ProxyRoute {
         let config = WinrmConfig {
-            proxy: Some(proxy.into()),
+            proxy: Some(SecretString::from(proxy)),
             ..Default::default()
         };
         ProxyRoute::resolve(&config, false, |_: &str| None).unwrap()
@@ -1194,7 +1198,7 @@ mod tests {
     #[test]
     fn proxy_route_debug_redacts_userinfo() {
         let config = WinrmConfig {
-            proxy: Some("http://u:s3cret@p.corp:1".into()),
+            proxy: Some(SecretString::from("http://u:s3cret@p.corp:1")),
             ..Default::default()
         };
         let shown = format!(

@@ -2294,6 +2294,7 @@ mod tests {
     //! (Linux only).
     use super::*;
     use crate::tls::NoVerifier;
+    use secrecy::SecretString;
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -3259,7 +3260,7 @@ mod tests {
         let files = pem_files("mtls", RSA_CERT_PEM, RSA_KEY_PKCS1_PEM);
         let config = WinrmConfig {
             port: Some(port),
-            proxy: Some(format!("http://127.0.0.1:{port}")),
+            proxy: Some(SecretString::from(format!("http://127.0.0.1:{port}"))),
             connect_timeout_secs: 5,
             operation_timeout_secs: 5,
             ..cert_tls_config(&files)
@@ -3417,7 +3418,7 @@ mod tests {
             auth_method: AuthMethod::Basic,
             use_tls: false,
             encryption: EncryptionMode::Never,
-            proxy: Some("http://proxy:8080".into()),
+            proxy: Some(SecretString::from("http://proxy:8080")),
             ..Default::default()
         };
         let creds = WinrmCredentials::new("admin", "pass", "");
@@ -3654,7 +3655,7 @@ mod tests {
         // The second has a scheme no proxy supports.
         for proxy in ["socks5h:/proxy.corp:1080", "ftp://proxy:21"] {
             let config = WinrmConfig {
-                proxy: Some(proxy.into()),
+                proxy: Some(SecretString::from(proxy)),
                 ..Default::default()
             };
             let err = HttpTransport::new(config, WinrmCredentials::new("u", "p", ""))
@@ -3670,7 +3671,7 @@ mod tests {
     #[test]
     fn invalid_proxy_url_returns_error() {
         let config = WinrmConfig {
-            proxy: Some("not a url".into()),
+            proxy: Some(SecretString::from("not a url")),
             ..Default::default()
         };
         let creds = WinrmCredentials::new("u", "p", "");
@@ -5039,7 +5040,7 @@ mod tests {
             ..Default::default()
         };
         let explicit = WinrmConfig {
-            proxy: Some("https://user:s3cret@explicit.corp:8443".into()),
+            proxy: Some(SecretString::from("https://user:s3cret@explicit.corp:8443")),
             ..tls_config(AuthMethod::Ntlm, 5986)
         };
         transport_in_env(explicit, danger.clone(), &[]).unwrap();
@@ -5073,12 +5074,12 @@ mod tests {
         )
         .unwrap();
         let socks = WinrmConfig {
-            proxy: Some("socks5://socks.corp:1080".into()),
+            proxy: Some(SecretString::from("socks5://socks.corp:1080")),
             ..config.clone()
         };
         transport_in_env(socks, danger, &[]).unwrap();
         let https_proxy = WinrmConfig {
-            proxy: Some("https://explicit.corp:8443".into()),
+            proxy: Some(SecretString::from("https://explicit.corp:8443")),
             ..config
         };
         transport_in_env(https_proxy, TlsOptions::default(), &[]).unwrap();
@@ -5193,7 +5194,7 @@ mod tests {
     fn credssp_proxied_transport(port: u16, proxy: String) -> Result<HttpTransport, WinrmError> {
         HttpTransport::new_with(
             WinrmConfig {
-                proxy: Some(proxy),
+                proxy: Some(SecretString::from(proxy)),
                 ..credssp_test_config(port)
             },
             WinrmCredentials::new(USER, PASS, ""),
@@ -5381,7 +5382,7 @@ mod tests {
             WinrmConfig {
                 auth_method: AuthMethod::Ntlm,
                 use_tls: true,
-                proxy: Some("https://127.0.0.1:1".into()),
+                proxy: Some(SecretString::from("https://127.0.0.1:1")),
                 ..Default::default()
             },
             creds(),
@@ -5442,7 +5443,7 @@ mod tests {
             use_tls: true,
             accept_invalid_certs: true,
             port: Some(port),
-            proxy: Some(format!("http://127.0.0.1:{proxy_port}")),
+            proxy: Some(SecretString::from(format!("http://127.0.0.1:{proxy_port}"))),
             connect_timeout_secs: 5,
             operation_timeout_secs: 5,
             ..Default::default()
@@ -6626,7 +6627,7 @@ mod tests {
                 .unwrap(),
         ));
         let url = format!("https://127.0.0.1:{port}/wsman");
-        let transport = |auth_method: AuthMethod, proxy: Option<String>, suite| {
+        let transport = |auth_method: AuthMethod, proxy: Option<SecretString>, suite| {
             // Basic refuses `accept_invalid_certs`: it pins the certificate.
             let basic = matches!(auth_method, AuthMethod::Basic);
             HttpTransport::with_provider(
@@ -6661,7 +6662,10 @@ mod tests {
             let direct = transport(AuthMethod::Ntlm, None, suite);
             let proxied = transport(
                 AuthMethod::Ntlm,
-                Some(format!("http://127.0.0.1:{}", spawn_connect_proxy())),
+                Some(SecretString::from(format!(
+                    "http://127.0.0.1:{}",
+                    spawn_connect_proxy()
+                ))),
                 suite,
             );
             let results = [
@@ -6819,7 +6823,7 @@ mod tests {
             accept_invalid_certs: true,
             port: Some(port),
             // "localhost" for the proxy, "127.0.0.1" for the target: two names.
-            proxy: Some(format!("https://localhost:{proxy}")),
+            proxy: Some(SecretString::from(format!("https://localhost:{proxy}"))),
             connect_timeout_secs: 5,
             operation_timeout_secs: 5,
             ..Default::default()
@@ -6943,7 +6947,7 @@ mod tests {
         // The other two legs are plain HTTP, where the WARN would apply.
         let explicit = WinrmConfig {
             auth_method: AuthMethod::Ntlm,
-            proxy: Some("http://explicit.corp:1".into()),
+            proxy: Some(SecretString::from("http://explicit.corp:1")),
             ..WinrmConfig::http()
         };
         let plain = WinrmConfig {
@@ -7190,7 +7194,7 @@ mod tests {
             port: Some(server.address().port()),
             use_tls: false,
             encryption,
-            proxy: Some(format!("http://127.0.0.1:{proxy_port}")),
+            proxy: Some(SecretString::from(format!("http://127.0.0.1:{proxy_port}"))),
             operation_timeout_secs: 10,
             ..Default::default()
         };
@@ -7324,7 +7328,7 @@ mod tests {
                 auth_method: AuthMethod::Ntlm,
                 use_tls,
                 encryption: EncryptionMode::Never,
-                proxy: proxy.map(str::to_string),
+                proxy: proxy.map(SecretString::from),
                 ..Default::default()
             };
             let var = move |k: &str| {
@@ -7388,7 +7392,7 @@ mod tests {
             auth_method: AuthMethod::Kerberos,
             port: Some(server.address().port()),
             encryption: EncryptionMode::Never,
-            proxy: Some(format!("http://127.0.0.1:{proxy}")),
+            proxy: Some(SecretString::from(format!("http://127.0.0.1:{proxy}"))),
             operation_timeout_secs: 5,
             ..WinrmConfig::http()
         };
@@ -7436,7 +7440,7 @@ mod tests {
             auth_method: AuthMethod::Kerberos,
             port: Some(server.address().port()),
             encryption: EncryptionMode::Never,
-            proxy: Some(format!("http://127.0.0.1:{proxy_port}")),
+            proxy: Some(SecretString::from(format!("http://127.0.0.1:{proxy_port}"))),
             operation_timeout_secs: 5,
             ..WinrmConfig::http()
         };
@@ -7582,7 +7586,9 @@ mod tests {
             use_tls: false,
             encryption: EncryptionMode::Never,
             accept_invalid_certs,
-            proxy: Some(format!("https://proxyuser:proxysecret@localhost:{p}")),
+            proxy: Some(SecretString::from(format!(
+                "https://proxyuser:proxysecret@localhost:{p}"
+            ))),
             ..tls_config(AuthMethod::Basic, 5985)
         };
         let t = transport_with(config, opts).unwrap();
@@ -7609,7 +7615,7 @@ mod tests {
         let p = spawn_https_connect_proxy(RSA_CERT_PEM, RSA_KEY_PKCS1_PEM);
         let config = WinrmConfig {
             accept_invalid_certs: true,
-            proxy: Some(format!("https://localhost:{p}")),
+            proxy: Some(SecretString::from(format!("https://localhost:{p}"))),
             ..tls_config(AuthMethod::Ntlm, port)
         };
         let url = format!("https://127.0.0.1:{port}/wsman");
@@ -7631,7 +7637,7 @@ mod tests {
         let p = spawn_https_connect_proxy(CA_LEAF_PEM, CA_LEAF_KEY_PEM);
         let config = WinrmConfig {
             accept_invalid_certs: true,
-            proxy: Some(format!("https://localhost:{p}")),
+            proxy: Some(SecretString::from(format!("https://localhost:{p}"))),
             ..tls_config(AuthMethod::Ntlm, port)
         };
         let url = format!("https://127.0.0.1:{port}/wsman");
@@ -7664,7 +7670,7 @@ mod tests {
         let p = spawn_https_connect_proxy(RSA_CERT_PEM, RSA_KEY_PKCS1_PEM);
         let config = WinrmConfig {
             accept_invalid_certs: false,
-            proxy: Some(format!("https://localhost:{p}")),
+            proxy: Some(SecretString::from(format!("https://localhost:{p}"))),
             ..tls_config(AuthMethod::Ntlm, port)
         };
         let opts = TlsOptions {
@@ -7680,7 +7686,7 @@ mod tests {
         // The refusal came from the origin: with the origin pinned, the same
         // proxy is accepted and the exchange completes.
         let config = WinrmConfig {
-            proxy: Some(format!("https://localhost:{p}")),
+            proxy: Some(SecretString::from(format!("https://localhost:{p}"))),
             ..tls_config(AuthMethod::Ntlm, port)
         };
         let opts = TlsOptions {
@@ -7702,7 +7708,7 @@ mod tests {
             EC_KEY_PKCS8_PEM,
         ));
         let config = WinrmConfig {
-            proxy: Some(format!("https://localhost:{port}")),
+            proxy: Some(SecretString::from(format!("https://localhost:{port}"))),
             ..tls_config(AuthMethod::Basic, port)
         };
         let opts = TlsOptions {
@@ -7750,7 +7756,7 @@ mod tests {
             ));
             let config = WinrmConfig {
                 accept_invalid_certs: true,
-                proxy: Some(format!("https://localhost:{p}")),
+                proxy: Some(SecretString::from(format!("https://localhost:{p}"))),
                 ..cert_tls_config(&client_files)
             };
             let config = WinrmConfig {
@@ -8262,7 +8268,10 @@ mod tests {
     async fn extra_root_applies_to_the_dedicated_leg() {
         use crate::test_pki::{CA_LEAF_KEY_PEM, CA_LEAF_PEM, TEST_CA_PEM};
         let ca = root_file("ca-dedicated", TEST_CA_PEM);
-        let proxy = Some(format!("http://127.0.0.1:{}", spawn_connect_proxy()));
+        let proxy = Some(SecretString::from(format!(
+            "http://127.0.0.1:{}",
+            spawn_connect_proxy()
+        )));
         let (port, seen) = spawn_ntlm_tls_server(CA_LEAF_PEM, CA_LEAF_KEY_PEM);
         let url = format!("https://localhost:{port}/wsman");
         let config = || WinrmConfig {
@@ -8329,7 +8338,7 @@ mod tests {
             let config = WinrmConfig {
                 use_tls: false,
                 encryption: EncryptionMode::Never,
-                proxy: Some(format!("https://localhost:{p}")),
+                proxy: Some(SecretString::from(format!("https://localhost:{p}"))),
                 ..tls_config(AuthMethod::Basic, 5985)
             };
             let t = transport_with(config, &opts).unwrap();
@@ -8556,7 +8565,10 @@ mod tests {
     #[tokio::test]
     async fn pin_applies_to_shared_and_dedicated_legs() {
         use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM, RSA_CERT_PEM};
-        let proxy = Some(format!("http://127.0.0.1:{}", spawn_connect_proxy()));
+        let proxy = Some(SecretString::from(format!(
+            "http://127.0.0.1:{}",
+            spawn_connect_proxy()
+        )));
         let ntlm = |port| WinrmConfig {
             proxy: proxy.clone(),
             ..tls_config(AuthMethod::Ntlm, port)
@@ -8604,7 +8616,7 @@ mod tests {
         let (port, seen) = spawn_ntlm_tls_server(EC_CERT_PEM, EC_KEY_PKCS8_PEM);
         let p = spawn_https_connect_proxy(CA_LEAF_PEM, CA_LEAF_KEY_PEM);
         let config = || WinrmConfig {
-            proxy: Some(format!("https://localhost:{p}")),
+            proxy: Some(SecretString::from(format!("https://localhost:{p}"))),
             ..tls_config(AuthMethod::Ntlm, port)
         };
         let url = format!("https://127.0.0.1:{port}/wsman");
@@ -8645,7 +8657,7 @@ mod tests {
         #[cfg(feature = "credssp")]
         {
             let config = WinrmConfig {
-                proxy: Some(format!("https://LOCALHOST:{p}")),
+                proxy: Some(SecretString::from(format!("https://LOCALHOST:{p}"))),
                 ..tls_config(AuthMethod::CredSsp, 5986)
             };
             let opts = TlsOptions {
@@ -8699,7 +8711,7 @@ mod tests {
                 CA_LEAF_KEY_PEM,
             ));
             let config = WinrmConfig {
-                proxy: Some(format!("https://LOCALHOST:{p}")),
+                proxy: Some(SecretString::from(format!("https://LOCALHOST:{p}"))),
                 ..tls_config(method, port)
             };
             // A pin the listener does not match, next to a root it chains to.
@@ -8733,7 +8745,7 @@ mod tests {
             CA_LEAF_KEY_PEM,
         ));
         let config = WinrmConfig {
-            proxy: Some(format!("https://localhost:{p}")),
+            proxy: Some(SecretString::from(format!("https://localhost:{p}"))),
             ..tls_config(AuthMethod::Basic, port)
         };
         let opts = TlsOptions {

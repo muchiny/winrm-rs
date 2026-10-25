@@ -370,7 +370,7 @@ to a share. It does not limit which local files a path names.
 | `max_retries` | `0` | Retries for transient HTTP errors (exponential backoff) |
 | `client_cert_pem` | `None` | Path to client cert PEM (Certificate auth) |
 | `client_key_pem` | `None` | Path to client key PEM (Certificate auth) |
-| `proxy` | `None` | Proxy URL (e.g. `http://proxy:8080`); CredSSP takes `http://` and `socks5://` only |
+| `proxy` | `None` | Proxy URL as a `SecretString` (e.g. `SecretString::from("http://proxy:8080")`), wiped on drop; CredSSP takes `http://` and `socks5://` only |
 | `encryption` | `Auto` | Message sealing for NTLM and Kerberos: `Auto` (over HTTP only), `Always`, `Never`. Basic over plain HTTP requires `Never`; `Always` with Basic, Certificate or CredSSP is refused |
 | `max_output_bytes` | `Some(64 MiB)` | Cap on a command's stdout+stderr; `None` removes it |
 

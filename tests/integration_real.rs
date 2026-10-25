@@ -50,8 +50,8 @@
 
 use std::time::{Duration, Instant};
 use winrm_rs::{
-    AuthMethod, CancellationToken, EncryptionMode, WinrmClient, WinrmConfig, WinrmCredentials,
-    WinrmError,
+    AuthMethod, CancellationToken, EncryptionMode, SecretString, WinrmClient, WinrmConfig,
+    WinrmCredentials, WinrmError,
 };
 
 fn test_client() -> Option<(WinrmClient, String)> {
@@ -545,7 +545,7 @@ async fn ntlm_through_a_forward_proxy() {
             auth_method: AuthMethod::Ntlm,
             encryption: EncryptionMode::Auto,
             port: Some(port),
-            proxy: Some(proxy.clone()),
+            proxy: Some(SecretString::from(proxy.clone())),
             ..WinrmConfig::http()
         };
         let client = WinrmClient::builder(config)
@@ -2512,7 +2512,7 @@ async fn invalid_proxy_returns_http_error() {
         auth_method: AuthMethod::Basic,
         encryption: EncryptionMode::Never,
         port: Some(port),
-        proxy: Some("http://127.0.0.1:19999".into()),
+        proxy: Some(SecretString::from("http://127.0.0.1:19999")),
         ..WinrmConfig::http()
     };
     let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).unwrap();
@@ -2729,7 +2729,7 @@ async fn http_proxy_carries_ntlm_over_http() {
     let (client, host) = test_client_with(|c| {
         c.auth_method = AuthMethod::Ntlm;
         c.encryption = EncryptionMode::Auto; // the base config is Basic (Never)
-        c.proxy = Some(proxy_url);
+        c.proxy = Some(SecretString::from(proxy_url));
     })
     .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
 
@@ -2768,7 +2768,7 @@ async fn http_proxy_connect_carries_https() {
         use_tls: true,
         accept_invalid_certs: false,
         port: Some(https_test_port()),
-        proxy: Some(proxy_url),
+        proxy: Some(SecretString::from(proxy_url)),
         ..Default::default()
     };
     let client = WinrmClient::builder(config)
@@ -2798,7 +2798,7 @@ async fn socks5_proxy_carries_ntlm() {
     let (client, host) = test_client_with(|c| {
         c.auth_method = AuthMethod::Ntlm;
         c.encryption = EncryptionMode::Auto; // the base config is Basic (Never)
-        c.proxy = Some(proxy_url);
+        c.proxy = Some(SecretString::from(proxy_url));
     })
     .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
 
@@ -3113,7 +3113,7 @@ async fn credssp_whoami_through(test: &str, proxy_url: String) -> Option<()> {
         use_tls: true,
         accept_invalid_certs: false,
         port: Some(https_test_port()),
-        proxy: Some(proxy_url),
+        proxy: Some(SecretString::from(proxy_url)),
         ..Default::default()
     };
     let client = WinrmClient::builder(config)

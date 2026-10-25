@@ -263,6 +263,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `use_tls`, 5985 without. Migration: `port: 5986` becomes
   `port: Some(5986)`, and a read of the port in use calls
   `WinrmConfig::effective_port()`.
+- `WinrmConfig::proxy` is an `Option<SecretString>`: build it with
+  `SecretString::from(url)`. The crate's copy of the proxy URL, which can
+  hold credentials, is wiped on drop.
 
 ### Added
 

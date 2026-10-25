@@ -2,7 +2,7 @@
 //
 // Contains WinrmConfig, AuthMethod, and WinrmCredentials extracted from client.rs.
 
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 
 /// Configuration for a [`WinrmClient`](crate::WinrmClient) connection.
 ///
@@ -173,7 +173,10 @@ pub struct WinrmConfig {
     /// and `EC PRIVATE KEY` (SEC1), unencrypted. It must match the end-entity
     /// certificate of [`client_cert_pem`](Self::client_cert_pem).
     pub client_key_pem: Option<String>,
-    /// Proxy URL (e.g. `"http://proxy:8080"`).
+    /// Proxy URL (e.g. `"http://proxy:8080"`), held as a [`SecretString`]
+    /// because it can carry credentials: the crate's copy is wiped on drop
+    /// and never shown by `Debug`. Build it with
+    /// `SecretString::from("http://proxy:8080")`.
     ///
     /// When set, WinRM requests go through this proxy.
     /// [`AuthMethod::CredSsp`] uses this proxy through an HTTP `CONNECT` or
@@ -237,7 +240,7 @@ pub struct WinrmConfig {
     /// the endpoint's, except an `https://` proxy's own leg: this one, or
     /// else the `https://` proxy the environment gives for `https://`
     /// endpoints. The operating system's proxy is never used.
-    pub proxy: Option<String>,
+    pub proxy: Option<SecretString>,
     /// Console output code page (default: 65001 = UTF-8).
     ///
     /// Controls the `WINRS_CODEPAGE` option in the shell creation envelope.
@@ -439,7 +442,9 @@ impl std::fmt::Debug for WinrmConfig {
             idle_timeout_secs,
             max_output_bytes,
         } = self;
-        let proxy = proxy.as_deref().map(crate::transport::redact_userinfo);
+        let proxy = proxy
+            .as_ref()
+            .map(|p| crate::transport::redact_userinfo(p.expose_secret()));
         f.debug_struct("WinrmConfig")
             .field("port", port)
             .field("use_tls", use_tls)
@@ -873,7 +878,6 @@ impl std::fmt::Debug for WinrmCredentials {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use secrecy::ExposeSecret;
 
     #[test]
     fn https_preset_is_tls_on_5986() {
@@ -977,7 +981,9 @@ mod tests {
     #[test]
     fn config_debug_redacts_proxy_userinfo_and_env_values() {
         let config = WinrmConfig {
-            proxy: Some("http://proxyuser:proxy-secret@proxy.corp:8080".into()),
+            proxy: Some(SecretString::from(
+                "http://proxyuser:proxy-secret@proxy.corp:8080",
+            )),
             env_vars: vec![("API_TOKEN".into(), "env-secret".into())],
             ..Default::default()
         };
@@ -1014,6 +1020,19 @@ mod tests {
         }
         let plain = format!("{:?}", WinrmConfig::default());
         assert!(plain.contains("proxy: None"), "{plain}");
+    }
+
+    #[test]
+    fn proxy_is_a_secret_string() {
+        let c = WinrmConfig {
+            proxy: Some(SecretString::from("http://u:pw@p:3128")),
+            ..Default::default()
+        };
+        assert_eq!(
+            c.proxy.as_ref().map(|p| p.expose_secret().to_string()),
+            Some("http://u:pw@p:3128".to_string())
+        );
+        assert!(!format!("{c:?}").contains("pw"));
     }
 
     #[test]

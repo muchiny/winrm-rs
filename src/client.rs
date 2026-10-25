@@ -1259,6 +1259,7 @@ mod tests {
     use crate::config::{AuthMethod, EncryptionMode};
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD as B64;
+    use secrecy::{ExposeSecret, SecretString};
     use wiremock::matchers::{body_string_contains, header, method};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2580,11 +2581,18 @@ mod tests {
     #[test]
     fn proxy_config_is_preserved() {
         let config = WinrmConfig {
-            proxy: Some("http://proxy:8080".into()),
+            proxy: Some(SecretString::from("http://proxy:8080")),
             ..Default::default()
         };
         let client = WinrmClient::new(config.clone(), test_creds()).unwrap();
-        assert_eq!(client.config().proxy.as_deref(), Some("http://proxy:8080"));
+        assert_eq!(
+            client
+                .config()
+                .proxy
+                .as_ref()
+                .map(|p| p.expose_secret().to_string()),
+            Some("http://proxy:8080".to_string())
+        );
     }
 
     // --- Phase 5: Transfer and streaming tests ---

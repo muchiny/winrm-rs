@@ -214,12 +214,26 @@ impl WinrmClient {
     /// `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -NonInteractive`:
     /// profile scripts do not run, and a prompt fails instead of waiting.
     ///
-    /// `local_path` is created, or overwritten in place, once the whole remote
-    /// file has arrived: a local write error (disk full, quota) can leave it
-    /// truncated. Nothing local is created or modified when the remote read
-    /// fails or times out. The write runs on tokio's blocking pool: dropping
-    /// the future while it runs does not stop it, so the file may still be
-    /// written after the caller gave up.
+    /// `local_path` is replaced atomically once the whole remote file has
+    /// arrived: the data goes to a temporary `.winrm-rs-<random>.tmp` file in
+    /// the same directory, which is then renamed over `local_path`, so a failed
+    /// write leaves `local_path` as it was. On Unix a new file is created with
+    /// mode 0600 (`chmod` it afterwards if others must read it). An existing
+    /// file keeps its permission bits and, when this process may set them, its
+    /// owner and group; ACLs and extended attributes are not carried over. A
+    /// symbolic link at `local_path` is refused (resolve it yourself and pass
+    /// its target), and so is anything that is not a regular file; directories
+    /// along the path are still resolved through links. A read-only
+    /// destination is refused as before. The file is rewritten in place, which
+    /// is not atomic, when its directory is not writable, when it has other
+    /// hard links, or when its owner cannot be kept. On Windows the rename
+    /// fails while another process holds `local_path` open without delete
+    /// sharing.
+    ///
+    /// Nothing local is created or modified when the remote read fails or
+    /// times out. The write runs on tokio's blocking pool: dropping the future
+    /// while it runs does not stop it, so the file may still be written after
+    /// the caller gave up.
     ///
     /// Returns the number of bytes downloaded.
     ///
@@ -236,9 +250,10 @@ impl WinrmClient {
     ///   never pass an untrusted `remote_path`.
     /// - The file comes back as base64 on the command's stdout. PowerShell
     ///   transcription on the host, if enabled, records it.
-    /// - `local_path` is written with this process's privileges and follows
-    ///   symbolic links. Check an untrusted local path yourself before passing
-    ///   it.
+    /// - `local_path` is written with this process's privileges. A symbolic
+    ///   link at `local_path` itself is refused, but the directories above it
+    ///   are resolved through links. Check an untrusted local path yourself
+    ///   before passing it.
     pub async fn download_file(
         &self,
         host: &str,
@@ -252,7 +267,7 @@ impl WinrmClient {
             .await?;
         let data = decode_download(&output)?;
         let total = data.len() as u64;
-        write_local(local_path, data).await?;
+        store_download(local_path, data).await?;
         Ok(total)
     }
 
@@ -266,12 +281,26 @@ impl WinrmClient {
     /// transfer from the host, not the local write that follows it. No local
     /// file is created or modified on timeout.
     ///
-    /// `local_path` is created, or overwritten in place, once the whole remote
-    /// file has arrived: a local write error (disk full, quota) can leave it
-    /// truncated. Nothing local is created or modified when the remote read
-    /// fails or times out. The write runs on tokio's blocking pool: dropping
-    /// the future while it runs does not stop it, so the file may still be
-    /// written after the caller gave up.
+    /// `local_path` is replaced atomically once the whole remote file has
+    /// arrived: the data goes to a temporary `.winrm-rs-<random>.tmp` file in
+    /// the same directory, which is then renamed over `local_path`, so a failed
+    /// write leaves `local_path` as it was. On Unix a new file is created with
+    /// mode 0600 (`chmod` it afterwards if others must read it). An existing
+    /// file keeps its permission bits and, when this process may set them, its
+    /// owner and group; ACLs and extended attributes are not carried over. A
+    /// symbolic link at `local_path` is refused (resolve it yourself and pass
+    /// its target), and so is anything that is not a regular file; directories
+    /// along the path are still resolved through links. A read-only
+    /// destination is refused as before. The file is rewritten in place, which
+    /// is not atomic, when its directory is not writable, when it has other
+    /// hard links, or when its owner cannot be kept. On Windows the rename
+    /// fails while another process holds `local_path` open without delete
+    /// sharing.
+    ///
+    /// Nothing local is created or modified when the remote read fails or
+    /// times out. The write runs on tokio's blocking pool: dropping the future
+    /// while it runs does not stop it, so the file may still be written after
+    /// the caller gave up.
     ///
     /// Returns the number of bytes downloaded.
     ///
@@ -288,9 +317,10 @@ impl WinrmClient {
     ///   never pass an untrusted `remote_path`.
     /// - The file comes back as base64 on the command's stdout. PowerShell
     ///   transcription on the host, if enabled, records it.
-    /// - `local_path` is written with this process's privileges and follows
-    ///   symbolic links. Check an untrusted local path yourself before passing
-    ///   it.
+    /// - `local_path` is written with this process's privileges. A symbolic
+    ///   link at `local_path` itself is refused, but the directories above it
+    ///   are resolved through links. Check an untrusted local path yourself
+    ///   before passing it.
     ///
     /// # Example
     /// ```rust,no_run
@@ -328,7 +358,7 @@ impl WinrmClient {
             .await?;
         let data = decode_download(&output)?;
         let total = data.len() as u64;
-        write_local(local_path, data).await?;
+        store_download(local_path, data).await?;
         Ok(total)
     }
 }
@@ -443,17 +473,198 @@ async fn read_local(path: &Path) -> Result<Vec<u8>, WinrmError> {
         })
 }
 
-/// Write `data` to a local file on tokio's blocking pool.
-async fn write_local(path: &Path, data: Vec<u8>) -> Result<(), WinrmError> {
-    let owned = path.to_path_buf();
-    tokio::task::spawn_blocking(move || std::fs::write(&owned, &data))
+/// The directory that holds `local_path`, where its temporary file goes:
+/// `.` for a bare file name.
+fn temp_dir_of(local_path: &Path) -> std::io::Result<&Path> {
+    let no_name = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "local path has no file name",
+        )
+    };
+    if local_path.file_name().is_none() {
+        return Err(no_name());
+    }
+    match local_path.parent() {
+        Some(parent) if parent.as_os_str().is_empty() => Ok(Path::new(".")),
+        Some(parent) => Ok(parent),
+        None => Err(no_name()),
+    }
+}
+
+/// The regular file at `local_path`, opened for writing without truncating
+/// it, with its `lstat` metadata; `None` when nothing is there.
+///
+/// A symbolic link or anything else that is not a regular file is refused.
+/// Opening for writing refuses a read-only file. On Unix the opened file must
+/// be the one `lstat` saw, so a swap between the two calls is caught.
+fn open_existing(local_path: &Path) -> std::io::Result<Option<(std::fs::File, std::fs::Metadata)>> {
+    let meta = match std::fs::symlink_metadata(local_path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if meta.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} is a symbolic link; download_file does not follow it (resolve it yourself)",
+                local_path.display()
+            ),
+        ));
+    }
+    if !meta.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", local_path.display()),
+        ));
+    }
+    let file = std::fs::OpenOptions::new().write(true).open(local_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let opened = file.metadata()?;
+        if (opened.dev(), opened.ino()) != (meta.dev(), meta.ino()) {
+            return Err(std::io::Error::other(format!(
+                "{} changed while being replaced",
+                local_path.display()
+            )));
+        }
+    }
+    Ok(Some((file, meta)))
+}
+
+/// Rewrite `file` in place with `data`: not atomic, a failed write leaves it
+/// truncated.
+fn write_in_place(
+    file: &mut std::fs::File,
+    data: &[u8],
+    write: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    file.set_len(0)?;
+    write(file, data)?;
+    file.sync_all()
+}
+
+/// Create the temporary file at `path`: never an existing entry (no link is
+/// followed), owner-only on Unix from the start.
+fn create_temp(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(path)
+}
+
+/// Give `tmp` the owner and group of the file it replaces, when they differ.
+#[cfg(unix)]
+fn keep_owner(tmp: &std::fs::File, meta: &std::fs::Metadata) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let current = tmp.metadata()?;
+    if (current.uid(), current.gid()) == (meta.uid(), meta.gid()) {
+        return Ok(());
+    }
+    std::os::unix::fs::fchown(tmp, Some(meta.uid()), Some(meta.gid()))
+}
+
+/// Replace `local_path` with `data`, which `write` puts into the file it is
+/// given.
+///
+/// The data goes to a fresh `.winrm-rs-<uuid>.tmp` file next to
+/// `local_path`, which is renamed over it, so a failed write leaves
+/// `local_path` as it was. An existing file keeps its permission bits and,
+/// on Unix, its owner and group. The file is rewritten in place instead when
+/// its directory refuses the temporary file, when it has other hard links,
+/// or when its owner cannot be kept. The temporary file is removed on every
+/// error.
+fn replace_local_file_with(
+    local_path: &Path,
+    data: &[u8],
+    write: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let dir = temp_dir_of(local_path)?;
+    let mut existing = open_existing(local_path)?;
+
+    // A rename would split a hard link from its other names.
+    #[cfg(unix)]
+    if let Some((file, meta)) = existing.as_mut()
+        && std::os::unix::fs::MetadataExt::nlink(meta) > 1
+    {
+        return write_in_place(file, data, write);
+    }
+
+    let tmp_path = dir.join(format!(".winrm-rs-{}.tmp", uuid::Uuid::new_v4().simple()));
+    let mut tmp = match create_temp(&tmp_path) {
+        Ok(tmp) => tmp,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+            ) =>
+        {
+            return match existing.as_mut() {
+                Some((file, _)) => write_in_place(file, data, write),
+                None => Err(e),
+            };
+        }
+        Err(e) => return Err(e),
+    };
+
+    // Never leave a file whose owner changed: fall back to the in-place
+    // rewrite, which keeps it.
+    #[cfg(unix)]
+    if let Some((file, meta)) = existing.as_mut()
+        && keep_owner(&tmp, meta).is_err()
+    {
+        drop(tmp);
+        let _ = std::fs::remove_file(&tmp_path);
+        return write_in_place(file, data, write);
+    }
+
+    // The modes are set after the write, which may clear set-id bits.
+    let staged = write(&mut tmp, data)
+        .and_then(|()| match existing.as_ref() {
+            Some((_, meta)) => tmp.set_permissions(meta.permissions()),
+            None => Ok(()),
+        })
+        .and_then(|()| tmp.sync_all());
+    // Close both handles before the rename (Windows refuses to replace an
+    // open file without delete sharing).
+    drop(tmp);
+    drop(existing);
+    if let Err(e) = staged.and_then(|()| std::fs::rename(&tmp_path, local_path)) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
+    // Make the rename durable; best effort.
+    #[cfg(unix)]
+    let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
+    Ok(())
+}
+
+/// Replace `local_path` with `data` (see [`replace_local_file_with`]).
+fn replace_local_file(local_path: &Path, data: &[u8]) -> std::io::Result<()> {
+    replace_local_file_with(
+        local_path,
+        data,
+        <std::fs::File as std::io::Write>::write_all,
+    )
+}
+
+/// Store a downloaded file at `local_path` on tokio's blocking pool.
+async fn store_download(local_path: &Path, data: Vec<u8>) -> Result<(), WinrmError> {
+    let owned = local_path.to_path_buf();
+    tokio::task::spawn_blocking(move || replace_local_file(&owned, &data))
         .await
         .map_err(|e| e.to_string())
         .and_then(|written| written.map_err(|e| e.to_string()))
         .map_err(|e| {
             WinrmError::Transfer(format!(
                 "failed to write local file {}: {e}",
-                path.display()
+                local_path.display()
             ))
         })
 }
@@ -778,5 +989,201 @@ mod tests {
                 "upload_file returned instead of waiting on the FIFO"
             ),
         }
+    }
+
+    /// A fresh, empty directory of its own for one test.
+    fn test_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "winrm-rs-{name}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The temporary files a replacement left in `dir`.
+    fn leftover_temp_files(dir: &Path) -> usize {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".winrm-rs-")
+            })
+            .count()
+    }
+
+    #[test]
+    fn replace_local_file_keeps_the_old_content_when_the_write_fails() {
+        let dir = test_dir("replace-fail");
+        let dest = dir.join("f.bin");
+        std::fs::write(&dest, b"old").unwrap();
+        let err = replace_local_file_with(&dest, b"new content", |f, d| {
+            std::io::Write::write_all(f, &d[..d.len() / 2])?;
+            Err(std::io::Error::from(std::io::ErrorKind::StorageFull))
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::StorageFull);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"old");
+        assert_eq!(leftover_temp_files(&dir), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replace_local_file_creates_new_files_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = test_dir("replace-new");
+        let dest = dir.join("f.bin");
+        replace_local_file(&dest, b"secret").unwrap();
+        let mode = std::fs::metadata(&dest).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "mode {mode:o}");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"secret");
+        assert_eq!(leftover_temp_files(&dir), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replace_local_file_keeps_the_mode_of_an_existing_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = test_dir("replace-mode");
+        let dest = dir.join("f.bin");
+        std::fs::write(&dest, b"old").unwrap();
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o640)).unwrap();
+        replace_local_file(&dest, b"new").unwrap();
+        let mode = std::fs::metadata(&dest).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o640, "mode {mode:o}");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+        assert_eq!(leftover_temp_files(&dir), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replace_local_file_refuses_a_symlink_destination() {
+        let dir = test_dir("replace-link");
+        let target = dir.join("t.txt");
+        let link = dir.join("l");
+        std::fs::write(&target, b"target").unwrap();
+        std::os::unix::fs::symlink("t.txt", &link).unwrap();
+        let err = replace_local_file(&link, b"new").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("symbolic link"), "{err}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"target");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(leftover_temp_files(&dir), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn replace_local_file_refuses_a_directory() {
+        let dir = test_dir("replace-dir");
+        let sub = dir.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let err = replace_local_file(&sub, b"new").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+        assert!(sub.is_dir());
+        assert_eq!(leftover_temp_files(&dir), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replace_local_file_refuses_a_read_only_destination() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = test_dir("replace-ro-file");
+        let dest = dir.join("f.bin");
+        std::fs::write(&dest, b"old").unwrap();
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o444)).unwrap();
+        if std::fs::OpenOptions::new().write(true).open(&dest).is_ok() {
+            eprintln!("a read-only file is writable here (root): test skipped");
+        } else {
+            let err = replace_local_file(&dest, b"new").unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+            assert_eq!(std::fs::read(&dest).unwrap(), b"old");
+            assert_eq!(leftover_temp_files(&dir), 0);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replace_local_file_writes_in_place_in_a_read_only_directory() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = test_dir("replace-ro-dir");
+        let dest = dir.join("f.bin");
+        std::fs::write(&dest, b"old").unwrap();
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let ino = std::fs::metadata(&dest).unwrap().ino();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::write(dir.join("probe"), b"").is_ok() {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!("a read-only directory is writable here (root): test skipped");
+        } else {
+            let result = replace_local_file(&dest, b"new");
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            result.unwrap();
+            assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+            assert_eq!(std::fs::metadata(&dest).unwrap().ino(), ino);
+            assert_eq!(leftover_temp_files(&dir), 0);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replace_local_file_keeps_a_hard_link() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = test_dir("replace-hard-link");
+        let dest = dir.join("f.bin");
+        let other = dir.join("g.bin");
+        std::fs::write(&dest, b"old").unwrap();
+        std::fs::hard_link(&dest, &other).unwrap();
+        replace_local_file(&dest, b"new").unwrap();
+        assert_eq!(std::fs::read(&other).unwrap(), b"new");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+        assert_eq!(std::fs::metadata(&dest).unwrap().nlink(), 2);
+        assert_eq!(leftover_temp_files(&dir), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn temp_dir_of_handles_bare_and_rootless_paths() {
+        assert_eq!(temp_dir_of(Path::new("app.log")).unwrap(), Path::new("."));
+        assert_eq!(
+            temp_dir_of(Path::new("logs/app.log")).unwrap(),
+            Path::new("logs")
+        );
+        for no_name in ["/", ".."] {
+            let err = temp_dir_of(Path::new(no_name)).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{no_name}");
+            assert!(err.to_string().contains("no file name"), "{err}");
+        }
+    }
+
+    #[test]
+    fn replace_local_file_accepts_a_long_destination_name() {
+        let dir = test_dir("replace-long");
+        let dest = dir.join("n".repeat(250));
+        replace_local_file(&dest, b"long").unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"long");
+        assert_eq!(leftover_temp_files(&dir), 0);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

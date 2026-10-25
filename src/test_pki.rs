@@ -17,15 +17,22 @@
 //   openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256   # impostor key
 //
 // Trust-anchor fixtures (CA, a CA-issued leaf, a non-CA self-signed leaf), made
-// with OpenSSL 3.5 and equally throwaway:
+// with OpenSSL 3.5 and equally throwaway. The CA and its leaf also reach the
+// operating system's verifier (an `https://` proxy over plain HTTP,
+// `platform_roots`). On macOS a TLS server certificate issued on or after
+// 1 July 2019 that chains to a root added by the application may be valid for
+// at most 825 days, so their validity starts before that date and still runs
+// for a century. The non-CA self-signed leaf only reaches the WebPKI
+// verifier, which sets no such limit.
 //
 //   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout ca.key \
-//       -out ca.pem -days 36500 -subj "/CN=winrm-rs throwaway test CA"   # default v3_ca: CA:TRUE
+//       -out ca.pem -not_before 20190101000000Z -not_after 21190101000000Z \
+//       -subj "/CN=winrm-rs throwaway test CA"   # default v3_ca: CA:TRUE
 //   printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:localhost\n' > leaf.ext
 //   openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout leaf.key \
 //       -out leaf.csr -subj "/CN=winrm-rs throwaway CA-issued leaf"
-//   openssl x509 -req -in leaf.csr -CA ca.pem -CAkey ca.key -set_serial 2 -days 36500 \
-//       -extfile leaf.ext -out leaf.pem
+//   openssl x509 -req -in leaf.csr -CA ca.pem -CAkey ca.key -set_serial 2 \
+//       -not_before 20190101000000Z -not_after 21181201000000Z -extfile leaf.ext -out leaf.pem
 //   openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout ss.key \
 //       -out ss.csr -subj "/CN=winrm-rs throwaway non-CA self-signed"
 //   openssl x509 -req -in ss.csr -key ss.key -set_serial 3 -days 36500 -extfile leaf.ext -out ss.pem
@@ -533,40 +540,40 @@ TZkzaJG8kyjjXD9Hm+4XvQoYWD7qDvK1xYymIr+F28TE4IV/nKG5Axfi
 /// Throwaway P-256 CA (`CN=winrm-rs throwaway test CA`, `CA:TRUE`); it issued [`CA_LEAF_PEM`].
 pub(crate) const TEST_CA_PEM: &str = "\
 -----BEGIN CERTIFICATE-----
-MIIBoTCCAUegAwIBAgIUUFwHMwwgXImKMIMdRG/DbhF3a80wCgYIKoZIzj0EAwIw
-JTEjMCEGA1UEAwwad2lucm0tcnMgdGhyb3dhd2F5IHRlc3QgQ0EwIBcNMjYxMDI1
-MDA1NTE5WhgPMjEyNjEwMDEwMDU1MTlaMCUxIzAhBgNVBAMMGndpbnJtLXJzIHRo
-cm93YXdheSB0ZXN0IENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE4huGQcE4
-Z73m9e946pA4Y98uJIdolSHqlz7mDSft5pFjbKLeIUqpIYll06deGjUU4CPQMk23
-mjTt43hlzf9/QKNTMFEwHQYDVR0OBBYEFPTwETCVzdw1CASJRkzrMAZ8W1LhMB8G
-A1UdIwQYMBaAFPTwETCVzdw1CASJRkzrMAZ8W1LhMA8GA1UdEwEB/wQFMAMBAf8w
-CgYIKoZIzj0EAwIDSAAwRQIgOKOHuw8q3VCCQw47qbYXlUEdUWyS/L5SA2m3a0Ld
-Q9gCIQCRJbfABdEhBBjXR4n0iHsQjlFXRtTYunYfeny23AHKOA==
+MIIBoTCCAUegAwIBAgIUcA+cqr9ttGm82Ag+kT3NfVW3fkgwCgYIKoZIzj0EAwIw
+JTEjMCEGA1UEAwwad2lucm0tcnMgdGhyb3dhd2F5IHRlc3QgQ0EwIBcNMTkwMTAx
+MDAwMDAwWhgPMjExOTAxMDEwMDAwMDBaMCUxIzAhBgNVBAMMGndpbnJtLXJzIHRo
+cm93YXdheSB0ZXN0IENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE1wmNbja/
+pC2W0d0gmidS/m6fOCi5mqjgJFhNkG15tKuRtB+EDwcqDxwgz0uU/WDeyXObAqIL
+v8sETWZmjKWWj6NTMFEwHQYDVR0OBBYEFF1riqkKL8/CAYJbVVuruAJiobtbMB8G
+A1UdIwQYMBaAFF1riqkKL8/CAYJbVVuruAJiobtbMA8GA1UdEwEB/wQFMAMBAf8w
+CgYIKoZIzj0EAwIDSAAwRQIgPoW/j2nSjgMB4RVWBPULNYsCdl9F2+CbgLVu0ERD
+Sr8CIQCqoAYI2hn3YJNoy95Ps03/VgxepsxUb5w7Iytg6Io+hg==
 -----END CERTIFICATE-----
 ";
 
 /// P-256 listener certificate issued by [`TEST_CA_PEM`]: `CA:FALSE`, `serverAuth`, SAN `DNS:localhost`.
 pub(crate) const CA_LEAF_PEM: &str = "\
 -----BEGIN CERTIFICATE-----
-MIIB0DCCAXWgAwIBAgIBAjAKBggqhkjOPQQDAjAlMSMwIQYDVQQDDBp3aW5ybS1y
-cyB0aHJvd2F3YXkgdGVzdCBDQTAgFw0yNjEwMjUwMDU1MTlaGA8yMTI2MTAwMTAw
-NTUxOVowLDEqMCgGA1UEAwwhd2lucm0tcnMgdGhyb3dhd2F5IENBLWlzc3VlZCBs
-ZWFmMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEv+C/7q8/0QRGgELNJ87xUEu1
-UObYe0fI6m6Ay54jrct+NJbE2Od/4hq/RQBMQY08G1HyDZ9ghd8JTvV2Lv4HT6OB
+MIIBzjCCAXWgAwIBAgIBAjAKBggqhkjOPQQDAjAlMSMwIQYDVQQDDBp3aW5ybS1y
+cyB0aHJvd2F3YXkgdGVzdCBDQTAgFw0xOTAxMDEwMDAwMDBaGA8yMTE4MTIwMTAw
+MDAwMFowLDEqMCgGA1UEAwwhd2lucm0tcnMgdGhyb3dhd2F5IENBLWlzc3VlZCBs
+ZWFmMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEmn+7NK9sOsbjxhj5QvadWQYD
+0ghmc3lkdHllp5l+M6zSuMeFBj7LRcW2CEILMUku+iDBxUZ4CpPk+1goN8/p5KOB
 jDCBiTAMBgNVHRMBAf8EAjAAMA4GA1UdDwEB/wQEAwIHgDATBgNVHSUEDDAKBggr
-BgEFBQcDATAUBgNVHREEDTALgglsb2NhbGhvc3QwHQYDVR0OBBYEFG9P1EjVHlKq
-Ee6XqitUghpW1dMbMB8GA1UdIwQYMBaAFPTwETCVzdw1CASJRkzrMAZ8W1LhMAoG
-CCqGSM49BAMCA0kAMEYCIQD1tBuoonZiLYdN5VA4TAgyvol/hNgAJbHCvG7gQx5l
-UgIhAJ8caRvuzb58cSw83SpUQuefW+XRhfpbo2aHA+WAsBda
+BgEFBQcDATAUBgNVHREEDTALgglsb2NhbGhvc3QwHQYDVR0OBBYEFCIVDJGH8rvt
+A91y84n3y0zd1tx5MB8GA1UdIwQYMBaAFF1riqkKL8/CAYJbVVuruAJiobtbMAoG
+CCqGSM49BAMCA0cAMEQCIHlQvg/4vO7TnCK5gt1qndZ5Svk1r8Mmzd2aWerABTBA
+AiB527LnHujmvIrlVzJi/vPw7Qv3a1hvdAs+4WQ3d00VrQ==
 -----END CERTIFICATE-----
 ";
 
 /// Key of [`CA_LEAF_PEM`], PKCS#8 (`PRIVATE KEY`).
 pub(crate) const CA_LEAF_KEY_PEM: &str = "\
 -----BEGIN PRIVATE KEY-----
-MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgsXq/yism2esy250x
-kiHHs5JOMZcMVs+g7T4A4oRkkBihRANCAAS/4L/urz/RBEaAQs0nzvFQS7VQ5th7
-R8jqboDLniOty340lsTY53/iGr9FAExBjTwbUfINn2CF3wlO9XYu/gdP
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgcvZHJJSPiQeeTrua
+qwtbWKsTq1c3sgfG9Bu3TiwB35ChRANCAASaf7s0r2w6xuPGGPlC9p1ZBgPSCGZz
+eWR0eWWnmX4zrNK4x4UGPstFxbYIQgsxSS76IMHFRngKk+T7WCg3z+nk
 -----END PRIVATE KEY-----
 ";
 

@@ -8544,8 +8544,9 @@ mod tests {
             platform_roots: true,
             ..roots(&[&ca])
         };
-        let (_, read) = basic_against_sink(&opts, CA_LEAF_PEM, CA_LEAF_KEY_PEM, "localhost").await;
-        assert!(read > 0, "the listener must be trusted");
+        let (result, read) =
+            basic_against_sink(&opts, CA_LEAF_PEM, CA_LEAF_KEY_PEM, "localhost").await;
+        assert!(read > 0, "the listener must be trusted: {result:?}");
     }
 
     /// The options apply to an `https://` proxy over plain HTTP.
@@ -8565,10 +8566,13 @@ mod tests {
                 ..tls_config(AuthMethod::Basic, 5985)
             };
             let t = transport_with(config, &opts).unwrap();
-            let _ = send_basic(&t, "127.0.0.1").await;
+            let result = send_basic(&t, "127.0.0.1").await;
             let read = read.load(Ordering::SeqCst);
             if trusted {
-                assert!(read > 0, "the proxy certificate must be trusted");
+                assert!(
+                    read > 0,
+                    "the proxy certificate must be trusted: {result:?}"
+                );
             } else {
                 assert_eq!(read, 0, "without the root the proxy is refused");
             }

@@ -289,6 +289,13 @@ println!("{}", String::from_utf8_lossy(&output.stdout));
 
 `args` are joined into one `cmd.exe` command line on the host: never put untrusted text in them. See `WinrmClient::run_command`.
 
+To pass an untrusted value to the host, put it in a `run_powershell` script as a literal built with `winrm_rs::quote_powershell_string`: the script reaches PowerShell unchanged through `-EncodedCommand`, and the quoted value is one verbatim string whatever it holds.
+
+```rust
+let script = format!("Get-Item -LiteralPath {}", winrm_rs::quote_powershell_string(user_path));
+let output = client.run_powershell("win-server", &script).await?;
+```
+
 ### Streaming output
 
 ```rust

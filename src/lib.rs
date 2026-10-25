@@ -137,7 +137,7 @@ mod transport;
 
 pub use builder::{NeedsCredentials, Ready, WinrmClientBuilder};
 pub use client::WinrmClient;
-pub use command::{CommandOutput, encode_powershell_command};
+pub use command::{CommandOutput, encode_powershell_command, quote_powershell_string};
 pub use config::{
     AuthMethod, EncryptionMode, ProxySessionAuth, TlsProvider, WinrmConfig, WinrmCredentials,
 };

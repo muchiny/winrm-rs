@@ -7,7 +7,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use winrm_rs::__fuzz::{escape_ps_single_quoted, validate_remote_path, validate_remote_path_for};
-use winrm_rs::RemotePathPolicy;
+use winrm_rs::{RemotePathPolicy, quote_powershell_string};
 
 /// The five characters PowerShell accepts as a single quote, stated here
 /// independently of the implementation.
@@ -88,5 +88,27 @@ fuzz_target!(|data: &[u8]| {
         collapse_pairs(&escaped).as_deref(),
         Some(path),
         "PowerShell quote escaping is not reversible"
+    );
+
+    // The public helper wraps that escape in ASCII quotes: one literal, whose
+    // inner part keeps every quote run even.
+    let quoted = quote_powershell_string(path);
+    assert!(
+        quoted.starts_with('\'') && quoted.ends_with('\'') && quoted.len() >= 2,
+        "quote_powershell_string is not wrapped in single quotes"
+    );
+    let inner = quoted
+        .strip_prefix('\'')
+        .and_then(|rest| rest.strip_suffix('\''))
+        .unwrap_or_default();
+    assert_eq!(
+        longest_quote_run(inner),
+        2 * longest_quote_run(path),
+        "quoted literal does not double every quote run"
+    );
+    assert_eq!(
+        collapse_pairs(inner).as_deref(),
+        Some(path),
+        "quote_powershell_string is not reversible"
     );
 });

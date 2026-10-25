@@ -378,7 +378,18 @@ impl WinrmClient {
     /// quoting is safe for every value: never put untrusted text in
     /// `command` or `args`. Pass untrusted values to PowerShell as data
     /// instead, for example with [`run_powershell`](Self::run_powershell)
-    /// and a single-quoted literal.
+    /// and a literal built with
+    /// [`quote_powershell_string`](crate::quote_powershell_string).
+    ///
+    /// ```rust,no_run
+    /// # use winrm_rs::{WinrmClient, WinrmConfig, WinrmCredentials, WinrmError};
+    /// # async fn example(user_path: &str) -> Result<(), WinrmError> {
+    /// # let client = WinrmClient::new(WinrmConfig::default(), WinrmCredentials::new("u","p",""))?;
+    /// let script = format!("Get-Item -LiteralPath {}", winrm_rs::quote_powershell_string(user_path));
+    /// let out = client.run_powershell("server", &script).await?;
+    /// # let _ = out;
+    /// # Ok(()) }
+    /// ```
     #[tracing::instrument(
         level = "debug",
         skip(self, host, command, args),

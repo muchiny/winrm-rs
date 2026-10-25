@@ -630,7 +630,7 @@ pub fn validate_remote_path_for(
 
 /// Escape a value for a PowerShell single-quoted string literal.
 pub fn escape_ps_single_quoted(s: &str) -> String {
-    crate::transfer::escape_ps_single_quoted(s)
+    crate::command::escape_ps_single_quoted(s)
 }
 
 // ---------------------------------------------------------------------------

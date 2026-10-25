@@ -1,10 +1,9 @@
 // Security regression tests.
 //
-// These tests pin specific defensive behaviours added during the security
-// hardening pass so future refactors cannot silently regress them. They
-// focus on behaviour observable through the public API + wiremock; deeper
-// crypto / parser regressions live in unit tests next to the affected
-// module.
+// These tests pin defensive behaviours observable through the public API +
+// wiremock. The two redirect tests below each fail if `build_http_client`
+// follows redirects; deeper crypto / parser regressions live in unit tests
+// next to the affected module.
 //
 // The clients here are built through the public API, which (outside the
 // crate's own unit tests) reads `HTTP_PROXY` / `ALL_PROXY` from the
@@ -12,7 +11,9 @@
 // server: if your shell exports a proxy, make sure `NO_PROXY` covers
 // `127.0.0.1` (`*` does not: it matches names only).
 
-use winrm_rs::{AuthMethod, EncryptionMode, WinrmClient, WinrmConfig, WinrmCredentials};
+use winrm_rs::{
+    AuthMethod, EncryptionMode, WinrmClient, WinrmConfig, WinrmCredentials, WinrmError,
+};
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -44,34 +45,68 @@ fn basic_client(uri: &str) -> (WinrmClient, String) {
     (client, host)
 }
 
-/// The transport must NOT follow HTTP redirects: WinRM endpoints are fixed
-/// and a 30x is unexpected. Following it could leak the Authorization
-/// header to an arbitrary target.
+/// A 307 to another origin must not be followed: the SOAP body (and the
+/// `Authorization` header) must never reach the other origin.
 #[tokio::test]
-async fn http_redirects_are_not_followed() {
+async fn http_307_to_another_origin_is_not_followed() {
+    let target = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&target)
+        .await;
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(
-            ResponseTemplate::new(302).insert_header("location", "http://attacker.invalid/x"),
+            ResponseTemplate::new(307)
+                .insert_header("location", format!("{}/wsman", target.uri()).as_str()),
         )
         .mount(&server)
         .await;
 
     let (client, host) = basic_client(&server.uri());
-    let result = client.run_command(&host, "ipconfig", &[]).await;
+    let err = client
+        .run_command(&host, "ipconfig", &[])
+        .await
+        .expect_err("a 307 must not be followed");
     assert!(
-        result.is_err(),
-        "expected error on 302, got Ok({:?})",
-        result.ok()
+        matches!(&err, WinrmError::AuthFailed(m) if m.contains("307")),
+        "{err:?}"
+    );
+    assert!(
+        target
+            .received_requests()
+            .await
+            .expect("recording")
+            .is_empty(),
+        "the SOAP body reached the other origin"
+    );
+    assert_eq!(
+        server.received_requests().await.expect("recording").len(),
+        1
     );
 }
 
-/// A host that is not a bare host name is refused before anything is sent. Full
-/// integration coverage requires a live SOAP responder; the behaviour is
-/// pinned by `transport::tests::sanitize_host_*` and `validate_host_*` unit tests. This sentinel
-/// keeps the docstring discoverable so the unit tests are not removed
-/// without updating this file.
+/// A 302 to the same origin must not be followed either: exactly one request
+/// reaches the server.
 #[tokio::test]
-async fn host_sanitization_intent_is_documented() {
-    // See src/transport.rs sanitize_host* unit tests.
+async fn http_302_to_the_same_origin_is_not_followed() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(302).insert_header("location", "/elsewhere"))
+        .mount(&server)
+        .await;
+
+    let (client, host) = basic_client(&server.uri());
+    let err = client
+        .run_command(&host, "ipconfig", &[])
+        .await
+        .expect_err("a 302 must not be followed");
+    assert!(
+        matches!(&err, WinrmError::AuthFailed(m) if m.contains("302")),
+        "{err:?}"
+    );
+    assert_eq!(
+        server.received_requests().await.expect("recording").len(),
+        1
+    );
 }

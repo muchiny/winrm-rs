@@ -9,6 +9,15 @@
 // Host state: `pwsh` (`pwsh.exe` on Windows) must be on `PATH`. Without it
 // the test is skipped with a message; the CI job that runs it checks that
 // `pwsh` is present.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    reason = "test code"
+)]
 
 use std::path::PathBuf;
 

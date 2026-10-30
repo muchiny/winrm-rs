@@ -13,9 +13,9 @@ use winrm_rs::{WinrmClient, WinrmConfig, WinrmCredentials};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let host = std::env::var("WINRM_HOST").expect("set WINRM_HOST");
+    let host = std::env::var("WINRM_HOST").map_err(|_| "set WINRM_HOST")?;
     let user = std::env::var("WINRM_USER").unwrap_or_else(|_| "administrator".into());
-    let pass = std::env::var("WINRM_PASS").expect("set WINRM_PASS");
+    let pass = std::env::var("WINRM_PASS").map_err(|_| "set WINRM_PASS")?;
     let credentials = WinrmCredentials::new(user, pass, "");
 
     let client = if std::env::var_os("WINRM_HTTP").is_some() {

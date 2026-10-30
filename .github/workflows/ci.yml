@@ -283,17 +283,11 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Install OpenSSL headers
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
-      # `--lib` only: these restriction lints target production code. With
-      # `--all-targets` the lib is checked twice (plain and test harness), so
-      # every warning reached SonarQube twice, and the test code (which the
-      # `clippy` job already holds to the default lints) filled the report.
+      # `--lib` only: the restriction lints of Cargo.toml target production
+      # code, and with `--all-targets` the lib is checked twice (plain and test
+      # harness), so every warning would reach SonarQube twice.
       - name: Clippy report (JSON)
-        run: |
-          cargo clippy --locked --lib --features credssp --message-format=json -- \
-            -W clippy::unwrap_used -W clippy::expect_used -W clippy::panic \
-            -W clippy::todo -W clippy::unimplemented -W clippy::indexing_slicing \
-            -W clippy::arithmetic_side_effects -W clippy::as_conversions \
-            > clippy-report.json
+        run: cargo clippy --locked --lib --features credssp --message-format=json > clippy-report.json
       - name: Keep clippy-report.json for the sonar job
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -378,32 +372,6 @@ jobs:
       - name: Install krb5 and OpenSSL dev headers
         run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libssl-dev pkg-config
       - run: cargo doc --locked --no-deps --all-features
-
-  hardening:
-    # Informatif : compte les violations des lints durcis (rust-hardening.md).
-    # Ne bloque jamais ; à rendre bloquant quand les compteurs sont à zéro.
-    name: Hardening (informatif)
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-24
-        with:
-          toolchain: 1.98.0
-          components: clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - name: Lints durcis (comptage)
-        run: |
-          cargo clippy --locked --message-format=short -- \
-            -W clippy::unwrap_used -W clippy::expect_used -W clippy::panic -W clippy::todo -W clippy::unimplemented -W clippy::indexing_slicing -W clippy::arithmetic_side_effects -W clippy::as_conversions 2> hardening.txt || true
-          {
-            echo '### Lints durcis (non bloquant)'
-            echo '```'
-            sed -nE 's/^[^ ]+ (warning|error): //p' hardening.txt | sort | uniq -c | sort -rn
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
 
   vet:
     name: cargo vet

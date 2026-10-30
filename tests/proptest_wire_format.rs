@@ -24,6 +24,15 @@
 //! Run with: `cargo test --features __internal --test proptest_wire_format`
 
 #![cfg(feature = "__internal")]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    reason = "test code"
+)]
 
 use proptest::prelude::*;
 

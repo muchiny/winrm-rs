@@ -120,6 +120,23 @@
 //! # }
 //! ```
 
+// Test builds only: the plain library build still holds production code to
+// these lints (Cargo.toml). `clippy.toml` exempts `#[test]` functions and
+// `#[cfg(test)]` modules from some of them, not from `as` or arithmetic, and
+// not modules gated on `cfg(all(test, ...))`.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::as_conversions,
+        reason = "test code"
+    )
+)]
+
 #[cfg(feature = "credssp")]
 mod asn1;
 mod auth;

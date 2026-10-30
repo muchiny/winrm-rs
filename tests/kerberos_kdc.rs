@@ -25,6 +25,15 @@
 //!   the sealed requests on that connection.
 
 #![cfg(all(feature = "kerberos", unix))]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    reason = "test code"
+)]
 
 use std::sync::{Arc, Mutex};
 

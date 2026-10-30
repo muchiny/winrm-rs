@@ -48,6 +48,16 @@
 //! failure a few times and report every one if they never get a verdict; they
 //! are still most reliable with `-- --ignored --test-threads=1`.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    reason = "test code"
+)]
+
 use std::time::{Duration, Instant};
 use winrm_rs::{
     AuthMethod, CancellationToken, EncryptionMode, SecretString, WinrmClient, WinrmConfig,

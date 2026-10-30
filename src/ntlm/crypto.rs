@@ -123,6 +123,7 @@ pub(crate) fn compute_ntlmv2_hash(
 /// facade and the test NTLM server. Anything keyed by key material (NTLMv2
 /// hash, session keys, the MIC) goes through [`hmac_md5_secret`] or
 /// [`hmac_md5_parts`], which wipe the pad blocks they build.
+#[expect(clippy::expect_used, reason = "HMAC accepts keys of any length")]
 pub(crate) fn hmac_md5(key: &[u8], data: &[u8]) -> [u8; 16] {
     let mut mac = HmacMd5::new_from_slice(key).expect("HMAC accepts any key size");
     mac.update(data);
@@ -199,7 +200,8 @@ pub(crate) fn build_ntlmv2_blob(
     client_challenge: &[u8; 8],
     target_info: &[u8],
 ) -> Vec<u8> {
-    let mut blob = Vec::with_capacity(28 + target_info.len() + 4);
+    // 28 bytes of fixed fields, the AV pairs, then the 4-byte terminator.
+    let mut blob = Vec::with_capacity(target_info.len().saturating_add(32));
     blob.push(0x01); // RespType
     blob.push(0x01); // HiRespType
     blob.extend_from_slice(&[0u8; 6]); // Reserved
@@ -293,7 +295,9 @@ pub(crate) fn current_windows_filetime() -> [u8; 8] {
         .unwrap_or_default()
         .as_secs();
     // FILETIME epoch offset: seconds between 1601-01-01 and 1970-01-01
-    let filetime = (unix_secs + 11_644_473_600) * 10_000_000;
+    let filetime = unix_secs
+        .saturating_add(11_644_473_600)
+        .saturating_mul(10_000_000);
     filetime.to_le_bytes()
 }
 
@@ -501,11 +505,15 @@ fn channel_bindings_with(hash: CbtHash, cert_der: &[u8]) -> [u8; 16] {
     //   [acceptor_addrtype:u32 LE][acceptor_len:u32 LE][acceptor_data]
     //   [application_data_len:u32 LE][application_data]
     // For TLS-only CBT, initiator and acceptor are empty (length 0).
-    let mut bindings = Vec::with_capacity(20 + app_data.len());
+    let mut bindings = Vec::with_capacity(app_data.len().saturating_add(20));
     bindings.extend_from_slice(&0u32.to_le_bytes()); // initiator addrtype = 0
     bindings.extend_from_slice(&0u32.to_le_bytes()); // initiator length = 0
     bindings.extend_from_slice(&0u32.to_le_bytes()); // acceptor addrtype = 0
     bindings.extend_from_slice(&0u32.to_le_bytes()); // acceptor length = 0
+    #[expect(
+        clippy::as_conversions,
+        reason = "app data is a 21-byte prefix and a hash of at most 64 bytes"
+    )]
     bindings.extend_from_slice(&(app_data.len() as u32).to_le_bytes()); // app_data length
     bindings.extend_from_slice(&app_data);
 
@@ -550,28 +558,42 @@ impl Rc4State {
 
     /// Re-key the state in place: the S-box is rewritten where it lies, so no
     /// new copy of it is made, and the keystream restarts at offset 0.
+    ///
+    /// # Panics
+    ///
+    /// If `key` is empty: RC4 has no key schedule for it. The callers pass
+    /// 16-byte keys.
     pub(crate) fn reinit(&mut self, key: &[u8]) {
-        for (i, v) in self.s.iter_mut().enumerate() {
-            *v = i as u8;
+        assert!(!key.is_empty(), "RC4 key must not be empty");
+        for (v, i) in self.s.iter_mut().zip(0..=u8::MAX) {
+            *v = i;
         }
         self.i = 0;
         self.j = 0;
         let mut j: u8 = 0;
-        for i in 0..256 {
-            j = j.wrapping_add(self.s[i]).wrapping_add(key[i % key.len()]);
-            self.s.swap(i, j as usize);
+        for (i, &k) in (0..=u8::MAX).zip(key.iter().cycle()) {
+            j = j.wrapping_add(self.sbox(i)).wrapping_add(k);
+            self.s.swap(usize::from(i), usize::from(j));
         }
     }
 
     pub(crate) fn process(&mut self, data: &mut [u8]) {
         for byte in data.iter_mut() {
             self.i = self.i.wrapping_add(1);
-            self.j = self.j.wrapping_add(self.s[self.i as usize]);
-            self.s.swap(self.i as usize, self.j as usize);
-            let k =
-                self.s[(self.s[self.i as usize].wrapping_add(self.s[self.j as usize])) as usize];
+            self.j = self.j.wrapping_add(self.sbox(self.i));
+            self.s.swap(usize::from(self.i), usize::from(self.j));
+            let k = self.sbox(self.sbox(self.i).wrapping_add(self.sbox(self.j)));
             *byte ^= k;
         }
+    }
+
+    #[inline]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "a u8 index is always within the 256-byte S-box"
+    )]
+    fn sbox(&self, index: u8) -> u8 {
+        self.s[usize::from(index)]
     }
 }
 

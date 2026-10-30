@@ -261,7 +261,7 @@ impl WinrmClient {
         upload_chunk_len(&escaped_path)?;
 
         let shell = self.open_shell(host).await?;
-        let total = data.len() as u64;
+        let total = byte_count(data.len());
 
         let uploaded = self.upload_chunks(&shell, &data, &escaped_path).await;
         let closed = match &uploaded {
@@ -381,7 +381,7 @@ impl WinrmClient {
             .run_command(host, POWERSHELL_EXE, &transfer_args(&encoded))
             .await?;
         let data = decode_download(&output)?;
-        let total = data.len() as u64;
+        let total = byte_count(data.len());
         store_download(local_path, data).await?;
         Ok(total)
     }
@@ -437,7 +437,7 @@ impl WinrmClient {
             .run_command_with_timeout(host, POWERSHELL_EXE, &transfer_args(&encoded), timeout)
             .await?;
         let data = decode_download(&output)?;
-        let total = data.len() as u64;
+        let total = byte_count(data.len());
         store_download(local_path, data).await?;
         Ok(total)
     }
@@ -464,6 +464,12 @@ fn transfer_command_line_len(script: &str) -> usize {
 /// The length of the base64 text for `n` raw bytes.
 fn base64_len(n: usize) -> usize {
     n.div_ceil(3).saturating_mul(4)
+}
+
+/// `len` as the byte count the transfer API returns. `usize` is at most 64
+/// bits on every supported target, so the saturation never applies.
+fn byte_count(len: usize) -> u64 {
+    u64::try_from(len).unwrap_or(u64::MAX)
 }
 
 /// The largest chunk length, up to [`CHUNK_SIZE`], whose upload command line

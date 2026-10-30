@@ -368,13 +368,12 @@ impl WinrmClient {
     /// The `powershell.exe` arguments for an encoded script: the
     /// non-interactive flags first when the builder asked for them.
     pub(crate) fn powershell_args<'a>(&self, encoded: &'a str) -> Vec<&'a str> {
-        let mut args = Vec::with_capacity(NON_INTERACTIVE_FLAGS.len() + 2);
-        if self.transport.options().non_interactive_powershell {
-            args.extend(NON_INTERACTIVE_FLAGS);
-        }
-        args.push("-EncodedCommand");
-        args.push(encoded);
-        args
+        let flags: &[&str] = if self.transport.options().non_interactive_powershell {
+            &NON_INTERACTIVE_FLAGS
+        } else {
+            &[]
+        };
+        [flags, &["-EncodedCommand", encoded]].concat()
     }
 
     /// Run a command on a remote host, collecting all output.

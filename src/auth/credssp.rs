@@ -132,8 +132,8 @@ impl std::io::Read for MemBio {
             ));
         }
         let n = std::cmp::min(buf.len(), self.incoming.len());
-        for slot in buf.iter_mut().take(n) {
-            *slot = self.incoming.pop_front().unwrap();
+        for (slot, byte) in buf.iter_mut().zip(self.incoming.drain(..n)) {
+            *slot = byte;
         }
         Ok(n)
     }
@@ -193,7 +193,7 @@ impl OpenSslMemTls {
         loop {
             match self.ssl.ssl_read(&mut buf) {
                 Ok(0) => break,
-                Ok(n) => out.extend_from_slice(&buf[..n]),
+                Ok(n) => out.extend(buf.iter().take(n)),
                 Err(e) if e.code() == ErrorCode::WANT_READ || e.code() == ErrorCode::WANT_WRITE => {
                     break;
                 }
@@ -933,8 +933,9 @@ pub(crate) fn extract_credssp_token_str(www_auth: &str) -> Option<String> {
         .as_bytes()
         .windows(SCHEME.len())
         .position(|w| w.eq_ignore_ascii_case(SCHEME))?;
-    // `pos + SCHEME.len()` follows an ASCII space, so it is a char boundary.
-    let after = www_auth.get(pos + SCHEME.len()..)?;
+    // The match is ASCII and ends with a space, so both its start and its
+    // end are char boundaries.
+    let after = www_auth.get(pos..)?.get(SCHEME.len()..)?;
     let token: String = after
         .chars()
         .take_while(|c| !c.is_whitespace() && *c != ',')
@@ -1364,9 +1365,9 @@ async fn authenticate(
     //   3. Receive server response (ServerHello, etc.) in WWW-Authenticate
     //   4. Feed back into rustls
     //   5. Repeat until !is_handshaking()
-    let mut round = 0;
+    let mut round: u32 = 0;
     loop {
-        round += 1;
+        round = round.saturating_add(1);
         if round > 10 {
             return Err(WinrmError::AuthFailed(
                 "CredSSP: TLS handshake did not complete in 10 rounds".into(),

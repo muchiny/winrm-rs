@@ -2152,7 +2152,7 @@ impl HttpTransport {
                     tracing::warn!(
                         attempt = attempt.saturating_add(1),
                         max_retries = max,
-                        delay_ms = delay.as_millis() as u64,
+                        delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
                         "retrying after transient HTTP error"
                     );
                     tokio::time::sleep(delay).await;
@@ -2240,7 +2240,7 @@ fn is_tls_failure(err: &reqwest::Error) -> bool {
         current = match e.downcast_ref::<std::io::Error>() {
             Some(io) => io
                 .get_ref()
-                .map(|w| w as &(dyn std::error::Error + 'static)),
+                .map(|w| -> &(dyn std::error::Error + 'static) { w }),
             None => e.source(),
         };
     }

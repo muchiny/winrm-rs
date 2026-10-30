@@ -97,7 +97,7 @@ pub fn quote_powershell_string(value: &str) -> String {
 /// The input is converted to UTF-16LE and then base64-encoded, which avoids
 /// shell quoting and character escaping issues.
 pub fn encode_powershell_command(script: &str) -> String {
-    let mut utf16 = Vec::with_capacity(script.len() * 2);
+    let mut utf16 = Vec::with_capacity(script.len().saturating_mul(2));
     for c in script.encode_utf16() {
         utf16.extend_from_slice(&c.to_le_bytes());
     }

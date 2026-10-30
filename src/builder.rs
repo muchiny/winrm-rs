@@ -592,6 +592,10 @@ impl WinrmClientBuilder<Ready> {
     pub fn build(self) -> Result<WinrmClient, WinrmError> {
         // SAFETY: The typestate pattern guarantees that `credentials` is
         // `Some` when `build()` is callable (state = Ready).
+        #[expect(
+            clippy::expect_used,
+            reason = "the typestate only exposes `build` once credentials are set"
+        )]
         let mut client = WinrmClient::with_options(
             self.config,
             self.credentials

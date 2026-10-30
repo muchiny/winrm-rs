@@ -40,27 +40,23 @@ pub struct TsRequest {
 // --- DER Encoding Primitives ---
 
 fn encode_length(len: usize) -> Vec<u8> {
+    // The four low-order bytes of `len`, `b0` the least significant.
+    let [.., b3, b2, b1, b0] = len.to_be_bytes();
     if len < 0x80 {
-        vec![len as u8]
+        vec![b0]
     } else if len < 0x100 {
-        vec![0x81, len as u8]
+        vec![0x81, b0]
     } else if len < 0x10000 {
-        vec![0x82, (len >> 8) as u8, len as u8]
+        vec![0x82, b1, b0]
     } else if len < 0x100_0000 {
-        vec![0x83, (len >> 16) as u8, (len >> 8) as u8, len as u8]
+        vec![0x83, b2, b1, b0]
     } else {
         // Without this arm the 3-byte form silently dropped the top bits and
         // emitted a TLV whose declared length was wrong. We never build a
         // message this large, and `decode_length` deliberately still refuses
         // to read one (its 3-byte cap bounds what a hostile server can
         // declare); this arm exists so the encoder cannot lie about a length.
-        vec![
-            0x84,
-            (len >> 24) as u8,
-            (len >> 16) as u8,
-            (len >> 8) as u8,
-            len as u8,
-        ]
+        vec![0x84, b3, b2, b1, b0]
     }
 }
 
@@ -90,13 +86,14 @@ fn encode_integer_value(value: u32) -> Vec<u8> {
     }
     let bytes = value.to_be_bytes();
     let start = bytes.iter().position(|&b| b != 0).unwrap_or(3);
+    let magnitude = bytes.get(start..).unwrap_or_default();
     // If high bit is set, prepend 0x00 to keep it positive
-    if bytes[start] & 0x80 != 0 {
+    if magnitude.first().is_some_and(|&b| b & 0x80 != 0) {
         let mut content = vec![0x00];
-        content.extend_from_slice(&bytes[start..]);
+        content.extend_from_slice(magnitude);
         encode_tlv(TAG_INTEGER, &content)
     } else {
-        encode_tlv(TAG_INTEGER, &bytes[start..])
+        encode_tlv(TAG_INTEGER, magnitude)
     }
 }
 
@@ -277,59 +274,67 @@ pub(crate) const MECH_TYPE_LIST_NTLM: &[u8] = &[
 
 // --- DER Decoding Primitives ---
 
-/// Decode a DER length field. Returns (length, bytes_consumed).
-fn decode_length(data: &[u8]) -> Result<(usize, usize), CredSspError> {
-    if data.is_empty() {
+/// Decode a DER length field. Returns (length, bytes after the field).
+fn decode_length(data: &[u8]) -> Result<(usize, &[u8]), CredSspError> {
+    let Some((&first, rest)) = data.split_first() else {
         return Err(CredSspError::Asn1Decode("empty length".into()));
+    };
+    if first < 0x80 {
+        return Ok((usize::from(first), rest));
     }
-    if data[0] < 0x80 {
-        Ok((data[0] as usize, 1))
-    } else {
-        let num_bytes = (data[0] & 0x7F) as usize;
-        if num_bytes == 0 || num_bytes > 3 || data.len() < 1 + num_bytes {
-            return Err(CredSspError::Asn1Decode("invalid length encoding".into()));
+    let num_bytes = usize::from(first & 0x7F);
+    match (num_bytes, rest.split_at_checked(num_bytes)) {
+        (1..=3, Some((len_bytes, after))) => {
+            let len = len_bytes
+                .iter()
+                .fold(0usize, |len, &b| (len << 8) | usize::from(b));
+            Ok((len, after))
         }
-        let mut len = 0usize;
-        for i in 0..num_bytes {
-            len = (len << 8) | data[1 + i] as usize;
-        }
-        Ok((len, 1 + num_bytes))
+        _ => Err(CredSspError::Asn1Decode("invalid length encoding".into())),
     }
 }
 
-/// Read a TLV (tag-length-value) at the start of data. Returns (tag, value_bytes, total_consumed).
-fn read_tlv(data: &[u8]) -> Result<(u8, &[u8], usize), CredSspError> {
-    if data.is_empty() {
+/// Read a TLV (tag-length-value) at the start of data. Returns (tag, value_bytes, bytes after the TLV).
+fn read_tlv(data: &[u8]) -> Result<(u8, &[u8], &[u8]), CredSspError> {
+    let Some((&tag, after_tag)) = data.split_first() else {
         return Err(CredSspError::Asn1Decode("unexpected end of data".into()));
-    }
-    let tag = data[0];
-    let (len, len_bytes) = decode_length(&data[1..])?;
-    let start = 1 + len_bytes;
-    let end = start + len;
-    if end > data.len() {
+    };
+    let (len, after_length) = decode_length(after_tag)?;
+    let Some((value, rest)) = after_length.split_at_checked(len) else {
         return Err(CredSspError::Asn1Decode(format!(
             "TLV length {len} exceeds data ({})",
-            data.len() - start
+            after_length.len()
         )));
-    }
-    Ok((tag, &data[start..end], end))
+    };
+    Ok((tag, value, rest))
+}
+
+/// The (tag, value) of each TLV in a SEQUENCE's contents, in order. A
+/// malformed TLV yields its error and ends the iteration.
+fn tlvs(mut data: &[u8]) -> impl Iterator<Item = Result<(u8, &[u8]), CredSspError>> {
+    std::iter::from_fn(move || {
+        if data.is_empty() {
+            return None;
+        }
+        match read_tlv(data) {
+            Ok((tag, value, rest)) => {
+                data = rest;
+                Some(Ok((tag, value)))
+            }
+            Err(e) => {
+                data = &[];
+                Some(Err(e))
+            }
+        }
+    })
 }
 
 /// Find a context-tagged field [tag] within a SEQUENCE's contents.
 fn find_context_tag(data: &[u8], tag: u8) -> Option<&[u8]> {
     let target = 0xA0 | tag;
-    let mut pos = 0;
-    while pos < data.len() {
-        if let Ok((t, val, consumed)) = read_tlv(&data[pos..]) {
-            if t == target {
-                return Some(val);
-            }
-            pos += consumed;
-        } else {
-            break;
-        }
-    }
-    None
+    tlvs(data)
+        .map_while(Result::ok)
+        .find_map(|(t, val)| (t == target).then_some(val))
 }
 
 /// Extract the value from an OCTET STRING TLV.
@@ -374,7 +379,7 @@ fn decode_integer(data: &[u8]) -> Result<u32, CredSspError> {
     }
     let mut result = 0u32;
     for &b in magnitude {
-        result = (result << 8) | b as u32;
+        result = (result << 8) | u32::from(b);
     }
     Ok(result)
 }
@@ -453,9 +458,8 @@ pub(crate) fn decode_spnego_token(data: &[u8]) -> Result<Vec<u8>, CredSspError> 
     if tag == 0x60 {
         // GSS-API APPLICATION[0] wrapper — skip OID, parse NegTokenInit inside [0]
         // Find the [0] context tag after the OID
-        let oid_tlv =
+        let (_, _, after_oid) =
             read_tlv(contents).map_err(|_| CredSspError::Asn1Decode("bad OID in SPNEGO".into()))?;
-        let after_oid = &contents[oid_tlv.2..];
         // [0] NegTokenInit → mechToken [2]
         if let Some(init_data) = find_context_tag(after_oid, 0) {
             let (_, seq_data, _) = read_tlv(init_data)?;
@@ -512,7 +516,7 @@ pub(crate) fn decode_spnego_final(
             "expected NegTokenResp (0xa1), got tag 0x{tag:02x}"
         )));
     }
-    let (seq_tag, mut rest, _) = read_tlv(contents)?;
+    let (seq_tag, fields, _) = read_tlv(contents)?;
     if seq_tag != TAG_SEQUENCE {
         return Err(CredSspError::Asn1Decode(format!(
             "expected NegTokenResp SEQUENCE (0x30), got tag 0x{seq_tag:02x}"
@@ -520,8 +524,8 @@ pub(crate) fn decode_spnego_final(
     }
     let mut state = None;
     let mut mic = None;
-    while !rest.is_empty() {
-        let (field_tag, value, consumed) = read_tlv(rest)?;
+    for field in tlvs(fields) {
+        let (field_tag, value) = field?;
         match field_tag {
             0xA0 => {
                 let (enum_tag, enum_value, _) = read_tlv(value)?;
@@ -540,7 +544,6 @@ pub(crate) fn decode_spnego_final(
             0xA3 => mic = Some(decode_octet_string(value)?.to_vec()),
             _ => {}
         }
-        rest = rest.get(consumed..).unwrap_or_default();
     }
     Ok((state, mic))
 }
@@ -560,26 +563,23 @@ pub(crate) fn extract_subject_public_key(cert_der: &[u8]) -> Result<Vec<u8>, Cre
     // by looking for the SEQUENCE that contains a SEQUENCE (algorithm) + BIT STRING (key).
     // Simpler approach: iterate through TBS fields and find one that is a SEQUENCE
     // containing a BIT STRING.
-    let mut pos = 0;
-    let mut field_idx = 0;
-    while pos < tbs_seq.len() {
-        let (tag, val, consumed) = read_tlv(&tbs_seq[pos..])?;
+    for (field_idx, field) in tlvs(tbs_seq).enumerate() {
+        let (tag, val) = field?;
         // SubjectPublicKeyInfo is typically field index 6 (0-based) when version is present
         // (version is context-tagged [0], which shifts indices)
         if tag == TAG_SEQUENCE && field_idx >= 5 {
             // Check if this SEQUENCE contains a BIT STRING (subjectPublicKey)
-            let mut inner_pos = 0;
-            while inner_pos < val.len() {
-                let (inner_tag, inner_val, inner_consumed) = read_tlv(&val[inner_pos..])?;
-                if inner_tag == TAG_BIT_STRING && inner_val.len() > 1 {
-                    // Skip the "unused bits" byte (first byte of BIT STRING value)
-                    return Ok(inner_val[1..].to_vec());
+            for inner in tlvs(val) {
+                let (inner_tag, inner_val) = inner?;
+                // Skip the "unused bits" byte (first byte of BIT STRING value)
+                if inner_tag == TAG_BIT_STRING
+                    && let Some((_unused_bits, key)) = inner_val.split_first()
+                    && !key.is_empty()
+                {
+                    return Ok(key.to_vec());
                 }
-                inner_pos += inner_consumed;
             }
         }
-        pos += consumed;
-        field_idx += 1;
     }
 
     Err(CredSspError::Asn1Decode(

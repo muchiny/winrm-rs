@@ -283,9 +283,13 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Install OpenSSL headers
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+      # `--lib` only: these restriction lints target production code. With
+      # `--all-targets` the lib is checked twice (plain and test harness), so
+      # every warning reached SonarQube twice, and the test code (which the
+      # `clippy` job already holds to the default lints) filled the report.
       - name: Clippy report (JSON)
         run: |
-          cargo clippy --locked --all-targets --features credssp --message-format=json -- \
+          cargo clippy --locked --lib --features credssp --message-format=json -- \
             -W clippy::unwrap_used -W clippy::expect_used -W clippy::panic \
             -W clippy::todo -W clippy::unimplemented -W clippy::indexing_slicing \
             -W clippy::arithmetic_side_effects -W clippy::as_conversions \

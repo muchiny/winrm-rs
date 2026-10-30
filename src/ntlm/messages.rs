@@ -82,39 +82,39 @@ fn create_negotiate_message_with_flags(flags: u32, include_version: bool) -> Vec
 /// signature, or is not message type 2.
 #[allow(unreachable_pub)] // re-exported `pub` under the `__internal` feature for fuzz targets
 pub fn parse_challenge(data: &[u8]) -> Result<ChallengeMessage, NtlmError> {
-    if data.len() < 32 {
+    let Some(header) = data.first_chunk::<32>() else {
         return Err(NtlmError::InvalidMessage("Type 2 message too short".into()));
-    }
-    if &data[0..8] != SIGNATURE {
+    };
+    if &header[0..8] != SIGNATURE {
         return Err(NtlmError::InvalidMessage("bad NTLMSSP signature".into()));
     }
-    let msg_type = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+    let msg_type = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
     if msg_type != 2 {
         return Err(NtlmError::InvalidMessage(format!(
             "expected type 2, got {msg_type}"
         )));
     }
 
-    let negotiate_flags = u32::from_le_bytes([data[20], data[21], data[22], data[23]]);
+    let negotiate_flags = u32::from_le_bytes([header[20], header[21], header[22], header[23]]);
 
     let mut server_challenge = [0u8; 8];
-    server_challenge.copy_from_slice(&data[24..32]);
+    server_challenge.copy_from_slice(&header[24..32]);
 
     // Target info security buffer at offset 40.
     //
-    // ti_offset comes from a u32 cast to usize; on 32-bit targets the
-    // raw `ti_offset + ti_len` could wrap. checked_add keeps us honest
-    // regardless of pointer width.
-    let (target_info, target_domain, timestamp) = if data.len() >= 48 {
-        let ti_len = u16::from_le_bytes([data[40], data[41]]) as usize;
-        let ti_offset = u32::from_le_bytes([data[44], data[45], data[46], data[47]]) as usize;
+    // The buffer is taken with `get` from its offset, then up to its length:
+    // no `offset + len` is computed, so nothing can wrap whatever the pointer
+    // width, and an offset that does not fit `usize` is refused.
+    let (target_info, target_domain, timestamp) = if let Some(fields) = data.first_chunk::<48>() {
+        let ti_len = usize::from(u16::from_le_bytes([fields[40], fields[41]]));
+        let ti_offset = u32::from_le_bytes([fields[44], fields[45], fields[46], fields[47]]);
         if ti_len == 0 {
             // A zero-length buffer is legal whatever its offset.
             (Vec::new(), String::new(), None)
         } else {
-            let ti = ti_offset
-                .checked_add(ti_len)
-                .and_then(|end| data.get(ti_offset..end))
+            let ti = usize::try_from(ti_offset)
+                .ok()
+                .and_then(|start| data.get(start..)?.get(..ti_len))
                 .ok_or_else(|| {
                     NtlmError::InvalidMessage("NTLM Type 2: TargetInfo outside the message".into())
                 })?
@@ -410,9 +410,7 @@ pub(crate) fn create_authenticate_message_full(
 
     let blob = build_ntlmv2_blob(&timestamp, &client_challenge, &target_info);
 
-    let mut proof_input = Vec::with_capacity(8 + blob.len());
-    proof_input.extend_from_slice(&challenge.server_challenge);
-    proof_input.extend_from_slice(&blob);
+    let proof_input = [challenge.server_challenge.as_slice(), &blob].concat();
     let nt_proof_str = *hmac_md5_secret(ntlmv2_hash.as_slice(), &proof_input);
 
     // SessionBaseKey = HMAC-MD5(NTLMv2_Hash, NTProofStr)  (MS-NLMP 3.3.2)
@@ -452,9 +450,7 @@ pub(crate) fn create_authenticate_message_full(
     };
 
     // NT response = NTProofStr + blob
-    let mut nt_response = Vec::with_capacity(16 + blob.len());
-    nt_response.extend_from_slice(&nt_proof_str);
-    nt_response.extend_from_slice(&blob);
+    let nt_response = [nt_proof_str.as_slice(), &blob].concat();
 
     // LM response
     // When a MIC is required (CredSSP / NTLMv2 with timestamp present in target_info)
@@ -492,8 +488,12 @@ pub(crate) fn create_authenticate_message_full(
     //   - +16 bytes for MIC if mic_input is provided
     let include_version = flags & NEGOTIATE_VERSION != 0;
     let include_mic = mic_input.is_some();
-    let header_size: usize =
-        64 + (if include_version { 8 } else { 0 }) + (if include_mic { 16 } else { 0 });
+    let header_size: usize = match (include_version, include_mic) {
+        (false, false) => 64,
+        (true, false) => 64 + 8,
+        (false, true) => 64 + 16,
+        (true, true) => 64 + 8 + 16,
+    };
 
     // Every length is checked against the 16-bit field first; the offsets are
     // then summed in `usize` and each is checked against the 32-bit field.
@@ -547,11 +547,13 @@ pub(crate) fn create_authenticate_message_full(
 
     // Compute and patch MIC if requested
     if let Some((type1, type2)) = mic_input {
-        let mut input = Vec::with_capacity(type1.len() + type2.len() + msg.len());
-        input.extend_from_slice(type1);
-        input.extend_from_slice(type2);
-        input.extend_from_slice(&msg);
+        let input = [type1, type2, &msg].concat();
         let mic = *hmac_md5_secret(exported_session_key.as_slice(), &input);
+        #[expect(
+            clippy::indexing_slicing,
+            clippy::arithmetic_side_effects,
+            reason = "the 16-byte MIC placeholder was pushed at `mic_pos` above"
+        )]
         msg[mic_pos..mic_pos + 16].copy_from_slice(&mic);
 
         // CREDSSP_DEBUG dumps every secret in the handshake to stderr. It is

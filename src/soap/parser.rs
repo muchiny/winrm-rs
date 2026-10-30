@@ -178,6 +178,10 @@ pub fn check_soap_fault(xml: &str) -> Result<(), SoapError> {
 /// Linear in the size of `xml`: one pass indexes where each closing tag last
 /// occurs, so an opening tag with no closing tag after it is skipped without
 /// rescanning the rest of the document.
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "each sum is a position in `xml` plus the length of a match found there"
+)]
 fn extract_element_text(xml: &str, element: &str) -> Option<String> {
     let suffixed = format!(":{element}>");
     let bare_open = format!("<{element}>");
@@ -231,8 +235,8 @@ fn extract_element_text(xml: &str, element: &str) -> Option<String> {
 /// The trimmed text between `content_start` and the first `close_tag` after
 /// it, or `None` when that text is empty or no such closing tag exists.
 fn text_up_to(xml: &str, content_start: usize, close_tag: &str) -> Option<String> {
-    let end = xml[content_start..].find(close_tag)?;
-    let text = xml[content_start..content_start + end].trim();
+    let (text, _) = xml.get(content_start..)?.split_once(close_tag)?;
+    let text = text.trim();
     (!text.is_empty()).then(|| text.to_string())
 }
 
@@ -256,6 +260,10 @@ enum PrefixedTag<'a> {
 /// and `>` before each occurrence are tracked incrementally, so the whole
 /// walk reads `xml` once (a prefix without `>` cannot span two occurrences,
 /// so prefixes do not overlap either).
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "each sum is a position in `xml` plus an offset or length that stays within it"
+)]
 fn prefixed_tags<'a>(xml: &'a str, suffixed: &'a str) -> impl Iterator<Item = PrefixedTag<'a>> {
     let mut from = 0;
     let mut scanned = 0;
@@ -496,9 +504,9 @@ fn extract_streams(xml: &str) -> Vec<(String, String)> {
 /// Extract an XML attribute value from a tag string.
 fn extract_attribute(tag: &str, attr_name: &str) -> Option<String> {
     let pattern = format!("{attr_name}=\"");
-    let start = tag.find(&pattern)? + pattern.len();
-    let end = tag[start..].find('"')? + start;
-    Some(tag[start..end].to_string())
+    let (_, after) = tag.split_once(&pattern)?;
+    let (value, _) = after.split_once('"')?;
+    Some(value.to_string())
 }
 
 /// Longest fault code kept, in characters (real codes are a few dozen).

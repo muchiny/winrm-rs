@@ -20,7 +20,7 @@ struct Input<'a> {
     target_info: &'a [u8],
     cert_der: &'a [u8],
     /// Fixed size: the in-crate callers always derive a 16-byte sealing key,
-    /// and `Rc4State::new` divides by the key length.
+    /// and `Rc4State::new` asserts that the key is not empty.
     rc4_key: [u8; 16],
     rc4_payload: &'a [u8],
 }

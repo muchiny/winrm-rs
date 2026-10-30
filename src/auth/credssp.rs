@@ -1693,7 +1693,9 @@ impl AuthTransport for CredSspAuth {
     }
 }
 
-#[cfg(all(test, feature = "credssp"))]
+// `auth/mod.rs` already gates this module on `credssp`. A plain `cfg(test)`
+// is also what Clippy's `allow-*-in-tests` (clippy.toml) recognises.
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::WinrmConfig;

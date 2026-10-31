@@ -6,6 +6,16 @@
 //! with `ClientConfig::builder()` or `ServerConfig::builder()`, which install
 //! a process default from the rustls crate features.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    reason = "test code"
+)]
+
 use rustls::crypto::CryptoProvider;
 use winrm_rs::{TlsProvider, WinrmClient, WinrmConfig, WinrmCredentials, WinrmError};
 

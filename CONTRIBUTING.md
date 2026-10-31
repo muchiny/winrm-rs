@@ -98,6 +98,7 @@ We follow [Conventional Commits](https://www.conventionalcommits.org/):
 - Run `cargo +nightly fmt` before committing
 - Follow existing patterns in the codebase
 - Use `tracing` for logging, not `println!`
+- No `unwrap`, `expect`, `panic!`, unchecked indexing, unchecked arithmetic or `as` casts in library code: Cargo.toml sets these Clippy lints and CI denies warnings. Tests are exempt. A justified exception is an `#[expect(clippy::..., reason = "...")]` on the smallest item that needs it
 - Wrap secrets with `secrecy::SecretString` and zeroize sensitive data
 
 ## CredSSP differential against pyspnego

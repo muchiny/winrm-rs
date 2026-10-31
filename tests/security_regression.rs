@@ -9,6 +9,16 @@
 // `use_env_proxy`, so they read no proxy from the environment (see
 // `WinrmConfig::proxy`) and reach the loopback mock server directly.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    reason = "test code"
+)]
+
 use winrm_rs::{
     AuthMethod, EncryptionMode, WinrmClient, WinrmConfig, WinrmCredentials, WinrmError,
 };

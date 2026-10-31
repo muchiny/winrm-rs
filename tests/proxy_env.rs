@@ -8,6 +8,16 @@
 // Host state: `no_proxy_star_goes_direct` sends to the host name `localhost`,
 // which must resolve to the loopback address.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    reason = "test code"
+)]
+
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};

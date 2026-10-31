@@ -88,6 +88,17 @@ todo = "warn"
 unreadable_literal = "warn"
 needless_raw_string_hashes = "warn"
 map_unwrap_or = "warn"
+# Hidden panics and silent overflow or truncation, mostly on server input.
+# Production code only: test code is exempt (clippy.toml, the
+# `cfg_attr(test, ...)` at the top of src/lib.rs, a header in each file of
+# tests/). A justified exception is a `#[expect(..., reason = "...")]`.
+unimplemented = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+indexing_slicing = "warn"
+arithmetic_side_effects = "warn"
+as_conversions = "warn"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

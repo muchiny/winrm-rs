@@ -25,7 +25,12 @@ struct Input<'a> {
 fuzz_target!(|input: Input<'_>| {
     // 1. Arbitrary bytes must never panic the decoder.
     if let Ok(req) = decode_ts_request(input.wire) {
-        for field in [&req.nego_token, &req.auth_info, &req.pub_key_auth, &req.client_nonce] {
+        for field in [
+            &req.nego_token,
+            &req.auth_info,
+            &req.pub_key_auth,
+            &req.client_nonce,
+        ] {
             if let Some(bytes) = field {
                 assert!(
                     bytes.len() <= input.wire.len(),

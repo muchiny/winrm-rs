@@ -6,8 +6,8 @@
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use winrm_rs::__fuzz::{
-    build_ntlmv2_blob, compute_channel_bindings, compute_nt_hash, compute_ntlmv2_hash, from_utf16le,
-    hmac_md5, rc4_process, to_utf16le,
+    build_ntlmv2_blob, compute_channel_bindings, compute_nt_hash, compute_ntlmv2_hash,
+    from_utf16le, hmac_md5, rc4_process, to_utf16le,
 };
 
 #[derive(Arbitrary, Debug)]

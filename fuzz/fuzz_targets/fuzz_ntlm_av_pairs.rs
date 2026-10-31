@@ -19,7 +19,11 @@ fuzz_target!(|data: &[u8]| {
     if timestamp.is_some() {
         // AV_TIMESTAMP is only accepted at exactly 8 bytes, which needs a
         // 4-byte header plus 8 bytes of payload to be present at all.
-        assert!(data.len() >= 12, "timestamp reported from a {}-byte input", data.len());
+        assert!(
+            data.len() >= 12,
+            "timestamp reported from a {}-byte input",
+            data.len()
+        );
     }
 
     // Same decoder, unframed: every AV_PAIR value ends up here.

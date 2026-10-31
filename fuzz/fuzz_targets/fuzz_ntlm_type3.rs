@@ -147,12 +147,9 @@ fuzz_target!(|input: Input<'_>| {
     };
 
     // An input that does not fit a 16-bit length is refused, never wrapped.
-    let Ok(msg) = create_authenticate_message(
-        &challenge,
-        input.username,
-        input.password,
-        input.domain,
-    ) else {
+    let Ok(msg) =
+        create_authenticate_message(&challenge, input.username, input.password, input.domain)
+    else {
         return;
     };
     check_type3(&msg);

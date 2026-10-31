@@ -17,7 +17,8 @@
 //! cargo test --test integration_real -- --ignored
 //! ```
 //! (`tests/scripts/vm-connect-2012r2.sh` does the same for the Server 2012 R2
-//! bench.)
+//! bench.) When the HTTPS listener answers, they also export its certificate
+//! pin, `WINRM_TEST_HTTPS_CERT_SHA256`, read with `openssl`.
 //!
 //! The certificate tests (`certificate_auth_*`,
 //! `silent_command_completes_over_certificate_auth`) also need
@@ -5984,7 +5985,7 @@ async fn custom_ca_https_listener_authenticates() {
 
 /// SHA-256 fingerprint of the bench's HTTPS listener certificate, from
 /// `WINRM_TEST_HTTPS_CERT_SHA256` (64 hex digits, `:` separators allowed).
-/// On the server:
+/// The bench scripts export it; on the server:
 ///
 /// ```powershell
 /// $c = Get-Item Cert:\LocalMachine\My\<thumbprint>

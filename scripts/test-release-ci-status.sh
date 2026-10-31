@@ -72,6 +72,10 @@ reset_case() {
 }
 
 # expect <label> <exit code> <text in the output or ""> <command>...
+#
+# The messages report the elapsed time in whole seconds of `$SECONDS`, which
+# reads 1 when a second boundary falls inside a run, so the checks below stop
+# at "after " and never name the number.
 expect() {
   local label="$1" want="$2" text="$3"
   shift 3
@@ -123,7 +127,7 @@ expect "one success among failures" 0 "" env CI_WAIT_SECONDS=0 "$SCRIPT" "$SHA"
 reset_case
 answers last.json "$(run push main "$SHA" completed failure)" "$(run push main "$SHA" completed cancelled)"
 expect "only failed push runs" 1 "$SHA" env CI_WAIT_SECONDS=600 "$SCRIPT" "$SHA"
-expect "only failed push runs, message" 1 "after 0 s" env CI_WAIT_SECONDS=0 "$SCRIPT" "$SHA"
+expect "only failed push runs, message" 1 "completed without success (failure,cancelled), after " env CI_WAIT_SECONDS=0 "$SCRIPT" "$SHA"
 
 # Successful runs that are not the push to main of this commit do not count.
 reset_case
@@ -133,17 +137,17 @@ answers last.json \
   "$(run push my-branch "$SHA" completed success)" \
   "$(run push main "$OTHER" completed success)"
 expect "pull_request and other runs only" 1 "$SHA" env CI_WAIT_SECONDS=0 "$SCRIPT" "$SHA"
-expect "pull_request and other runs only, message" 1 "after 0 s" env CI_WAIT_SECONDS=0 "$SCRIPT" "$SHA"
+expect "pull_request and other runs only, message" 1 "no push-to-main CI run of $SHA found after " env CI_WAIT_SECONDS=0 "$SCRIPT" "$SHA"
 
 # No run yet and no time to wait.
 reset_case
 answers last.json
-expect "no run" 1 "after 0 s" env CI_WAIT_SECONDS=0 "$SCRIPT" "$SHA"
+expect "no run" 1 "no push-to-main CI run of $SHA found after " env CI_WAIT_SECONDS=0 "$SCRIPT" "$SHA"
 
 # A run still in progress at the deadline fails.
 reset_case
 answers last.json "$(run push main "$SHA" in_progress null)"
-expect "run in progress at the deadline" 1 "after 0 s" env CI_WAIT_SECONDS=0 "$SCRIPT" "$SHA"
+expect "run in progress at the deadline" 1 "has not completed after " env CI_WAIT_SECONDS=0 "$SCRIPT" "$SHA"
 
 # The script polls until the run completes.
 reset_case

@@ -34,6 +34,8 @@ jobs:
           toolchain: nightly
           components: rustfmt
       - run: cargo fmt --all --check
+      # fuzz/ is a crate of its own, which `--all` above leaves out.
+      - run: cargo fmt --all --check --manifest-path fuzz/Cargo.toml
       # `cargo metadata --no-deps` only reads Cargo.toml: no build, no network.
       - name: SECURITY.md lists the current minor
         run: |

@@ -55,8 +55,9 @@ cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --features kerberos -- -D warnings
 cargo clippy --all-targets --all-features -- -D warnings
 
-# Format (requires nightly)
+# Format (requires nightly). fuzz/ is a crate of its own: check it too.
 cargo +nightly fmt --check
+cargo +nightly fmt --all --check --manifest-path fuzz/Cargo.toml
 
 # Fuzzing (requires the nightly toolchain and cargo-fuzz).
 # See fuzz/README.md for the full target list.

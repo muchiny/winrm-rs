@@ -8,12 +8,11 @@
 // this is a low-level primitives module, not public API.
 #![allow(dead_code)]
 
+#[cfg(test)]
 use hmac::{Hmac, KeyInit, Mac};
 use md4::{Digest, Md4};
 use md5::Md5;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
-
-pub(crate) type HmacMd5 = Hmac<Md5>;
 
 pub(crate) const SIGNATURE: &[u8; 8] = b"NTLMSSP\0";
 
@@ -119,13 +118,12 @@ pub(crate) fn compute_ntlmv2_hash(
     hmac_md5_secret(nt_hash, &identity_bytes)
 }
 
-/// HMAC-MD5 for callers whose key is not secret: the tests, the fuzz
-/// facade and the test NTLM server. Anything keyed by key material (NTLMv2
-/// hash, session keys, the MIC) goes through [`hmac_md5_secret`] or
-/// [`hmac_md5_parts`], which wipe the pad blocks they build.
-#[expect(clippy::expect_used, reason = "HMAC accepts keys of any length")]
+/// HMAC-MD5 from the `hmac` crate, for the tests: the reference that
+/// [`hmac_md5_secret`] and [`hmac_md5_parts`] are checked against. Library
+/// code goes through those two, which wipe the pad blocks they build.
+#[cfg(test)]
 pub(crate) fn hmac_md5(key: &[u8], data: &[u8]) -> [u8; 16] {
-    let mut mac = HmacMd5::new_from_slice(key).expect("HMAC accepts any key size");
+    let mut mac = Hmac::<Md5>::new_from_slice(key).expect("HMAC accepts any key size");
     mac.update(data);
     let result = mac.finalize();
     let mut out = [0u8; 16];

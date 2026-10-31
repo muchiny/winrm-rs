@@ -38,7 +38,8 @@ description. To rebuild the bench, write them from it:
   prints only `export` lines on stdout: `WINRM_TEST_KRB_HOST`
   (`dc.winrm.test`), `WINRM_TEST_KRB_PORT`, `WINRM_TEST_KRB_HTTPS_PORT`,
   `WINRM_TEST_KRB_USER`, `WINRM_TEST_KRB_PASS`, `KRB5_CONFIG` and
-  `KRB5CCNAME`.
+  `KRB5CCNAME`, plus `WINRM_TEST_KRB_HTTPS_CERT_SHA256` once the HTTPS
+  listener exists (the SHA-256 of its certificate, read with `openssl`).
 
 The commands below run elevated Windows tools through `gsudo`; `$G` stands
 for the path of your `gsudo.exe` as WSL sees it, for instance

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **`hmac` is no longer a dependency of the library.** The NTLM code
+  computes HMAC-MD5 itself, so that it can wipe the pad blocks; the `hmac`
+  crate only served as the reference of its tests. It moves to the
+  dev-dependencies, and `hmac`, `ctutils` and `cmov` leave the dependency
+  tree of crates that use winrm-rs.
+
 ## [2.0.0] - 2026-10-25
 
 HTTPS with a validated certificate becomes the default, and environment

@@ -169,8 +169,10 @@ pub fn compute_channel_bindings(cert_der: &[u8]) -> Option<[u8; 16]> {
     crate::ntlm::crypto::compute_channel_bindings(cert_der).ok()
 }
 
+/// HMAC-MD5 of `data` under `key`, as the NTLM code computes it (the
+/// implementation that wipes its pad blocks).
 pub fn hmac_md5(key: &[u8], data: &[u8]) -> [u8; 16] {
-    crate::ntlm::crypto::hmac_md5(key, data)
+    crate::ntlm::crypto::hmac_md5_parts(key, &[data])
 }
 
 /// Run RC4 over `data` in place with `key`.

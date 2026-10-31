@@ -54,7 +54,6 @@ thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 md4 = { version = "0.11", features = ["zeroize"] }
 md-5 = { version = "0.11", features = ["zeroize"] }
-hmac = { version = "0.13", features = ["zeroize"] }
 rand = "0.10"
 secrecy = { version = "0.10", features = ["serde"] }
 tracing = "0.1"
@@ -108,6 +107,8 @@ tracing-test = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 proptest = "1"
 bytes = "1"
+# Reference HMAC for the tests of the wiping one in src/ntlm/crypto.rs.
+hmac = "0.13"
 
 # The OS proxy check (tests/proxy_env.rs, `os_proxy_is_never_used`) enables the
 # system proxy lookup the library must never use; the feature is test-only.

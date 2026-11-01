@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.1] - 2026-11-01
+
+The library code is held to the restriction lints, and `hmac` leaves the
+dependency tree. No API change.
+
 ### Changed
 
 - **`hmac` is no longer a dependency of the library.** The NTLM code
@@ -14,6 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   crate only served as the reference of its tests. It moves to the
   dev-dependencies, and `hmac`, `ctutils` and `cmov` leave the dependency
   tree of crates that use winrm-rs.
+- **The library code is held to the restriction lints.** `unwrap_used`,
+  `expect_used`, `panic`, `unimplemented`, `indexing_slicing`,
+  `arithmetic_side_effects` and `as_conversions` are now rejected in library
+  code by CI (test code is exempt). The NTLM Type 2 parser, RC4, the ASN.1
+  decoder behind CredSSP and the SOAP parser's text and attribute helpers
+  read server input through checked access instead of indexes and offset
+  sums; they accept and reject the same inputs as 2.0.0. Each invariant that
+  remains is stated in a reasoned `#[expect]`.
 
 ## [2.0.0] - 2026-10-25
 
@@ -1773,7 +1786,8 @@ considered stable and covered by SemVer guarantees.
 - Raw command execution (`cmd.exe` or any executable)
 - Full shell lifecycle: create, execute, receive, signal, delete
 
-[Unreleased]: https://github.com/muchiny/winrm-rs/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/muchiny/winrm-rs/compare/v2.0.1...HEAD
+[2.0.1]: https://github.com/muchiny/winrm-rs/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/muchiny/winrm-rs/compare/v1.4.1...v2.0.0
 [1.4.1]: https://github.com/muchiny/winrm-rs/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/muchiny/winrm-rs/compare/v1.3.0...v1.4.0

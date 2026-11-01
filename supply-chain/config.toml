@@ -1020,7 +1020,7 @@ version = "1.0.4"
 criteria = "safe-to-run"
 
 [[exemptions.winrm-rs]]
-version = "2.0.0"
+version = "2.0.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.wiremock]]

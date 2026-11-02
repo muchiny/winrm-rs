@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- `uuid` 1.29.0 and `webpki-roots` 1.0.11 in the lockfile (Dependabot #32 and
+  #33), with their `cargo vet` exemptions. This lockfile only builds this
+  repository: a crate that depends on winrm-rs resolves `webpki-roots`
+  (`>= 1.0.6`) in its own. Where that resolves to 1.0.11, two eMudhra roots
+  that Mozilla withdrew are gone, "emSign Root CA - C1" and "emSign ECC Root
+  CA - C3", and none is added. With `use_tls`, a server whose certificate
+  chains only to one of them no longer verifies; trust its CA with
+  `WinrmClientBuilder::add_root_certificates_pem`, or use
+  `platform_roots(true)`.
+
 ## [2.0.1] - 2026-11-01
 
 The library code is held to the restriction lints, and `hmac` leaves the

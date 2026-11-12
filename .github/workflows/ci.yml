@@ -89,7 +89,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
-          tool: cargo-nextest@0.9.135
+          tool: cargo-nextest@0.9.149
       - name: Run tests
         run: cargo nextest run --locked
       - name: Run doc tests
@@ -108,7 +108,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
-          tool: cargo-nextest@0.9.135
+          tool: cargo-nextest@0.9.149
       - name: Install libkrb5-dev
         run: sudo apt-get update && sudo apt-get install -y libkrb5-dev
       - run: cargo nextest run --locked --features kerberos
@@ -132,7 +132,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
-          tool: cargo-nextest@0.9.135
+          tool: cargo-nextest@0.9.149
       - name: Install OpenSSL headers
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
       # tests/pwsh_quote_oracle.rs skips itself without pwsh; this step makes
@@ -208,7 +208,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
-          tool: cargo-nextest@0.9.135
+          tool: cargo-nextest@0.9.149
       - name: Install libkrb5-dev
         run: sudo apt-get update && sudo apt-get install -y libkrb5-dev
       # Installs the MIT KDC, starts it and writes its environment to
@@ -235,7 +235,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
-          tool: cargo-llvm-cov@0.8.7
+          tool: cargo-llvm-cov@0.9.1
       - name: Install OpenSSL headers
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
       # Runs with the `credssp` feature, so the CredSSP code is measured and
@@ -386,7 +386,7 @@ jobs:
           persist-credentials: false
       - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
-          tool: cargo-vet@0.10.2
+          tool: cargo-vet@0.10.3
       - run: cargo vet --locked
 
   # The declared MSRV (`rust-version` in Cargo.toml, `msrv` in clippy.toml).
@@ -417,7 +417,7 @@ jobs:
           persist-credentials: false
       - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
-          tool: cargo-deny@0.19.6
+          tool: cargo-deny@0.20.2
       # Also checks the RustSec advisories (deny.toml `[advisories]`).
       - run: cargo deny --all-features --locked check
 
@@ -449,7 +449,7 @@ jobs:
       # cargo-fuzz is no longer in the action's tool manifest. `cargo install`
       # is slower but cannot silently no-op.
       - name: Install cargo-fuzz
-        run: cargo +1.99.1 install cargo-fuzz@0.13.1 --locked
+        run: cargo +1.99.1 install cargo-fuzz@0.13.2 --locked
       - name: Install OpenSSL headers (credssp feature)
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
       - name: Build every target

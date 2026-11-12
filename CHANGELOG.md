@@ -28,6 +28,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `WinrmClientBuilder::add_root_certificates_pem`, or use
   `platform_roots(true)`.
 
+### Added
+
+- **Four examples**, next to `examples/basic.rs`: `auth_methods` (NTLM,
+  Basic, Kerberos, Certificate and CredSSP, with the three ways to trust the
+  listener's certificate), `streaming` (`open_shell`, `start_command`,
+  `receive_next`), `file_transfer` (upload, a check on the host through
+  `quote_powershell_string`, download) and `timeout_cancel`
+  (`run_powershell_with_timeout`, and `run_powershell_with_cancel` on
+  Ctrl+C). The README lists them under *Runnable examples*.
+
+### Documentation
+
+- The header of `examples/basic.rs` said that a self-signed listener
+  certificate can be given to `WINRM_CA` only if it is a CA certificate. It
+  is the opposite, as the rustdoc of `add_root_certificates_pem` says: only
+  if it is not one.
+
 ## [2.0.1] - 2026-11-01
 
 The library code is held to the restriction lints, and `hmac` leaves the

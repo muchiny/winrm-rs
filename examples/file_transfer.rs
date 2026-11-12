@@ -43,7 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut roundtrip = local.clone();
     roundtrip.push(".roundtrip");
     let (local, roundtrip) = (PathBuf::from(local), PathBuf::from(roundtrip));
-    if roundtrip.exists() {
+    if tokio::fs::try_exists(&roundtrip).await? {
         return Err(format!("{} already exists", roundtrip.display()).into());
     }
 
@@ -78,11 +78,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let downloaded = client.download_file(&host, &remote, &roundtrip).await?;
     println!("downloaded {downloaded} bytes to {}", roundtrip.display());
 
-    if std::fs::read(&local)? != std::fs::read(&roundtrip)? {
+    if tokio::fs::read(&local).await? != tokio::fs::read(&roundtrip).await? {
         // The copy is the evidence: it stays.
         return Err(format!("{} differs from the original", roundtrip.display()).into());
     }
-    std::fs::remove_file(&roundtrip)?;
+    tokio::fs::remove_file(&roundtrip).await?;
     println!("round trip verified: the downloaded copy is identical to the original");
     Ok(())
 }

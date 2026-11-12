@@ -27,6 +27,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   chains only to one of them no longer verifies; trust its CA with
   `WinrmClientBuilder::add_root_certificates_pem`, or use
   `platform_roots(true)`.
+- `openssl` 0.10.82 (feature `credssp`) and 29 transitive crates move to
+  newer compatible versions in the lockfile, with their `cargo vet`
+  exemptions. `utf_types` 1.0.0 comes in through `utf8_iter` 1.1.0, and
+  `fuzz/Cargo.lock` follows. As above, this lockfile only builds this
+  repository. The memory-safety fixes of `openssl` 0.10.82 are in calls this
+  crate does not make, and the two panics `der` 0.8.3 fixes are behind
+  features (`real`, `ber`) that are off here. The `icu_*` 2.4.0 data is
+  Unicode 18: it is what `idna` reads when a non-ASCII host name is checked.
 
 ### Added
 

@@ -4,7 +4,7 @@ Thank you for your interest in contributing to winrm-rs! This document provides 
 
 ## Prerequisites
 
-- **Rust 1.98.0** or later
+- **Rust 1.99.0** or later (CI and releases build with 1.99.1)
 - **libkrb5-dev** (Linux) or equivalent — only needed for the `kerberos` feature.
   On macOS that is MIT krb5 from Homebrew (`brew install krb5`, then
   `LIBGSSAPI_IMPL=mit` and `LIBGSSAPI_PREFIX="$(brew --prefix krb5)"` in the

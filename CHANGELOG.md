@@ -61,6 +61,9 @@ lockfile is refreshed. No API change.
   certificate can be given to `WINRM_CA` only if it is a CA certificate. It
   is the opposite, as the rustdoc of `add_root_certificates_pem` says: only
   if it is not one.
+- SECURITY.md lists 2.1.x as the supported line. Security fixes ship for the
+  latest minor only, so 2.0.x gets none from this release on, and 2.1 needs
+  Rust 1.99.0 or later.
 
 ## [2.0.1] - 2026-11-01
 

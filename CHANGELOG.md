@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- The unit tests of `src/transport.rs` and `src/client.rs` move to
+  `src/transport/tests.rs` and `src/client/tests.rs`: same tests, same
+  names, no API change.
 - `uuid` 1.29.0 and `webpki-roots` 1.0.11 in the lockfile (Dependabot #32 and
   #33), with their `cargo vet` exemptions. This lockfile only builds this
   repository: a crate that depends on winrm-rs resolves `webpki-roots`

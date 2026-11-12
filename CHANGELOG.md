@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **MSRV raised to 1.99.0** (from 1.98.0). `clippy.toml` and the MSRV job
+  follow. CI and the release workflow pin 1.99.1, which fixes a
+  miscompilation of FFI `bool` return values on x86_64 in 1.99.0: prefer it
+  to build this crate.
 - The unit tests of `src/transport.rs` and `src/client.rs` move to
   `src/transport/tests.rs` and `src/client/tests.rs`: same tests, same
   names, no API change.

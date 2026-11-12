@@ -364,6 +364,26 @@ Leave the default when remote paths come from anyone but you. The default
 check is lexical: a link, junction or mapped drive on the host can still lead
 to a share. It does not limit which local files a path names.
 
+### Runnable examples
+
+The [`examples/`](examples) directory holds complete programs, configured
+through environment variables (`WINRM_HOST`, `WINRM_USER`, `WINRM_PASS`, ...;
+the header of each file lists its own):
+
+| Example | Shows |
+|---|---|
+| [`basic`](examples/basic.rs) | one PowerShell script over HTTPS, an internal CA, or plain HTTP |
+| [`auth_methods`](examples/auth_methods.rs) | NTLM, Basic, Kerberos, Certificate and CredSSP; trusting a CA, a pinned certificate or the system store |
+| [`streaming`](examples/streaming.rs) | reading a command's output while it runs (`open_shell`, `start_command`, `receive_next`) |
+| [`file_transfer`](examples/file_transfer.rs) | upload, a check on the host with `quote_powershell_string`, download |
+| [`timeout_cancel`](examples/timeout_cancel.rs) | a total timeout, and cancellation on Ctrl+C, which also asks the host to end the command |
+
+```sh
+WINRM_HOST=win-server WINRM_USER=admin WINRM_PASS=password cargo run --example streaming
+# Kerberos and CredSSP need their feature:
+WINRM_HOST=server.corp.example WINRM_AUTH=kerberos cargo run --example auth_methods --features kerberos
+```
+
 ## Configuration
 
 `WinrmConfig` fields:

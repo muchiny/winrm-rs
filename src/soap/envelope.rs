@@ -540,16 +540,17 @@ pub(crate) fn delete_shell_request_for(
 ///
 /// Disconnects the client from a running shell while leaving the shell
 /// alive on the server so it can be reconnected later.
-#[allow(dead_code)] // Kept for CMD shell path; PSRP uses _with_uri variant.
-pub(crate) fn disconnect_shell_request(
+pub(crate) fn disconnect_shell_request_with_uri(
     endpoint: &str,
     shell_id: &str,
     timeout_secs: u64,
     max_envelope_size: u32,
+    resource_uri: &str,
 ) -> String {
-    let header = build_header(
+    let header = build_header_for(
         endpoint,
         ACTION_DISCONNECT,
+        resource_uri,
         Some(shell_id),
         timeout_secs,
         max_envelope_size,
@@ -572,48 +573,6 @@ pub(crate) fn disconnect_shell_request(
 /// Build a WS-Management Reconnect Shell SOAP envelope (MS-WSMV 3.1.4.27).
 ///
 /// Rejoins a previously disconnected shell identified by `shell_id`.
-#[allow(dead_code)]
-pub(crate) fn reconnect_shell_request(
-    endpoint: &str,
-    shell_id: &str,
-    timeout_secs: u64,
-    max_envelope_size: u32,
-) -> String {
-    reconnect_shell_request_with_uri(
-        endpoint,
-        shell_id,
-        timeout_secs,
-        max_envelope_size,
-        RESOURCE_URI_CMD,
-    )
-}
-
-pub(crate) fn disconnect_shell_request_with_uri(
-    endpoint: &str,
-    shell_id: &str,
-    timeout_secs: u64,
-    max_envelope_size: u32,
-    resource_uri: &str,
-) -> String {
-    let header = build_header_for(
-        endpoint,
-        ACTION_DISCONNECT,
-        resource_uri,
-        Some(shell_id),
-        timeout_secs,
-        max_envelope_size,
-    );
-    // Bare element — see `disconnect_shell_request`.
-    format!(
-        r"<s:Envelope {NS_DECL_WITH_RSP}>
-{header}
-  <s:Body>
-    <rsp:Disconnect/>
-  </s:Body>
-</s:Envelope>"
-    )
-}
-
 pub(crate) fn reconnect_shell_request_with_uri(
     endpoint: &str,
     shell_id: &str,
@@ -643,28 +602,6 @@ pub(crate) fn reconnect_shell_request_with_uri(
 ///
 /// Sends stdin data to a running command. The data is base64-encoded
 /// in the request body. Set `end_of_stream` to `true` to signal EOF.
-#[allow(dead_code)] // Kept for existing tests; live code uses send_input_request_with_uri.
-pub(crate) fn send_input_request(
-    endpoint: &str,
-    shell_id: &str,
-    command_id: &str,
-    data: &[u8],
-    end_of_stream: bool,
-    timeout_secs: u64,
-    max_envelope_size: u32,
-) -> String {
-    send_input_request_with_uri(
-        endpoint,
-        shell_id,
-        command_id,
-        data,
-        end_of_stream,
-        timeout_secs,
-        max_envelope_size,
-        RESOURCE_URI_CMD,
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn send_input_request_with_uri(
     endpoint: &str,
@@ -1065,7 +1002,7 @@ mod tests {
 
     #[test]
     fn send_input_contains_required_elements() {
-        let xml = send_input_request(
+        let xml = send_input_request_with_uri(
             "http://host:5985/wsman",
             "S1",
             "C1",
@@ -1073,6 +1010,7 @@ mod tests {
             false,
             60,
             153_600,
+            RESOURCE_URI_CMD,
         );
         assert!(xml.contains("Send"));
         assert!(xml.contains("S1"));
@@ -1086,7 +1024,7 @@ mod tests {
 
     #[test]
     fn send_input_end_of_stream() {
-        let xml = send_input_request(
+        let xml = send_input_request_with_uri(
             "http://host:5985/wsman",
             "S1",
             "C1",
@@ -1094,6 +1032,7 @@ mod tests {
             true,
             60,
             153_600,
+            RESOURCE_URI_CMD,
         );
         assert!(xml.contains(r#"End="true""#));
     }
@@ -1166,7 +1105,7 @@ mod tests {
 
     #[test]
     fn send_input_max_envelope_size() {
-        let xml = send_input_request(
+        let xml = send_input_request_with_uri(
             "http://host:5985/wsman",
             "S1",
             "C1",
@@ -1174,6 +1113,7 @@ mod tests {
             false,
             60,
             600_000,
+            RESOURCE_URI_CMD,
         );
         assert!(xml.contains("600000"));
     }
@@ -1463,7 +1403,13 @@ mod tests {
 
     #[test]
     fn disconnect_shell_contains_required_elements() {
-        let xml = disconnect_shell_request("http://host:5985/wsman", "SHELL-1", 60, 153_600);
+        let xml = disconnect_shell_request_with_uri(
+            "http://host:5985/wsman",
+            "SHELL-1",
+            60,
+            153_600,
+            RESOURCE_URI_CMD,
+        );
         assert!(xml.contains("SHELL-1"));
         assert!(xml.contains("shell/Disconnect"));
         assert!(xml.contains("Disconnect"));
@@ -1478,7 +1424,13 @@ mod tests {
 
     #[test]
     fn reconnect_shell_contains_required_elements() {
-        let xml = reconnect_shell_request("http://host:5985/wsman", "SHELL-1", 60, 153_600);
+        let xml = reconnect_shell_request_with_uri(
+            "http://host:5985/wsman",
+            "SHELL-1",
+            60,
+            153_600,
+            RESOURCE_URI_CMD,
+        );
         assert!(xml.contains("SHELL-1"));
         assert!(xml.contains("shell/Reconnect"));
         assert!(xml.contains("<rsp:Reconnect/>"));
@@ -1673,11 +1625,6 @@ mod tests {
                 K::Receive,
             ),
             (
-                "send_input_request",
-                send_input_request(ep, "S", "C", b"x", false, t, m),
-                K::SendInput,
-            ),
-            (
                 "send_input_request_with_uri",
                 send_input_request_with_uri(ep, "S", "C", b"x", true, t, m, ps),
                 K::SendInput,
@@ -1708,19 +1655,9 @@ mod tests {
                 K::Delete,
             ),
             (
-                "disconnect_shell_request",
-                disconnect_shell_request(ep, "S", t, m),
-                K::Disconnect,
-            ),
-            (
                 "disconnect_shell_request_with_uri",
                 disconnect_shell_request_with_uri(ep, "S", t, m, ps),
                 K::Disconnect,
-            ),
-            (
-                "reconnect_shell_request",
-                reconnect_shell_request(ep, "S", t, m),
-                K::Reconnect,
             ),
             (
                 "reconnect_shell_request_with_uri",

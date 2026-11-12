@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- The unit tests of `src/transport.rs` and `src/client.rs` move to
+  `src/transport/tests.rs` and `src/client/tests.rs`: same tests, same
+  names, no API change.
+- Three SOAP envelope builders that only their own tests called are removed
+  (`disconnect_shell_request`, `reconnect_shell_request`,
+  `send_input_request`). The `_with_uri` builders the client calls stay, and
+  the tests now call those: no API change. `__fuzz::send_input_request`
+  takes the resource URI, so `fuzz_soap_envelope` checks it too (`__internal`
+  surface, not covered by SemVer).
 - `uuid` 1.29.0 and `webpki-roots` 1.0.11 in the lockfile (Dependabot #32 and
   #33), with their `cargo vet` exemptions. This lockfile only builds this
   repository: a crate that depends on winrm-rs resolves `webpki-roots`
@@ -18,6 +27,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   chains only to one of them no longer verifies; trust its CA with
   `WinrmClientBuilder::add_root_certificates_pem`, or use
   `platform_roots(true)`.
+
+### Added
+
+- **Four examples**, next to `examples/basic.rs`: `auth_methods` (NTLM,
+  Basic, Kerberos, Certificate and CredSSP, with the three ways to trust the
+  listener's certificate), `streaming` (`open_shell`, `start_command`,
+  `receive_next`), `file_transfer` (upload, a check on the host through
+  `quote_powershell_string`, download) and `timeout_cancel`
+  (`run_powershell_with_timeout`, and `run_powershell_with_cancel` on
+  Ctrl+C). The README lists them under *Runnable examples*.
+
+### Documentation
+
+- The header of `examples/basic.rs` said that a self-signed listener
+  certificate can be given to `WINRM_CA` only if it is a CA certificate. It
+  is the opposite, as the rustdoc of `add_root_certificates_pem` says: only
+  if it is not one.
 
 ## [2.0.1] - 2026-11-01
 

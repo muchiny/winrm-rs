@@ -515,6 +515,9 @@ pub fn signal_psrp_ctrl_c_request(
     )
 }
 
+/// Send carries the shell's own ResourceURI, like Delete: a caller-supplied
+/// string spliced into the header, so it is part of the injection surface.
+#[expect(clippy::too_many_arguments, reason = "mirrors the wrapped builder")]
 pub fn send_input_request(
     endpoint: &str,
     shell_id: &str,
@@ -523,8 +526,9 @@ pub fn send_input_request(
     end_of_stream: bool,
     timeout_secs: u64,
     max_envelope_size: u32,
+    resource_uri: &str,
 ) -> String {
-    crate::soap::envelope::send_input_request(
+    crate::soap::envelope::send_input_request_with_uri(
         endpoint,
         shell_id,
         command_id,
@@ -532,6 +536,7 @@ pub fn send_input_request(
         end_of_stream,
         timeout_secs,
         max_envelope_size,
+        resource_uri,
     )
 }
 

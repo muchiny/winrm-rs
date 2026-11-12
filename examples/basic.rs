@@ -4,7 +4,7 @@
 //!
 //! By default the example connects over HTTPS on 5986 and validates the
 //! listener certificate. `WINRM_CA` names a PEM file with the CA to trust (a
-//! self-signed listener certificate works only if it is a CA certificate;
+//! self-signed listener certificate works only if it is not a CA certificate;
 //! otherwise pin it, see the README). `WINRM_HTTP=1`
 //! selects plain HTTP on 5985, where NTLM does not authenticate the server
 //! (README, "Choosing a transport").

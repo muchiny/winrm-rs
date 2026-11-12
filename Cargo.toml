@@ -1,6 +1,6 @@
 [package]
 name = "winrm-rs"
-version = "2.0.1"
+version = "2.1.0"
 edition = "2024"
 rust-version = "1.99.0"
 description = "Async WinRM (WS-Management) client for Rust with NTLMv2, Basic, Kerberos, and Certificate authentication"

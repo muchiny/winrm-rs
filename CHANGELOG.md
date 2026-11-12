@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-11-12
+
+The MSRV moves to 1.99.0, four examples join `examples/basic.rs`, and the
+lockfile is refreshed. No API change.
+
 ### Changed
 
 - **MSRV raised to 1.99.0** (from 1.98.0). `clippy.toml` and the MSRV job
@@ -56,6 +61,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   certificate can be given to `WINRM_CA` only if it is a CA certificate. It
   is the opposite, as the rustdoc of `add_root_certificates_pem` says: only
   if it is not one.
+- SECURITY.md lists 2.1.x as the supported line. Security fixes ship for the
+  latest minor only, so 2.0.x gets none from this release on, and 2.1 needs
+  Rust 1.99.0 or later.
 
 ## [2.0.1] - 2026-11-01
 
@@ -1836,7 +1844,8 @@ considered stable and covered by SemVer guarantees.
 - Raw command execution (`cmd.exe` or any executable)
 - Full shell lifecycle: create, execute, receive, signal, delete
 
-[Unreleased]: https://github.com/muchiny/winrm-rs/compare/v2.0.1...HEAD
+[Unreleased]: https://github.com/muchiny/winrm-rs/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/muchiny/winrm-rs/compare/v2.0.1...v2.1.0
 [2.0.1]: https://github.com/muchiny/winrm-rs/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/muchiny/winrm-rs/compare/v1.4.1...v2.0.0
 [1.4.1]: https://github.com/muchiny/winrm-rs/compare/v1.4.0...v1.4.1

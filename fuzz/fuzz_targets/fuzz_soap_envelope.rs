@@ -108,8 +108,17 @@ fuzz_target!(|input: Input<'_>| {
         ),
         (
             "send_input",
-            send_input_request(ep, sid, cid, input.stdin, input.end_of_stream, t, m),
-            send_input_request("", "", "", input.stdin, input.end_of_stream, t, m),
+            send_input_request(
+                ep,
+                sid,
+                cid,
+                input.stdin,
+                input.end_of_stream,
+                t,
+                m,
+                input.resource_uri,
+            ),
+            send_input_request("", "", "", input.stdin, input.end_of_stream, t, m, ""),
         ),
         (
             "enumerate_wql",

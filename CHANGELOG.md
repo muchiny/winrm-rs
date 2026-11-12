@@ -12,6 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - The unit tests of `src/transport.rs` and `src/client.rs` move to
   `src/transport/tests.rs` and `src/client/tests.rs`: same tests, same
   names, no API change.
+- Three SOAP envelope builders that only their own tests called are removed
+  (`disconnect_shell_request`, `reconnect_shell_request`,
+  `send_input_request`). The `_with_uri` builders the client calls stay, and
+  the tests now call those: no API change. `__fuzz::send_input_request`
+  takes the resource URI, so `fuzz_soap_envelope` checks it too (`__internal`
+  surface, not covered by SemVer).
 - `uuid` 1.29.0 and `webpki-roots` 1.0.11 in the lockfile (Dependabot #32 and
   #33), with their `cargo vet` exemptions. This lockfile only builds this
   repository: a crate that depends on winrm-rs resolves `webpki-roots`

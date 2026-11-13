@@ -39,11 +39,14 @@ see [Choosing a transport](#choosing-a-transport).
 - **Basic authentication** -- over HTTPS; over plain HTTP only with `EncryptionMode::Never`, the explicit plaintext opt-in
 - **Kerberos authentication** -- via `cross-krb5`, feature-gated (`--features kerberos`); raw Kerberos GSS-API tokens under the `Negotiate` scheme, messages sealed with the Kerberos context over HTTP, and over HTTPS with `accept_invalid_certs`
 - **Certificate authentication** -- TLS client certificate auth
+- **CredSSP authentication** -- double-hop delegation, feature-gated (`--features credssp`) and experimental; see [Cargo features](#cargo-features)
 - **PowerShell execution** -- scripts auto-encoded as UTF-16LE Base64 (`-EncodedCommand`)
 - **Raw command execution** -- `cmd.exe` command lines (the host runs every command through `cmd.exe /C`; arguments are not quoted)
 - **Full shell lifecycle** -- create, execute, receive, signal, delete
 - **Streaming output** -- `start_command` + `receive_next` for incremental polling
 - **File transfer** -- upload/download files via PowerShell base64 chunking
+- **WQL queries** -- `run_wql` runs a WMI query through WS-Enumeration and returns the items as XML
+- **Timeouts and cancellation** -- `*_with_timeout` variants bound a whole call, `*_with_cancel` variants stop it on a `CancellationToken`
 - **Proxy support** -- HTTP(S) and SOCKS proxies (`WinrmConfig::proxy`, or the environment once opted in with `WinrmClientBuilder::use_env_proxy(true)`); CredSSP is tunnelled through `http://` and `socks5://` proxies
 - **Async/await** -- built on `tokio` and `reqwest`
 - **TLS support** -- `rustls` backend, optional invalid cert acceptance
@@ -401,7 +404,12 @@ WINRM_HOST=server.corp.example WINRM_AUTH=kerberos cargo run --example auth_meth
 | `client_cert_pem` | `None` | Path to client cert PEM (Certificate auth) |
 | `client_key_pem` | `None` | Path to client key PEM (Certificate auth) |
 | `proxy` | `None` | Proxy URL as a `SecretString` (e.g. `SecretString::from("http://proxy:8080")`), wiped on drop; CredSSP takes `http://` and `socks5://` only |
+| `codepage` | `65001` | Console output code page of the remote shell (65001 is UTF-8) |
+| `working_directory` | `None` | Initial working directory of the remote shell; `None` is the user profile directory (see its rustdoc before naming a directory that others can write to) |
+| `env_vars` | empty | Environment variables set in the remote shell when it is created |
 | `encryption` | `Auto` | Message sealing for NTLM and Kerberos: `Auto` (over HTTP, and over HTTPS with `accept_invalid_certs`), `Always`, `Never`. Basic over plain HTTP requires `Never`; `Always` with Basic, Certificate or CredSSP is refused |
+| `user_agent` | `None` | Custom HTTP `User-Agent` header; `None` sends `winrm-rs/<version>` |
+| `idle_timeout_secs` | `None` | Shell idle timeout in seconds; `None` leaves the server's default |
 | `max_output_bytes` | `Some(64 MiB)` | Cap on a command's stdout+stderr; `None` removes it |
 
 ### Proxies
@@ -426,34 +434,39 @@ winrm-rs logs through `tracing`. Below `trace` it logs no command text, argument
 | **v0.5** | File transfer, streaming output, proxy | Done |
 | **v1.0** | Stable public API, TLS channel binding, CI/CD | Done |
 | **v1.4** | `before_send` request hook | Done |
-| **v2.0** | HTTPS on 5986 by default, `WinrmConfig::https()` / `http()` presets, opt-in environment proxies and SOAP body logging | **Current** |
+| **v2.0** | HTTPS on 5986 by default, `WinrmConfig::https()` / `http()` presets, opt-in environment proxies and SOAP body logging | Done |
+| **v2.1** | MSRV 1.99, four more runnable examples | **Current** |
 | **v2.x** | CredSSP stabilization (`--features credssp`) | Planned |
 
 ## Comparison
 
-| | **winrm-rs** | **pywinrm** (Python) | **go-winrm** (Go) |
+| | **winrm-rs** | **pywinrm** (Python) | **masterzen/winrm** (Go) |
 |---|---|---|---|
 | Async | native async/await | no | no |
 | NTLM | pure Rust (NTLMv2) | via requests-ntlm | built-in |
 | Kerberos | via cross-krb5 (v0.4) | via requests-kerberos | built-in |
 | Certificate | built-in (v0.4) | yes | yes |
-| Encryption | NTLM sealing (v0.3), Kerberos sealing | via pywinrm[credssp] | built-in |
+| CredSSP | feature `credssp` (experimental) | via pywinrm[credssp] | built-in |
+| Message encryption | NTLM sealing (v0.3), Kerberos sealing | NTLM, Kerberos, CredSSP | NTLM and Kerberos (opt-in) |
 | TLS backend | rustls | OpenSSL | Go stdlib |
 | PowerShell encoding | built-in | built-in | built-in |
 | Shell reuse | yes (v0.2) | yes | yes |
 | File transfer | base64 chunked (v0.5) | yes | yes |
-| Streaming | poll-based (v0.5) | no | no |
+| Streaming | poll-based (v0.5) | low-level API only (`get_command_output_raw`) | yes (`io.Reader` / `io.Writer`) |
 | Binary size | single static binary | interpreter | single binary |
 
 ## Contributing
 
 Contributions are welcome. Please open an issue to discuss larger changes before submitting a PR.
+[CONTRIBUTING.md](CONTRIBUTING.md) lists every check CI runs; the short loop is:
 
 ```sh
-cargo test --workspace    # run tests
-cargo clippy --workspace  # lint
-cargo fmt --check         # format check
+cargo nextest run                           # run tests
+cargo clippy --all-targets -- -D warnings   # lint
+cargo +nightly fmt --check                  # format check
 ```
+
+To report a vulnerability, follow [SECURITY.md](SECURITY.md) and do not open a public issue.
 
 ## Fuzzing
 
@@ -510,7 +523,7 @@ cargo test --test integration_real -- --ignored
 
 The `credssp` feature links the host's OpenSSL (libssl) through `openssl-sys`: dynamically by default, statically with `OPENSSL_STATIC=1`, from a chosen install with `OPENSSL_DIR`. Building needs the headers and `pkg-config` (`libssl-dev pkg-config` on Debian and Ubuntu, `openssl-devel` on Fedora and RHEL).
 
-The inner CredSSP TLS client runs on that library. It parses records the server controls, including the server certificate, before any NTLM authentication and with certificate verification off (the inner channel is bound by `pubKeyAuth` instead). Keep that library on a branch that still receives security fixes, from OpenSSL upstream or from your distribution's backports. As of `openssl-sys` 0.9.117 it builds against OpenSSL 1.1.0, 1.1.1, 3.x and 4.x and LibreSSL 3.5 to 4.3. This crate is interop-tested only with OpenSSL 3.5 against Windows Server 2025. LibreSSL builds but has never been tested against SChannel. Each CredSSP handshake logs the OpenSSL version loaded at run time (`debug` level, target `winrm_rs::credssp`).
+The inner CredSSP TLS client runs on that library. It parses records the server controls, including the server certificate, before any NTLM authentication and with certificate verification off (the inner channel is bound by `pubKeyAuth` instead). Keep that library on a branch that still receives security fixes, from OpenSSL upstream or from your distribution's backports. As of `openssl-sys` 0.9.118 it builds against OpenSSL 1.1.0, 1.1.1, 3.x and 4.x and LibreSSL 3.5 to 4.4. This crate is interop-tested only with OpenSSL 3.5 against Windows Server 2025. LibreSSL builds but has never been tested against SChannel. Each CredSSP handshake logs the OpenSSL version loaded at run time (`debug` level, target `winrm_rs::credssp`).
 
 ## License
 

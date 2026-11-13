@@ -10,7 +10,7 @@ body:
     id: version
     attributes:
       label: winrm-rs version
-      placeholder: "0.5.0"
+      placeholder: "2.1.0"
     validations:
       required: true
   - type: input
@@ -18,7 +18,7 @@ body:
     attributes:
       label: Rust version
       description: Output of `rustc --version`
-      placeholder: "rustc 1.94.0"
+      placeholder: "rustc 1.99.1"
     validations:
       required: true
   - type: dropdown
@@ -41,6 +41,7 @@ body:
         - Basic
         - Kerberos
         - Certificate
+        - CredSSP
     validations:
       required: true
   - type: textarea

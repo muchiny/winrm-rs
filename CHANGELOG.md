@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- `release.toml` (`cargo-release`) and `cliff.toml` (`git-cliff`) are
+  removed: the release procedure uses neither tool (CONTRIBUTING.md,
+  "Releasing"), and `release.toml` asked for a publish and a push from the
+  maintainer's machine, which that procedure forbids. Neither file was in
+  the published crate.
+
+### Documentation
+
+- README: the `credssp` section names `openssl-sys` 0.9.118, the version in
+  the lockfile since 2.1.0, which builds against LibreSSL up to 4.4. The
+  `WinrmConfig` table gains the five fields it left out (`codepage`,
+  `working_directory`, `env_vars`, `user_agent`, `idle_timeout_secs`), and
+  the feature list names CredSSP, WQL queries and the timeout and
+  cancellation variants. The contributing commands are those of
+  CONTRIBUTING.md, and the section links it and SECURITY.md.
+- README, comparison table: pywinrm encrypts messages with NTLM, Kerberos
+  and CredSSP, not only with its `credssp` extra, and the Go library is
+  `masterzen/winrm`, which streams the output of a command. The table gains
+  a CredSSP row.
+- `docs/validation/live-matrix.md` said that `add_root_certificates_pem`,
+  `platform_roots` and the terminate that `Shell::run_command` sends when
+  it gives up came with 1.5.0, a version that was never published: they
+  shipped in 2.0.0. A note at its top says that the document is a snapshot
+  from before 2.0.0.
+- This file linked 1.0.0 and the 0.x versions to tags that do not exist.
+  The 0.x versions were never tagged or published; 1.0.0 now links its tag.
+- The bug report form offers CredSSP as an authentication method.
+
 ## [2.1.0] - 2026-11-12
 
 The MSRV moves to 1.99.0, four examples join `examples/basic.rs`, and the
@@ -1802,6 +1832,9 @@ considered stable and covered by SemVer guarantees.
 
 ## [0.5.0] - 2026-03-29
 
+Versions 0.1.0 to 0.5.0 were development milestones: none was tagged or
+published to crates.io, where 1.0.0 is the first release.
+
 ### Added
 
 - File transfer: upload/download via PowerShell base64 chunking
@@ -1856,9 +1889,4 @@ considered stable and covered by SemVer guarantees.
 [1.2.0]: https://github.com/muchiny/winrm-rs/compare/v1.1.2...v1.2.0
 [1.1.2]: https://github.com/muchiny/winrm-rs/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/muchiny/winrm-rs/compare/v1.0.0...v1.1.1
-[1.0.0]: https://github.com/muchiny/winrm-rs/compare/v0.5.0...v1.0.0
-[0.5.0]: https://github.com/muchiny/winrm-rs/compare/v0.4.0...v0.5.0
-[0.4.0]: https://github.com/muchiny/winrm-rs/compare/v0.3.0...v0.4.0
-[0.3.0]: https://github.com/muchiny/winrm-rs/compare/v0.2.0...v0.3.0
-[0.2.0]: https://github.com/muchiny/winrm-rs/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/muchiny/winrm-rs/releases/tag/v0.1.0
+[1.0.0]: https://github.com/muchiny/winrm-rs/releases/tag/v1.0.0

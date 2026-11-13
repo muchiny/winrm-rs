@@ -1,5 +1,14 @@
 # Matrice de validation live de winrm-rs
 
+> **Instantané d'avant la 2.0.0.** Ce document rend compte de la campagne des
+> 2026-10-21 et 2026-10-22 et a reçu ses dernières retouches le 2026-10-25,
+> jour de la 2.0.0. Il n'a pas été rejoué depuis : les versions des
+> dépendances et des crates aval, les comptes de tests et de cibles de fuzz
+> sont ceux de la campagne, et « configuration par défaut » y désigne celle
+> de la 1.x (HTTP sur 5985). Depuis la 2.0.0 le défaut est HTTPS sur 5986
+> (*Upgrading from 1.x* dans le [CHANGELOG](../../CHANGELOG.md)). Les lignes
+> marquées `⏳` n'ont pas été mises à jour.
+
 Campagne du 2026-10-21, branche `test/live-coverage`. Chaque `✅` ci-dessous est
 adossé à un test nommé qui a réellement passé contre une VM Windows ; rien n'est
 déduit de la lecture du code.
@@ -423,7 +432,7 @@ ne figurent pas dans la matrice.
 - **Un proxy `https://` partage la configuration d'authentification cliente** du
   transport.
 - **Racines de confiance.** Par défaut, seules les racines webpki (Mozilla)
-  sont reconnues. Depuis 1.5.0, `WinrmClientBuilder::add_root_certificates_pem`
+  sont reconnues. Depuis 2.0.0, `WinrmClientBuilder::add_root_certificates_pem`
   et `platform_roots` couvrent les CA internes ; le certificat de l'écouteur
   doit porter le nom d'hôte dans son SAN.
 - **`WinrmClient::run_command`, `run_powershell` et `download_file` n'ont
@@ -445,7 +454,7 @@ ne figurent pas dans la matrice.
   délai total de `2 * operation_timeout_secs`. `run_wql` ne scrute pas
   Receive et n'est pas concerné.
 - **`Shell::run_command` termine la commande quand il abandonne (depuis
-  1.5.0).** Quand la commande se termine, atteint le plafond
+  2.0.0).** Quand la commande se termine, atteint le plafond
   `max_output_bytes` (`WinrmError::Transfer`) ou son délai total
   (`WinrmError::Timeout(2 * operation_timeout_secs)`), il envoie une seule
   terminaison, bornée (voie de nettoyage, `min(operation_timeout_secs, 10)` s,

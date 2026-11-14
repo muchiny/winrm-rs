@@ -95,6 +95,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   "Releasing"), and `release.toml` asked for a publish and a push from the
   maintainer's machine, which that procedure forbids. Neither file was in
   the published crate.
+- The unit tests of eighteen more modules move to a file of their own, as
+  those of `src/transport.rs` and `src/client.rs` did in 2.1.0
+  (`src/soap/parser.rs` to `src/soap/parser/tests.rs`, `src/ntlm/mod.rs` to
+  `src/ntlm/tests.rs`, the `layout_tests` of `src/auth/kerberos.rs` to
+  `src/auth/kerberos/layout_tests.rs`, and so on): every test module of
+  more than 150 lines. Same tests, same names, no API change.
+  `sonar-project.properties` leaves these files, and
+  `src/auth/credssp/test_server.rs`, out of main-code analysis.
 
 ### Documentation
 

@@ -28,7 +28,7 @@
 //   inner session (`OpenSslMemTls`).
 // - `connection.rs`: the one HTTPS connection of an exchange
 //   (`CredSspConnection`) and its limits (`CredSspConnOptions`).
-// - `http.rs`: the HTTP/1.1 responses read off that connection
+// - `response.rs`: the HTTP/1.1 responses read off that connection
 //   (`ResponseReader`).
 // - `handshake.rs`: the handshake itself, up to the delegation.
 // - this file: `CredSspAuth`, which runs one request from the connection to
@@ -63,7 +63,9 @@
 //                              `WWW-Authenticate: CredSSP`, no TSRequest
 //
 // `auth/mod.rs` gates this module on the `credssp` feature, so nothing in
-// it carries the gate again.
+// it carries the gate again. Its test modules are a plain `cfg(test)`,
+// which is also what the `allow-*-in-tests` of `clippy.toml` recognise: a
+// `cfg(all(test, ...))` module is not exempt.
 
 use std::sync::Arc;
 
@@ -76,7 +78,7 @@ use crate::transport::proxy::CredSspDial;
 mod connection;
 mod endpoint;
 mod handshake;
-mod http;
+mod response;
 mod tls;
 mod tunnel;
 
@@ -86,12 +88,14 @@ pub(crate) mod test_server;
 pub(crate) use connection::CredSspConnOptions;
 // The fuzz surface (`src/__fuzz.rs`) reads responses and tokens.
 #[cfg(feature = "__internal")]
-pub(crate) use http::{MAX_RESPONSE_HEAD_BYTES, ResponseReader, extract_credssp_token_str};
+pub(crate) use handshake::extract_credssp_token_str;
+#[cfg(feature = "__internal")]
+pub(crate) use response::{MAX_RESPONSE_HEAD_BYTES, ResponseReader};
 pub(crate) use tls::CredSspTls;
 
 use connection::CredSspConnection;
 use endpoint::CredSspEndpoint;
-use http::HttpResponse;
+use response::HttpResponse;
 
 /// CredSSP authentication transport.
 ///
@@ -108,7 +112,8 @@ pub(crate) struct CredSspAuth {
     /// Response size and timeout limits of the connection.
     pub(crate) opts: CredSspConnOptions,
     /// How the connection reaches the host: directly or through the proxy
-    /// of `WinrmConfig::proxy`.
+    /// of the client's proxy route (`WinrmConfig::proxy`, or the one of the
+    /// environment with `use_env_proxy(true)`).
     pub(crate) dial: Arc<CredSspDial>,
 }
 

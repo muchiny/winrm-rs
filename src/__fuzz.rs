@@ -715,7 +715,7 @@ pub fn extract_subject_public_key(cert_der: &[u8]) -> Result<Vec<u8>, crate::err
 }
 
 // ---------------------------------------------------------------------------
-// CredSSP HTTP (`src/auth/credssp/http.rs`)
+// CredSSP HTTP (`src/auth/credssp/response.rs`, `handshake.rs`)
 // ---------------------------------------------------------------------------
 
 /// Feed `chunks` one by one to the CredSSP response reader (head cap of the

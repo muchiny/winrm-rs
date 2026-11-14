@@ -320,9 +320,8 @@ fn inner_acceptor() -> Result<OpenSslMemTls, String> {
     let key = PKey::private_key_from_pem(RSA_KEY_PKCS1_PEM.as_bytes()).map_err(e)?;
     builder.set_private_key(&key).map_err(e)?;
     let acceptor = builder.build();
-    let mut ssl = Ssl::new(acceptor.context()).map_err(e)?;
-    ssl.set_accept_state();
-    OpenSslMemTls::over_memory(ssl).map_err(e)
+    let ssl = Ssl::new(acceptor.context()).map_err(e)?;
+    OpenSslMemTls::server(ssl).map_err(e)
 }
 
 /// The SubjectPublicKey of the inner certificate, read with the crate's own

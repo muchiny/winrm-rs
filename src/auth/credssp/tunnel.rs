@@ -1,14 +1,16 @@
-//! The TCP stream of a CredSSP connection: direct, or a tunnel through the
-//! proxy of `WinrmConfig::proxy` (HTTP `CONNECT` or SOCKS5).
+//! The TCP stream of a CredSSP connection: direct, or a tunnel through a
+//! proxy (HTTP `CONNECT` or SOCKS5).
 //!
 //! `reqwest` does this for the other methods. CredSSP holds one raw
 //! connection (see the parent module), so the proxy handshakes are written
-//! here, over the route the transport resolved ([`CredSspDial`]).
+//! here, over the route the transport resolved ([`CredSspDial`]): the proxy
+//! of `WinrmConfig::proxy`, or the one of the environment with
+//! `use_env_proxy(true)`.
 
 use zeroize::Zeroizing;
 
 use super::endpoint::authority;
-use super::http::{find_head_end, parse_response_head};
+use super::response::{find_head_end, parse_response_head};
 use crate::error::WinrmError;
 use crate::transport::proxy::CredSspDial;
 

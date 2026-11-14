@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use super::endpoint::CredSspEndpoint;
-use super::http::{HttpResponse, MAX_RESPONSE_HEAD_BYTES, ResponseReader};
+use super::response::{HttpResponse, MAX_RESPONSE_HEAD_BYTES, ResponseReader};
 use super::tls::CredSspTls;
 use super::tunnel::dial_tunnel;
 use crate::error::WinrmError;
@@ -37,13 +37,13 @@ pub(super) struct CredSspConnection<S = tokio_rustls::client::TlsStream<tokio::n
 #[derive(Clone, Debug)]
 pub(crate) struct CredSspConnOptions {
     /// Largest response body accepted (see `transport::max_response_bytes`).
-    pub(crate) max_response_bytes: usize,
+    pub(super) max_response_bytes: usize,
     /// TCP connect, proxy handshake and outer TLS handshake, together.
-    pub(crate) connect_timeout: std::time::Duration,
+    pub(super) connect_timeout: std::time::Duration,
     /// Each HTTP exchange (request written, response read).
-    pub(crate) exchange_timeout: std::time::Duration,
+    pub(super) exchange_timeout: std::time::Duration,
     /// `User-Agent` header of every request.
-    pub(crate) user_agent: String,
+    pub(super) user_agent: String,
 }
 
 impl CredSspConnOptions {

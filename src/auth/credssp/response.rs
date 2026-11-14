@@ -365,42 +365,5 @@ impl ResponseReader {
     }
 }
 
-/// Call after a handshake round's status and token checks, only when another round follows.
-pub(super) fn handshake_round_ok(resp: &HttpResponse, round: &str) -> Result<(), WinrmError> {
-    if resp.closing {
-        return Err(WinrmError::AuthFailed(format!(
-            "CredSSP: server closed the connection during {round}"
-        )));
-    }
-    if resp.leftover {
-        return Err(WinrmError::AuthFailed(format!(
-            "CredSSP: unexpected bytes after the response during {round}"
-        )));
-    }
-    Ok(())
-}
-
-/// Extract the CredSSP token from the WWW-Authenticate header (handles
-/// `CredSSP <b64>` possibly mixed with other schemes).
-pub(crate) fn extract_credssp_token_str(www_auth: &str) -> Option<String> {
-    // ASCII-only case folding keeps every byte offset of `www_auth` valid:
-    // `to_uppercase` can change the byte length of non-ASCII characters
-    // (`ɐ` is 2 bytes, `Ɐ` is 3), so its offsets would slice the original
-    // off a character boundary and panic.
-    const SCHEME: &[u8] = b"CREDSSP ";
-    let pos = www_auth
-        .as_bytes()
-        .windows(SCHEME.len())
-        .position(|w| w.eq_ignore_ascii_case(SCHEME))?;
-    // The match is ASCII and ends with a space, so both its start and its
-    // end are char boundaries.
-    let after = www_auth.get(pos..)?.get(SCHEME.len()..)?;
-    let token: String = after
-        .chars()
-        .take_while(|c| !c.is_whitespace() && *c != ',')
-        .collect();
-    if token.is_empty() { None } else { Some(token) }
-}
-
 #[cfg(test)]
 mod tests;

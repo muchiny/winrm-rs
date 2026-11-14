@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use super::*;
-use crate::auth::credssp::http::find_head_end;
+use crate::auth::credssp::response::find_head_end;
 use crate::auth::credssp::tests::no_verify;
 use crate::config::WinrmConfig;
 use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};

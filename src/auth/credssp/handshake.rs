@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use super::CredSspAuth;
 use super::connection::CredSspConnection;
 use super::endpoint::CredSspEndpoint;
-use super::http::{extract_credssp_token_str, handshake_round_ok};
+use super::response::HttpResponse;
 use super::tls::{OpenSslMemTls, build_inner_openssl_tls};
 use crate::asn1;
 use crate::error::{CredSspError, WinrmError};
@@ -108,6 +108,43 @@ async fn exchange(
     handshake_round_ok(&resp, &round.name())?;
     B64.decode(answer.trim_ascii())
         .map_err(|e| round.bad_base64(&e))
+}
+
+/// Extract the CredSSP token from the WWW-Authenticate header (handles
+/// `CredSSP <b64>` possibly mixed with other schemes).
+pub(crate) fn extract_credssp_token_str(www_auth: &str) -> Option<String> {
+    // ASCII-only case folding keeps every byte offset of `www_auth` valid:
+    // `to_uppercase` can change the byte length of non-ASCII characters
+    // (`ɐ` is 2 bytes, `Ɐ` is 3), so its offsets would slice the original
+    // off a character boundary and panic.
+    const SCHEME: &[u8] = b"CREDSSP ";
+    let pos = www_auth
+        .as_bytes()
+        .windows(SCHEME.len())
+        .position(|w| w.eq_ignore_ascii_case(SCHEME))?;
+    // The match is ASCII and ends with a space, so both its start and its
+    // end are char boundaries.
+    let after = www_auth.get(pos..)?.get(SCHEME.len()..)?;
+    let token: String = after
+        .chars()
+        .take_while(|c| !c.is_whitespace() && *c != ',')
+        .collect();
+    if token.is_empty() { None } else { Some(token) }
+}
+
+/// Call after a handshake round's status and token checks, only when another round follows.
+fn handshake_round_ok(resp: &HttpResponse, round: &str) -> Result<(), WinrmError> {
+    if resp.closing {
+        return Err(WinrmError::AuthFailed(format!(
+            "CredSSP: server closed the connection during {round}"
+        )));
+    }
+    if resp.leftover {
+        return Err(WinrmError::AuthFailed(format!(
+            "CredSSP: unexpected bytes after the response during {round}"
+        )));
+    }
+    Ok(())
 }
 
 /// Rounds the inner TLS handshake may take.
@@ -446,6 +483,73 @@ pub(super) async fn authenticate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::credssp::response::ResponseReader;
+
+    #[test]
+    fn extract_credssp_token_str_simple() {
+        assert_eq!(
+            extract_credssp_token_str("CredSSP YWJjZGVm"),
+            Some("YWJjZGVm".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_credssp_token_str_case_insensitive_and_mixed() {
+        assert_eq!(
+            extract_credssp_token_str("Negotiate, credssp ABCDEF, Basic"),
+            Some("ABCDEF".to_string())
+        );
+    }
+
+    /// A non-ASCII character whose uppercase form is longer in UTF-8
+    /// (`ɐ` → `Ɐ`) before the scheme must neither panic nor shift the cut.
+    #[test]
+    fn extract_credssp_token_str_survives_non_ascii_before_the_scheme() {
+        assert_eq!(
+            extract_credssp_token_str("ɐ CredSSP éé"),
+            Some("éé".to_string())
+        );
+        assert_eq!(
+            extract_credssp_token_str("ɐɐɐɐ, CredSSP QUJD, Basic"),
+            Some("QUJD".to_string())
+        );
+        assert_eq!(extract_credssp_token_str("ɐ ẞ ſ"), None);
+    }
+
+    #[test]
+    fn extract_credssp_token_str_returns_none_when_no_token() {
+        assert_eq!(extract_credssp_token_str("Negotiate, Basic"), None);
+        assert_eq!(extract_credssp_token_str("CredSSP "), None);
+    }
+
+    /// The final response a reader gives for `bytes`.
+    fn response(bytes: &[u8]) -> HttpResponse {
+        ResponseReader::new(1024, 64).feed(bytes).unwrap().unwrap()
+    }
+
+    #[test]
+    fn handshake_round_ok_refuses_closing_and_leftover() {
+        let kept = response(b"HTTP/1.1 401 \r\nContent-Length: 0\r\n\r\n");
+        let closing = response(b"HTTP/1.1 401 \r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+        let leftover = response(b"HTTP/1.1 401 \r\nContent-Length: 0\r\n\r\nextra");
+        assert!(!kept.closing && !kept.leftover);
+        assert!(closing.closing && !closing.leftover);
+        assert!(!leftover.closing && leftover.leftover);
+
+        assert!(handshake_round_ok(&kept, "NTLM negotiate").is_ok());
+        let refused = |resp: &HttpResponse| match handshake_round_ok(resp, "NTLM negotiate") {
+            Err(WinrmError::AuthFailed(message)) => message,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            refused(&closing),
+            "CredSSP: server closed the connection during NTLM negotiate"
+        );
+        assert_eq!(
+            refused(&leftover),
+            "CredSSP: unexpected bytes after the response during NTLM negotiate"
+        );
+    }
 
     /// The nonce of `pubKeyAuth` comes from the CSPRNG: two of them differ.
     /// `CREDSSP_FIXED_NONCE` pins it in a debug build with `__internal`; the

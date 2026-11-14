@@ -245,7 +245,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   part: `endpoint.rs` (the endpoint URL), `tunnel.rs` (the TCP stream,
   direct or through a `CONNECT` or SOCKS5 proxy), `tls.rs` (the TLS
   contexts of a client and the in-memory inner session), `connection.rs`
-  (the one HTTPS connection of an exchange), `http.rs` (its HTTP/1.1
+  (the one HTTPS connection of an exchange), `response.rs` (its HTTP/1.1
   responses) and `handshake.rs` (the handshake, up to the delegation).
   `credssp.rs` keeps `CredSspAuth`. The tests of each part are next to it;
   the exchanges against the in-process acceptor stay in

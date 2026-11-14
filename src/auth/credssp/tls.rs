@@ -68,9 +68,22 @@ impl std::io::Write for MemBio {
 }
 
 impl OpenSslMemTls {
-    /// A session of `ssl`, already in its connect or accept state, over a
-    /// fresh in-memory BIO.
-    pub(super) fn over_memory(ssl: openssl::ssl::Ssl) -> Result<Self, openssl::error::ErrorStack> {
+    /// The client side of a session of `ssl`, over a fresh in-memory BIO.
+    pub(super) fn client(mut ssl: openssl::ssl::Ssl) -> Result<Self, openssl::error::ErrorStack> {
+        ssl.set_connect_state();
+        Self::over_memory(ssl)
+    }
+
+    /// The server side of a session of `ssl`, for the in-process acceptor of
+    /// the tests (`test_server.rs`): the library never accepts a session.
+    #[cfg(test)]
+    pub(super) fn server(mut ssl: openssl::ssl::Ssl) -> Result<Self, openssl::error::ErrorStack> {
+        ssl.set_accept_state();
+        Self::over_memory(ssl)
+    }
+
+    /// `ssl`, whose side is set, over a fresh in-memory BIO.
+    fn over_memory(ssl: openssl::ssl::Ssl) -> Result<Self, openssl::error::ErrorStack> {
         let bio = MemBio {
             incoming: std::collections::VecDeque::new(),
             outgoing: Vec::new(),
@@ -152,7 +165,7 @@ pub(crate) struct CredSspTls {
     /// without ALPN and session resumption.
     pub(crate) outer: Arc<rustls::ClientConfig>,
     /// Inner TLS leg that carries the `TSRequest` messages (OpenSSL).
-    pub(crate) inner: openssl::ssl::SslConnector,
+    pub(super) inner: openssl::ssl::SslConnector,
 }
 
 impl CredSspTls {
@@ -220,13 +233,11 @@ pub(super) fn build_inner_openssl_tls(
         .map_err(|e| WinrmError::AuthFailed(format!("ssl configure: {e}")))?
         .verify_hostname(false)
         .use_server_name_indication(false);
-    let mut mhss = cfg
+    let ssl = cfg
         .into_ssl("credssp")
         .map_err(|e| WinrmError::AuthFailed(format!("into_ssl: {e}")))?;
-    mhss.set_connect_state();
 
-    OpenSslMemTls::over_memory(mhss)
-        .map_err(|e| WinrmError::AuthFailed(format!("SslStream::new: {e}")))
+    OpenSslMemTls::client(ssl).map_err(|e| WinrmError::AuthFailed(format!("SslStream::new: {e}")))
 }
 
 #[cfg(test)]

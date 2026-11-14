@@ -1,6 +1,5 @@
-//! Where a CredSSP request goes: the endpoint URL, parsed once per request
-//! into what the connection, the `Host` header and the NTLM target name
-//! each need.
+//! The endpoint URL of a CredSSP request, parsed once per request into what
+//! the connection, the `Host` header and the NTLM target name each need.
 
 use crate::error::WinrmError;
 

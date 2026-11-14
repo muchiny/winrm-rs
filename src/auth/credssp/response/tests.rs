@@ -1,42 +1,5 @@
 use super::*;
 
-#[test]
-fn extract_credssp_token_str_simple() {
-    assert_eq!(
-        extract_credssp_token_str("CredSSP YWJjZGVm"),
-        Some("YWJjZGVm".to_string())
-    );
-}
-
-#[test]
-fn extract_credssp_token_str_case_insensitive_and_mixed() {
-    assert_eq!(
-        extract_credssp_token_str("Negotiate, credssp ABCDEF, Basic"),
-        Some("ABCDEF".to_string())
-    );
-}
-
-/// A non-ASCII character whose uppercase form is longer in UTF-8
-/// (`ɐ` → `Ɐ`) before the scheme must neither panic nor shift the cut.
-#[test]
-fn extract_credssp_token_str_survives_non_ascii_before_the_scheme() {
-    assert_eq!(
-        extract_credssp_token_str("ɐ CredSSP éé"),
-        Some("éé".to_string())
-    );
-    assert_eq!(
-        extract_credssp_token_str("ɐɐɐɐ, CredSSP QUJD, Basic"),
-        Some("QUJD".to_string())
-    );
-    assert_eq!(extract_credssp_token_str("ɐ ẞ ſ"), None);
-}
-
-#[test]
-fn extract_credssp_token_str_returns_none_when_no_token() {
-    assert_eq!(extract_credssp_token_str("Negotiate, Basic"), None);
-    assert_eq!(extract_credssp_token_str("CredSSP "), None);
-}
-
 fn read_all(chunks: &[&[u8]]) -> Result<Option<HttpResponse>, WinrmError> {
     let mut r = ResponseReader::new(1024, 64);
     for c in chunks {
@@ -388,28 +351,4 @@ fn reader_result_does_not_depend_on_chunking() {
     }
     let bytes: Vec<&[u8]> = input.chunks(1).collect();
     assert_eq!(key(&read_all(&bytes).unwrap().unwrap()), key(&one));
-}
-
-#[test]
-fn handshake_round_ok_refuses_closing_and_leftover() {
-    let resp = |closing, leftover| HttpResponse {
-        status: 401,
-        head: ResponseHead {
-            minor_version: 1,
-            status: 401,
-            headers: Vec::new(),
-        },
-        body: Vec::new(),
-        closing,
-        leftover,
-    };
-    assert!(handshake_round_ok(&resp(false, false), "NTLM negotiate").is_ok());
-    assert!(
-        matches!(handshake_round_ok(&resp(true, false), "NTLM negotiate"),
-            Err(WinrmError::AuthFailed(m)) if m == "CredSSP: server closed the connection during NTLM negotiate")
-    );
-    assert!(
-        matches!(handshake_round_ok(&resp(false, true), "NTLM negotiate"),
-            Err(WinrmError::AuthFailed(m)) if m == "CredSSP: unexpected bytes after the response during NTLM negotiate")
-    );
 }

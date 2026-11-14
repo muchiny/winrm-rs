@@ -29,6 +29,7 @@ pub struct Ready;
 ///     .build()
 ///     .unwrap();
 /// ```
+#[must_use = "a builder does nothing until `build` is called"]
 pub struct WinrmClientBuilder<S = NeedsCredentials> {
     config: WinrmConfig,
     credentials: Option<WinrmCredentials>,

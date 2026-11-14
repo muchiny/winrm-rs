@@ -95,6 +95,7 @@ pub(crate) fn escape_ps_single_quoted(s: &str) -> String {
 /// );
 /// assert_eq!(script, "Get-Item -LiteralPath 'C:\\Users\\o''brien'");
 /// ```
+#[must_use]
 pub fn quote_powershell_string(value: &str) -> String {
     format!("'{}'", escape_ps_single_quoted(value))
 }
@@ -104,6 +105,7 @@ pub fn quote_powershell_string(value: &str) -> String {
 /// This is the encoding format expected by `powershell.exe -EncodedCommand`.
 /// The input is converted to UTF-16LE and then base64-encoded, which avoids
 /// shell quoting and character escaping issues.
+#[must_use]
 pub fn encode_powershell_command(script: &str) -> String {
     let mut utf16 = Vec::with_capacity(script.len().saturating_mul(2));
     for c in script.encode_utf16() {

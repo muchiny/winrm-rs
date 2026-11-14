@@ -952,6 +952,7 @@ pub struct StderrDecoder(ClixmlDecoder);
 
 impl StderrDecoder {
     /// A decoder for a new command's stderr.
+    #[must_use]
     pub fn new() -> Self {
         Self(ClixmlDecoder::new())
     }

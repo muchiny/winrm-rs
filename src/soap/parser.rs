@@ -16,15 +16,20 @@
 //!
 //! A parser of a successful answer reads the whole response
 //! ([`read_answer`]) and fails, in this order: with the fault, when the
-//! response is one; with a [`SoapError::ParseError`], when an element it
-//! reads is not what the protocol writes there (an element inside an id or
-//! a stream, a stream that is not base64) or when the response is not a
-//! document [`walk`] accepts. What it returns therefore comes from a
-//! response that was read to its end and is not a fault.
+//! response has one where [`walk`] gets to it; with a
+//! [`SoapError::ParseError`], when an element it reads is not what the
+//! protocol writes there (an element inside an id or a stream, a stream
+//! that is not base64) or when the response is not a document `walk`
+//! accepts. What it returns therefore comes from a response that was read
+//! to its end and is not a fault. [`check_answer`] is that check alone, and
+//! the transport makes it on every response that comes with a success
+//! status.
 //!
 //! [`check_soap_fault`] and the readers of the header are tolerant: they
 //! read as far as they need to, and keep what they have read of a response
-//! that then stops being a document.
+//! that then stops being a document. They are for what is not known to be
+//! an answer: the body of an HTTP error, a response whose binding to its
+//! request is not checked yet.
 
 use std::ops::ControlFlow;
 
@@ -48,6 +53,11 @@ pub struct ReceiveOutput {
     /// Decoded stderr bytes from this poll (may be empty).
     pub stderr: Vec<u8>,
     /// Process exit code, present only when the command has finished.
+    ///
+    /// Windows writes it as an unsigned 32-bit number: one above `i32::MAX`
+    /// is given as the `i32` with the same bits, see
+    /// [`CommandOutput::exit_code`](crate::CommandOutput::exit_code). `None`
+    /// also when the server wrote one that is not a 32-bit number.
     pub exit_code: Option<i32>,
     /// `true` when the server reports `CommandState/Done`, indicating no more
     /// output will follow.
@@ -80,8 +90,9 @@ pub(crate) fn parse_command_id(xml: &str) -> Result<String, SoapError> {
 /// `stderr`, reads `done` from a `CommandState` whose `State` is the `Done`
 /// URI, and the exit code from the first `ExitCode` that has text.
 /// Returns the [`SoapError::Fault`] if the response is one, and
-/// [`SoapError::ParseError`] if it is not well-formed XML, or if a stream is
-/// not base64 or holds an element.
+/// [`SoapError::ParseError`] if it is not well-formed XML, if a stream is
+/// not base64, if a stream or an exit code holds an element, or if the
+/// attributes of a `Stream` or of a `CommandState` are not well-formed.
 ///
 /// PowerShell CLIXML on stderr is decoded within this one response, with a
 /// decoder finished at its end. A document split across Receive responses is
@@ -167,11 +178,30 @@ pub(crate) fn parse_enumerate_response(xml: &str) -> Result<(String, Option<Stri
 /// code (`s:Receiver`). The reason is the first message of the fault's
 /// detail when it has one (the text Windows tools show), else its reason
 /// text.
+///
+/// This is not the check of a successful answer, which is [`check_answer`].
+/// A response this function finds no fault in may be a fault for a parser of
+/// an answer: it stops where the response stops being XML, and it reads the
+/// `Items` those parsers go past.
 pub(crate) fn check_soap_fault(xml: &str) -> Result<(), SoapError> {
     let mut reader = FaultReader::default();
     // A fault that was read stands, whatever the response becomes after it.
     let _ = walk(xml, &mut reader);
     reader.fault().map_or(Ok(()), Err)
+}
+
+/// Check that a response is an answer: an XML document, read to its end,
+/// that is not a fault. Returns the [`SoapError::Fault`] if it is one, and
+/// [`SoapError::ParseError`] if it is not a document.
+///
+/// The transport asks this of every response a server gives with a success
+/// status, whatever the operation: the answer of a Delete, of a Signal or of
+/// a Send holds nothing to read, so no parser would refuse a fault there, or
+/// a body that is not a response at all. What an `Items` element holds is
+/// not read, as in [`parse_enumerate_response`].
+pub(crate) fn check_answer(xml: &str) -> Result<(), SoapError> {
+    read_answer(xml, AnyAnswer)?;
+    Ok(())
 }
 
 /// Whether a SOAP error is the WS-Management `TimedOut` fault.
@@ -188,12 +218,14 @@ pub(crate) fn is_timed_out_fault(err: &SoapError) -> bool {
     }
 }
 
-/// The `wsa:MessageID` of a request, if its header has one.
+/// The `wsa:MessageID` of a request: the first one of its header, when it
+/// holds text alone and is not blank.
 pub(crate) fn message_id(request: &str) -> Option<String> {
     header_text(request, Tag::MessageId)
 }
 
-/// The first `RelatesTo` of a response's header, if it has one.
+/// The first `RelatesTo` of a response's header, when it holds text alone
+/// and is not blank.
 pub(crate) fn relates_to(response: &str) -> Option<String> {
     header_text(response, Tag::RelatesTo)
 }
@@ -213,7 +245,8 @@ pub(crate) fn check_relates_to(request: &str, response: &str) -> Result<(), Stri
     }
 }
 
-/// `text` without the blanks around it, unless nothing is left.
+/// `text` without the white space around it (Unicode's, a wider set than
+/// the blanks of XML), unless nothing is left.
 fn non_blank(text: &str) -> Option<String> {
     let text = text.trim();
     (!text.is_empty()).then(|| text.to_owned())
@@ -221,29 +254,38 @@ fn non_blank(text: &str) -> Option<String> {
 
 // --- The header ---
 
-/// The text of the first `tag` child of the `Header` that has some. A header
-/// read before the document stops being XML stands.
+/// The text of the first `tag` child of the `Header`, when that element
+/// holds text alone and is not blank. A header read before the document
+/// stops being XML stands.
 fn header_text(xml: &str, tag: Tag) -> Option<String> {
     let mut reader = HeaderReader {
         tag,
         own: OwnText::default(),
+        holds_an_element: false,
         found: None,
     };
     let _ = walk(xml, &mut reader);
     reader.found
 }
 
-/// Finds the first `tag` child of the envelope's `Header` that holds text.
-/// The search ends with the header.
+/// Reads the first `tag` child of the envelope's `Header`. That one decides:
+/// the search ends with it, and with the header when it has none. A value
+/// that binds an answer to its request is not looked for further down when
+/// the first one is blank, and is not put together from the text around an
+/// element.
 struct HeaderReader {
     tag: Tag,
     own: OwnText,
+    /// The element being read holds an element: it has no value.
+    holds_an_element: bool,
     found: Option<String>,
 }
 
 impl Visitor<'_> for HeaderReader {
     fn open(&mut self, path: &[Tag], _start: &BytesStart<'_>) -> Step {
-        if matches!(path, [Tag::Envelope, Tag::Header, last] if *last == self.tag) {
+        if self.own.reading() {
+            self.holds_an_element = true;
+        } else if matches!(path, [Tag::Envelope, Tag::Header, last] if *last == self.tag) {
             self.own.start(path, ());
         }
         Step::Into
@@ -255,9 +297,12 @@ impl Visitor<'_> for HeaderReader {
 
     fn close(&mut self, path: &[Tag]) -> ControlFlow<()> {
         if let Some(((), text)) = self.own.finish(path) {
-            self.found = non_blank(text);
+            if !self.holds_an_element {
+                self.found = non_blank(text);
+            }
+            return ControlFlow::Break(());
         }
-        if self.found.is_some() || matches!(path, [Tag::Envelope, Tag::Header]) {
+        if matches!(path, [Tag::Envelope, Tag::Header]) {
             ControlFlow::Break(())
         } else {
             ControlFlow::Continue(())
@@ -558,6 +603,25 @@ impl<'a, A: Answer<'a>> Visitor<'a> for AnswerReader<A> {
             self.refuse(error);
         }
         ControlFlow::Continue(())
+    }
+}
+
+/// An answer nothing is read from: any element may be anywhere in it. The
+/// content of an `Items` is not looked at, like in the answer that has some.
+struct AnyAnswer;
+
+impl Answer<'_> for AnyAnswer {
+    fn open(&mut self, path: &[Tag], _start: &BytesStart<'_>) -> Result<Step, SoapError> {
+        Ok(match path.last() {
+            Some(Tag::Items) => Step::Raw,
+            _ => Step::Into,
+        })
+    }
+
+    fn text(&mut self, _path: &[Tag], _text: &str) {}
+
+    fn close(&mut self, _path: &[Tag]) -> Result<(), SoapError> {
+        Ok(())
     }
 }
 

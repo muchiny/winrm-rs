@@ -1042,9 +1042,60 @@ async fn send_basic_soap_fault_returns_soap_error() {
         .await
         .unwrap_err();
     assert!(
-        matches!(err, WinrmError::Soap(_)),
-        "expected Soap error, got: {err}"
+        matches!(&err, WinrmError::Soap(crate::error::SoapError::Fault { code, .. }) if code == "s:Receiver"),
+        "expected the fault, got: {err}"
     );
+}
+
+/// A body that comes with a success status is an answer, or the exchange
+/// fails: the operations that read nothing from their answer (Delete,
+/// Signal, Send) have this check alone between a server and a success.
+#[tokio::test]
+async fn a_success_status_with_a_body_that_is_no_answer_is_an_error() {
+    let fault = "<s:Envelope><s:Body><s:Fault><s:Code><s:Value>s:Receiver</s:Value></s:Code>\
+                 </s:Fault></s:Body></s:Envelope>";
+    for (body, is_fault) in [
+        (String::new(), false),
+        ("OK".to_owned(), false),
+        ("<s:Envelope><s:Body>".to_owned(), false),
+        ("<s:Envelope/><s:Envelope/>".to_owned(), false),
+        ("<!DOCTYPE x><s:Envelope/>".to_owned(), false),
+        // Read as far as it is XML, this one holds no fault.
+        (format!("x{fault}"), false),
+        (fault.to_owned(), true),
+        (format!("{fault}<!-- end -->\n"), true),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body.clone()))
+            .mount(&server)
+            .await;
+        let addr = server.address();
+        let err = basic_transport(addr.port())
+            .send_soap_with_retry(&addr.ip().to_string(), "<soap/>".into())
+            .await
+            .unwrap_err();
+        let expected = match &err {
+            WinrmError::Soap(crate::error::SoapError::Fault { .. }) => is_fault,
+            WinrmError::Soap(crate::error::SoapError::ParseError(_)) => !is_fault,
+            _ => false,
+        };
+        assert!(expected, "{body:?}: {err:?}");
+    }
+
+    // An answer with nothing in it, as a Delete has.
+    let server = MockServer::start().await;
+    let answer = "<?xml version=\"1.0\"?>\n<s:Envelope><s:Header/><s:Body/></s:Envelope>\n";
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(answer))
+        .mount(&server)
+        .await;
+    let addr = server.address();
+    let reply = basic_transport(addr.port())
+        .send_soap_with_retry(&addr.ip().to_string(), "<soap/>".into())
+        .await
+        .unwrap();
+    assert_eq!(reply, answer);
 }
 
 #[tokio::test]
@@ -5892,7 +5943,7 @@ async fn dedicated_client_never_opens_a_second_connection() {
     let fake = FakeNtlmServer::mount(&server).await;
     let (relay, accepts) = spawn_counting_relay(server.address().port());
     let transport = relayed_transport(relay);
-    let big = "x".repeat(200_000);
+    let big = format!("<r>{}</r>", "x".repeat(200_000));
     for _ in 0..20 {
         fake.push(Reply::ok(&big));
     }
@@ -5901,7 +5952,7 @@ async fn dedicated_client_never_opens_a_second_connection() {
             .send_soap_with_retry("127.0.0.1", format!("<r{i}/>"))
             .await
             .unwrap();
-        assert_eq!(reply.len(), 200_000, "exchange {i}");
+        assert_eq!(reply.len(), big.len(), "exchange {i}");
     }
     assert_eq!(accepts.load(Ordering::SeqCst), 1, "log: {:?}", fake.log());
     assert_eq!(fake.handshakes(), 1);

@@ -851,6 +851,11 @@ impl WinrmClient {
     /// WMI object instances matching the query. Use a `namespace` of `None`
     /// for the default `root/cimv2`.
     ///
+    /// The items are what the server wrote, and they are not checked: only
+    /// the balance of their tags is. Read them with an XML parser that
+    /// expands no entity and processes no DTD, as for any XML from a host
+    /// you do not control.
+    ///
     /// Pages are pulled until a response carries an `EndOfSequence` element
     /// outside its `Items`, or no `EnumerationContext`. Text inside the items,
     /// or a property element of that name, never ends the enumeration.

@@ -4,7 +4,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use winrm_rs::__fuzz::{check_soap_fault, parse_enumerate_response, pull_request};
+use winrm_rs::__fuzz::{check_answer, check_soap_fault, parse_enumerate_response, pull_request};
 
 fuzz_target!(|data: &[u8]| {
     let Ok(xml) = std::str::from_utf8(data) else {
@@ -43,6 +43,10 @@ fuzz_target!(|data: &[u8]| {
     assert!(
         items.len() <= xml.len(),
         "items text longer than the response"
+    );
+    assert!(
+        check_answer(xml).is_ok(),
+        "a page read from a response the transport refuses"
     );
 
     // A response that is read is a document, so it can be the content of an

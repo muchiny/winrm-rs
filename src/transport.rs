@@ -1365,7 +1365,10 @@ impl HttpTransport {
         } else {
             trace!(response_len = response_text.len(), "SOAP response body");
         }
-        soap::check_soap_fault(&response_text).map_err(WinrmError::Soap)?;
+        // Every route gives the body of a success status here. Such a body
+        // is an answer or it is refused, whatever the operation: several of
+        // them (Delete, Signal, Send) read nothing else from it.
+        soap::check_answer(&response_text).map_err(WinrmError::Soap)?;
         Ok(response_text)
     }
 

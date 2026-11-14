@@ -4,7 +4,18 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use winrm_rs::__fuzz::{check_soap_fault, parse_command_id, parse_receive_output, parse_shell_id};
+use winrm_rs::__fuzz::{
+    check_answer, check_soap_fault, parse_command_id, parse_receive_output, parse_shell_id,
+};
+use winrm_rs::SoapError;
+
+/// The fault a parser answered with, as it displays.
+fn fault_of<T>(result: &Result<T, SoapError>) -> Option<String> {
+    match result {
+        Err(fault @ SoapError::Fault { .. }) => Some(fault.to_string()),
+        _ => None,
+    }
+}
 
 fuzz_target!(|data: &[u8]| {
     let Ok(xml) = std::str::from_utf8(data) else {
@@ -14,7 +25,9 @@ fuzz_target!(|data: &[u8]| {
     // None of these may panic on arbitrary XML.
     let shell_id = parse_shell_id(xml);
     let command_id = parse_command_id(xml);
-    let fault = check_soap_fault(xml);
+    let receive = parse_receive_output(xml);
+    let answer = check_answer(xml);
+    let found = fault_of(&check_soap_fault(xml));
 
     // An id is the text of one element of a response read to its end: it is
     // in the response, and it has no blank around it.
@@ -25,24 +38,32 @@ fuzz_target!(|data: &[u8]| {
         );
     }
 
-    // A response that is a fault is that fault for every parser of an
-    // answer: none of them may take it for an answer, or for something else.
-    if let Err(fault) = &fault {
-        let fault = Err(fault.to_string());
-        for answer in [
-            parse_receive_output(xml).map(|_| ()),
-            shell_id.map(|_| ()),
-            command_id.map(|_| ()),
-        ] {
-            assert_eq!(
-                answer.map_err(|e| e.to_string()),
-                fault,
-                "a fault read as an answer, or as another error"
-            );
-        }
+    // These parsers read every element, as `check_soap_fault` does. A
+    // response is a fault for them when it is one for it, and it is the same
+    // fault: none of them takes a fault for an answer or for something else,
+    // and none of them finds a fault of its own.
+    for fault in [
+        fault_of(&shell_id),
+        fault_of(&command_id),
+        fault_of(&receive),
+    ] {
+        assert_eq!(fault, found, "a parser and check_soap_fault disagree");
     }
 
-    if let Ok(out) = parse_receive_output(xml) {
+    // The check of the transport goes past the `Items` of an enumeration,
+    // so it may find a fault `check_soap_fault` stops before. It never
+    // misses one, and it never refuses what a parser takes for an answer.
+    if found.is_some() {
+        assert_eq!(fault_of(&answer), found, "the transport missed a fault");
+    }
+    if shell_id.is_ok() || command_id.is_ok() || receive.is_ok() {
+        assert!(
+            answer.is_ok(),
+            "a parser read a response the transport refuses"
+        );
+    }
+
+    if let Ok(out) = receive {
         // stdout is base64 and nothing else: 4 characters in, 3 bytes out.
         assert!(
             out.stdout.len() <= xml.len(),

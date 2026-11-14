@@ -215,6 +215,20 @@ async fn run_command_exit_code_above_i32_max() {
     }
 }
 
+/// The same through PowerShell, whose `exit` takes the signed number.
+#[tokio::test]
+#[ignore]
+async fn run_powershell_exit_code_above_i32_max() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    for code in [-1_073_741_819_i32, -2] {
+        let output = client
+            .run_powershell(&host, &format!("exit {code}"))
+            .await
+            .expect("run exit");
+        assert_eq!(output.exit_code, code);
+    }
+}
+
 // --- PowerShell ---
 
 #[tokio::test]

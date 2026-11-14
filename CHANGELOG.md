@@ -101,11 +101,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     answer cut short, an empty body, text around the root element, a second
     root element, an entity XML does not define, a DTD. This holds for
     `ShellId` and `CommandId` too: an id that stands before a malformed
-    part is no longer returned. One case stays as it was: the body of an
-    HTTP error that is not XML is not an error of its own;
-  - a fault comes first. A response that is a fault gives that fault from
-    every parser, whatever else it holds: a Create or a Command response
-    that is a fault and has a `ShellId` in it no longer gives an id;
+    part is no longer returned, so a Create response refused this way
+    leaves its shell on the host until the server ends it for being idle;
+  - this holds for every operation. The transport refuses a response that
+    comes with a success status and is not an XML document, or is a fault,
+    whatever was asked. Delete, Signal, Send, Disconnect and Reconnect have
+    nothing to read in their answer and took any body for a success. One
+    case stays as it was: the body of an HTTP error that is not XML is not
+    an error of its own;
+  - a fault comes first. A response whose fault is read gives that fault
+    from every parser, whatever else it holds: a Create or a Command
+    response that is a fault and has a `ShellId` in it no longer gives an
+    id. A fault that stands after the place where a response stops being a
+    document is not read: the response is refused for not being one;
+  - the `RelatesTo` that binds a sealed answer to its request is the first
+    one of the header, and it is text alone: one that is blank, or that
+    holds an element, binds nothing, where the next one that had text was
+    taken;
   - text is decoded: character references, the five predefined entities and
     CDATA sections are resolved, and comments are skipped, in an id, an
     enumeration context, an exit code, a fault code and a fault reason. A
@@ -131,8 +143,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
   What is still not checked: the characters of a name and of a text (a
   control character a server writes in an id goes into the next request as
-  it is), and the attributes of the elements whose attributes are not
-  read.
+  it is), where the XML declaration stands, and the attributes of the
+  elements whose attributes are not read. Byte order marks at the start of
+  a response are skipped, however many there are.
 
   New dependency: `quick-xml` 0.42 without its default features
   (`#![forbid(unsafe_code)]`; its one dependency, `memchr`, was in the tree
@@ -254,8 +267,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   server did not give. It is now the `i32` with the same bits
   (`-1073741819`, `-2`), which is what `std::process::ExitStatus::code`
   returns on Windows and what `%ERRORLEVEL%` shows.
-  `ReceiveOutput::exit_code` follows. Seen on Windows Server 2025, whose
-  answer is now a fixture of the parser's tests.
+  `ReceiveOutput::exit_code` follows. Windows Server 2012 R2 and 2025 both
+  write it so; the answer of the latter is now a fixture of the parser's
+  tests.
 
 ### Documentation
 

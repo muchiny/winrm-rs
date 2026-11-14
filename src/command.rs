@@ -18,7 +18,8 @@ pub struct CommandOutput {
     pub stdout: Vec<u8>,
     /// Standard error bytes accumulated from all Receive polls.
     pub stderr: Vec<u8>,
-    /// Process exit code, or `-1` if the server did not report one.
+    /// Process exit code, or `-1` if the server did not report one, or
+    /// reported one that is not a 32-bit number.
     ///
     /// Windows keeps an exit code as an unsigned 32-bit number, and WinRM
     /// writes it so. It is given here as the `i32` with the same bits, as

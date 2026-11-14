@@ -10,7 +10,8 @@
 //! What a document may hold is decided here, once for all the parsers. A
 //! walk that reaches the end of a document has checked that:
 //! - it has one root element, with nothing around it but blanks, comments,
-//!   processing instructions and the XML declaration;
+//!   processing instructions and the XML declaration (and, at its very
+//!   start, byte order marks, however many);
 //! - its tags are balanced and matching;
 //! - it has no DTD (SOAP 1.2 Part 1 §5 forbids one), so it can declare no
 //!   entity: the five predefined entities and the character references are

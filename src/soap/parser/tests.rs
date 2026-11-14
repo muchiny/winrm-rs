@@ -281,9 +281,57 @@ fn relates_to_outside_the_header_is_not_read() {
         assert_eq!(relates_to(response), None, "{response}");
         assert!(check_relates_to(REQ, response).is_err(), "{response}");
     }
-    // The first one that has text, when the header has several.
-    let response = "<s:Envelope><s:Header><a:RelatesTo> </a:RelatesTo><a:RelatesTo>one</a:RelatesTo><a:RelatesTo>two</a:RelatesTo></s:Header></s:Envelope>";
-    assert_eq!(relates_to(response).as_deref(), Some("one"));
+}
+
+/// The first `RelatesTo` of the header decides, and it is text alone: what
+/// binds an answer to its request is not looked for further down, and is
+/// not put together from the text around an element.
+#[test]
+fn the_first_relates_to_of_the_header_decides() {
+    let header = |content: &str| format!("<s:Envelope><s:Header>{content}</s:Header></s:Envelope>");
+    let id = "uuid:0a1B2c3D-0000-4000-8000-00000000abcd";
+
+    for content in [
+        format!("<a:RelatesTo>{id}</a:RelatesTo>"),
+        format!("<a:To>x</a:To><a:RelatesTo a=\"1\">\n {id} </a:RelatesTo>"),
+        format!("<a:RelatesTo>{id}</a:RelatesTo><a:RelatesTo>uuid:other</a:RelatesTo>"),
+        "<a:RelatesTo>uuid<!-- c -->:0a1B2c3D<![CDATA[-0000-4000-]]>8000-00000000abc&#100;\
+         </a:RelatesTo>"
+            .to_owned(),
+    ] {
+        let response = header(&content);
+        assert_eq!(relates_to(&response).as_deref(), Some(id), "{content}");
+        assert!(check_relates_to(REQ, &response).is_ok(), "{content}");
+    }
+
+    for content in [
+        // Blank, then the one that would match.
+        format!("<a:RelatesTo> </a:RelatesTo><a:RelatesTo>{id}</a:RelatesTo>"),
+        format!("<a:RelatesTo/><a:RelatesTo>{id}</a:RelatesTo>"),
+        // An element inside: the text around it would match.
+        "<a:RelatesTo>uuid:0a1B2c3D-0000-4000-<y/>8000-00000000abcd</a:RelatesTo>".to_owned(),
+        format!("<a:RelatesTo>{id}<y/></a:RelatesTo>"),
+        format!("<a:RelatesTo><y/>{id}</a:RelatesTo>"),
+        format!("<a:RelatesTo><y>{id}</y></a:RelatesTo>"),
+        format!("<a:RelatesTo><a:RelatesTo>{id}</a:RelatesTo></a:RelatesTo>"),
+        format!("<a:RelatesTo>{id}<y/></a:RelatesTo><a:RelatesTo>{id}</a:RelatesTo>"),
+    ] {
+        let response = header(&content);
+        assert_eq!(relates_to(&response), None, "{content}");
+        assert_eq!(
+            check_relates_to(REQ, &response).unwrap_err(),
+            "it carries no RelatesTo",
+            "{content}"
+        );
+    }
+
+    // The request is read the same way.
+    let request = header("<wsa:MessageID>uuid:1<y/></wsa:MessageID>");
+    assert_eq!(message_id(&request), None);
+    assert_eq!(
+        check_relates_to(&request, &header("<a:RelatesTo>uuid:1</a:RelatesTo>")).unwrap_err(),
+        "the request carries no MessageID"
+    );
 }
 
 /// Every request the crate builds carries a `MessageID` (the Kerberos
@@ -1353,6 +1401,143 @@ fn a_fault_after_a_malformed_part_is_a_refused_answer() {
     assert!(why.contains("more than one root"), "{why}");
 }
 
+// --- An answer, whatever it holds: what the transport asks of a response ---
+
+#[test]
+fn check_answer_accepts_a_document_that_is_not_a_fault() {
+    for xml in [
+        CREATE,
+        COMMAND,
+        RECEIVE,
+        RECEIVE_2025,
+        RECEIVE_NTSTATUS_2025,
+        DELETE,
+        ENUMERATE,
+        "<r/>",
+        "\u{feff}<?xml version=\"1.0\"?>\n<s:Envelope><s:Header/><s:Body/></s:Envelope>\n",
+    ] {
+        assert!(check_answer(xml).is_ok(), "{xml}");
+    }
+    for xml in [
+        FAULT_TIMED_OUT,
+        FAULT_NO_SUCH_SHELL,
+        FAULT_WQL_INVALID_CLASS,
+        FAULT_WQL_SYNTAX,
+    ] {
+        let fault = check_soap_fault(xml).map_err(|fault| fault.to_string());
+        assert!(fault.is_err(), "{xml}");
+        assert_eq!(check_answer(xml).map_err(|fault| fault.to_string()), fault);
+    }
+}
+
+/// A response that is no document is refused. `check_soap_fault`, which
+/// reads as far as a response is XML, finds no fault in these: with it
+/// alone, an operation that reads nothing from its answer would take them
+/// for a success.
+#[test]
+fn check_answer_refuses_what_is_not_a_document() {
+    let fault = envelope("<s:Fault><s:Code><s:Value>s:Receiver</s:Value></s:Code></s:Fault>");
+    for xml in [
+        String::new(),
+        "OK".to_owned(),
+        "<a>".to_owned(),
+        "<a/><b/>".to_owned(),
+        "<a/>tail".to_owned(),
+        "<!DOCTYPE a><a/>".to_owned(),
+        "<a>&nbsp;</a>".to_owned(),
+        // The fault stands after the place where the response stops being
+        // a document.
+        format!("x{fault}"),
+        format!("&#65;{fault}"),
+        format!("<![CDATA[]]>{fault}"),
+        format!("<x/>{fault}"),
+        format!("<!DOCTYPE x>{fault}"),
+    ] {
+        parse_error(check_answer(&xml));
+        assert!(check_soap_fault(&xml).is_ok(), "{xml}");
+    }
+    // A fault that is read is the answer, whatever follows it.
+    for tail in ["</oops>", "<x/>", "tail", "<!DOCTYPE x>", "&nbsp;"] {
+        let xml = format!("{fault}{tail}");
+        assert!(
+            matches!(check_answer(&xml), Err(SoapError::Fault { .. })),
+            "{tail}"
+        );
+    }
+}
+
+/// What the `Items` hold is data for `check_answer` as for the parser of an
+/// enumeration. A parser that reads something else goes into them.
+#[test]
+fn check_answer_does_not_read_the_items() {
+    let page = enumerate_page("<!DOCTYPE x><p:X>&nbsp;</p:X>", "");
+    assert!(check_answer(&page).is_ok());
+    assert!(parse_enumerate_response(&page).is_ok());
+    parse_error(parse_receive_output_raw(&page).map(|output| output.done));
+    // Their tags are still to be balanced.
+    parse_error(check_answer(&enumerate_page("<p:X>", "")));
+}
+
+/// `check_soap_fault` reads the `Items` and stops at what is not XML in
+/// them. A fault that stands after them is one it does not see, and one
+/// that `check_answer` and the parser of an enumeration, which go past
+/// them, do.
+#[test]
+fn a_fault_after_items_that_are_not_xml_is_read_by_those_that_skip_them() {
+    let xml = "<s:Envelope><s:Header><w:Items>&nbsp;</w:Items></s:Header><s:Body>\
+               <s:Fault><s:Code><s:Value>s:Receiver</s:Value></s:Code></s:Fault>\
+               </s:Body></s:Envelope>";
+    assert!(check_soap_fault(xml).is_ok());
+    assert!(matches!(check_answer(xml), Err(SoapError::Fault { .. })));
+    assert!(matches!(
+        parse_enumerate_response(xml),
+        Err(SoapError::Fault { .. })
+    ));
+    parse_error(parse_shell_id(xml));
+}
+
+/// A document that is a fault alone, with no envelope around it.
+#[test]
+fn a_document_that_is_a_fault_alone_is_that_fault_for_every_parser() {
+    let xml = "<s:Fault><s:Code><s:Value>s:Sender</s:Value></s:Code>\
+               <rsp:ShellId>X</rsp:ShellId><rsp:CommandId>Y<x/></rsp:CommandId>\
+               <rsp:Stream Name=\"stdout\">!!!</rsp:Stream></s:Fault>";
+    for error in [
+        check_soap_fault(xml).unwrap_err(),
+        check_answer(xml).unwrap_err(),
+        parse_shell_id(xml).map(|_| ()).unwrap_err(),
+        parse_command_id(xml).map(|_| ()).unwrap_err(),
+        parse_receive_output_raw(xml).map(|_| ()).unwrap_err(),
+        parse_enumerate_response(xml).map(|_| ()).unwrap_err(),
+    ] {
+        assert!(
+            matches!(&error, SoapError::Fault { code, .. } if code == "s:Sender"),
+            "{error:?}"
+        );
+    }
+}
+
+/// Where the XML declaration stands is not checked: it is skipped like a
+/// processing instruction.
+#[test]
+fn an_xml_declaration_is_skipped_wherever_it_stands() {
+    let xml = "<r><?xml version=\"1.0\"?><rsp:ShellId>X<?xml version=\"1.0\"?></rsp:ShellId>\
+               </r><?xml version=\"1.0\"?>";
+    assert_eq!(parse_shell_id(xml).unwrap(), "X");
+    assert!(check_answer(xml).is_ok());
+}
+
+/// An exit code that is blank is not one: the next one is read, and it is
+/// text alone like the first.
+#[test]
+fn an_exit_code_after_a_blank_one_is_read_like_the_first() {
+    let xml = "<r><rsp:ExitCode> </rsp:ExitCode><rsp:ExitCode>2<x/></rsp:ExitCode></r>";
+    assert_eq!(
+        parse_error(parse_receive_output_raw(xml).map(|output| output.done)),
+        ELEMENT_IN_TEXT
+    );
+}
+
 /// SOAP forbids a DTD, and without one a document cannot declare an entity.
 #[test]
 fn a_dtd_is_refused() {
@@ -1570,10 +1755,31 @@ proptest::proptest! {
         let xml = pieces.concat();
         let _ = relates_to(&xml);
 
+        // The parsers that read every element find the fault that
+        // `check_soap_fault` finds, and no other.
+        let found = check_soap_fault(&xml).map_err(|fault| fault.to_string());
+        for answer in [
+            parse_receive_output_raw(&xml).map(|_| ()),
+            parse_shell_id(&xml).map(|_| ()),
+            parse_command_id(&xml).map(|_| ()),
+        ] {
+            if let Err(fault @ SoapError::Fault { .. }) = answer {
+                proptest::prop_assert_eq!(Err(fault.to_string()), found.clone());
+            }
+        }
+
+        // What a parser takes for an answer, the transport does.
+        let read = parse_receive_output_raw(&xml).is_ok()
+            || parse_enumerate_response(&xml).is_ok()
+            || parse_shell_id(&xml).is_ok()
+            || parse_command_id(&xml).is_ok();
+        proptest::prop_assert!(!read || check_answer(&xml).is_ok());
+
         // A fault is that fault for every parser.
         if let Err(fault) = check_soap_fault(&xml) {
             let fault = Err(fault.to_string());
             for answer in [
+                check_answer(&xml),
                 parse_receive_output(&xml).map(|_| ()),
                 parse_receive_output_raw(&xml).map(|_| ()),
                 parse_enumerate_response(&xml).map(|_| ()),
@@ -1761,6 +1967,10 @@ proptest::proptest! {
     fn the_parsers_agree_on_a_well_formed_document(xml in well_formed()) {
         let fault = check_soap_fault(&xml).err().map(|fault| fault.to_string());
         let fault = fault.as_deref();
+
+        // For the transport it is an answer, unless it is a fault.
+        let refused = check_answer(&xml).err().map(|error| error.to_string());
+        proptest::prop_assert_eq!(refused.as_deref(), fault);
 
         match parse_enumerate_response(&xml) {
             Ok((items, _)) => {

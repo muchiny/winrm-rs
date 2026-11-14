@@ -18,7 +18,7 @@ mod xml;
 // Re-export for internal use
 pub(crate) use envelope::*;
 pub(crate) use parser::{
-    check_soap_fault, is_timed_out_fault, parse_command_id, parse_enumerate_response,
+    check_answer, is_timed_out_fault, parse_command_id, parse_enumerate_response,
     parse_receive_output, parse_receive_output_raw, parse_shell_id,
 };
 // Re-export ReceiveOutput as fully public so lib.rs can `pub use` it.

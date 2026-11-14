@@ -1479,3 +1479,110 @@ async fn cleanup_requests_go_through_while_data_slots_are_full() {
         .is_err()
     );
 }
+
+/// A Receive on a PSRP shell asks for stdout alone, under the `CommandId` of
+/// the pipeline, or under none when the caller polls the runspace pool
+/// itself (an empty id, or the shell's own).
+#[tokio::test]
+async fn receive_next_on_a_psrp_shell_asks_for_stdout_only() {
+    let server = MockServer::start().await;
+    let stdout = |b64: &str| {
+        ResponseTemplate::new(200).set_body_string(format!(
+            r#"<s:Envelope><s:Body><rsp:ReceiveResponse><rsp:Stream Name="stdout">{b64}</rsp:Stream></rsp:ReceiveResponse></s:Body></s:Envelope>"#
+        ))
+    };
+    Mock::given(method("POST"))
+        .and(body_string_contains(
+            "<rsp:DesiredStream>stdout</rsp:DesiredStream>",
+        ))
+        .respond_with(stdout("cG9vbA=="))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains(
+            r#"<rsp:DesiredStream CommandId="PIPE-1">stdout</rsp:DesiredStream>"#,
+        ))
+        .respond_with(stdout("cGlwZQ=="))
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_ok(&server, "<s:Envelope><s:Body/></s:Envelope>", u64::MAX).await;
+
+    let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+    let shell = client
+        .reconnect_shell(
+            "127.0.0.1",
+            "PSRP-SHELL",
+            crate::soap::namespaces::RESOURCE_URI_PSRP,
+        )
+        .await
+        .unwrap();
+    for id in ["", "PSRP-SHELL"] {
+        let out = shell.receive_next(id).await.unwrap();
+        assert_eq!(out.stdout, b"pool", "{id:?}");
+        assert!(!out.done);
+    }
+    let out = shell.receive_next("PIPE-1").await.unwrap();
+    assert_eq!(out.stdout, b"pipe");
+    shell.close().await.unwrap();
+}
+
+/// A fault with `subcode`, as a `500` answer.
+fn fault(subcode: &str) -> ResponseTemplate {
+    ResponseTemplate::new(500).set_body_string(format!(
+        r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><s:Fault>
+        <s:Code><s:Value>s:Sender</s:Value><s:Subcode><s:Value>{subcode}</s:Value></s:Subcode></s:Code>
+        <s:Reason><s:Text xml:lang="en-US">Refused.</s:Text></s:Reason>
+    </s:Fault></s:Body></s:Envelope>"#
+    ))
+}
+
+/// `disconnect` consumes the shell: when the server refuses it, the shell is
+/// deleted, once, and the error returned is the one of the Disconnect, also
+/// when the Delete fails in turn.
+#[tokio::test]
+async fn a_refused_disconnect_deletes_the_shell_and_returns_its_error() {
+    use crate::soap::namespaces::{ACTION_DELETE, ACTION_DISCONNECT};
+
+    for delete in [
+        ResponseTemplate::new(200).set_body_string("<s:Envelope><s:Body/></s:Envelope>"),
+        fault("w:InvalidSelectors"),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains(ACTION_DISCONNECT))
+            .respond_with(fault("w:UnsupportedFeature"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains(ACTION_DELETE))
+            .and(body_string_contains("SH-KEPT"))
+            .respond_with(delete)
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_ok(
+            &server,
+            r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>SH-KEPT</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
+            1,
+        )
+        .await;
+
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        let shell = client.open_shell("127.0.0.1").await.unwrap();
+        let err = shell.disconnect().await.unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                WinrmError::Soap(crate::error::SoapError::Fault { code, .. })
+                    if code == "w:UnsupportedFeature"
+            ),
+            "{err:?}"
+        );
+        // The server checks, when dropped, that it saw one Disconnect and
+        // one Delete.
+        drop(server);
+    }
+}

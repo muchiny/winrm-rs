@@ -633,9 +633,11 @@ fn decode_ts_request_rejects_a_field_of_the_wrong_type() {
     for field in [2, 3, 5] {
         let mut contents = encode_context_tag(0, &encode_integer_value(6));
         contents.extend_from_slice(&encode_context_tag(field, &encode_integer_value(1)));
+        let err = decode_ts_request(&encode_sequence(&contents)).err();
         assert!(
-            decode_ts_request(&encode_sequence(&contents)).is_err(),
-            "field [{field}]"
+            matches!(&err, Some(CredSspError::Asn1Decode(m))
+                if m == "expected OCTET STRING (0x04), got 0x02"),
+            "field [{field}]: {err:?}"
         );
     }
 }
@@ -703,6 +705,13 @@ fn decode_spnego_token_rejects_a_neg_token_init_without_mech_token() {
 #[test]
 fn extract_subject_public_key_reports_a_certificate_without_a_key() {
     let filler = encode_integer_value(1).repeat(6);
+    // The control: with a key in that field, it is returned.
+    let with_key = encode_sequence(&encode_tlv(0x03, &[0x00, 0xAA, 0xBB]));
+    let tbs = encode_sequence(&[filler.clone(), with_key].concat());
+    assert_eq!(
+        extract_subject_public_key(&encode_sequence(&tbs)).unwrap(),
+        [0xAA, 0xBB]
+    );
     for spki in [
         encode_sequence(&encode_sequence(&[])),
         // A BIT STRING with its unused-bits byte and nothing else.

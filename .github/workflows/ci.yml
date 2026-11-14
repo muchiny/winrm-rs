@@ -228,7 +228,8 @@ jobs:
       # The `#[cfg(test)]` helper modules (in-process servers, test PKI):
       # `src/test_*.rs` and `src/auth/credssp/test_server.rs`. Test code, like
       # the `tests.rs` files and `tests/`, which cargo-llvm-cov leaves out of
-      # the report by itself.
+      # the report by itself. The short test modules written in a source file
+      # still count.
       TEST_HELPERS: '(^|/)src/(.*/)?test_[a-z_]+\.rs$'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -247,7 +248,6 @@ jobs:
       # Runs with the `credssp` feature, so the CredSSP code is measured and
       # gated too. Coverage runs without --features kerberos: the Kerberos
       # FFI glue is exercised by the kerberos-kdc job, not counted here.
-      # The 95 % are those of the library code: no test code is in the report.
       - name: Generate coverage
         run: >-
           cargo llvm-cov --locked --features credssp --summary-only

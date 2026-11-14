@@ -293,6 +293,27 @@ fn validate_host_rejects_what_would_mis_route_the_endpoint() {
     }
 }
 
+/// What the character check refuses is refused by it, before the URL parser
+/// is asked: brackets around nothing or around something that is not an
+/// address, and, outside ASCII, a character that is whitespace or a control
+/// character (either one is enough).
+#[test]
+fn validate_host_refuses_bad_characters_before_asking_the_url_parser() {
+    for host in [
+        "[]",
+        "[g]",
+        "[::g]",
+        // Whitespace that is not a control character.
+        "win\u{3000}01",
+        "win\u{a0}01",
+        // A C1 control character, which is not whitespace.
+        "win\u{9f}01",
+    ] {
+        let err = validate_host(host).unwrap_err().to_string();
+        assert!(err.contains("expected a host name"), "{host:?}: {err}");
+    }
+}
+
 #[test]
 fn invalid_host_error_never_quotes_the_userinfo() {
     // Userinfo is redacted before the host is quoted: no password leaks.
@@ -4255,6 +4276,18 @@ async fn idle_host_slot_entries_are_pruned() {
     drop(held);
 }
 
+/// A host with only a clean-up permit out is in use: its entry is kept, so
+/// the host's clean-up limit still counts that permit.
+#[tokio::test]
+async fn a_host_with_only_a_cleanup_permit_out_keeps_its_slot_entry() {
+    let (_server, _fake, transport, _host) = sealed_setup().await;
+    let held = transport.conn_slot("a", Lane::Cleanup).await.unwrap();
+    drop(transport.conn_slot("b", Lane::Data).await.unwrap());
+    assert_eq!(transport.host_slot_entries(), 2);
+    assert_eq!(transport.host_slots("a").1.available_permits(), 7);
+    drop(held);
+}
+
 #[tokio::test]
 async fn cleanup_lane_carries_a_sealed_request_while_data_slots_are_full() {
     let (_server, fake, transport, host) = sealed_setup().await;
@@ -5543,6 +5576,40 @@ fn is_proxy_refusal(err: &WinrmError) -> bool {
     err.to_string().contains("proxy_session_auth")
 }
 
+/// One unsealed exchange on an authenticated dedicated connection: a 200
+/// gives its body, a 401 says the connection no longer carries the
+/// authentication, any other status is an error.
+#[cfg(feature = "kerberos")]
+#[tokio::test]
+async fn send_plain_body_reads_the_answer_of_a_dedicated_connection() {
+    use wiremock::matchers::body_string;
+
+    let server = MockServer::start().await;
+    for (body, status) in [("<ok/>", 200), ("<denied/>", 401), ("<broken/>", 503)] {
+        Mock::given(method("POST"))
+            .and(body_string(body))
+            .respond_with(ResponseTemplate::new(status).set_body_string("<answer/>"))
+            .mount(&server)
+            .await;
+    }
+    let transport = basic_transport(server.address().port());
+    let mut conn = transport.new_conn("127.0.0.1").unwrap();
+    let url = transport.endpoint("127.0.0.1");
+
+    let ok = HttpTransport::send_plain_body(&mut conn, &url, "<ok/>", 1024).await;
+    assert!(matches!(&ok, Ok(text) if text == "<answer/>"));
+    let denied = HttpTransport::send_plain_body(&mut conn, &url, "<denied/>", 1024).await;
+    assert!(matches!(denied, Err(SealedFailure::Unauthorized)));
+    let broken = HttpTransport::send_plain_body(&mut conn, &url, "<broken/>", 1024).await;
+    assert!(matches!(
+        broken,
+        Err(SealedFailure::Error(WinrmError::HttpStatus {
+            status: 503,
+            ..
+        }))
+    ));
+}
+
 /// A probe answered by something other than the server's 401 is not
 /// kept: the next request probes again, and goes on once a 401 with the
 /// announcement comes back.
@@ -6121,6 +6188,97 @@ async fn locked_gate_refuses_after_handshake_but_not_before() {
         accepts.load(Ordering::SeqCst),
         2,
         "a locked gate opened a connection"
+    );
+}
+
+/// The answer of a dedicated connection is checked against the pin of its
+/// verifier: the connection must have presented that certificate, and one
+/// certificate only.
+#[tokio::test]
+async fn check_pinned_certificate_wants_the_pinned_certificate_and_no_other() {
+    use crate::tls::{Captured, CertHandle};
+
+    crate::test_pki::install_test_provider();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    // Plain HTTP: the certificate of the connection is the handle's.
+    let resp = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(server.uri())
+        .send()
+        .await
+        .unwrap();
+    let pinned_to_a = |captured: Captured| {
+        let handle = CertHandle::with(captured);
+        handle.pin(b"cert-a".to_vec()).unwrap();
+        handle
+    };
+
+    // No handle, or nothing pinned: nothing to check.
+    check_pinned_certificate(&resp, None).unwrap();
+    let unpinned = CertHandle::with(Captured::One(b"cert-b".to_vec()));
+    check_pinned_certificate(&resp, Some(&unpinned)).unwrap();
+
+    let same = pinned_to_a(Captured::One(b"cert-a".to_vec()));
+    check_pinned_certificate(&resp, Some(&same)).unwrap();
+    for captured in [Captured::One(b"cert-b".to_vec()), Captured::Several] {
+        let shown = format!("{captured:?}");
+        let err = check_pinned_certificate(&resp, Some(&pinned_to_a(captured))).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                WinrmError::Authentication(m)
+                    if m.starts_with("Kerberos over TLS: the answer did not come over a connection")
+            ),
+            "{shown}: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn conn_gate_refusal_says_why_no_connection_is_opened() {
+    assert_eq!(
+        ConnGateRefused.to_string(),
+        "the dedicated connection is already authenticated; not opening another connection"
+    );
+}
+
+/// The gate is ready when the connector behind it is: it does not answer in
+/// its place.
+#[test]
+fn gated_connector_is_ready_when_its_connector_is() {
+    /// A connector whose readiness is an error.
+    #[derive(Clone)]
+    struct Closed;
+    impl tower_service::Service<()> for Closed {
+        type Response = ();
+        type Error = BoxError;
+        type Future = std::future::Ready<Result<(), BoxError>>;
+
+        fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), BoxError>> {
+            Poll::Ready(Err("connector closed".into()))
+        }
+
+        fn call(&mut self, (): ()) -> Self::Future {
+            std::future::ready(Ok(()))
+        }
+    }
+
+    let gate = Arc::new(ConnGate {
+        locked: AtomicBool::new(false),
+        wait: Duration::ZERO,
+    });
+    let mut gated = tower_layer::Layer::layer(&ConnGateLayer(gate), Closed);
+    let mut cx = Context::from_waker(std::task::Waker::noop());
+    let ready = tower_service::Service::<()>::poll_ready(&mut gated, &mut cx);
+    assert!(
+        matches!(&ready, Poll::Ready(Err(e)) if e.to_string() == "connector closed"),
+        "{ready:?}"
     );
 }
 

@@ -616,6 +616,57 @@ fn pss_parameters_default_or_fail_closed() {
     }
 }
 
+/// Each hash an RSASSA-PSS `hashAlgorithm` can name gives its own channel
+/// binding hash; SHA-1 is upgraded to SHA-256 (RFC 5929 4.1).
+#[test]
+fn pss_hash_algorithm_selects_the_channel_binding_hash() {
+    let named: [(&str, &[u8], CbtHash); 5] = [
+        ("SHA-1", OID_SHA1, CbtHash::Sha256),
+        ("SHA-224", OID_SHA224, CbtHash::Sha224),
+        ("SHA-256", OID_SHA256, CbtHash::Sha256),
+        ("SHA-384", OID_SHA384, CbtHash::Sha384),
+        ("SHA-512", OID_SHA512, CbtHash::Sha512),
+    ];
+    for (name, oid, hash) in named {
+        // SEQUENCE { [0] { SEQUENCE { OID } } }
+        let oid_len = u8::try_from(oid.len()).unwrap();
+        let mut params = vec![0x30, oid_len + 6, 0xA0, oid_len + 4, 0x30, oid_len + 2];
+        params.extend_from_slice(&[0x06, oid_len]);
+        params.extend_from_slice(oid);
+        assert_eq!(cbt_hash(&pss_with(&params)), Some(hash), "{name}");
+    }
+}
+
+/// `der_element` reads a definite length: the short form, or the long form
+/// on 1 to 4 bytes. `0x80` (indefinite) and 5 length bytes are refused even
+/// when the bytes that follow would make an element.
+#[test]
+fn der_element_takes_definite_lengths_of_at_most_four_bytes() {
+    let mut indefinite = vec![0x30, 0x80];
+    indefinite.extend_from_slice(&[0u8; 200]);
+    assert_eq!(der_element(&indefinite), None, "indefinite length");
+
+    let short = [0x04, 0x7F];
+    let mut longest_short = short.to_vec();
+    longest_short.extend_from_slice(&[0xAB; 0x7F]);
+    longest_short.push(0xEE);
+    assert_eq!(
+        der_element(&longest_short),
+        Some((0x04, &[0xAB; 0x7F][..], &[0xEE][..])),
+        "short form, 127 bytes"
+    );
+
+    let four = [0x04, 0x84, 0x00, 0x00, 0x00, 0x02, 0xAA, 0xBB, 0xCC];
+    assert_eq!(
+        der_element(&four),
+        Some((0x04, &[0xAA, 0xBB][..], &[0xCC][..])),
+        "long form on 4 bytes"
+    );
+
+    let five = [0x04, 0x85, 0x00, 0x00, 0x00, 0x00, 0x02, 0xAA, 0xBB, 0xCC];
+    assert_eq!(der_element(&five), None, "long form on 5 bytes");
+}
+
 proptest::proptest! {
     #![proptest_config(proptest::prelude::ProptestConfig::with_cases(512))]
 

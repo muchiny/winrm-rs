@@ -722,9 +722,50 @@ fn pinned_verifier_compares_the_end_entity_digest() {
         both.verify_server_cert(&ec, &[], &target("win01"), &[], UnixTime::now())
             .is_ok()
     );
+    // The same pin listed twice still matches.
+    let twice = PinnedVerifier::new(vec![der_sha256(EC_CERT_PEM), der_sha256(EC_CERT_PEM)], &p);
+    assert!(
+        twice
+            .verify_server_cert(&ec, &[], &target("win01"), &[], UnixTime::now())
+            .is_ok()
+    );
     assert_eq!(
         verifier.supported_verify_schemes(),
         p.signature_verification_algorithms.supported_schemes()
+    );
+}
+
+/// A PEM error is described by a fixed text: its payload (a line of the
+/// file, base64 details) can be key material and is never shown.
+#[test]
+fn pem_errors_are_described_without_their_payload() {
+    fn first_error(pem: &str) -> pem::Error {
+        CertificateDer::pem_slice_iter(pem.as_bytes())
+            .find_map(Result::err)
+            .unwrap()
+    }
+    let cases = [
+        (
+            "-----BEGIN CERTIFICATE-----\nAAAA\n",
+            "a section has no END line",
+        ),
+        (
+            "-----BEGIN CERTIFICATE\nAAAA\n-----END CERTIFICATE-----\n",
+            "malformed BEGIN line",
+        ),
+        (
+            "-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n",
+            "section body is not valid base64",
+        ),
+    ];
+    for (pem, text) in cases {
+        assert_eq!(describe_pem_error(&first_error(pem)), text, "{pem:?}");
+    }
+    let nothing = CertificateDer::from_pem_slice(b"no section here\n").unwrap_err();
+    assert_eq!(describe_pem_error(&nothing), "no PEM section found");
+    assert_eq!(
+        describe_pem_error(&pem::Error::SectionTooLarge),
+        "PEM section too large"
     );
 }
 

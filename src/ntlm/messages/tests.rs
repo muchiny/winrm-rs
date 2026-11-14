@@ -1447,7 +1447,13 @@ fn sealing_type2_without_nb_names_is_refused() {
 #[test]
 fn type3_never_echoes_lm_key_identify_datagram_anonymous() {
     let mut ch = challenge_with(nb_ti());
-    ch.negotiate_flags |= TYPE3_NEVER_ECHO;
+    // The six flags by their values in MS-NLMP 2.2.2.5, not by the constant
+    // under test: DATAGRAM 0x40, LM_KEY 0x80, ANONYMOUS 0x800,
+    // OEM_DOMAIN_SUPPLIED 0x1000, OEM_WORKSTATION_SUPPLIED 0x2000 and
+    // IDENTIFY 0x0010_0000. A flag missing from `TYPE3_NEVER_ECHO` would be
+    // echoed below.
+    ch.negotiate_flags |= 0x0010_38c0;
+    assert_eq!(TYPE3_NEVER_ECHO, 0x0010_38c0);
     let type3_flags = |type3: &[u8]| u32::from_le_bytes(type3[60..64].try_into().unwrap());
     let (http, _) = create_authenticate_message_http(
         &ch,
@@ -1479,9 +1485,11 @@ fn type3_never_echoes_lm_key_identify_datagram_anonymous() {
             &[0u8; 32],
         )
         .unwrap();
+        // The whole word: the six flags are gone, and SIGN, SEAL and VERSION,
+        // which the challenge had, are still there.
         assert_eq!(
-            type3_flags(&credssp) & TYPE3_NEVER_ECHO,
-            0,
+            type3_flags(&credssp),
+            TEST_FLAGS,
             "{:#010x}",
             type3_flags(&credssp)
         );

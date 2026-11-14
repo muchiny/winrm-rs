@@ -539,6 +539,28 @@ fn proxy_io_tells_a_closed_connection_from_another_error() {
     );
 }
 
+/// A `CONNECT` answer whose head is exactly 65 536 bytes opens the tunnel:
+/// the cap is 64 KiB, inclusive. The size is written out here, not taken from
+/// the constant under test.
+#[tokio::test]
+async fn dial_tunnel_accepts_a_head_of_exactly_64_kib() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut s, _) = listener.accept().await.unwrap();
+        let mut head = [0u8; 1024];
+        let _ = s.read(&mut head).await;
+        let mut answer = b"HTTP/1.1 200 OK\r\nX-Pad: ".to_vec();
+        answer.resize(65_536 - 4, b'a');
+        answer.extend_from_slice(b"\r\n\r\n");
+        let _ = s.write_all(&answer).await;
+        let _ = s.read(&mut head).await;
+    });
+    let tunnel = bounded(dial_tunnel(&http_dial(port, None), "127.0.0.1", 9)).await;
+    assert!(tunnel.is_ok(), "{:?}", tunnel.err());
+}
+
 /// A `CONNECT` answer whose head ends past the 64 KiB cap is refused, also
 /// when its end comes in the read that crosses the cap.
 #[tokio::test]

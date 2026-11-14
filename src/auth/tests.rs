@@ -122,6 +122,49 @@ async fn read_body_capped_refuses_a_declared_length_over_the_cap() {
     assert!(format!("{err}").contains("exceeds 100 bytes"), "{err}");
 }
 
+/// The declared length alone is enough to refuse: the server here announces
+/// 101 bytes and sends none, so reading the body could only fail otherwise.
+#[tokio::test]
+async fn read_body_capped_refuses_a_declared_length_without_reading_the_body() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = stream.read(&mut buf).await;
+        let _ = stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 101\r\n\r\n")
+            .await;
+    });
+    let resp = crate::transport::test_http_client()
+        .post(format!("http://{addr}/wsman"))
+        .send()
+        .await
+        .unwrap();
+    let err = read_body_capped(resp, 100).await.unwrap_err();
+    assert!(format!("{err}").contains("exceeds 100 bytes"), "{err}");
+}
+
+/// A declared length equal to the cap is read.
+#[tokio::test]
+async fn read_body_capped_reads_a_declared_length_equal_to_the_cap() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("z".repeat(100)))
+        .mount(&server)
+        .await;
+    let resp = crate::transport::test_http_client()
+        .post(server.uri())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.content_length(), Some(100));
+    assert_eq!(read_body_capped(resp, 100).await.unwrap(), vec![b'z'; 100]);
+}
+
 /// A raw HTTP server sending `body` in chunked encoding (no
 /// `Content-Length`), in pieces of `piece` bytes.
 async fn chunked_server(body: Vec<u8>, piece: usize) -> String {

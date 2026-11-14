@@ -4277,6 +4277,91 @@ async fn run_wql_paces_instant_empty_pages() {
     );
 }
 
+/// A page that brings items is progress, even when the enumeration goes on:
+/// instant pages with items are not paced.
+#[tokio::test]
+async fn run_wql_does_not_pace_pages_that_bring_items() {
+    use std::time::{Duration, Instant};
+    let server = MockServer::start().await;
+    let page = "<s:Envelope><s:Body><n:PullResponse><n:EnumerationContext>ctx-1</n:EnumerationContext>\
+                <n:Items><p:X>item</p:X></n:Items></n:PullResponse></s:Body></s:Envelope>";
+    Mock::given(method("POST"))
+        .and(body_string_contains("enumeration/Enumerate"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(page))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("enumeration/Pull"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(page))
+        .up_to_n_times(9)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("enumeration/Pull"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<s:Envelope><s:Body><n:PullResponse><n:Items><p:X>last</p:X></n:Items>\
+             <n:EndOfSequence/></n:PullResponse></s:Body></s:Envelope>",
+        ))
+        .mount(&server)
+        .await;
+    let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+    let started = Instant::now();
+    let items = client
+        .run_wql("127.0.0.1", "SELECT * FROM X", None)
+        .await
+        .unwrap();
+    assert!(items.contains("last"));
+    // Paced as if empty, the nine Pulls would add 3.55 s.
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+/// Output on either stream is progress: a command that answers at once with
+/// output, poll after poll, is not paced.
+#[tokio::test]
+async fn run_command_does_not_pace_polls_that_bring_output() {
+    use std::time::{Duration, Instant};
+    const STDOUT_ONLY: &str = r#"<s:Envelope><s:Body><rsp:ReceiveResponse>
+        <rsp:Stream Name="stdout" CommandId="C1">YQ==</rsp:Stream>
+        </rsp:ReceiveResponse></s:Body></s:Envelope>"#;
+    const STDERR_ONLY: &str = r#"<s:Envelope><s:Body><rsp:ReceiveResponse>
+        <rsp:Stream Name="stderr" CommandId="C1">YQ==</rsp:Stream>
+        </rsp:ReceiveResponse></s:Body></s:Envelope>"#;
+    for (stream, poll) in [("stdout", STDOUT_ONLY), ("stderr", STDERR_ONLY)] {
+        let server = MockServer::start().await;
+        mount_ok(&server, SHELL_S1, 1).await;
+        mount_ok(&server, COMMAND_C1, 1).await;
+        mount_ok(&server, poll, 9).await;
+        mount_ok(&server, DONE_HELLO, 1).await;
+        mount_ok(&server, EMPTY_BODY, u64::MAX).await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        let started = Instant::now();
+        let out = client.run_command("127.0.0.1", "x", &[]).await.unwrap();
+        let took = started.elapsed();
+        assert_eq!(out.exit_code, 7, "{stream}");
+        // Paced as if empty, the nine polls would add 3.55 s.
+        assert!(took < Duration::from_secs(3), "{stream}: {took:?}");
+    }
+}
+
+/// Output of exactly `max_output_bytes` is within the limit.
+#[tokio::test]
+async fn run_command_accepts_output_of_exactly_max_output_bytes() {
+    let server = MockServer::start().await;
+    mount_ok(&server, SHELL_S1, 1).await;
+    mount_ok(&server, COMMAND_C1, 1).await;
+    mount_ok(&server, DONE_HELLO, 1).await;
+    mount_ok(&server, EMPTY_BODY, u64::MAX).await;
+    let mut config = basic_config(server.address().port());
+    config.max_output_bytes = Some(5);
+    let client = WinrmClient::new(config, test_creds()).unwrap();
+    let out = client.run_command("127.0.0.1", "x", &[]).await.unwrap();
+    assert_eq!(out.stdout, b"hello");
+}
+
 /// Enumerate and every Pull answer with an empty page that keeps the
 /// enumeration open; the Pulls take 100 ms.
 async fn mount_endless_empty_enumeration(server: &MockServer) {

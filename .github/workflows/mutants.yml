@@ -116,16 +116,34 @@ jobs:
           pattern: mutants-shard-*
           path: shards
 
+      # A missed mutant fails this job, and so does a shard that did not run
+      # to its end. A mutant that times out does not: the tests ran past
+      # their time limit, which says neither "caught" nor "missed". It is
+      # nearly always a loop, a poll or a retry that no longer ends; it can
+      # also be a change that only slows the tests down, and that one is a
+      # survivor. So they are listed, and the list is to be read.
       - name: Summary
+        env:
+          SHARD_RESULT: ${{ needs.shard.result }}
+          # cargo-mutants 27.1.0 does not apply `exclude_re` to a mutant that
+          # deletes a field of a struct literal (fixed after that release,
+          # see its changelog), so the one `.cargo/mutants.toml` excludes is
+          # taken out here. Remove this with the next cargo-mutants.
+          NOT_FILTERED: ": delete field use_tls from struct Self expression in WinrmConfig::https$"
         run: |
           set -euo pipefail
           shopt -s nullglob
-          lines() { if [ "$#" -gt 0 ]; then cat "$@" | wc -l; else echo 0; fi; }
+          # The lines of the files given, sorted; nothing when there is none.
+          all() { if [ "$#" -gt 0 ]; then sort "$@"; fi; }
           reporting=(shards/mutants-shard-*/)
-          caught=$(lines shards/*/caught.txt)
-          missed=$(lines shards/*/missed.txt)
-          timed_out=$(lines shards/*/timeout.txt)
-          unviable=$(lines shards/*/unviable.txt)
+          all shards/*/caught.txt > caught.txt
+          all shards/*/missed.txt | { grep -v -- "$NOT_FILTERED" || true; } > missed.txt
+          all shards/*/timeout.txt > timeout.txt
+          all shards/*/unviable.txt > unviable.txt
+          caught=$(wc -l < caught.txt)
+          missed=$(wc -l < missed.txt)
+          timed_out=$(wc -l < timeout.txt)
+          unviable=$(wc -l < unviable.txt)
           {
             echo "## Mutants"
             echo
@@ -137,15 +155,15 @@ jobs:
               echo "### Missed: no test notices the change"
               echo
               echo '```'
-              sort shards/*/missed.txt
+              cat missed.txt
               echo '```'
             fi
             if [ "$timed_out" -gt 0 ]; then
               echo
-              echo "### Timed out: the change makes a test run without end"
+              echo "### Timed out: the change makes a test run past its time limit"
               echo
               echo '```'
-              sort shards/*/timeout.txt
+              cat timeout.txt
               echo '```'
             fi
           } >> "$GITHUB_STEP_SUMMARY"
@@ -153,7 +171,12 @@ jobs:
             echo "::error::${#reporting[@]} of $SHARDS shards reported: the result is partial"
             exit 1
           fi
-          if [ "$missed" -gt 0 ] || [ "$timed_out" -gt 0 ]; then
-            echo "::error::$missed mutants survived and $timed_out timed out: see the summary of this run"
+          # A shard that stops half-way still uploads what it has.
+          if [ "$SHARD_RESULT" != "success" ]; then
+            echo "::error::the shards ended with \"$SHARD_RESULT\": the result is partial"
+            exit 1
+          fi
+          if [ "$missed" -gt 0 ]; then
+            echo "::error::$missed mutants survived: see the summary of this run"
             exit 1
           fi

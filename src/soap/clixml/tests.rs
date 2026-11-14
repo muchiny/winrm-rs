@@ -607,6 +607,16 @@ fn signed_and_nul_numeric_references_stay_literal() {
     );
 }
 
+/// A hexadecimal reference takes the letters `a` to `f` in either case; a
+/// decimal one takes none.
+#[test]
+fn hexadecimal_references_take_letters_and_decimal_ones_do_not() {
+    assert_eq!(
+        decode(b"#< CLIXML\r\n<Objs><S S=\"Error\">&#x4a;&#X4B;&#4a;</S></Objs>"),
+        "JK&#4a;"
+    );
+}
+
 /// Each `&` used to search the rest of the record for `;`.
 #[test]
 fn decode_entities_is_linear_on_ampersand_runs() {

@@ -90,6 +90,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `toml_edit` 0.25.19 and `winnow` 1.0.5 in the lockfile, with their
   `cargo vet` exemptions; `fuzz/Cargo.lock` follows for the three it has.
   This lockfile only builds this repository.
+- `cargo vet` imports the audits that Mozilla, Google, the Bytecode
+  Alliance, Embark Studios, ISRG and Zcash publish (`[imports]` in
+  `supply-chain/config.toml`). An audit now covers 62 of the 268 crate
+  versions of the dependency tree, where each one was an exemption; 206
+  exemptions remain. CI still reads no network: `cargo vet --locked` checks
+  against `supply-chain/imports.lock`.
 - `release.toml` (`cargo-release`) and `cliff.toml` (`git-cliff`) are
   removed: the release procedure uses neither tool (CONTRIBUTING.md,
   "Releasing"), and `release.toml` asked for a publish and a push from the

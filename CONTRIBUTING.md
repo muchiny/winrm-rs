@@ -124,6 +124,7 @@ a production host.
 ## Dependency review
 
 - `cargo vet --locked` is a required check. A bump that brings a crate version nobody has audited fails it, Dependabot's included, because Dependabot cannot certify. On the PR branch, `cargo vet` lists what is missing. Audit it and run `cargo vet certify <crate> <version>`, or record a deliberate, dated decision with `cargo vet add-exemption <crate> <version>`, then commit `supply-chain/`.
+- The audits of six organizations are imported (`[imports]` in `supply-chain/config.toml`): Mozilla, Google, the Bytecode Alliance, Embark Studios, ISRG and Zcash. `supply-chain/imports.lock` is the copy of them that `--locked` checks against. `cargo vet` without `--locked` fetches their current audits, so run it first after a bump: a new version may already be covered. `cargo vet prune` then drops the exemptions that an audit replaces.
 - `.github/workflows/advisories.yml` runs `cargo deny --all-features --locked check advisories` every day. A failure means a new RustSec advisory or a yanked dependency: bump the dependency, or add a `deny.toml` `ignore` entry with a reason and `revue avant AAAA-MM-JJ`. GitHub disables scheduled workflows after 60 days without repository activity; re-enable it from the Actions tab if that happens.
 
 ## Releasing (maintainers)

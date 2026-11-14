@@ -859,6 +859,13 @@ fn replace_local_file_with(
 
 /// The ownership rule an existing file must pass before it is written: the
 /// sticky-directory rule ([`check_sticky_rule`]) on Unix, none elsewhere.
+#[cfg_attr(
+    not(unix),
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "one signature for every platform: the rule can refuse on Unix"
+    )
+)]
 fn owner_rule(
     local_path: &Path,
     dir: &Path,

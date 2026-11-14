@@ -2400,9 +2400,11 @@ fn refusing_port() -> (tokio::net::TcpSocket, u16) {
 /// refuses connections until a listener appears on it, then the request
 /// goes through.
 #[tokio::test]
-// Windows answers a refused loopback connect only after ~2 s of SYN
-// retries, which makes this slow and timing-sensitive there.
-#[cfg_attr(windows, ignore)]
+#[cfg_attr(
+    windows,
+    ignore = "Windows answers a refused loopback connect only after ~2 s of SYN retries: \
+              slow and timing-sensitive there"
+)]
 async fn retry_backoff_on_http_error() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -3022,9 +3024,11 @@ async fn upload_file_launches_powershell_by_full_path() {
 /// Retries of refused connections back off exponentially (100 ms, then
 /// 200 ms) rather than additively.
 #[tokio::test]
-// Windows answers a refused loopback connect only after ~2 s of SYN
-// retries, so three attempts would take seconds there.
-#[cfg_attr(windows, ignore)]
+#[cfg_attr(
+    windows,
+    ignore = "Windows answers a refused loopback connect only after ~2 s of SYN retries: \
+              three attempts would take seconds there"
+)]
 async fn retry_backoff_is_exponential_not_additive() {
     let (_held, port) = refusing_port();
     let config = WinrmConfig {

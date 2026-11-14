@@ -152,16 +152,12 @@ pub(crate) fn create_shell_request(endpoint: &str, config: &crate::config::Winrm
 
     let codepage = config.codepage;
 
-    let working_dir = config
-        .working_directory
-        .as_deref()
-        .map(|dir| {
-            format!(
-                "\n      <rsp:WorkingDirectory>{}</rsp:WorkingDirectory>",
-                xml_escape(dir)
-            )
-        })
-        .unwrap_or_default();
+    let working_dir = config.working_directory.as_deref().map_or_default(|dir| {
+        format!(
+            "\n      <rsp:WorkingDirectory>{}</rsp:WorkingDirectory>",
+            xml_escape(dir)
+        )
+    });
 
     let env_block = if config.env_vars.is_empty() {
         String::new()
@@ -181,8 +177,7 @@ pub(crate) fn create_shell_request(endpoint: &str, config: &crate::config::Winrm
 
     let idle_timeout = config
         .idle_timeout_secs
-        .map(|secs| format!("\n      <rsp:IdleTimeOut>PT{secs}S</rsp:IdleTimeOut>"))
-        .unwrap_or_default();
+        .map_or_default(|secs| format!("\n      <rsp:IdleTimeOut>PT{secs}S</rsp:IdleTimeOut>"));
 
     format!(
         r#"<s:Envelope {NS_DECL_WITH_RSP}>
@@ -228,8 +223,7 @@ pub(crate) fn create_psrp_shell_request(
     );
     let idle_timeout = config
         .idle_timeout_secs
-        .map(|secs| format!("\n      <rsp:IdleTimeOut>PT{secs}S</rsp:IdleTimeOut>"))
-        .unwrap_or_default();
+        .map_or_default(|secs| format!("\n      <rsp:IdleTimeOut>PT{secs}S</rsp:IdleTimeOut>"));
 
     // `header` ends with `</s:Header>` — insert the OptionSet before it.
     let header_with_options = header.replace(

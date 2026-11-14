@@ -1,4 +1,4 @@
-msrv = "1.99.0"
+msrv = "1.100.0"
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-panic-in-tests = true

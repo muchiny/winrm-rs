@@ -259,6 +259,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `NEGOTIATE_KEY_EXCH` itself. Its branch without a key exchange, where
   the exported key is the session base key, could not be reached (both
   callers set the flag) and is removed. The messages are unchanged.
+- **The futures of the client are four times smaller.** With the `credssp`
+  feature on, the future of `run_powershell`, `run_command` or
+  `download_file` was 30 kB, whatever the authentication method in use: the
+  exchange of a request was held in place, sized by its largest route
+  (CredSSP), and each wrapper around it (deadline, cleanup) held it once
+  more. The exchange is now one heap allocation per request, and the
+  largest future of the public API is under 8 kB (x86_64 Linux, every
+  feature on). No behaviour change.
 
 ### Fixed
 

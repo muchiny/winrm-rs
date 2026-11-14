@@ -1305,42 +1305,71 @@ impl HttpTransport {
             self.kerberos_proxy_probe(&url).await?;
         }
 
-        let response_text: String = match route {
+        // The exchange is on the heap, one allocation per request. Left in
+        // place, it is part of the future of every caller, whatever the
+        // method in use: the largest route (CredSSP, several kilobytes) sets
+        // its size, and each wrapper above (deadline, cleanup) holds it once
+        // more, up to 30 kB for the future of `run_powershell`.
+        let response_text = Box::pin(self.exchange(route, host, &url, body, slot)).await?;
+
+        if self.log_soap_bodies {
+            trace!(target: "winrm_rs::wire", response = %response_text, "SOAP response body");
+        } else {
+            trace!(response_len = response_text.len(), "SOAP response body");
+        }
+        // Every route gives the body of a success status here. Such a body
+        // is an answer or it is refused, whatever the operation: several of
+        // them (Delete, Signal, Send) read nothing else from it.
+        soap::check_answer(&response_text).map_err(WinrmError::Soap)?;
+        Ok(response_text)
+    }
+
+    /// One request on `route`, authentication included: the body of the
+    /// response to a success status. [`Self::send_soap`] is the only caller.
+    async fn exchange(
+        &self,
+        route: Route,
+        host: &str,
+        url: &str,
+        body: String,
+        slot: Option<SlotGuard>,
+    ) -> Result<String, WinrmError> {
+        match route {
             Route::Basic => {
                 let auth = BasicAuth::new(
                     &self.credentials.username,
                     self.credentials.password.expose_secret(),
                     self.max_response_bytes(),
                 );
-                auth.send_authenticated(&self.http, &url, body).await?
+                auth.send_authenticated(&self.http, url, body).await
             }
             Route::Sealed => {
-                self.send_sealed(host, &url, &body, dedicated_slot(slot)?)
-                    .await?
+                self.send_sealed(host, url, &body, dedicated_slot(slot)?)
+                    .await
             }
             Route::NtlmOverTls => {
-                self.send_ntlm_over_tls(host, &url, &body, dedicated_slot(slot)?)
-                    .await?
+                self.send_ntlm_over_tls(host, url, &body, dedicated_slot(slot)?)
+                    .await
             }
             Route::KerberosOverTls => {
-                self.send_kerberos_over_tls(host, &url, &body, dedicated_slot(slot)?)
-                    .await?
+                self.send_kerberos_over_tls(host, url, &body, dedicated_slot(slot)?)
+                    .await
             }
             Route::NtlmPlain => {
-                self.ntlm_auth_for(&url)
-                    .send_authenticated(&self.http, &url, body)
-                    .await?
+                self.ntlm_auth_for(url)
+                    .send_authenticated(&self.http, url, body)
+                    .await
             }
             Route::KerberosPlain => {
-                self.kerberos_auth(&url)?
-                    .send_authenticated(&self.http, &url, body)
-                    .await?
+                self.kerberos_auth(url)?
+                    .send_authenticated(&self.http, url, body)
+                    .await
             }
             Route::Certificate => {
                 let auth = CertificateAuth {
                     max_response_bytes: self.max_response_bytes(),
                 };
-                auth.send_authenticated(&self.http, &url, body).await?
+                auth.send_authenticated(&self.http, url, body).await
             }
             #[cfg(feature = "credssp")]
             Route::CredSsp => {
@@ -1354,28 +1383,15 @@ impl HttpTransport {
                         WinrmError::AuthFailed("CredSSP requires HTTPS (set use_tls = true)".into())
                     })?),
                     opts: CredSspConnOptions::from_config(&self.config),
-                    dial: self.credssp_dial_for(&url)?,
+                    dial: self.credssp_dial_for(url)?,
                 };
-                auth.send_authenticated(&self.http, &url, body).await?
+                auth.send_authenticated(&self.http, url, body).await
             }
             #[cfg(not(feature = "credssp"))]
-            Route::CredSsp => {
-                return Err(WinrmError::AuthFailed(
-                    "CredSSP authentication requires the `credssp` cargo feature".into(),
-                ));
-            }
-        };
-
-        if self.log_soap_bodies {
-            trace!(target: "winrm_rs::wire", response = %response_text, "SOAP response body");
-        } else {
-            trace!(response_len = response_text.len(), "SOAP response body");
+            Route::CredSsp => Err(WinrmError::AuthFailed(
+                "CredSSP authentication requires the `credssp` cargo feature".into(),
+            )),
         }
-        // Every route gives the body of a success status here. Such a body
-        // is an answer or it is refused, whatever the operation: several of
-        // them (Delete, Signal, Send) read nothing else from it.
-        soap::check_answer(&response_text).map_err(WinrmError::Soap)?;
-        Ok(response_text)
     }
 
     /// The [`Route`] of every request of this transport.

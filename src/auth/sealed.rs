@@ -228,4 +228,20 @@ mod tests {
         body[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(parse(&body, KERBEROS_PROTOCOL, ANY_LEN, bad).is_err());
     }
+
+    /// The length is 1 to 10 digits, whatever its value.
+    #[test]
+    fn original_length_takes_one_to_ten_digits() {
+        let line = |n: &str| {
+            format!("\tOriginalContent: type=application/soap+xml;charset=UTF-8;Length={n}\r\n")
+        };
+        assert_eq!(original_length(line("0000000007").as_bytes()), Some(7));
+        for refused in ["00000000007", "", "7a"] {
+            assert_eq!(
+                original_length(line(refused).as_bytes()),
+                None,
+                "{refused:?}"
+            );
+        }
+    }
 }

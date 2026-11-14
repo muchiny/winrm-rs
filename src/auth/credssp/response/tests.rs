@@ -209,6 +209,8 @@ fn reader_refuses_bad_lines() {
         "HTTP/1.1 20 X",
         "HTTP/1.1 abc OK",
         "HTTP/1.1  200 OK",
+        "HTTP/1.1 200OK",
+        "HTTP/1.1 2000",
     ] {
         let input = format!("{line}\r\nContent-Length: 0\r\n\r\n");
         assert!(
@@ -289,6 +291,27 @@ fn head_ending_past_the_cap_in_one_read_is_refused() {
             .unwrap()
             .is_some()
     );
+}
+
+/// The limits are inclusive: what is exactly at a limit passes.
+#[test]
+fn reader_limits_are_inclusive() {
+    // Eight interim responses, the most accepted, then the final one.
+    let eight = "HTTP/1.1 100 Continue\r\n\r\n".repeat(8);
+    let input = format!("{eight}HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+    let resp = read_all(&[input.as_bytes()]).unwrap().unwrap();
+    assert_eq!(resp.status, 200);
+
+    // A head still open with as many bytes as the cap is waited for; one
+    // more byte is too many.
+    let open = b"HTTP/1.1 200 OK\r\nX-Pad: aaaaaaaa";
+    assert_eq!(open.len(), 32);
+    let mut r = ResponseReader::new(32, 64);
+    assert!(matches!(r.feed(open), Ok(None)));
+    assert!(matches!(
+        r.feed(b"a"),
+        Err(WinrmError::Protocol(m)) if m == "CredSSP: response head too large"
+    ));
 }
 
 #[test]

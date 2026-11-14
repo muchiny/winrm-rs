@@ -75,6 +75,25 @@ fn openssl_inner_tls_errors_name_the_session_and_the_step() {
     );
 }
 
+/// What `ssl_read` refuses is an error of the read; only "nothing to read
+/// yet" ends it quietly.
+#[test]
+fn openssl_inner_tls_read_reports_what_is_not_a_tls_record() {
+    let mut tls = build_inner_openssl_tls(&no_verify().inner).expect("build inner tls");
+    assert!(!tls.handshake_step().unwrap());
+    tls.drain_outgoing();
+    assert_eq!(tls.read_plaintext().unwrap(), Vec::<u8>::new());
+    tls.feed_incoming(b"HTTP/1.1 400 Bad Request\r\n\r\n");
+    let err = tls.read_plaintext().unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            WinrmError::Authentication(m) if m.starts_with("CredSSP inner TLS read: ")
+        ),
+        "{err:?}"
+    );
+}
+
 #[test]
 fn openssl_inner_tls_feed_incoming_then_drain_clears_outgoing() {
     let mut tls = build_inner_openssl_tls(&no_verify().inner).expect("build inner tls");

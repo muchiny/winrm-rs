@@ -755,8 +755,9 @@ async fn start_command_with_id_returns_server_command_id() {
     assert_eq!(cmd_id, "MY-CMD-ID");
 }
 
-// Kills shell.rs:183 — send_input conditional (|| → && and == → !=)
-// Tests the PSRP branch: when command_id equals shell_id, it should use send_psrp_request
+/// Input for the shell itself (an empty command id, or the shell's own id)
+/// goes out in the PSRP form, with no `CommandId` on the stream; input for a
+/// command names it.
 #[tokio::test]
 async fn send_input_psrp_path_when_command_id_is_shell_id() {
     let server = MockServer::start().await;
@@ -786,6 +787,21 @@ async fn send_input_psrp_path_when_command_id_is_shell_id() {
         .unwrap();
     // Send input with empty command_id → also takes PSRP path
     shell.send_input("", b"data", false).await.unwrap();
+    // A real command id is named on the stream.
+    shell.send_input("CMD-1", b"data", false).await.unwrap();
+
+    let sends: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+        .filter(|body| body.contains("/shell/Send"))
+        .collect();
+    assert_eq!(sends.len(), 3);
+    assert!(!sends[0].contains("CommandId="), "{}", sends[0]);
+    assert!(!sends[1].contains("CommandId="), "{}", sends[1]);
+    assert!(sends[2].contains("CommandId=\"CMD-1\""), "{}", sends[2]);
 }
 
 // Kills shell.rs:302 — receive_next conditional (|| → && and == → !=)
@@ -1034,6 +1050,51 @@ async fn shell_run_command_paces_a_server_answering_receive_instantly() {
         took >= Duration::from_millis(700) && took < Duration::from_secs(5),
         "{took:?}"
     );
+}
+
+/// Output on either stream is progress: a command that answers at once with
+/// output, poll after poll, is not paced.
+#[tokio::test]
+async fn shell_run_command_does_not_pace_polls_that_bring_output() {
+    use std::time::{Duration, Instant};
+    const STDOUT_ONLY: &str = r#"<s:Envelope><s:Body><rsp:ReceiveResponse>
+        <rsp:Stream Name="stdout" CommandId="TC">YQ==</rsp:Stream>
+        </rsp:ReceiveResponse></s:Body></s:Envelope>"#;
+    const STDERR_ONLY: &str = r#"<s:Envelope><s:Body><rsp:ReceiveResponse>
+        <rsp:Stream Name="stderr" CommandId="TC">YQ==</rsp:Stream>
+        </rsp:ReceiveResponse></s:Body></s:Envelope>"#;
+    for (stream, poll) in [("stdout", STDOUT_ONLY), ("stderr", STDERR_ONLY)] {
+        let server = MockServer::start().await;
+        mount_open_shell_and_command(&server).await;
+        mount_ok(&server, poll, 9).await;
+        mount_ok(&server, DONE_OK, 1).await;
+        mount_ok(&server, "<s:Envelope><s:Body/></s:Envelope>", u64::MAX).await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        let shell = client.open_shell("127.0.0.1").await.unwrap();
+        let started = Instant::now();
+        let out = shell.run_command("x", &[]).await.unwrap();
+        let took = started.elapsed();
+        assert_eq!(out.exit_code, 3, "{stream}");
+        // Paced as if empty, the nine polls would add 3.55 s.
+        assert!(took < Duration::from_secs(3), "{stream}: {took:?}");
+    }
+}
+
+/// Output of exactly `max_output_bytes` is within the limit.
+#[tokio::test]
+async fn shell_run_command_accepts_output_of_exactly_max_output_bytes() {
+    let server = MockServer::start().await;
+    mount_open_shell_and_command(&server).await;
+    mount_ok(&server, DONE_OK, 1).await;
+    mount_ok(&server, "<s:Envelope><s:Body/></s:Envelope>", u64::MAX).await;
+    let config = WinrmConfig {
+        max_output_bytes: Some(2),
+        ..basic_config(server.address().port())
+    };
+    let client = WinrmClient::new(config, test_creds()).unwrap();
+    let shell = client.open_shell("127.0.0.1").await.unwrap();
+    let out = shell.run_command("x", &[]).await.unwrap();
+    assert_eq!(out.stdout, b"ok");
 }
 
 #[tokio::test]

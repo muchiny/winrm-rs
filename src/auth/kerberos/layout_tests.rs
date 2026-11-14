@@ -76,6 +76,34 @@ fn windows_layout_keeps_an_sspi_header_without_trailer() {
     assert_eq!(data, b"x");
 }
 
+/// Without a trailer the header must be a whole wrap token header: 16 bytes
+/// at least, starting with the wrap token identifier.
+#[test]
+fn windows_layout_without_trailer_wants_a_whole_wrap_token_header() {
+    let mut exact = vec![0x05, 0x04, 0x06, 0xFF, 0, 0, 0, 28];
+    exact.extend_from_slice(&[0; 8]);
+    assert_eq!(exact.len(), 16);
+    let (out, _) = windows_layout(&exact, b"x", &[], &[]).unwrap();
+    assert_eq!(out, exact, "a header of exactly 16 bytes is kept");
+
+    let mut foreign = exact.clone();
+    foreign[..2].copy_from_slice(&[0x02, 0x01]);
+    let refused: [(&str, &[u8]); 2] = [
+        ("one byte short", &exact[..15]),
+        ("not a wrap token", &foreign),
+    ];
+    for (name, header) in refused {
+        let err = windows_layout(header, b"x", &[], &[]).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                WinrmError::Authentication(m) if m.contains("no separate wrap token header")
+            ),
+            "{name}: {err:?}"
+        );
+    }
+}
+
 #[test]
 fn windows_layout_refuses_what_is_not_a_sealed_initiator_wrap_token() {
     type Mutation = fn(&mut Vec<u8>);
@@ -406,6 +434,48 @@ mod blocking {
             start.elapsed() >= Duration::from_millis(300),
             "the second call did not wait for the slot: {:?}",
             start.elapsed()
+        );
+    }
+}
+
+/// What only the `kerberos` feature compiles and needs no KDC.
+#[cfg(feature = "kerberos")]
+mod with_the_feature {
+    use super::super::KerberosAuth;
+    use crate::error::WinrmError;
+    use reqwest::header::{HeaderMap, HeaderValue};
+
+    fn www_authenticate(values: &[&'static str]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for value in values {
+            headers.append("WWW-Authenticate", HeaderValue::from_static(value));
+        }
+        headers
+    }
+
+    #[test]
+    fn server_token_is_the_negotiate_token_of_any_www_authenticate_header() {
+        let none = [
+            ("no header", www_authenticate(&[])),
+            ("another scheme", www_authenticate(&["Basic realm=\"x\""])),
+        ];
+        for (name, headers) in none {
+            assert_eq!(
+                KerberosAuth::server_token(&headers).unwrap(),
+                None,
+                "{name}"
+            );
+        }
+        // "AQID" is the base64 of 01 02 03.
+        let headers = www_authenticate(&["Basic realm=\"x\"", "Negotiate AQID "]);
+        assert_eq!(
+            KerberosAuth::server_token(&headers).unwrap(),
+            Some(vec![1, 2, 3])
+        );
+        let err = KerberosAuth::server_token(&www_authenticate(&["Negotiate ***"])).unwrap_err();
+        assert!(
+            matches!(&err, WinrmError::Protocol(m) if m.contains("bad b64")),
+            "{err:?}"
         );
     }
 }

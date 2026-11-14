@@ -682,3 +682,12 @@ fn proxy_route_debug_redacts_userinfo() {
         "{shown}"
     );
 }
+
+/// In a unit-test build no variable of the environment is read, whatever
+/// the machine sets: the clients of the tests talk to loopback servers.
+#[test]
+fn env_var_reads_nothing_in_a_unit_test_build() {
+    for name in ["HTTP_PROXY", "https_proxy", "NO_PROXY", "REQUEST_METHOD"] {
+        assert_eq!(env_var(name), None, "{name}");
+    }
+}

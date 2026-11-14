@@ -847,12 +847,115 @@ fn replace_local_file_accepts_its_own_file_in_a_shared_sticky_directory() {
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
         assert!(err.to_string().contains("sticky, world-writable"), "{err}");
         check_sticky_rule(&dest, &shared, &meta, Some(ours)).unwrap();
+        // `owner_rule`, the rule `replace_local_file` applies, is that one.
+        let err = owner_rule(&dest, &shared, &meta, None).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        owner_rule(&dest, &shared, &meta, Some(ours)).unwrap();
 
         replace_local_file(&dest, b"new").unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), b"new");
         assert_eq!(std::fs::metadata(&dest).unwrap().uid(), ours);
     }
     std::fs::remove_file(&dest).ok();
+}
+
+/// Only "no such file" means there is nothing to replace: any other error
+/// of `lstat` is returned.
+#[cfg(unix)]
+#[test]
+fn open_existing_returns_an_lstat_error_that_is_not_not_found() {
+    let dir = test_dir("open-existing-errors");
+    assert!(open_existing(&dir.join("missing")).unwrap().is_none());
+    let file = dir.join("f.bin");
+    std::fs::write(&file, b"x").unwrap();
+    // A path through a regular file: ENOTDIR.
+    let err = open_existing(&file.join("child")).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::NotADirectory);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A file of another group this user belongs to keeps that group: the
+/// temporary file is given it before the rename.
+#[cfg(target_os = "linux")]
+#[test]
+fn replace_local_file_keeps_the_group_of_the_file() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = test_dir("replace-keeps-group");
+    let dest = dir.join("f.bin");
+    std::fs::write(&dest, b"old").unwrap();
+    let primary = std::fs::metadata(&dest).unwrap().gid();
+    // The first other group of this process (from /proc) the file can be
+    // given: in a user namespace, a group that is not mapped cannot.
+    let status = std::fs::read_to_string("/proc/self/status").unwrap();
+    let other = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Groups:"))
+        .into_iter()
+        .flat_map(str::split_whitespace)
+        .filter_map(|gid| gid.parse::<u32>().ok())
+        .filter(|&gid| gid != primary)
+        .find(|&gid| std::os::unix::fs::chown(&dest, None, Some(gid)).is_ok());
+    if let Some(other) = other {
+        replace_local_file(&dest, b"new").unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+        assert_eq!(std::fs::metadata(&dest).unwrap().gid(), other);
+        assert_eq!(leftover_temp_files(&dir), 0);
+    } else {
+        eprintln!("this user has no other group to give the file: test skipped");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A rewrite in place changes the mode of the file only to clear set-id
+/// bits. A file of another user that this user may write, with none to
+/// clear, is left as it is: its mode is not this user's to set, and the
+/// attempt would be refused before any byte is written.
+///
+/// `/dev/null` is such a file (root's, writable by all). The rewrite gets
+/// as far as the truncation, which a device refuses. Root may set the mode,
+/// so as root this shows nothing.
+#[cfg(target_os = "linux")]
+#[test]
+fn write_in_place_leaves_the_mode_of_a_file_without_set_id_bits() {
+    let mut null = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/null")
+        .unwrap();
+    let err = write_in_place(
+        &mut null,
+        b"new",
+        <std::fs::File as std::io::Write>::write_all,
+    )
+    .unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+}
+
+/// A temporary file that cannot be created for another reason than a refusal
+/// of the directory is an error. The file is not rewritten in place: on a
+/// full disk that would empty it and then fail.
+#[cfg(target_os = "linux")]
+#[test]
+fn replace_local_file_returns_another_error_of_the_temporary_file() {
+    // A directory whose path leaves room for `f` under it, but not for the
+    // 46 bytes of a temporary file name: creating one gives ENAMETOOLONG
+    // (paths are at most 4095 bytes on Linux).
+    const DIR_LEN: usize = 4060;
+    let root = test_dir("replace-temp-name-too-long");
+    let mut dir = root.clone();
+    while DIR_LEN - dir.as_os_str().len() - 1 > 255 {
+        dir.push("d".repeat(100));
+    }
+    dir.push("d".repeat(DIR_LEN - dir.as_os_str().len() - 1));
+    assert_eq!(dir.as_os_str().len(), DIR_LEN);
+    std::fs::create_dir_all(&dir).unwrap();
+    let dest = dir.join("f");
+    std::fs::write(&dest, b"old").unwrap();
+
+    let err = replace_local_file(&dest, b"new").unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidFilename, "{err}");
+    assert_eq!(std::fs::read(&dest).unwrap(), b"old");
+    std::fs::remove_dir_all(&root).ok();
 }
 
 /// A directory and a file owner that are neither this user nor each

@@ -704,14 +704,6 @@ fn create_negotiate_message_includes_version() {
     assert_eq!(msg[39], 15, "NTLMRevision = 15");
 }
 
-// Kills hex() returning "" or "xyzzy"
-#[test]
-fn hex_encodes_bytes() {
-    assert_eq!(hex(&[0xDE, 0xAD]), "dead");
-    assert_eq!(hex(&[]), "");
-    assert_eq!(hex(&[0x00, 0xFF]), "00ff");
-}
-
 // Kills create_authenticate_message_http returning replacement values
 #[test]
 fn create_authenticate_message_http_produces_valid_type3() {
@@ -823,19 +815,18 @@ fn full(
     spn: &str,
     cb: Option<[u8; 16]>,
 ) -> Result<(Vec<u8>, Zeroizing<[u8; 16]>), NtlmError> {
-    create_authenticate_message_full(
-        ch,
-        user,
-        "pass",
-        "",
-        cb,
-        TEST_FLAGS,
-        true,
-        Some((&create_negotiate_message(), &[0u8; 32])),
-        Some(spn),
-        Some(""),
-        workstation(),
-    )
+    create_authenticate_message_full(&AuthenticateInput {
+        challenge: ch,
+        username: user,
+        password: "pass",
+        domain: "",
+        display_domain: Some(""),
+        flags: TEST_FLAGS,
+        channel_bindings: cb,
+        mic_input: Some((&create_negotiate_message(), &[0u8; 32])),
+        target_name: Some(spn),
+        workstation: workstation(),
+    })
 }
 
 /// The `Workstation` field of the Type 3 carries the bytes the caller

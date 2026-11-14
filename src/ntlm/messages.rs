@@ -356,68 +356,207 @@ pub(crate) fn create_authenticate_message_internal(
     target_name: Option<&str>,
     workstation: &[u8],
 ) -> Result<(Vec<u8>, Zeroizing<[u8; 16]>), NtlmError> {
-    // Use the server's negotiated flags (from Type 2) for the Type 3 response,
-    // augmented with KEY_EXCH and VERSION to enable message sealing.
-    let flags =
-        (challenge.negotiate_flags & !TYPE3_NEVER_ECHO) | NEGOTIATE_KEY_EXCH | NEGOTIATE_VERSION;
-    let with_key_exch = flags & NEGOTIATE_KEY_EXCH != 0;
-    create_authenticate_message_full(
+    create_authenticate_message_full(&AuthenticateInput {
         challenge,
         username,
         password,
         domain,
+        display_domain: None,
+        // The server's negotiated flags (from the Type 2), augmented with
+        // KEY_EXCH and VERSION to enable message sealing.
+        flags: (challenge.negotiate_flags & !TYPE3_NEVER_ECHO)
+            | NEGOTIATE_KEY_EXCH
+            | NEGOTIATE_VERSION,
         channel_bindings,
-        flags,
-        with_key_exch,
         mic_input,
         target_name,
-        None,
         workstation,
-    )
+    })
 }
 
-/// Build NTLM Type 3 with full control over flags, key exchange, and MIC.
-///
-/// `domain` is used for the NTOWFv2 hash computation. `display_domain` (if Some)
-/// is used in the Domain security buffer of Type 3 (often empty for local
-/// accounts even when the hash uses the server's target domain).
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one argument per input of a Type 3; the callers are the two wrappers of this file"
-)]
-pub(crate) fn create_authenticate_message_full(
-    challenge: &ChallengeMessage,
-    username: &str,
-    password: &str,
-    domain: &str,
-    channel_bindings: Option<[u8; 16]>,
+/// The inputs of a Type 3, for [`create_authenticate_message_full`].
+struct AuthenticateInput<'a> {
+    challenge: &'a ChallengeMessage,
+    username: &'a str,
+    password: &'a str,
+    /// The domain of the NTOWFv2 hash.
+    domain: &'a str,
+    /// The domain written in the `DomainName` field when it is not `domain`
+    /// (CredSSP writes an empty one).
+    display_domain: Option<&'a str>,
+    /// The `NegotiateFlags` of the message. With `NEGOTIATE_KEY_EXCH` the
+    /// session key is random and travels encrypted; with `NEGOTIATE_VERSION`
+    /// the header carries a version.
     flags: u32,
-    with_key_exch: bool,
-    mic_input: Option<(&[u8], &[u8])>,
-    target_name: Option<&str>,
-    display_domain: Option<&str>,
-    workstation: &[u8],
-) -> Result<(Vec<u8>, Zeroizing<[u8; 16]>), NtlmError> {
-    let nt_hash = compute_nt_hash(password);
-    let ntlmv2_hash = compute_ntlmv2_hash(&nt_hash, username, domain);
+    channel_bindings: Option<[u8; 16]>,
+    /// The raw Type 1 and Type 2. With them the message carries a MIC over
+    /// Type1 || Type2 || Type3, a zero LM response and the workstation.
+    mic_input: Option<(&'a [u8], &'a [u8])>,
+    target_name: Option<&'a str>,
+    /// The `Workstation` field (UTF-16LE), written only with a MIC.
+    workstation: &'a [u8],
+}
 
-    // CREDSSP_FIXED_CC pins the client challenge for deterministic tests. It is
-    // honoured only in debug builds with the internal `__internal` feature;
-    // every other build draws from the CSPRNG.
+/// The 8-byte client challenge, from the CSPRNG.
+///
+/// `CREDSSP_FIXED_CC` pins it for deterministic tests. It is honoured only
+/// in debug builds with the internal `__internal` feature.
+fn client_challenge() -> [u8; 8] {
     #[cfg(all(debug_assertions, feature = "__internal"))]
-    let client_challenge: [u8; 8] = std::env::var("CREDSSP_FIXED_CC")
+    if let Some(fixed) = std::env::var("CREDSSP_FIXED_CC")
         .ok()
         .and_then(|s| super::crypto::parse_fixed_hex::<8>(&s))
-        .unwrap_or_else(rand::random);
+    {
+        return fixed;
+    }
+    rand::random()
+}
+
+/// A random ExportedSessionKey and the `EncryptedRandomSessionKey` field
+/// that carries it: the key encrypted with RC4 under `key_exchange_key`
+/// (NEGOTIATE_KEY_EXCH).
+///
+/// `CREDSSP_FIXED_RSK` pins the key for deterministic tests. It is honoured
+/// only in debug builds with the internal `__internal` feature; every other
+/// build reads the key from the operating system, not from the thread-local
+/// generator (see `random_session_key`).
+fn exchanged_session_key(
+    key_exchange_key: &[u8; 16],
+) -> Result<(Zeroizing<[u8; 16]>, Vec<u8>), NtlmError> {
+    #[cfg(all(debug_assertions, feature = "__internal"))]
+    let fixed = std::env::var("CREDSSP_FIXED_RSK")
+        .ok()
+        .and_then(|s| super::crypto::parse_fixed_hex::<16>(&s));
     #[cfg(not(all(debug_assertions, feature = "__internal")))]
-    let client_challenge: [u8; 8] = rand::random();
+    let fixed: Option<[u8; 16]> = None;
+    let key = match fixed {
+        Some(key) => Zeroizing::new(key),
+        None => random_session_key()?,
+    };
+    let mut encrypted = *key;
+    Rc4State::new(key_exchange_key).process(&mut encrypted);
+    Ok((key, encrypted.to_vec()))
+}
+
+/// The `LmChallengeResponse` field.
+///
+/// With a MIC (CredSSP, or NTLMv2 with a timestamp in the target info) it
+/// MUST be 24 zero bytes, to prevent replay attacks (MS-NLMP 3.1.5.1.2; it
+/// is what `pyspnego._ntlm._compute_response` does). Otherwise it is the
+/// LMv2 response.
+fn lm_response(
+    ntlmv2_hash: &[u8],
+    server_challenge: &[u8; 8],
+    client_challenge: &[u8; 8],
+    mic: bool,
+) -> Vec<u8> {
+    if mic {
+        return vec![0u8; 24];
+    }
+    let lm_input = [server_challenge.as_slice(), client_challenge].concat();
+    let lm_hash = *hmac_md5_secret(ntlmv2_hash, &lm_input);
+    [lm_hash.as_slice(), client_challenge].concat()
+}
+
+/// The fields of a Type 3, ready to be laid out.
+struct Type3Fields<'a> {
+    flags: u32,
+    /// Whether the header holds a MIC field.
+    mic: bool,
+    lm_response: &'a [u8],
+    nt_response: &'a [u8],
+    domain: &'a [u8],
+    user: &'a [u8],
+    workstation: &'a [u8],
+    encrypted_session_key: &'a [u8],
+}
+
+impl Type3Fields<'_> {
+    /// The message, and the offset of its MIC field (16 zero bytes, when the
+    /// header holds one).
+    ///
+    /// The header is 64 bytes up to the flags, then 8 for the OS version
+    /// with NEGOTIATE_VERSION, then 16 for the MIC.
+    fn encode(&self) -> Result<(Vec<u8>, usize), NtlmError> {
+        let include_version = self.flags & NEGOTIATE_VERSION != 0;
+        let header_size: usize = match (include_version, self.mic) {
+            (false, false) => 64,
+            (true, false) => 64 + 8,
+            (false, true) => 64 + 16,
+            (true, true) => 64 + 8 + 16,
+        };
+
+        // Every length is checked against the 16-bit field first; the offsets
+        // are then summed in `usize` and each is checked against the 32-bit
+        // field.
+        let lm_len = len16("LmChallengeResponse", self.lm_response.len())?;
+        let nt_len = len16("NtChallengeResponse", self.nt_response.len())?;
+        let domain_len = len16("DomainName", self.domain.len())?;
+        let user_len = len16("UserName", self.user.len())?;
+        let ws_len = len16("Workstation", self.workstation.len())?;
+        let session_len = len16(
+            "EncryptedRandomSessionKey",
+            self.encrypted_session_key.len(),
+        )?;
+
+        let mut offset = header_size;
+        let lm_offset = place(&mut offset, lm_len)?;
+        let nt_offset = place(&mut offset, nt_len)?;
+        let domain_offset = place(&mut offset, domain_len)?;
+        let user_offset = place(&mut offset, user_len)?;
+        let ws_offset = place(&mut offset, ws_len)?;
+        let session_offset = place(&mut offset, session_len)?;
+        // The end of the payload is the message length, which has to fit too.
+        to_u32("message", offset)?;
+
+        let mut msg = Vec::with_capacity(offset);
+
+        // Header
+        msg.extend_from_slice(SIGNATURE);
+        msg.extend_from_slice(&3u32.to_le_bytes());
+        write_security_buffer(&mut msg, lm_len, lm_offset);
+        write_security_buffer(&mut msg, nt_len, nt_offset);
+        write_security_buffer(&mut msg, domain_len, domain_offset);
+        write_security_buffer(&mut msg, user_len, user_offset);
+        write_security_buffer(&mut msg, ws_len, ws_offset);
+        write_security_buffer(&mut msg, session_len, session_offset);
+        msg.extend_from_slice(&self.flags.to_le_bytes());
+        if include_version {
+            msg.extend_from_slice(&[0, 12, 1, 0, 0, 0, 0, 15]);
+        }
+        let mic_pos = msg.len();
+        if self.mic {
+            msg.extend_from_slice(&[0u8; 16]); // placeholder
+        }
+
+        // Payload
+        msg.extend_from_slice(self.lm_response);
+        msg.extend_from_slice(self.nt_response);
+        msg.extend_from_slice(self.domain);
+        msg.extend_from_slice(self.user);
+        msg.extend_from_slice(self.workstation);
+        msg.extend_from_slice(self.encrypted_session_key);
+        Ok((msg, mic_pos))
+    }
+}
+
+/// Build an NTLM Type 3 with full control over flags, key exchange and MIC.
+/// Returns the message and the exported session key.
+fn create_authenticate_message_full(
+    input: &AuthenticateInput<'_>,
+) -> Result<(Vec<u8>, Zeroizing<[u8; 16]>), NtlmError> {
+    let challenge = input.challenge;
+    let nt_hash = compute_nt_hash(input.password);
+    let ntlmv2_hash = compute_ntlmv2_hash(&nt_hash, input.username, input.domain);
+
+    let client_challenge = client_challenge();
     let timestamp = challenge.timestamp.unwrap_or_else(current_windows_filetime);
 
     let target_info = authenticate_target_info(
         &challenge.target_info,
-        channel_bindings.as_ref(),
-        target_name,
-        mic_input.is_some(),
+        input.channel_bindings.as_ref(),
+        input.target_name,
+        input.mic_input.is_some(),
     )?;
 
     let blob = build_ntlmv2_blob(&timestamp, &client_challenge, &target_info);
@@ -425,143 +564,53 @@ pub(crate) fn create_authenticate_message_full(
     let proof_input = [challenge.server_challenge.as_slice(), &blob].concat();
     let nt_proof_str = *hmac_md5_secret(ntlmv2_hash.as_slice(), &proof_input);
 
-    // SessionBaseKey = HMAC-MD5(NTLMv2_Hash, NTProofStr)  (MS-NLMP 3.3.2)
+    // SessionBaseKey = HMAC-MD5(NTLMv2_Hash, NTProofStr)  (MS-NLMP 3.3.2).
+    // For NTLMv2 with EXTENDED_SESSIONSECURITY it is the KeyExchangeKey too.
     let session_base_key = hmac_md5_secret(ntlmv2_hash.as_slice(), &nt_proof_str);
 
-    // For NTLMv2 with EXTENDED_SESSIONSECURITY, KeyExchangeKey == SessionBaseKey
-    let key_exchange_key = &*session_base_key;
-
-    // If NEGOTIATE_KEY_EXCH: generate random ExportedSessionKey, encrypt with RC4
-    // Otherwise: ExportedSessionKey = KeyExchangeKey
-    let (exported_session_key, encrypted_random_session_key) = if with_key_exch {
-        // CREDSSP_FIXED_RSK pins the session key for deterministic tests. It is
-        // honoured only in debug builds with the internal `__internal` feature;
-        // every other build reads the key from the operating system, not from
-        // the thread-local generator (see `random_session_key`).
-        let random_key: Zeroizing<[u8; 16]> = {
-            #[cfg(all(debug_assertions, feature = "__internal"))]
-            let from_env = std::env::var("CREDSSP_FIXED_RSK")
-                .ok()
-                .and_then(|s| super::crypto::parse_fixed_hex::<16>(&s));
-            #[cfg(not(all(debug_assertions, feature = "__internal")))]
-            let from_env: Option<[u8; 16]> = None;
-            match from_env {
-                Some(key) => Zeroizing::new(key),
-                None => random_session_key()?,
-            }
+    // With NEGOTIATE_KEY_EXCH the ExportedSessionKey is random and travels
+    // encrypted; otherwise it is the KeyExchangeKey.
+    let (exported_session_key, encrypted_random_session_key) =
+        if input.flags & NEGOTIATE_KEY_EXCH != 0 {
+            exchanged_session_key(&session_base_key)?
+        } else {
+            (Zeroizing::new(*session_base_key), Vec::new())
         };
-        let mut encrypted = *random_key;
-        let mut rc4 = Rc4State::new(key_exchange_key);
-        rc4.process(&mut encrypted);
-        (random_key, encrypted.to_vec())
-    } else {
-        (Zeroizing::new(*key_exchange_key), Vec::new())
-    };
 
     // NT response = NTProofStr + blob
     let nt_response = [nt_proof_str.as_slice(), &blob].concat();
-
-    // LM response
-    // When a MIC is required (CredSSP / NTLMv2 with timestamp present in target_info)
-    // the LM response MUST be 24 zero bytes to prevent replay attacks (MS-NLMP 3.1.5.1.2,
-    // and matches pyspnego._ntlm._compute_response).
-    let lm_response: Vec<u8> = if mic_input.is_some() {
-        vec![0u8; 24]
-    } else {
-        let mut lm_input = Vec::with_capacity(16);
-        lm_input.extend_from_slice(&challenge.server_challenge);
-        lm_input.extend_from_slice(&client_challenge);
-        let lm_hash = *hmac_md5_secret(ntlmv2_hash.as_slice(), &lm_input);
-        let mut v = Vec::with_capacity(24);
-        v.extend_from_slice(&lm_hash);
-        v.extend_from_slice(&client_challenge);
-        v
+    let lm_response = lm_response(
+        ntlmv2_hash.as_slice(),
+        &challenge.server_challenge,
+        &client_challenge,
+        input.mic_input.is_some(),
+    );
+    let fields = Type3Fields {
+        flags: input.flags,
+        mic: input.mic_input.is_some(),
+        lm_response: &lm_response,
+        nt_response: &nt_response,
+        // The domain shown in the field may differ from the one of the hash.
+        domain: &to_utf16le(input.display_domain.unwrap_or(input.domain)),
+        user: &to_utf16le(input.username),
+        // The name the caller gives; empty when no MIC is required.
+        workstation: if input.mic_input.is_some() {
+            input.workstation
+        } else {
+            &[]
+        },
+        encrypted_session_key: &encrypted_random_session_key,
     };
-
-    // Domain shown in the Type 3 SB (may differ from `domain` used for the hash)
-    let domain_for_sb = display_domain.unwrap_or(domain);
-    let domain_bytes = to_utf16le(domain_for_sb);
-    let user_bytes = to_utf16le(username);
-    // Workstation: the name the caller gives (UTF-16LE); empty when no MIC is
-    // required.
-    let workstation_bytes: &[u8] = if mic_input.is_some() {
-        workstation
-    } else {
-        &[]
-    };
-
-    // Build Type 3 message
-    // Header layout depends on NEGOTIATE_VERSION and MIC presence:
-    //   - 64 bytes base (fields up to flags)
-    //   - +8 bytes for OS version if NEGOTIATE_VERSION is set
-    //   - +16 bytes for MIC if mic_input is provided
-    let include_version = flags & NEGOTIATE_VERSION != 0;
-    let include_mic = mic_input.is_some();
-    let header_size: usize = match (include_version, include_mic) {
-        (false, false) => 64,
-        (true, false) => 64 + 8,
-        (false, true) => 64 + 16,
-        (true, true) => 64 + 8 + 16,
-    };
-
-    // Every length is checked against the 16-bit field first; the offsets are
-    // then summed in `usize` and each is checked against the 32-bit field.
-    let lm_len = len16("LmChallengeResponse", lm_response.len())?;
-    let nt_len = len16("NtChallengeResponse", nt_response.len())?;
-    let domain_len = len16("DomainName", domain_bytes.len())?;
-    let user_len = len16("UserName", user_bytes.len())?;
-    let ws_len = len16("Workstation", workstation_bytes.len())?;
-    let session_len = len16(
-        "EncryptedRandomSessionKey",
-        encrypted_random_session_key.len(),
-    )?;
-
-    let mut offset = header_size;
-    let lm_offset = place(&mut offset, lm_len)?;
-    let nt_offset = place(&mut offset, nt_len)?;
-    let domain_offset = place(&mut offset, domain_len)?;
-    let user_offset = place(&mut offset, user_len)?;
-    let ws_offset = place(&mut offset, ws_len)?;
-    let session_offset = place(&mut offset, session_len)?;
-    // The end of the payload is the message length, which has to fit too.
-    to_u32("message", offset)?;
-
-    let mut msg = Vec::with_capacity(offset);
-
-    // Header
-    msg.extend_from_slice(SIGNATURE);
-    msg.extend_from_slice(&3u32.to_le_bytes());
-    write_security_buffer(&mut msg, lm_len, lm_offset);
-    write_security_buffer(&mut msg, nt_len, nt_offset);
-    write_security_buffer(&mut msg, domain_len, domain_offset);
-    write_security_buffer(&mut msg, user_len, user_offset);
-    write_security_buffer(&mut msg, ws_len, ws_offset);
-    write_security_buffer(&mut msg, session_len, session_offset);
-    msg.extend_from_slice(&flags.to_le_bytes());
-    if include_version {
-        msg.extend_from_slice(&[0, 12, 1, 0, 0, 0, 0, 15]);
-    }
-    let mic_pos = msg.len();
-    if include_mic {
-        msg.extend_from_slice(&[0u8; 16]); // placeholder
-    }
-
-    // Payload
-    msg.extend_from_slice(&lm_response);
-    msg.extend_from_slice(&nt_response);
-    msg.extend_from_slice(&domain_bytes);
-    msg.extend_from_slice(&user_bytes);
-    msg.extend_from_slice(workstation_bytes);
-    msg.extend_from_slice(&encrypted_random_session_key);
+    let (mut msg, mic_pos) = fields.encode()?;
 
     // Compute and patch MIC if requested
-    if let Some((type1, type2)) = mic_input {
-        let input = [type1, type2, &msg].concat();
-        let mic = *hmac_md5_secret(exported_session_key.as_slice(), &input);
+    if let Some((type1, type2)) = input.mic_input {
+        let mic_input = [type1, type2, &msg].concat();
+        let mic = *hmac_md5_secret(exported_session_key.as_slice(), &mic_input);
         #[expect(
             clippy::indexing_slicing,
             clippy::arithmetic_side_effects,
-            reason = "the 16-byte MIC placeholder was pushed at `mic_pos` above"
+            reason = "the 16-byte MIC placeholder was pushed at `mic_pos` by `encode`"
         )]
         msg[mic_pos..mic_pos + 16].copy_from_slice(&mic);
 
@@ -596,13 +645,6 @@ pub(crate) fn create_authenticate_message_full(
     }
 
     Ok((msg, exported_session_key))
-}
-
-// Only used inside the CREDSSP_DEBUG block, which exists only in debug builds
-// with the internal `__internal` feature (and by the unit tests).
-#[cfg(any(test, all(debug_assertions, feature = "__internal")))]
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{:02x}", x)).collect()
 }
 
 /// Create an NTLM Type 3 (Authenticate) message (MS-NLMP 2.2.1.3).
@@ -692,24 +734,23 @@ pub(crate) fn create_authenticate_message_credssp(
     type1_bytes: &[u8],
     type2_bytes: &[u8],
 ) -> Result<(Vec<u8>, Zeroizing<[u8; 16]>), NtlmError> {
-    let flags = (challenge.negotiate_flags & !TYPE3_NEVER_ECHO)
-        | NEGOTIATE_KEY_EXCH
-        | NEGOTIATE_SEAL
-        | NEGOTIATE_SIGN
-        | NEGOTIATE_VERSION;
-    create_authenticate_message_full(
+    create_authenticate_message_full(&AuthenticateInput {
         challenge,
         username,
         password,
         domain,
-        None,
-        flags,
-        true,
-        Some((type1_bytes, type2_bytes)),
-        Some(spn),
-        Some(""), // empty domain in Type 3 SB for local accounts
-        workstation(),
-    )
+        // An empty domain in the field, as for a local account.
+        display_domain: Some(""),
+        flags: (challenge.negotiate_flags & !TYPE3_NEVER_ECHO)
+            | NEGOTIATE_KEY_EXCH
+            | NEGOTIATE_SEAL
+            | NEGOTIATE_SIGN
+            | NEGOTIATE_VERSION,
+        channel_bindings: None,
+        mic_input: Some((type1_bytes, type2_bytes)),
+        target_name: Some(spn),
+        workstation: workstation(),
+    })
 }
 
 /// Encode an NTLM message (Type 1 or Type 3) for the HTTP `Authorization` header.

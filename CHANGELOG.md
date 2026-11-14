@@ -134,6 +134,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (`cargo hack clippy --feature-powerset`, 8 runs) instead of two. No API
   change; a build with `credssp` and without `__internal` no longer
   compiles those two readers.
+- No function of the library is longer than 100 lines any more
+  (`clippy::too_many_lines`); six were, the longest being the CredSSP
+  handshake (258 lines). That handshake is now a sequence of named steps:
+  the round that posts a token and reads the one that answers, the inner
+  TLS handshake, the client proof, the check of the server's, the
+  delegation. The NTLM handshake is its negotiate round, the Type 3 that
+  answers the challenge and the final request; the Type 3 builder takes a
+  structure instead of eleven positional arguments and reads the key
+  exchange from the flags; the CLIXML decoder has one method per mode; the
+  transport constructor and the SOCKS5 dial are split the same way. The
+  steps that hold the exported session key or the cleartext TSCredentials
+  are plain functions, not `async`: the compiler, where a comment used to,
+  keeps them out of the state of a future. No behaviour change: same
+  requests in the same order, same error messages. The debug-only
+  `CREDSSP_DUMP` lines keep their names; `inner_cert_der` now comes first.
 
 ### Documentation
 

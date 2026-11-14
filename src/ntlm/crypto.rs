@@ -635,5 +635,18 @@ pub(crate) fn parse_fixed_hex<const N: usize>(s: &str) -> Option<[u8; N]> {
     Some(out)
 }
 
+/// `bytes` in lowercase hexadecimal, for the debug-only dumps
+/// (`CREDSSP_DEBUG`, `CREDSSP_DUMP`).
+#[cfg(any(test, all(debug_assertions, feature = "__internal")))]
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        // Writing to a `String` cannot fail.
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests;

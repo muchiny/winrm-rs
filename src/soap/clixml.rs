@@ -67,6 +67,7 @@
 //! The output depends only on the bytes, never on how they were sliced.
 
 use std::fmt;
+use std::ops::ControlFlow::{self, Break, Continue};
 
 use super::scan::NextMatch;
 
@@ -191,184 +192,217 @@ impl ClixmlDecoder {
         out
     }
 
+    /// Decode from `start` as far as the bytes in `pending` allow, one step
+    /// of the current mode after another, advancing `start` past what is
+    /// consumed.
     fn drain_from(&mut self, start: &mut usize, eof: bool) -> Vec<u8> {
         let mut out = Vec::new();
         loop {
-            let view = self.pending.get(*start..).unwrap_or_default();
-            match self.mode {
-                Mode::Text => {
-                    let documents = self.held_marker.is_some();
-                    let Some((pos, line)) = find_line_start(view, self.at_line_start, documents)
-                    else {
-                        // Hold back a trailing `#< CL...` that the next slice
-                        // may complete into a marker and, while a marker is
-                        // held, a trailing `<Obj...` that starts a line.
-                        let keep = if eof {
-                            0
-                        } else if documents {
-                            partial_marker_len(view)
-                                .max(partial_document_len(view, self.at_line_start))
-                        } else {
-                            partial_marker_len(view)
-                        };
-                        let ready = view.len().saturating_sub(keep);
-                        self.emit_text(&mut out, start, ready);
-                        return out;
-                    };
-                    if line == LineStart::Document {
-                        // The document the held marker announced.
-                        self.emit_text(&mut out, start, pos);
-                        self.held_marker = None;
-                        self.enter(Mode::Root);
-                        continue;
-                    }
-                    let after = pos.saturating_add(MARKER.len());
-                    let header = view.get(after..).unwrap_or_default();
-                    match classify_header(header, eof, true) {
-                        Header::Document(blank) => {
-                            self.emit_text(&mut out, start, pos);
-                            *start = start.saturating_add(MARKER.len()).saturating_add(blank);
-                            self.enter(Mode::Root);
-                        }
-                        Header::Marker(blank) => {
-                            // Drop this marker; the one after it is read as
-                            // if it stood here, at a line start.
-                            self.emit_text(&mut out, start, pos);
-                            *start = start.saturating_add(MARKER.len()).saturating_add(blank);
-                            self.at_line_start = true;
-                        }
-                        Header::Line(marker_line) if !documents => {
-                            // Hold the marker line back for a later document
-                            // and go on with the text after it.
-                            self.emit_text(&mut out, start, pos);
-                            *start = start.saturating_add(marker_line.len());
-                            self.held_marker = Some(marker_line);
-                            self.at_line_start = true;
-                        }
-                        Header::Line(_) | Header::Text => self.emit_text(&mut out, start, after),
-                        Header::Wait => {
-                            // Wait for the bytes that tell what follows.
-                            self.emit_text(&mut out, start, pos);
-                            return out;
-                        }
-                    }
-                }
-                Mode::AfterDocument => match classify_header(view, eof, false) {
-                    Header::Document(blank) => {
-                        *start = start.saturating_add(blank);
-                        // Like a line starting with `<Objs`, this document
-                        // has no marker of its own: it takes a held one.
-                        self.held_marker = None;
-                        self.enter(Mode::Root);
-                    }
-                    Header::Wait => return out,
-                    // `Marker` and `Line` are never returned here: markers are
-                    // not looked for after a document.
-                    Header::Text | Header::Marker(_) | Header::Line(_) => {
-                        self.enter(Mode::Text);
-                        self.at_line_start = true;
-                    }
-                },
-                Mode::Root => {
-                    let window = view.get(..MAX_PENDING).unwrap_or(view);
-                    if let Some(end) = find_byte_from(window, self.scan.pos, b'>') {
-                        let len = end.saturating_add(1);
-                        let empty = window.get(..len).is_some_and(|tag| tag.ends_with(b"/>"));
-                        *start = start.saturating_add(len);
-                        self.enter(if empty {
-                            Mode::AfterDocument
-                        } else {
-                            Mode::Body
-                        });
-                    } else if view.len() > MAX_PENDING {
-                        self.give_up();
-                    } else if eof {
-                        // The stream ended inside the root start tag: there is
-                        // no record to decode, and the truncated tag is
-                        // dropped (it is CLIXML framing, not text).
-                        *start = self.pending.len();
-                        return out;
-                    } else {
-                        self.scan.pos = window.len();
-                        return out;
-                    }
-                }
-                Mode::Body => {
-                    let body = view.trim_ascii_start();
-                    let blank = view.len().saturating_sub(body.len());
-                    *start = start.saturating_add(blank);
-                    if body.is_empty() {
-                        return out;
-                    }
-                    let kind = match classify_item(body) {
-                        Item::Tag(kind) => kind,
-                        Item::End => {
-                            *start = start.saturating_add(DOCUMENT_END.len());
-                            self.close_document();
-                            continue;
-                        }
-                        Item::Wait if !eof => return out,
-                        Item::Wait | Item::Text => {
-                            // Not CLIXML: stderr written while the document
-                            // is open. Its first byte goes out here, the rest
-                            // in `BodyText`.
-                            self.emit_text(&mut out, start, 1);
-                            self.enter(Mode::BodyText);
-                            continue;
-                        }
-                    };
-                    let window = body.get(..MAX_PENDING).unwrap_or(body);
-                    match scan_item(window, kind, self.scan) {
-                        Step::Complete { len } => {
-                            let item = window.get(..len).unwrap_or_default();
-                            if kind != Kind::Root {
-                                out.extend(decode_record(item));
-                            } else if !item.ends_with(b"/>") {
-                                // A document inside this one: its root tag
-                                // is framing, its records are read like the
-                                // others.
-                                self.nested = self.nested.saturating_add(1);
-                            }
-                            *start = start.saturating_add(len);
-                            self.enter(Mode::Body);
-                        }
-                        Step::Text { len } => {
-                            // Not well-formed, so not a record: these bytes
-                            // are text, and the `<` after them is read
-                            // afresh.
-                            self.emit_text(&mut out, start, len);
-                            self.enter(Mode::Body);
-                        }
-                        Step::Partial(_) if body.len() > MAX_PENDING => self.give_up(),
-                        Step::Partial(_) if eof && kind == Kind::Root => {
-                            // No `>` came: nothing shows it was a root tag.
-                            let rest = self.pending.len().saturating_sub(*start);
-                            self.emit_text(&mut out, start, rest);
-                            return out;
-                        }
-                        Step::Partial(_) if eof => {
-                            out.extend(decode_record(body));
-                            *start = self.pending.len();
-                            return out;
-                        }
-                        Step::Partial(scan) => {
-                            self.scan = scan;
-                            return out;
-                        }
-                    }
-                }
-                Mode::BodyText => {
-                    // Release the text up to the next `<`, which may start a
-                    // record or a root tag: `Body` decides.
-                    let next_tag = find_byte_from(view, 0, b'<');
-                    self.emit_text(&mut out, start, next_tag.unwrap_or(view.len()));
-                    if next_tag.is_none() {
-                        return out;
-                    }
-                    self.enter(Mode::Body);
-                }
+            let step = match self.mode {
+                Mode::Text => self.drain_text(&mut out, start, eof),
+                Mode::AfterDocument => self.drain_after_document(start, eof),
+                Mode::Root => self.drain_root(start, eof),
+                Mode::Body => self.drain_body(&mut out, start, eof),
+                Mode::BodyText => self.drain_body_text(&mut out, start),
+            };
+            if step.is_break() {
+                return out;
             }
         }
+    }
+
+    /// A step in plain text: release it up to the next marker, or up to the
+    /// document a held marker announced. `Break` when the bytes at hand do
+    /// not tell what comes next.
+    fn drain_text(&mut self, out: &mut Vec<u8>, start: &mut usize, eof: bool) -> ControlFlow<()> {
+        let view = self.pending.get(*start..).unwrap_or_default();
+        let documents = self.held_marker.is_some();
+        let Some((pos, line)) = find_line_start(view, self.at_line_start, documents) else {
+            // Hold back a trailing `#< CL...` that the next slice
+            // may complete into a marker and, while a marker is
+            // held, a trailing `<Obj...` that starts a line.
+            let keep = if eof {
+                0
+            } else if documents {
+                partial_marker_len(view).max(partial_document_len(view, self.at_line_start))
+            } else {
+                partial_marker_len(view)
+            };
+            let ready = view.len().saturating_sub(keep);
+            self.emit_text(out, start, ready);
+            return Break(());
+        };
+        if line == LineStart::Document {
+            // The document the held marker announced.
+            self.emit_text(out, start, pos);
+            self.held_marker = None;
+            self.enter(Mode::Root);
+            return Continue(());
+        }
+        let after = pos.saturating_add(MARKER.len());
+        let header = view.get(after..).unwrap_or_default();
+        match classify_header(header, eof, true) {
+            Header::Document(blank) => {
+                self.emit_text(out, start, pos);
+                *start = start.saturating_add(MARKER.len()).saturating_add(blank);
+                self.enter(Mode::Root);
+            }
+            Header::Marker(blank) => {
+                // Drop this marker; the one after it is read as
+                // if it stood here, at a line start.
+                self.emit_text(out, start, pos);
+                *start = start.saturating_add(MARKER.len()).saturating_add(blank);
+                self.at_line_start = true;
+            }
+            Header::Line(marker_line) if !documents => {
+                // Hold the marker line back for a later document
+                // and go on with the text after it.
+                self.emit_text(out, start, pos);
+                *start = start.saturating_add(marker_line.len());
+                self.held_marker = Some(marker_line);
+                self.at_line_start = true;
+            }
+            Header::Line(_) | Header::Text => self.emit_text(out, start, after),
+            Header::Wait => {
+                // Wait for the bytes that tell what follows.
+                self.emit_text(out, start, pos);
+                return Break(());
+            }
+        }
+        Continue(())
+    }
+
+    /// A step just after `</Objs>`: another document, or plain text again.
+    fn drain_after_document(&mut self, start: &mut usize, eof: bool) -> ControlFlow<()> {
+        let view = self.pending.get(*start..).unwrap_or_default();
+        match classify_header(view, eof, false) {
+            Header::Document(blank) => {
+                *start = start.saturating_add(blank);
+                // Like a line starting with `<Objs`, this document
+                // has no marker of its own: it takes a held one.
+                self.held_marker = None;
+                self.enter(Mode::Root);
+            }
+            Header::Wait => return Break(()),
+            // `Marker` and `Line` are never returned here: markers are
+            // not looked for after a document.
+            Header::Text | Header::Marker(_) | Header::Line(_) => {
+                self.enter(Mode::Text);
+                self.at_line_start = true;
+            }
+        }
+        Continue(())
+    }
+
+    /// A step at a document's `<Objs ...>` start tag: skip it once it has
+    /// ended.
+    fn drain_root(&mut self, start: &mut usize, eof: bool) -> ControlFlow<()> {
+        let view = self.pending.get(*start..).unwrap_or_default();
+        let window = view.get(..MAX_PENDING).unwrap_or(view);
+        if let Some(end) = find_byte_from(window, self.scan.pos, b'>') {
+            let len = end.saturating_add(1);
+            let empty = window.get(..len).is_some_and(|tag| tag.ends_with(b"/>"));
+            *start = start.saturating_add(len);
+            self.enter(if empty {
+                Mode::AfterDocument
+            } else {
+                Mode::Body
+            });
+        } else if view.len() > MAX_PENDING {
+            self.give_up();
+        } else if eof {
+            // The stream ended inside the root start tag: there is
+            // no record to decode, and the truncated tag is
+            // dropped (it is CLIXML framing, not text).
+            *start = self.pending.len();
+            return Break(());
+        } else {
+            self.scan.pos = window.len();
+            return Break(());
+        }
+        Continue(())
+    }
+
+    /// A step inside a document, before its next item: decode a record, open
+    /// or close a document, or release what is not CLIXML as text.
+    fn drain_body(&mut self, out: &mut Vec<u8>, start: &mut usize, eof: bool) -> ControlFlow<()> {
+        let view = self.pending.get(*start..).unwrap_or_default();
+        let body = view.trim_ascii_start();
+        let blank = view.len().saturating_sub(body.len());
+        *start = start.saturating_add(blank);
+        if body.is_empty() {
+            return Break(());
+        }
+        let kind = match classify_item(body) {
+            Item::Tag(kind) => kind,
+            Item::End => {
+                *start = start.saturating_add(DOCUMENT_END.len());
+                self.close_document();
+                return Continue(());
+            }
+            Item::Wait if !eof => return Break(()),
+            Item::Wait | Item::Text => {
+                // Not CLIXML: stderr written while the document
+                // is open. Its first byte goes out here, the rest
+                // in `BodyText`.
+                self.emit_text(out, start, 1);
+                self.enter(Mode::BodyText);
+                return Continue(());
+            }
+        };
+        let window = body.get(..MAX_PENDING).unwrap_or(body);
+        match scan_item(window, kind, self.scan) {
+            Step::Complete { len } => {
+                let item = window.get(..len).unwrap_or_default();
+                if kind != Kind::Root {
+                    out.extend(decode_record(item));
+                } else if !item.ends_with(b"/>") {
+                    // A document inside this one: its root tag
+                    // is framing, its records are read like the
+                    // others.
+                    self.nested = self.nested.saturating_add(1);
+                }
+                *start = start.saturating_add(len);
+                self.enter(Mode::Body);
+            }
+            Step::Text { len } => {
+                // Not well-formed, so not a record: these bytes
+                // are text, and the `<` after them is read
+                // afresh.
+                self.emit_text(out, start, len);
+                self.enter(Mode::Body);
+            }
+            Step::Partial(_) if body.len() > MAX_PENDING => self.give_up(),
+            Step::Partial(_) if eof && kind == Kind::Root => {
+                // No `>` came: nothing shows it was a root tag.
+                let rest = self.pending.len().saturating_sub(*start);
+                self.emit_text(out, start, rest);
+                return Break(());
+            }
+            Step::Partial(_) if eof => {
+                out.extend(decode_record(body));
+                *start = self.pending.len();
+                return Break(());
+            }
+            Step::Partial(scan) => {
+                self.scan = scan;
+                return Break(());
+            }
+        }
+        Continue(())
+    }
+
+    /// A step in stderr text inside a document: release it up to the next
+    /// `<`, which may start a record or a root tag (`Body` decides).
+    fn drain_body_text(&mut self, out: &mut Vec<u8>, start: &mut usize) -> ControlFlow<()> {
+        let view = self.pending.get(*start..).unwrap_or_default();
+        let next_tag = find_byte_from(view, 0, b'<');
+        self.emit_text(out, start, next_tag.unwrap_or(view.len()));
+        if next_tag.is_none() {
+            return Break(());
+        }
+        self.enter(Mode::Body);
+        Continue(())
     }
 
     /// Switch to `mode` with no item partly scanned.

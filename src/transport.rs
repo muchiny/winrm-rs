@@ -857,6 +857,107 @@ fn build_http_client(
     builder.build().map_err(WinrmError::Http)
 }
 
+/// Refuses a configuration whose encryption mode the auth method cannot
+/// honour, before anything else is read or built.
+fn check_encryption_policy(config: &WinrmConfig) -> Result<(), WinrmError> {
+    // Basic over plain HTTP puts the password and every body on the wire in
+    // cleartext, so `Never` is the caller's explicit consent to that.
+    if matches!(config.auth_method, AuthMethod::Basic)
+        && !config.use_tls
+        && config.encryption != EncryptionMode::Never
+    {
+        return Err(WinrmError::AuthFailed(
+            "Basic auth over HTTP sends the password and every SOAP body in cleartext: use \
+             HTTPS (use_tls = true), or set encryption = EncryptionMode::Never to accept \
+             plaintext"
+                .into(),
+        ));
+    }
+    if config.encryption == EncryptionMode::Always
+        && !matches!(config.auth_method, AuthMethod::Ntlm | AuthMethod::Kerberos)
+    {
+        return Err(WinrmError::AuthFailed(format!(
+            "EncryptionMode::Always: winrm-rs seals SOAP bodies only with NTLM and \
+             Kerberos and does not seal {}; use EncryptionMode::Auto, where HTTPS protects \
+             the bodies",
+            method_name(&config.auth_method)
+        )));
+    }
+    Ok(())
+}
+
+/// The client certificate and key of Certificate auth; `None` for the other
+/// methods.
+///
+/// Loaded when the transport is built, so a bad path or PEM fails at
+/// construction. It is presented through the rustls config of the shared
+/// client (`reqwest::Identity` would be discarded by
+/// `tls_backend_preconfigured`).
+fn load_client_auth(config: &WinrmConfig) -> Result<Option<ClientAuthCert>, WinrmError> {
+    if !matches!(config.auth_method, AuthMethod::Certificate) {
+        return Ok(None);
+    }
+    // Checked before any file is read: over plain HTTP there is no handshake
+    // to present the certificate in.
+    if !config.use_tls {
+        return Err(WinrmError::AuthFailed(
+            "Certificate auth requires HTTPS (set use_tls = true)".into(),
+        ));
+    }
+    let cert_path = config.client_cert_pem.as_deref().ok_or_else(|| {
+        WinrmError::AuthFailed("Certificate auth requires client_cert_pem".into())
+    })?;
+    let key_path = config
+        .client_key_pem
+        .as_deref()
+        .ok_or_else(|| WinrmError::AuthFailed("Certificate auth requires client_key_pem".into()))?;
+    crate::tls::load_client_auth_cert(cert_path, key_path).map(Some)
+}
+
+/// Warns about what Basic and NTLM leave unprotected over plain HTTP.
+fn warn_plain_http(config: &WinrmConfig) {
+    if config.use_tls {
+        return;
+    }
+    if matches!(config.auth_method, AuthMethod::Basic) {
+        tracing::warn!(
+            "Basic auth over HTTP transmits credentials in cleartext (EncryptionMode::Never) — \
+             use HTTPS in production"
+        );
+    }
+    if matches!(config.auth_method, AuthMethod::Ntlm) {
+        tracing::warn!(
+            target: "winrm_rs::ntlm_over_http",
+            sealed = config.encryption != EncryptionMode::Never,
+            "NTLM over plain HTTP: the handshake does not authenticate the server and is \
+             not bound to the connection, so a party on the network path can relay it, \
+             or record it to guess the password offline; sealing protects only the SOAP \
+             bodies. Use HTTPS (the default, WinrmConfig::https()) or Kerberos"
+        );
+    }
+}
+
+/// The rustls configuration of the shared client over HTTPS: `verifier`
+/// authenticates the server, and `client_auth` is presented when there is
+/// one (Certificate auth).
+fn origin_client_tls(
+    provider: &Arc<CryptoProvider>,
+    verifier: Arc<dyn ServerCertVerifier>,
+    client_auth: Option<ClientAuthCert>,
+) -> Result<rustls::ClientConfig, WinrmError> {
+    let builder = crate::tls::client_config_builder(provider)?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier);
+    match client_auth {
+        Some(ClientAuthCert { chain, key }) => {
+            builder.with_client_auth_cert(chain, key).map_err(|e| {
+                WinrmError::AuthFailed(format!("client certificate and key rejected: {e}"))
+            })
+        }
+        None => Ok(builder.with_no_client_auth()),
+    }
+}
+
 /// The construction WARNs for a certificate that is not verified: the
 /// server's (`accept_invalid_certs`), and an `https://` proxy's
 /// (`danger_accept_invalid_proxy_certs`) when the route has such a proxy for
@@ -942,71 +1043,9 @@ impl HttpTransport {
     ) -> Result<Self, WinrmError> {
         debug!(tls_provider = ?opts.tls.provider, "TLS crypto provider choice");
 
-        // Refused before anything else is read or built. Basic over plain
-        // HTTP puts the password and every body on the wire in cleartext, so
-        // `Never` is the caller's explicit consent to that.
-        if matches!(config.auth_method, AuthMethod::Basic)
-            && !config.use_tls
-            && config.encryption != EncryptionMode::Never
-        {
-            return Err(WinrmError::AuthFailed(
-                "Basic auth over HTTP sends the password and every SOAP body in cleartext: use \
-                 HTTPS (use_tls = true), or set encryption = EncryptionMode::Never to accept \
-                 plaintext"
-                    .into(),
-            ));
-        }
-        if config.encryption == EncryptionMode::Always
-            && !matches!(config.auth_method, AuthMethod::Ntlm | AuthMethod::Kerberos)
-        {
-            return Err(WinrmError::AuthFailed(format!(
-                "EncryptionMode::Always: winrm-rs seals SOAP bodies only with NTLM and \
-                 Kerberos and does not seal {}; use EncryptionMode::Auto, where HTTPS protects \
-                 the bodies",
-                method_name(&config.auth_method)
-            )));
-        }
-
-        // Load the client certificate for Certificate auth here, so a bad path
-        // or PEM fails at construction. It is presented through the rustls
-        // config built below (`reqwest::Identity` would be discarded by
-        // `tls_backend_preconfigured`).
-        let client_auth = if matches!(config.auth_method, AuthMethod::Certificate) {
-            // Checked before any file is read: over plain HTTP there is no
-            // handshake to present the certificate in.
-            if !config.use_tls {
-                return Err(WinrmError::AuthFailed(
-                    "Certificate auth requires HTTPS (set use_tls = true)".into(),
-                ));
-            }
-            let cert_path = config.client_cert_pem.as_deref().ok_or_else(|| {
-                WinrmError::AuthFailed("Certificate auth requires client_cert_pem".into())
-            })?;
-            let key_path = config.client_key_pem.as_deref().ok_or_else(|| {
-                WinrmError::AuthFailed("Certificate auth requires client_key_pem".into())
-            })?;
-            Some(crate::tls::load_client_auth_cert(cert_path, key_path)?)
-        } else {
-            None
-        };
-
-        if matches!(config.auth_method, AuthMethod::Basic) && !config.use_tls {
-            tracing::warn!(
-                "Basic auth over HTTP transmits credentials in cleartext (EncryptionMode::Never) — \
-                 use HTTPS in production"
-            );
-        }
-
-        if matches!(config.auth_method, AuthMethod::Ntlm) && !config.use_tls {
-            tracing::warn!(
-                target: "winrm_rs::ntlm_over_http",
-                sealed = config.encryption != EncryptionMode::Never,
-                "NTLM over plain HTTP: the handshake does not authenticate the server and is \
-                 not bound to the connection, so a party on the network path can relay it, \
-                 or record it to guess the password offline; sealing protects only the SOAP \
-                 bodies. Use HTTPS (the default, WinrmConfig::https()) or Kerberos"
-            );
-        }
+        check_encryption_policy(&config)?;
+        let client_auth = load_client_auth(&config)?;
+        warn_plain_http(&config);
 
         if matches!(config.auth_method, AuthMethod::CredSsp) && !config.use_tls {
             return Err(WinrmError::AuthFailed(
@@ -1066,18 +1105,10 @@ impl HttpTransport {
                 Vec::new()
             };
         let (client_tls, server_verifier) = if config.use_tls {
-            let tls_builder = crate::tls::client_config_builder(&provider)?
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::clone(&origin));
-            let client_tls = match client_auth {
-                Some(ClientAuthCert { chain, key }) => {
-                    tls_builder.with_client_auth_cert(chain, key).map_err(|e| {
-                        WinrmError::AuthFailed(format!("client certificate and key rejected: {e}"))
-                    })?
-                }
-                None => tls_builder.with_no_client_auth(),
-            };
-            (client_tls, Some(origin))
+            (
+                origin_client_tls(&provider, Arc::clone(&origin), client_auth)?,
+                Some(origin),
+            )
         } else {
             // Plain HTTP: TLS only on the leg to an `https://` proxy.
             (crate::tls::plain_http_config(proxy, &provider)?, None)

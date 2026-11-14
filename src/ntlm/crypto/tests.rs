@@ -650,3 +650,11 @@ proptest::proptest! {
         }
     }
 }
+
+// Kills hex() returning "" or "xyzzy"
+#[test]
+fn hex_encodes_bytes() {
+    assert_eq!(hex(&[0xDE, 0xAD]), "dead");
+    assert_eq!(hex(&[]), "");
+    assert_eq!(hex(&[0x00, 0xFF]), "00ff");
+}

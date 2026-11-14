@@ -35,6 +35,21 @@ pub(crate) struct NtlmAuth {
     pub(crate) workstation: Option<Vec<u8>>,
 }
 
+/// The exported session key of a handshake, in a box: moving it moves a
+/// pointer, and the key is wiped when the box is dropped.
+pub(crate) type SessionKey = Box<Zeroizing<[u8; 16]>>;
+
+/// What the negotiate round of a handshake leaves for its Type 3.
+struct Negotiated {
+    /// The Type 1 that was sent: the MIC of the Type 3 covers it.
+    type1: Vec<u8>,
+    /// The `WWW-Authenticate` value of the `401`, which carries the Type 2.
+    www_auth: String,
+    /// The server certificate of the connection that carried the challenge,
+    /// when it is known.
+    peer_certificate: Option<Vec<u8>>,
+}
+
 /// Length of an NTLM message signature (MS-NLMP 2.2.2.9.1).
 const SIGNATURE_LEN: usize = 16;
 
@@ -108,7 +123,7 @@ impl NtlmAuth {
         http: &reqwest::Client,
         cert: Option<&crate::tls::CertHandle>,
         url: &str,
-    ) -> Result<(Box<Zeroizing<[u8; 16]>>, bool), WinrmError> {
+    ) -> Result<(SessionKey, bool), WinrmError> {
         let (_, session_key, closing) = self.do_handshake(http, cert, url, None).await?;
         Ok((session_key, closing))
     }
@@ -147,8 +162,23 @@ impl NtlmAuth {
         cert: Option<&crate::tls::CertHandle>,
         url: &str,
         body: Option<&str>,
-    ) -> Result<(String, Box<Zeroizing<[u8; 16]>>, bool), WinrmError> {
-        // Step 1: Send Type 1 (Negotiate) with empty body
+    ) -> Result<(String, SessionKey, bool), WinrmError> {
+        let negotiated = self.negotiate(http, cert, url).await?;
+        // Sealed (no SOAP body in the Type 3), the exchange must also grant
+        // signing, sealing and key exchange.
+        let (type3, session_key) = self.answer_challenge(url, &negotiated, body.is_none())?;
+        let (text, closing) = self.send_type3(http, url, &type3, body).await?;
+        Ok((text, session_key, closing))
+    }
+
+    /// Steps 1 and 2: send the Type 1 with an empty body and read the `401`
+    /// that carries the challenge.
+    async fn negotiate(
+        &self,
+        http: &reqwest::Client,
+        cert: Option<&crate::tls::CertHandle>,
+        url: &str,
+    ) -> Result<Negotiated, WinrmError> {
         let type1 = ntlm::create_negotiate_message();
         let auth_header = crate::auth::authorization_value(&ntlm::encode_authorization(&type1))?;
 
@@ -161,7 +191,6 @@ impl NtlmAuth {
             .await
             .map_err(crate::auth::send_error)?;
 
-        // Step 2: Parse Type 2 (Challenge) from 401 response
         if resp.status().as_u16() != 401 {
             return Err(WinrmError::AuthFailed(format!(
                 "expected 401 for NTLM negotiate, got {}",
@@ -185,10 +214,9 @@ impl NtlmAuth {
         // Over TLS, the channel binding token must come from the certificate
         // of the very connection that carried the challenge (the Type 3 goes
         // on the same one). Read it now, before the response is consumed.
-        let over_tls = url.starts_with("https://");
         let peer_certificate = match crate::auth::peer_certificate(&resp, cert) {
             crate::auth::PeerCertificate::Known(der) => Some(der),
-            crate::auth::PeerCertificate::Ambiguous if over_tls => {
+            crate::auth::PeerCertificate::Ambiguous if url.starts_with("https://") => {
                 return Err(WinrmError::Ntlm(NtlmError::InvalidMessage(
                     "NTLM over TLS: this client has seen several server certificates and cannot \
                      tell which one its connection uses; refusing to authenticate without a \
@@ -202,7 +230,31 @@ impl NtlmAuth {
         // Consume the response body to release the connection back to the pool
         let _ = crate::auth::read_body_capped(resp, self.max_response_bytes).await;
 
-        // Decode challenge and keep raw Type 2 bytes for MIC computation
+        Ok(Negotiated {
+            type1,
+            www_auth,
+            peer_certificate,
+        })
+    }
+
+    /// The Type 3 that answers the challenge of `negotiated`, and the
+    /// exported session key, in a box. With `sealing`, the challenge must
+    /// also grant signing, sealing and key exchange.
+    ///
+    /// Not `async`: the exported session key only exists unboxed here, and
+    /// that copy is wiped before this returns, so the handshake awaits the
+    /// network with a pointer to the key in its future, never a copy. Not
+    /// wiped: the stack copies the message builder made (`ntlm::messages`).
+    /// The `SealingSession` built from the key is constructed in its box, so
+    /// its keys and RC4 S-boxes have no stack copy.
+    fn answer_challenge(
+        &self,
+        url: &str,
+        negotiated: &Negotiated,
+        sealing: bool,
+    ) -> Result<(Vec<u8>, SessionKey), WinrmError> {
+        // Decode the challenge and keep the raw Type 2 bytes for the MIC.
+        let www_auth = negotiated.www_auth.as_str();
         let token = www_auth.strip_prefix("Negotiate ").ok_or_else(|| {
             WinrmError::AuthFailed("missing Negotiate prefix in challenge".into())
         })?;
@@ -212,22 +264,14 @@ impl NtlmAuth {
                 .decode(token.trim_ascii())
                 .map_err(|e| WinrmError::AuthFailed(format!("base64 decode: {e}")))?
         };
-        let challenge = ntlm::decode_challenge_header(&www_auth).map_err(WinrmError::Ntlm)?;
+        let challenge = ntlm::decode_challenge_header(www_auth).map_err(WinrmError::Ntlm)?;
         // A Type 2 holds no secret (server challenge, names, timestamp). It is
         // logged before the check, so a refused challenge is visible too.
         tracing::trace!(target: "winrm_rs::ntlm::challenge", type2 = %token, "NTLM challenge received");
         ntlm::log_challenge(&challenge);
-        // Sealed (no SOAP body in the Type 3), the exchange must also grant
-        // signing, sealing and key exchange.
-        ntlm::check_challenge(&challenge, body.is_none()).map_err(WinrmError::Ntlm)?;
+        ntlm::check_challenge(&challenge, sealing).map_err(WinrmError::Ntlm)?;
 
-        // Step 3: Send Type 3 (Authenticate), with the SOAP body or none
-        // The domain for NTLMv2Hash must match what the user provided.
-        // When empty, keep it empty (local account) — do NOT substitute
-        // the server's target_domain, as that changes the hash.
-        let domain = self.domain.clone();
-
-        // Build the SPN for AV_TARGET_NAME (used in MIC computation)
+        // The SPN for AV_TARGET_NAME (covered by the MIC).
         let host_part = url
             .strip_prefix("http://")
             .or_else(|| url.strip_prefix("https://"))
@@ -239,8 +283,8 @@ impl NtlmAuth {
         // TLS channel and are the mitigation against NTLM-over-TLS relay.
         // Over TLS, a connection that reports no server certificate fails
         // the handshake instead of authenticating unbound.
-        let channel_bindings = if over_tls {
-            let cert_der = peer_certificate.ok_or_else(|| {
+        let channel_bindings = if url.starts_with("https://") {
+            let cert_der = negotiated.peer_certificate.as_deref().ok_or_else(|| {
                 WinrmError::Ntlm(NtlmError::InvalidMessage(
                     "NTLM over TLS: the connection reported no server certificate to bind \
                      the authentication to (channel binding)"
@@ -248,7 +292,7 @@ impl NtlmAuth {
                 ))
             })?;
             Some(
-                crate::ntlm::crypto::compute_channel_bindings(&cert_der)
+                crate::ntlm::crypto::compute_channel_bindings(cert_der)
                     .map_err(WinrmError::Ntlm)?,
             )
         } else {
@@ -256,12 +300,15 @@ impl NtlmAuth {
         };
         // One Type 3 shape over HTTP and HTTPS: MIC, MsvAvFlags, target name,
         // workstation and a zero LM response; plus the CBT over TLS.
-        let (type3, session_key) = ntlm::create_authenticate_message_http(
+        // The domain of the NTLMv2 hash is the one the user gave. When empty,
+        // it stays empty (local account): the server's target domain is not
+        // substituted, as that changes the hash.
+        let (type3, mut session_key) = ntlm::create_authenticate_message_http(
             &challenge,
             &self.username,
             &self.password,
-            &domain,
-            &type1,
+            &self.domain,
+            &negotiated.type1,
             &type2_raw,
             &target_name,
             channel_bindings,
@@ -270,19 +317,23 @@ impl NtlmAuth {
                 .unwrap_or_else(|| ntlm::workstation()),
         )
         .map_err(WinrmError::Ntlm)?;
-        // Copy the exported session key to the heap before the awaits below
-        // and wipe this copy in place, so no unboxed copy of it lives in this
-        // future while it waits on the network, and returning it moves a
-        // pointer. Not wiped: the stack copies the message builder made
-        // (`ntlm::messages`). The `SealingSession` built from it is constructed
-        // in its box, so its keys and RC4 S-boxes have no stack copy.
-        let mut session_key = session_key;
         let mut boxed_key = Box::new(Zeroizing::new([0u8; 16]));
         boxed_key.copy_from_slice(&*session_key);
         zeroize::Zeroize::zeroize(&mut *session_key);
-        let session_key = boxed_key;
-        let auth_header = crate::auth::authorization_value(&ntlm::encode_authorization(&type3))?;
+        Ok((type3, boxed_key))
+    }
 
+    /// Step 3: send the Type 3, with the SOAP `body` or an empty one, and
+    /// read the answer. Returns its body and whether it announced
+    /// `Connection: close`.
+    async fn send_type3(
+        &self,
+        http: &reqwest::Client,
+        url: &str,
+        type3: &[u8],
+        body: Option<&str>,
+    ) -> Result<(String, bool), WinrmError> {
+        let auth_header = crate::auth::authorization_value(&ntlm::encode_authorization(type3))?;
         let request = http.post(url).header(AUTHORIZATION, auth_header);
         let request = match body {
             Some(body) => request
@@ -308,7 +359,7 @@ impl NtlmAuth {
                 || format!("HTTP {status}: {}", crate::auth::excerpt(&text)),
             ));
         }
-        Ok((text, session_key, closing))
+        Ok((text, closing))
     }
 }
 

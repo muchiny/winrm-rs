@@ -48,6 +48,12 @@ exclude_re = [
     # no bit in common, before the `|`. (In front of SEAL it applies to the
     # echoed flags, and is caught.)
     '^src/ntlm/messages\.rs:(757|758):13: replace \| with \^ in create_authenticate_message_credssp$',
+    # `(value << 8) | byte`: the low eight bits of the shifted value are
+    # zero, so `^` puts the byte there just as `|` does.
+    '^src/asn1\.rs:\d+:\d+: replace \| with \^ in (decode_length|decode_integer)$',
+    # `0xA0 | tag`: the context tags are 0 to 5, written as literals by the
+    # callers of these two functions, and share no bit with 0xA0.
+    '^src/asn1\.rs:\d+:\d+: replace \| with \^ in (encode_context_tag|find_context_tag)$',
     # `use_tls` is already `true` in `WinrmConfig::default()`.
     '^src/config\.rs:\d+:\d+: delete field use_tls from struct Self expression in WinrmConfig::https$',
     # Differs for a connection idle for 60 s to the nanosecond.

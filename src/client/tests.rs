@@ -3712,12 +3712,12 @@ async fn upload_file_of_an_empty_file_truncates_the_remote_file() {
     let scripts = powershell_scripts(&bodies);
     assert_eq!(scripts.len(), 1, "{scripts:?}");
     assert!(
-        scripts[0].contains("FromBase64String('')"),
+        scripts[0].contains("GetFullPath('C:\\dest.txt')"),
         "{}",
         scripts[0]
     );
     assert!(
-        scripts[0].contains("WriteAllBytes('C:\\dest.txt'"),
+        scripts[0].contains("WriteAllBytes($p, [Convert]::FromBase64String(''))"),
         "{}",
         scripts[0]
     );
@@ -3731,6 +3731,53 @@ async fn upload_file_of_an_empty_file_truncates_the_remote_file() {
         bodies.last().is_some_and(|b| b.contains("transfer/Delete")),
         "{bodies:?}"
     );
+    std::fs::remove_file(&local).ok();
+}
+
+/// The scripts of the three transfer entry points carry the host's check
+/// under `LocalDrive` and not under `Any`.
+#[tokio::test]
+async fn the_remote_path_policy_decides_what_the_transfer_scripts_check() {
+    use std::time::Duration;
+    let local = unique_temp_path("winrm-rs-test-policy-scripts");
+    for (policy, checked) in [
+        (crate::RemotePathPolicy::LocalDrive, true),
+        (crate::RemotePathPolicy::Any, false),
+    ] {
+        let mut scripts = Vec::new();
+        for entry_point in 0..3 {
+            let server = MockServer::start().await;
+            let done = ResponseTemplate::new(200).set_body_string(receive_done(b"", b"", 0));
+            mount_hanging_command(&server, done).await;
+            let client = WinrmClient::builder(basic_config(server.address().port()))
+                .credentials(test_creds())
+                .remote_path_policy(policy)
+                .build()
+                .unwrap();
+            std::fs::write(&local, b"abc").unwrap();
+            let (host, remote) = ("127.0.0.1", "C:\\dest.txt");
+            match entry_point {
+                0 => client.upload_file(host, &local, remote).await,
+                1 => client.download_file(host, remote, &local).await,
+                _ => {
+                    client
+                        .download_file_with_timeout(host, remote, &local, Duration::from_secs(5))
+                        .await
+                }
+            }
+            .unwrap();
+            scripts.extend(powershell_scripts(&received_bodies(&server).await));
+        }
+        assert_eq!(scripts.len(), 3, "{policy:?}: {scripts:?}");
+        for script in &scripts {
+            let resolves = script.contains("$p = [IO.Path]::GetFullPath('C:\\dest.txt')");
+            assert_eq!(resolves, checked, "{policy:?}: {script}");
+            let reads_the_drive = script.contains("-ccontains $t");
+            assert_eq!(reads_the_drive, checked, "{policy:?}: {script}");
+            let opens_as_given = script.contains("$p = 'C:\\dest.txt'");
+            assert_eq!(opens_as_given, !checked, "{policy:?}: {script}");
+        }
+    }
     std::fs::remove_file(&local).ok();
 }
 

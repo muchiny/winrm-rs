@@ -548,7 +548,7 @@ impl WinrmClientBuilder<Ready> {
     /// Choose which `remote_path` forms the transfer methods accept; see
     /// [`RemotePathPolicy`](crate::RemotePathPolicy). The default since 2.0 is
     /// [`RemotePathPolicy::LocalDrive`](crate::RemotePathPolicy::LocalDrive):
-    /// drive-absolute paths only. Pass
+    /// drive-absolute paths only, on a drive the host says is local. Pass
     /// [`RemotePathPolicy::Any`](crate::RemotePathPolicy::Any) to reach UNC
     /// shares on purpose, typically CredSSP double-hop.
     pub fn remote_path_policy(mut self, policy: RemotePathPolicy) -> Self {

@@ -343,7 +343,11 @@ last component, after resolving `.` and `..`, is a DOS device name (`CON`,
 a printer port may be redirected to a network printer. A path with a
 component made only of dots and blanks, other than `.` and `..`, is refused
 as well (`C:\x\LPT1\. `): Windows does not read such a component the same
-way everywhere. With the `Any`
+way everywhere. The host checks too, before it opens the path: a drive
+letter that is a mapped network drive, or a `subst` drive on a share, is
+refused there, and the error quotes the host
+(`RemotePathPolicy::LocalDrive refuses 'T:\f.bin' (drive type 'Network')`).
+With the `Any`
 policy, a path may name a UNC share or a device path, and under CredSSP or
 Basic a UNC path is reached with your credentials: never pass an untrusted
 path. On the host, blocking outbound SMB (445) and WebDAV, the "Network
@@ -366,9 +370,10 @@ let client = WinrmClient::builder(config)
     .build()?;
 ```
 
-Leave the default when remote paths come from anyone but you. The default
-check is lexical: a link, junction or mapped drive on the host can still lead
-to a share. It does not limit which local files a path names.
+Leave the default when remote paths come from anyone but you. Neither the
+client's check nor the host's sees a symbolic link or a junction on the
+host, which can still lead to a share, and the policy does not limit which
+local files a path names.
 
 ### Runnable examples
 

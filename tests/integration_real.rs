@@ -65,8 +65,8 @@
 
 use std::time::{Duration, Instant};
 use winrm_rs::{
-    AuthMethod, CancellationToken, EncryptionMode, SecretString, WinrmClient, WinrmConfig,
-    WinrmCredentials, WinrmError,
+    AuthMethod, CancellationToken, EncryptionMode, RemotePathPolicy, SecretString, WinrmClient,
+    WinrmConfig, WinrmCredentials, WinrmError,
 };
 
 fn test_client() -> Option<(WinrmClient, String)> {
@@ -781,6 +781,142 @@ async fn upload_to_a_long_quoted_path() {
         .await;
     let _ = std::fs::remove_file(&local_upload);
     let _ = std::fs::remove_file(&local_download);
+}
+
+/// [`test_client`] with `RemotePathPolicy::Any`, which only the builder sets.
+fn test_client_any_remote_path() -> Option<(WinrmClient, String)> {
+    let host = std::env::var("WINRM_TEST_HOST").ok()?;
+    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
+    let pass = std::env::var("WINRM_TEST_PASS").ok()?;
+    let port: u16 = std::env::var("WINRM_TEST_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(5985);
+    let client = WinrmClient::builder(WinrmConfig {
+        auth_method: AuthMethod::Basic,
+        encryption: EncryptionMode::Never,
+        port: Some(port),
+        ..WinrmConfig::http()
+    })
+    .credentials(WinrmCredentials::new(user, pass, ""))
+    .remote_path_policy(RemotePathPolicy::Any)
+    .build()
+    .ok()?;
+    Some((client, host))
+}
+
+/// Gives drive `T:` to every logon session of the host, as a `subst` drive
+/// on the share `\\localhost\C$\Windows\Temp`, and prints its type.
+///
+/// A `subst` run by the test's own command is seen by that command's logon
+/// session alone; run by SYSTEM, here through a scheduled task, it goes to
+/// the namespace all sessions share.
+const NETWORK_DRIVE_UP: &str = r"& schtasks.exe /create /tn winrm-rs-netdrive /tr 'subst.exe T: \\localhost\C$\Windows\Temp' /sc once /st 00:00 /ru SYSTEM /f 2>&1 | Out-Null
+& schtasks.exe /run /tn winrm-rs-netdrive 2>&1 | Out-Null
+foreach ($i in 1..40) { if (Test-Path 'T:\') { break }; Start-Sleep -Milliseconds 250 }
+([IO.DriveInfo]'T:\').DriveType";
+
+/// Removes drive `T:`, the scheduled task and the file of the test, and
+/// prints whether the drive is still there.
+const NETWORK_DRIVE_DOWN: &str = r"& schtasks.exe /create /tn winrm-rs-netdrive /tr 'subst.exe T: /D' /sc once /st 00:00 /ru SYSTEM /f 2>&1 | Out-Null
+& schtasks.exe /run /tn winrm-rs-netdrive 2>&1 | Out-Null
+foreach ($i in 1..40) { if (-not (Test-Path 'T:\')) { break }; Start-Sleep -Milliseconds 250 }
+& schtasks.exe /delete /tn winrm-rs-netdrive /f 2>&1 | Out-Null
+Remove-Item -LiteralPath 'C:\Windows\Temp\winrm-rs-t.bin' -ErrorAction SilentlyContinue
+Test-Path 'T:\'";
+
+/// A drive letter of the host that leads to a share is refused by the host
+/// under `RemotePathPolicy::LocalDrive`, and opened under `Any`.
+///
+/// `T:\winrm-rs-t.bin` reads as a path on a local drive: only the host
+/// knows that the letter leads to `\\localhost\C$\Windows\Temp`. The
+/// transfers are made first and judged after the drive is removed, so that
+/// a failed assertion does not leave the drive behind.
+#[tokio::test]
+#[ignore = "BENCH ONLY: gives the host a drive letter and a scheduled task for the time of the test"]
+async fn network_drive_is_refused_by_the_host_under_local_drive() {
+    const ON_DRIVE: &str = r"T:\winrm-rs-t.bin";
+    const ON_DISK: &str = r"C:\Windows\Temp\winrm-rs-t.bin";
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let (any, _) = test_client_any_remote_path().expect("a client with RemotePathPolicy::Any");
+    let content = b"through a drive letter that leads to a share\n";
+    let local = std::env::temp_dir().join("winrm_rs_test_netdrive_up.bin");
+    let back = std::env::temp_dir().join("winrm_rs_test_netdrive_down.bin");
+    std::fs::write(&local, content).expect("write local file");
+
+    let up = client
+        .run_powershell(&host, NETWORK_DRIVE_UP)
+        .await
+        .expect("give the host drive T:");
+
+    let refused_upload = client.upload_file(&host, &local, ON_DRIVE).await;
+    let created = client
+        .run_powershell(&host, &format!("Test-Path -LiteralPath '{ON_DISK}'"))
+        .await;
+    let refused_download = client.download_file(&host, ON_DRIVE, &back).await;
+    let refused_timed = client
+        .download_file_with_timeout(&host, ON_DRIVE, &back, Duration::from_secs(60))
+        .await;
+    let written_before = back.exists();
+
+    let any_upload = any.upload_file(&host, &local, ON_DRIVE).await;
+    let any_download = any.download_file(&host, ON_DRIVE, &back).await;
+    let through_drive = std::fs::read(&back);
+    let _ = std::fs::remove_file(&back);
+    let disk_download = client.download_file(&host, ON_DISK, &back).await;
+    let on_disk = std::fs::read(&back);
+
+    let down = client
+        .run_powershell(&host, NETWORK_DRIVE_DOWN)
+        .await
+        .expect("remove drive T:");
+    let _ = std::fs::remove_file(&local);
+    let _ = std::fs::remove_file(&back);
+
+    assert_eq!(
+        String::from_utf8_lossy(&up.stdout).trim(),
+        "Network",
+        "drive T: is not a network drive: {}",
+        String::from_utf8_lossy(&up.stderr)
+    );
+    for (what, result) in [
+        ("upload_file", refused_upload),
+        ("download_file", refused_download),
+        ("download_file_with_timeout", refused_timed),
+    ] {
+        println!("{what}: {result:?}");
+        match result {
+            Err(WinrmError::Transfer(m)) => assert!(
+                m.contains(
+                    r"RemotePathPolicy::LocalDrive refuses 'T:\winrm-rs-t.bin' (drive type 'Network')"
+                ),
+                "{what}: {m}"
+            ),
+            other => panic!("{what}: expected the host's refusal, got {other:?}"),
+        }
+    }
+    let created = created.expect("look for the file a refused upload must not create");
+    assert_eq!(
+        String::from_utf8_lossy(&created.stdout).trim(),
+        "False",
+        "a refused upload created the file"
+    );
+    assert!(!written_before, "a refused download wrote the local file");
+
+    assert_eq!(any_upload.expect("upload under Any"), content.len() as u64);
+    assert_eq!(
+        any_download.expect("download under Any"),
+        content.len() as u64
+    );
+    assert_eq!(through_drive.expect("read what came through T:"), content);
+    disk_download.expect("download the same file by its path on C:");
+    assert_eq!(on_disk.expect("read what came from C:"), content);
+    assert_eq!(
+        String::from_utf8_lossy(&down.stdout).trim(),
+        "False",
+        "drive T: is still there: {}",
+        String::from_utf8_lossy(&down.stderr)
+    );
 }
 
 /// A failed upload leaves no shell behind.

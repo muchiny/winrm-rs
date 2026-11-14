@@ -89,9 +89,20 @@ pub(crate) fn validate_remote_path(path: &str) -> Result<(), WinrmError> {
 /// the last component is dropped like a trailing dot or space before the
 /// device check.
 ///
-/// This is a lexical check. A symbolic link, junction, `subst` drive or
-/// mapped network drive on the host can still lead a drive-absolute path to
-/// a share.
+/// These checks read the text of the path, before anything is sent. The
+/// host then checks what the text cannot show: the transfer script resolves
+/// the path as .NET does and refuses it, without opening it, unless it is
+/// still a path on a drive letter and that drive is local (fixed,
+/// removable, CD-ROM or RAM disk). A mapped network drive and a `subst`
+/// drive that leads to a share are refused there, and so is a device name
+/// the host knows that the list above would miss. The error is a
+/// [`WinrmError::Transfer`] that quotes the host's answer:
+/// `RemotePathPolicy::LocalDrive refuses 'T:\f.bin' (drive type 'Network')`.
+/// A drive letter the host does not have is refused the same way (drive
+/// type `NoRootDirectory`).
+///
+/// A symbolic link or a junction on the host can still lead a
+/// drive-absolute path to a share: neither check sees it.
 ///
 /// Only the builder chooses the policy, with
 /// [`WinrmClientBuilder::remote_path_policy`](crate::WinrmClientBuilder::remote_path_policy);
@@ -105,7 +116,8 @@ pub enum RemotePathPolicy {
     /// Accept only drive-absolute remote paths: a letter, `:`, then `\` or
     /// `/`, whose last component, after resolving `.` and `..`, is not a DOS
     /// device name, and with no component made only of dots and blanks
-    /// other than `.` and `..`. The default since 2.0.
+    /// other than `.` and `..`; and, on the host, only a path it resolves
+    /// to one of its local drives. The default since 2.0.
     #[default]
     LocalDrive,
 }
@@ -286,8 +298,11 @@ impl WinrmClient {
     ///   since 2.0) UNC, WebDAV and device paths, a last component that
     ///   is a DOS device name (`NUL`, `COM1`, `LPT1`, ...) and a component
     ///   made only of dots and blanks (other than `.` and `..`) are refused
-    ///   before anything is sent; it does not limit which local files a path
-    ///   names.
+    ///   before anything is sent, and the host refuses, before it opens it,
+    ///   a path on a drive that is not one of its local drives (a mapped
+    ///   or `subst` drive that leads to a share). The policy does not limit
+    ///   which local files a path names, and a symbolic link or a junction
+    ///   on the host is followed.
     ///   A client built with `.remote_path_policy(RemotePathPolicy::Any)`
     ///   lets them through.
     /// - Each chunk of the file, up to 2000 bytes, travels as base64 inside the
@@ -304,7 +319,8 @@ impl WinrmClient {
     /// [`WinrmError::Transfer`] when `remote_path` is refused before anything
     /// is sent (the policy above, a control character, a path too long for
     /// one command line), when `local_path` cannot be read, or when the
-    /// script of a chunk fails on the host (the error quotes its stderr).
+    /// script of a chunk fails on the host, which includes the host's own
+    /// refusal of the path under the policy (the error quotes its stderr).
     /// Otherwise the errors of [`open_shell`](Self::open_shell) and, for each
     /// chunk, of [`Shell::run_command`](crate::Shell::run_command), its
     /// deadline included.
@@ -321,7 +337,7 @@ impl WinrmClient {
         let escaped_path = escape_ps_single_quoted(remote_path);
         // Checked before the shell is opened: a path too long for any chunk
         // fails without a round trip.
-        upload_chunk_len(&escaped_path)?;
+        upload_chunk_len(&escaped_path, self.remote_path_policy)?;
 
         let shell = self.open_shell(host).await?;
         let total = byte_count(data.len());
@@ -347,11 +363,12 @@ impl WinrmClient {
         data: &[u8],
         escaped_path: &str,
     ) -> Result<(), WinrmError> {
-        let chunk_len = upload_chunk_len(escaped_path)?;
+        let policy = self.remote_path_policy;
+        let chunk_len = upload_chunk_len(escaped_path, policy)?;
         for (i, chunk) in chunks_to_send(data, chunk_len).into_iter().enumerate() {
             let b64 = B64.encode(chunk);
 
-            let script = upload_script(escaped_path, &b64, i == 0);
+            let script = upload_script(escaped_path, policy, &b64, i == 0);
             let encoded = encode_powershell_command(&script);
             let output = shell
                 .run_command(POWERSHELL_EXE, &transfer_args(&encoded))
@@ -420,8 +437,11 @@ impl WinrmClient {
     ///   since 2.0) UNC, WebDAV and device paths, a last component that
     ///   is a DOS device name (`NUL`, `COM1`, `LPT1`, ...) and a component
     ///   made only of dots and blanks (other than `.` and `..`) are refused
-    ///   before anything is sent; it does not limit which local files a path
-    ///   names.
+    ///   before anything is sent, and the host refuses, before it opens it,
+    ///   a path on a drive that is not one of its local drives (a mapped
+    ///   or `subst` drive that leads to a share). The policy does not limit
+    ///   which local files a path names, and a symbolic link or a junction
+    ///   on the host is followed.
     ///   A client built with `.remote_path_policy(RemotePathPolicy::Any)`
     ///   lets them through.
     /// - The file comes back as base64 on the command's stdout. PowerShell
@@ -439,7 +459,8 @@ impl WinrmClient {
     ///
     /// [`WinrmError::Transfer`] when `remote_path` is refused before anything
     /// is sent (the policy above, a control character, a path too long),
-    /// when the script fails on the host (the error quotes its stderr), when
+    /// when the script fails on the host, which includes the host's own
+    /// refusal of the path under the policy (the error quotes its stderr), when
     /// what it printed is not base64, or when `local_path` is refused or
     /// cannot be written. Otherwise the errors of
     /// [`run_command`](Self::run_command).
@@ -450,7 +471,8 @@ impl WinrmClient {
         local_path: &Path,
     ) -> Result<u64, WinrmError> {
         validate_remote_path_for(remote_path, self.remote_path_policy)?;
-        let encoded = encode_powershell_command(&download_script(remote_path));
+        let script = download_script(remote_path, self.remote_path_policy);
+        let encoded = encode_powershell_command(&script);
         let output = self
             .run_command(host, POWERSHELL_EXE, &transfer_args(&encoded))
             .await?;
@@ -512,7 +534,8 @@ impl WinrmClient {
         timeout: std::time::Duration,
     ) -> Result<u64, WinrmError> {
         validate_remote_path_for(remote_path, self.remote_path_policy)?;
-        let encoded = encode_powershell_command(&download_script(remote_path));
+        let script = download_script(remote_path, self.remote_path_policy);
+        let encoded = encode_powershell_command(&script);
         let output = self
             .run_command_with_timeout(host, POWERSHELL_EXE, &transfer_args(&encoded), timeout)
             .await?;
@@ -556,10 +579,11 @@ fn byte_count(len: usize) -> u64 {
 /// fits [`CMD_LINE_BUDGET`] for this (already escaped) remote path.
 ///
 /// The append form of the script is the longer one, so it sets the limit.
-fn upload_chunk_len(escaped_path: &str) -> Result<usize, WinrmError> {
+fn upload_chunk_len(escaped_path: &str, policy: RemotePathPolicy) -> Result<usize, WinrmError> {
     let fits = |n: usize| {
         let b64 = "A".repeat(base64_len(n));
-        transfer_command_line_len(&upload_script(escaped_path, &b64, false)) <= CMD_LINE_BUDGET
+        transfer_command_line_len(&upload_script(escaped_path, policy, &b64, false))
+            <= CMD_LINE_BUDGET
     };
     if !fits(1) {
         return Err(WinrmError::Transfer(
@@ -590,27 +614,74 @@ fn chunks_to_send(data: &[u8], chunk_len: usize) -> Vec<&[u8]> {
     }
 }
 
-/// The remote script for one upload chunk: the first chunk creates the file,
-/// later chunks append to it.
-fn upload_script(escaped_path: &str, b64: &str, first: bool) -> String {
-    if first {
-        format!(
-            "$bytes = [Convert]::FromBase64String('{b64}'); \
-             [IO.File]::WriteAllBytes('{escaped_path}', $bytes)"
-        )
-    } else {
-        format!(
-            "$bytes = [Convert]::FromBase64String('{b64}'); \
-             $f = [IO.File]::Open('{escaped_path}', 'Append'); \
-             $f.Write($bytes, 0, $bytes.Length); $f.Close()"
-        )
+/// The drive types [`RemotePathPolicy::LocalDrive`] lets a transfer script
+/// open, under the names of .NET's `System.IO.DriveType`. The types left out
+/// are `Network` (a mapped drive, a `subst` drive that leads to a share),
+/// `NoRootDirectory` (no such drive) and `Unknown`.
+const LOCAL_DRIVE_TYPES: &str = "'Fixed', 'Removable', 'CDRom', 'Ram'";
+
+/// The remote script that runs `action` on the remote path, which `action`
+/// names `$p`.
+///
+/// The script stops at its first error (`$ErrorActionPreference`), so
+/// `powershell.exe` ends with exit code 1 whichever statement failed.
+/// Without it the exit code is the one of the last statement alone.
+///
+/// Under [`RemotePathPolicy::LocalDrive`] the host checks the path before
+/// `action` runs, which is the part of the policy the text of a path cannot
+/// show to the client. `$p` is the path as .NET resolves it
+/// (`[IO.Path]::GetFullPath`, which `[IO.File]` applies to what it opens):
+/// it must still start with a drive letter, and that drive must be of one
+/// of the [`LOCAL_DRIVE_TYPES`]. A mapped network drive and a `subst` drive
+/// that leads to a share are of type `Network`, and a device name the host
+/// knows resolves to `\\.\name` (every DOS device name on Windows Server
+/// 2012 R2 to 2022, `NUL` alone on Server 2025). `action` then opens the
+/// resolved path, the one that was checked, and it sits in the branch the
+/// check allows: a check that fails for a reason of its own runs nothing.
+/// The refusal is one line on stderr, written as it is and not thrown, so
+/// that the error the caller gets quotes that line and not the way
+/// PowerShell prints an error record.
+///
+/// The check cannot see a symbolic link or a junction on the way: the
+/// resolved path and the type of its drive are the same with or without
+/// one.
+fn transfer_script(escaped_path: &str, policy: RemotePathPolicy, action: &str) -> String {
+    match policy {
+        RemotePathPolicy::Any => {
+            format!("$ErrorActionPreference = 'Stop'; $p = '{escaped_path}'; {action}")
+        }
+        RemotePathPolicy::LocalDrive => format!(
+            "$ErrorActionPreference = 'Stop'; \
+             $p = [IO.Path]::GetFullPath('{escaped_path}'); \
+             $t = if ($p -cmatch '^[A-Za-z]:\\\\') {{ ([IO.DriveInfo]$p.Substring(0, 3)).DriveType }}; \
+             if ({LOCAL_DRIVE_TYPES} -ccontains $t) {{ {action} }} \
+             else {{ [Console]::Error.WriteLine(\"RemotePathPolicy::LocalDrive refuses '$p' (drive type '$t')\"); exit 1 }}"
+        ),
     }
 }
 
+/// The remote script for one upload chunk: the first chunk creates the file,
+/// later chunks append to it.
+fn upload_script(escaped_path: &str, policy: RemotePathPolicy, b64: &str, first: bool) -> String {
+    let action = if first {
+        format!("[IO.File]::WriteAllBytes($p, [Convert]::FromBase64String('{b64}'))")
+    } else {
+        format!(
+            "$bytes = [Convert]::FromBase64String('{b64}'); \
+             $f = [IO.File]::Open($p, 'Append'); \
+             $f.Write($bytes, 0, $bytes.Length); $f.Close()"
+        )
+    };
+    transfer_script(escaped_path, policy, &action)
+}
+
 /// The remote script that prints `remote_path` as base64.
-fn download_script(remote_path: &str) -> String {
-    let escaped = escape_ps_single_quoted(remote_path);
-    format!("[Convert]::ToBase64String([IO.File]::ReadAllBytes('{escaped}'))")
+fn download_script(remote_path: &str, policy: RemotePathPolicy) -> String {
+    transfer_script(
+        &escape_ps_single_quoted(remote_path),
+        policy,
+        "[Convert]::ToBase64String([IO.File]::ReadAllBytes($p))",
+    )
 }
 
 /// Check a download's exit code and decode the base64 its script printed.

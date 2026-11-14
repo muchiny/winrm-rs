@@ -15,29 +15,44 @@ fn transfer_launch_is_the_full_path_without_profile_or_prompts() {
     );
 }
 
+/// The two policies, for the tests that hold under both.
+const POLICIES: [RemotePathPolicy; 2] = [RemotePathPolicy::Any, RemotePathPolicy::LocalDrive];
+
+/// Without the host's check a short path leaves room for the 2000-byte cap.
+/// The check takes 92 bytes of each chunk.
 #[test]
-fn short_paths_keep_2000_byte_chunks() {
-    assert_eq!(upload_chunk_len("C:\\dest.bin").unwrap(), 2000);
+fn chunk_len_of_a_short_path_under_each_policy() {
+    assert_eq!(
+        upload_chunk_len("C:\\dest.bin", RemotePathPolicy::Any).unwrap(),
+        CHUNK_SIZE
+    );
+    assert_eq!(
+        upload_chunk_len("C:\\dest.bin", RemotePathPolicy::LocalDrive).unwrap(),
+        1908
+    );
 }
 
 #[test]
 fn every_valid_path_fits_the_command_line() {
     // The longest escaped paths validate_remote_path admits: 260 ASCII
     // quotes, and 86 U+2019 (3 bytes each), both doubled by the escape.
-    for raw in ["'".repeat(260), "\u{2019}".repeat(86), "a".repeat(260)] {
-        assert!(validate_remote_path(&raw).is_ok());
-        let escaped = escape_ps_single_quoted(&raw);
-        let n = upload_chunk_len(&escaped).unwrap();
-        let fits = |n: usize| {
-            transfer_command_line_len(&upload_script(&escaped, &"A".repeat(base64_len(n)), false))
-                <= CMD_LINE_BUDGET
-        };
-        assert!(fits(n), "{n} does not fit for {raw:?}");
-        assert!(
-            n == CHUNK_SIZE || !fits(n + 1),
-            "{n} is not the largest for {raw:?}"
-        );
-        assert!(n >= 1000, "{n} is too small to be useful");
+    for policy in POLICIES {
+        for raw in ["'".repeat(260), "\u{2019}".repeat(86), "a".repeat(260)] {
+            assert!(validate_remote_path(&raw).is_ok());
+            let escaped = escape_ps_single_quoted(&raw);
+            let n = upload_chunk_len(&escaped, policy).unwrap();
+            let fits = |n: usize| {
+                let b64 = "A".repeat(base64_len(n));
+                transfer_command_line_len(&upload_script(&escaped, policy, &b64, false))
+                    <= CMD_LINE_BUDGET
+            };
+            assert!(fits(n), "{n} does not fit for {raw:?} under {policy:?}");
+            assert!(
+                n == CHUNK_SIZE || !fits(n + 1),
+                "{n} is not the largest for {raw:?} under {policy:?}"
+            );
+            assert!(n >= 1000, "{n} is too small to be useful under {policy:?}");
+        }
     }
 }
 
@@ -55,11 +70,13 @@ fn transfer_command_line_len_counts_the_full_launch() {
 
 #[test]
 fn a_path_beyond_any_budget_is_refused() {
-    let err = upload_chunk_len(&"a".repeat(CMD_LINE_BUDGET)).unwrap_err();
-    assert!(
-        matches!(&err, WinrmError::Transfer(m) if m == "remote path too long for a transfer command line"),
-        "{err:?}"
-    );
+    for policy in POLICIES {
+        let err = upload_chunk_len(&"a".repeat(CMD_LINE_BUDGET), policy).unwrap_err();
+        assert!(
+            matches!(&err, WinrmError::Transfer(m) if m == "remote path too long for a transfer command line"),
+            "{err:?}"
+        );
+    }
 }
 
 #[test]
@@ -69,13 +86,64 @@ fn chunks_to_send_of_an_empty_file_is_one_empty_chunk() {
     assert_eq!(chunks_to_send(&[7u8; 4000], 2000).len(), 2);
 }
 
+/// How every transfer script starts under `Any`, for the escaped path
+/// `C:\a''b`: it stops at its first error and names the path `$p`.
+const UNCHECKED_HEAD: &str = r"$ErrorActionPreference = 'Stop'; $p = 'C:\a''b'; ";
+
+/// What stands before the action of a script under `LocalDrive`, for the
+/// same path: the host resolves it and reads the type of its drive.
+const CHECK_HEAD: &str = r"$ErrorActionPreference = 'Stop'; $p = [IO.Path]::GetFullPath('C:\a''b'); $t = if ($p -cmatch '^[A-Za-z]:\\') { ([IO.DriveInfo]$p.Substring(0, 3)).DriveType }; if ('Fixed', 'Removable', 'CDRom', 'Ram' -ccontains $t) { ";
+
+/// What stands after it: the refusal, in the other branch.
+const CHECK_TAIL: &str = r#" } else { [Console]::Error.WriteLine("RemotePathPolicy::LocalDrive refuses '$p' (drive type '$t')"); exit 1 }"#;
+
 #[test]
 fn upload_script_keeps_both_chunk_forms() {
+    let any = RemotePathPolicy::Any;
     assert_eq!(
-        upload_script("C:\\a''b", "QUJD", true),
-        "$bytes = [Convert]::FromBase64String('QUJD'); [IO.File]::WriteAllBytes('C:\\a''b', $bytes)"
+        upload_script("C:\\a''b", any, "QUJD", true),
+        format!(
+            "{UNCHECKED_HEAD}[IO.File]::WriteAllBytes($p, [Convert]::FromBase64String('QUJD'))"
+        )
     );
-    assert!(upload_script("C:\\a", "QUJD", false).contains("[IO.File]::Open('C:\\a', 'Append')"));
+    assert_eq!(
+        upload_script("C:\\a''b", any, "QUJD", false),
+        format!(
+            "{UNCHECKED_HEAD}$bytes = [Convert]::FromBase64String('QUJD'); \
+             $f = [IO.File]::Open($p, 'Append'); $f.Write($bytes, 0, $bytes.Length); $f.Close()"
+        )
+    );
+}
+
+/// Under `LocalDrive` a script is the one of `Any` with the host's check
+/// around its action. The path is written once, as what the host resolves:
+/// the action opens `$p`, inside the branch the check allows.
+#[test]
+fn local_drive_scripts_run_their_action_inside_the_host_check() {
+    let (any, local) = (RemotePathPolicy::Any, RemotePathPolicy::LocalDrive);
+    let pairs = [
+        (
+            upload_script("C:\\a''b", local, "QUJD", true),
+            upload_script("C:\\a''b", any, "QUJD", true),
+        ),
+        (
+            upload_script("C:\\a''b", local, "QUJD", false),
+            upload_script("C:\\a''b", any, "QUJD", false),
+        ),
+        (
+            download_script("C:\\a'b", local),
+            download_script("C:\\a'b", any),
+        ),
+    ];
+    for (checked, unchecked) in pairs {
+        let action = unchecked
+            .strip_prefix(UNCHECKED_HEAD)
+            .unwrap_or_else(|| panic!("{unchecked}"));
+        assert!(action.contains("[IO.File]::"), "{action}");
+        assert!(!action.contains("C:"), "{action}");
+        assert_eq!(checked, format!("{CHECK_HEAD}{action}{CHECK_TAIL}"));
+        assert_eq!(checked.matches("C:\\a''b").count(), 1, "{checked}");
+    }
 }
 
 #[test]
@@ -366,9 +434,15 @@ fn any_policy_matches_the_base_check() {
 
 #[test]
 fn download_script_keeps_a_unicode_quote_inside_the_literal() {
+    let path = "C:\\temp\\a\u{2019})); x #";
     assert_eq!(
-        download_script("C:\\temp\\a\u{2019})); x #"),
-        "[Convert]::ToBase64String([IO.File]::ReadAllBytes('C:\\temp\\a\u{2019}\u{2019})); x #'))"
+        download_script(path, RemotePathPolicy::Any),
+        "$ErrorActionPreference = 'Stop'; $p = 'C:\\temp\\a\u{2019}\u{2019})); x #'; \
+         [Convert]::ToBase64String([IO.File]::ReadAllBytes($p))"
+    );
+    assert!(
+        download_script(path, RemotePathPolicy::LocalDrive)
+            .contains("GetFullPath('C:\\temp\\a\u{2019}\u{2019})); x #'); "),
     );
 }
 
@@ -949,4 +1023,106 @@ fn replace_local_file_accepts_a_long_destination_name() {
     assert_eq!(std::fs::read(&dest).unwrap(), b"long");
     assert_eq!(leftover_temp_files(&dir), 0);
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The transfer scripts, run by the PowerShell they are written for. Windows
+/// only: the Windows test job of CI is where these run.
+#[cfg(windows)]
+mod on_windows {
+    use super::*;
+
+    /// What `powershell.exe` gave for a script.
+    struct Ran {
+        code: Option<i32>,
+        stdout: String,
+        stderr: String,
+    }
+
+    /// Run `script` as a transfer launches it: the same executable, with the
+    /// arguments of [`transfer_args`].
+    fn run(script: &str) -> Ran {
+        let root = std::env::var("SystemRoot").expect("SystemRoot is set on Windows");
+        let exe = POWERSHELL_EXE.replace("%SystemRoot%", &root);
+        let encoded = encode_powershell_command(script);
+        #[expect(clippy::disallowed_methods, reason = "test-only subprocess")]
+        let out = std::process::Command::new(exe)
+            .args(transfer_args(&encoded))
+            .output()
+            .expect("powershell.exe runs");
+        Ran {
+            code: out.status.code(),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        }
+    }
+
+    /// A drive letter this machine does not use, from `Z` down.
+    fn unused_drive() -> Option<char> {
+        ('D'..='Z')
+            .rev()
+            .find(|letter| !Path::new(&format!(r"{letter}:\")).exists())
+    }
+
+    #[test]
+    fn the_scripts_write_and_read_a_file_under_each_policy() {
+        let dir = test_dir("scripts-on-windows");
+        for policy in POLICIES {
+            let file = dir.join(format!("{policy:?}.bin"));
+            let path = file.to_str().expect("a UTF-8 temporary path");
+            let escaped = escape_ps_single_quoted(path);
+
+            let first = run(&upload_script(&escaped, policy, &B64.encode(b"abc"), true));
+            assert_eq!(first.code, Some(0), "{policy:?}: {}", first.stderr);
+            let second = run(&upload_script(&escaped, policy, &B64.encode(b"def"), false));
+            assert_eq!(second.code, Some(0), "{policy:?}: {}", second.stderr);
+            assert_eq!(std::fs::read(&file).unwrap(), b"abcdef", "{policy:?}");
+
+            let read = run(&download_script(path, policy));
+            assert_eq!(read.code, Some(0), "{policy:?}: {}", read.stderr);
+            assert_eq!(
+                read.stdout.trim_ascii(),
+                B64.encode(b"abcdef"),
+                "{policy:?}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `NUL` is the one device name every Windows version resolves to a
+    /// device path, in any directory.
+    #[test]
+    fn the_host_refuses_a_device_name_under_local_drive() {
+        let device = std::env::temp_dir().join("nul");
+        let path = device.to_str().expect("a UTF-8 temporary path");
+        let ran = run(&download_script(path, RemotePathPolicy::LocalDrive));
+        assert_eq!(ran.code, Some(1), "{}", ran.stderr);
+        assert!(ran.stdout.is_empty(), "{}", ran.stdout);
+        let refusal = r"RemotePathPolicy::LocalDrive refuses '\\.\nul' (drive type '')";
+        assert!(ran.stderr.contains(refusal), "{}", ran.stderr);
+    }
+
+    /// A drive that does not exist is not a local drive. Under `Any` the
+    /// same path fails when it is opened, without a word of the policy.
+    #[test]
+    fn the_host_refuses_a_missing_drive_under_local_drive_only() {
+        let Some(letter) = unused_drive() else {
+            eprintln!("every drive letter is in use: test skipped");
+            return;
+        };
+        let path = format!(r"{letter}:\winrm-rs\missing.bin");
+
+        let refused = run(&download_script(&path, RemotePathPolicy::LocalDrive));
+        assert_eq!(refused.code, Some(1), "{}", refused.stderr);
+        let refusal =
+            format!("RemotePathPolicy::LocalDrive refuses '{path}' (drive type 'NoRootDirectory')");
+        assert!(refused.stderr.contains(&refusal), "{}", refused.stderr);
+
+        let unchecked = run(&download_script(&path, RemotePathPolicy::Any));
+        assert_eq!(unchecked.code, Some(1), "{}", unchecked.stderr);
+        assert!(
+            !unchecked.stderr.contains("RemotePathPolicy"),
+            "{}",
+            unchecked.stderr
+        );
+    }
 }

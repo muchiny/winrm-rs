@@ -69,7 +69,8 @@ We will credit reporters in the release notes and CHANGELOG (unless you prefer t
   `WinrmClientBuilder::use_env_proxy(true)`, or one from the operating
   system's proxy settings.
 - Under the default `RemotePathPolicy::LocalDrive`, a remote path that its
-  documentation says is refused and that reaches the host.
+  documentation says is refused and that reaches the host, or that the host
+  opens when the documentation says the host refuses it.
 - Arguments the crate places in a SOAP envelope that change its structure.
 - Values the crate places in PowerShell scripts that change what the script
   runs.
@@ -95,9 +96,9 @@ We will credit reporters in the release notes and CHANGELOG (unless you prefer t
 - What `accept_invalid_certs = true` gives up, as its documentation states:
   the server is not authenticated. CredSSP, and Basic over HTTPS, refuse the
   flag.
-- What `RemotePathPolicy::Any` lets through, and a link, junction, `subst`
-  drive or mapped drive on the host that leads a drive-absolute path to a
-  share: the `LocalDrive` check is lexical.
+- What `RemotePathPolicy::Any` lets through, and a symbolic link or a
+  junction on the host that leads a drive-absolute path to a share: neither
+  the client's check nor the host's sees it.
 - What `danger_accept_invalid_proxy_certs(true)` gives up: the `https://`
   proxy is not authenticated. The WinRM server stays verified.
 - Windows server settings: `AllowUnencrypted = true`,

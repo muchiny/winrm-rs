@@ -1,5 +1,13 @@
 use super::*;
 
+const TAG_OID: u8 = 0x06;
+
+/// Exact size of the DER encoding of the TSCredentials.
+fn ts_credentials_len(domain: &str, username: &str, password: &str) -> usize {
+    let [_, _, _, outer_content] = ts_credentials_sizes(domain, username, password);
+    tlv_len(outer_content)
+}
+
 #[test]
 fn ts_request_encode_decode_roundtrip() {
     let encoded = encode_ts_request(6, Some(b"ntlm_token"), None, None, Some(&[0xAA; 32]));

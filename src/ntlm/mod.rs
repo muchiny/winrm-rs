@@ -13,15 +13,13 @@ pub(crate) use messages::{
     decode_challenge_header, encode_authorization, log_challenge, sanitize_workstation,
     workstation,
 };
-// `parse_challenge` is only reached from outside `ntlm::messages` by the
-// CredSSP path; `crate::__fuzz` calls it through its full path. Tests inside
-// the module reach it through `super::`, so the reexport is feature-gated.
+// Only the CredSSP path reaches these three from outside `ntlm::messages`, so
+// the reexport is feature-gated. `crate::__fuzz` calls `parse_challenge`
+// through its full path, and the tests of the module through `super::`.
 #[cfg(feature = "credssp")]
-#[allow(unreachable_pub)] // used in-crate by auth/credssp.rs
-pub use messages::parse_challenge;
-#[cfg(feature = "credssp")]
-#[allow(unreachable_pub)] // used in-crate by auth/credssp.rs
-pub use messages::{create_authenticate_message_credssp, create_negotiate_message_credssp};
+pub(crate) use messages::{
+    create_authenticate_message_credssp, create_negotiate_message_credssp, parse_challenge,
+};
 
 // The sealing session uses crypto internals
 use crate::error::NtlmError;

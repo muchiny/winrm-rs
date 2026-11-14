@@ -103,6 +103,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   more than 150 lines. Same tests, same names, no API change.
   `sonar-project.properties` leaves these files, and
   `src/auth/credssp/test_server.rs`, out of main-code analysis.
+- **No `#[allow]` is left in the library but the test exemption at the top
+  of `src/lib.rs`, and Clippy now refuses one** (`allow_attributes`,
+  `allow_attributes_without_reason`). The two
+  module-wide `#![allow(dead_code)]` of `src/asn1.rs` and
+  `src/ntlm/crypto.rs` are gone, with what they hid sorted out item by
+  item: seven functions that were `pub` in a private module are
+  `pub(crate)`; two ASN.1 readers that only the test server and the fuzz
+  targets call (`decode_spnego_mech_list_mic`, `extract_subject_public_key`)
+  are built for tests and with `__internal` only; two NTLM constants are
+  built with `credssp` only; a constant and a helper used by tests alone
+  move to the tests. Each exception that remains is an
+  `#[expect(..., reason = "...")]`
+  under the feature condition where the lint fires, so it warns as soon as
+  it is no longer needed. CI lints every combination of the three features
+  (`cargo hack clippy --feature-powerset`, 8 runs) instead of two. No API
+  change; a build with `credssp` and without `__internal` no longer
+  compiles those two readers.
 
 ### Documentation
 

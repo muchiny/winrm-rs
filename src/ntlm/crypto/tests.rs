@@ -52,6 +52,7 @@ fn type1_flags_exact_hex_value() {
     assert_eq!(TYPE1_FLAGS, 0xe208_8235);
 }
 
+#[cfg(feature = "credssp")]
 #[test]
 fn type1_flags_credssp_exact_hex_value() {
     assert_eq!(TYPE1_FLAGS_CREDSSP, 0xe208_8237);

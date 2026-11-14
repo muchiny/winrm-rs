@@ -65,12 +65,17 @@ jobs:
           toolchain: 1.100.0
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
+        with:
+          tool: cargo-hack@0.6.46
       - name: Install krb5 and OpenSSL headers
         run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libssl-dev pkg-config
-      # Default features: catches leftovers behind `cfg(not(feature = ...))`.
-      - run: cargo clippy --locked --all-targets -- -D warnings
-      - name: Clippy (all features)
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      # Every combination of `kerberos`, `credssp` and `__internal`, from none
+      # to all (8 runs). What is dead code, or `pub` out of reach, depends on
+      # the features: the `#[expect]` written for one combination must hold
+      # in each of the others.
+      - name: Clippy (every feature combination)
+        run: cargo hack clippy --locked --feature-powerset --exclude-features default --all-targets -- -D warnings
 
   test:
     name: Test (${{ matrix.os }})

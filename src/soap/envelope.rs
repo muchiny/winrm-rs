@@ -260,7 +260,10 @@ pub(crate) fn create_psrp_shell_request(
 ///
 /// Used by PSRP where the CommandId must be the pipeline's UUID and
 /// the first pipeline fragment is passed as a base64 argument.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one argument per field of the request, as in the other builders"
+)]
 pub(crate) fn execute_command_with_id_request(
     endpoint: &str,
     shell_id: &str,
@@ -596,7 +599,10 @@ pub(crate) fn reconnect_shell_request_with_uri(
 ///
 /// Sends stdin data to a running command. The data is base64-encoded
 /// in the request body. Set `end_of_stream` to `true` to signal EOF.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one argument per field of the request, as in the other builders"
+)]
 pub(crate) fn send_input_request_with_uri(
     endpoint: &str,
     shell_id: &str,

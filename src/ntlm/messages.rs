@@ -14,19 +14,30 @@ use crate::error::NtlmError;
 /// Produced by `parse_challenge` from the raw bytes of a server challenge.
 /// Contains the fields needed to compute the Type 3 (Authenticate) response.
 #[derive(Debug)]
-#[allow(unreachable_pub)] // exposed under the `__internal` feature for fuzz targets
+#[cfg_attr(
+    not(feature = "__internal"),
+    expect(
+        unreachable_pub,
+        reason = "public for the re-export in `crate::__fuzz`"
+    )
+)]
 pub struct ChallengeMessage {
     /// 8-byte nonce from the server, used as input to NTProofStr (MS-NLMP 3.3.2).
     pub server_challenge: [u8; 8],
     /// Negotiated capability flags (MS-NLMP 2.2.2.5).
-    #[allow(dead_code)]
     pub negotiate_flags: u32,
     /// Raw `AV_PAIR` list from the `TargetInfo` field, parsed and rebuilt into
     /// a canonical AV list by `authenticate_target_info`; never signed verbatim.
     pub target_info: Vec<u8>,
     /// NetBIOS domain name extracted from `AV_NB_DOMAIN_NAME` in the target info.
-    /// Retained for diagnostics; not consumed by the authenticate-message builders.
-    #[allow(dead_code)]
+    /// Not consumed by the authenticate-message builders.
+    #[cfg_attr(
+        not(any(test, feature = "__internal")),
+        expect(
+            dead_code,
+            reason = "read by the tests only; public through `crate::__fuzz` with `__internal`"
+        )
+    )]
     pub target_domain: String,
     /// Server timestamp from `AV_TIMESTAMP` (Windows FILETIME, 100 ns since
     /// 1601-01-01), if present. Used in the client blob when available.
@@ -49,8 +60,7 @@ pub(crate) fn create_negotiate_message() -> Vec<u8> {
 /// TSCredentials. Also includes NEGOTIATE_VERSION which adds the 8-byte
 /// OS version field at the end of the message (40 bytes total).
 #[cfg(feature = "credssp")]
-#[allow(unreachable_pub)] // re-exported under the `credssp` feature for the CredSSP path
-pub fn create_negotiate_message_credssp() -> Vec<u8> {
+pub(crate) fn create_negotiate_message_credssp() -> Vec<u8> {
     create_negotiate_message_with_flags(TYPE1_FLAGS_CREDSSP, true)
 }
 
@@ -80,8 +90,7 @@ fn create_negotiate_message_with_flags(flags: u32, include_version: bool) -> Vec
 /// NetBIOS domain name, and optional server timestamp. Returns
 /// [`NtlmError::InvalidMessage`] if the message is too short, has an invalid
 /// signature, or is not message type 2.
-#[allow(unreachable_pub)] // re-exported `pub` under the `__internal` feature for fuzz targets
-pub fn parse_challenge(data: &[u8]) -> Result<ChallengeMessage, NtlmError> {
+pub(crate) fn parse_challenge(data: &[u8]) -> Result<ChallengeMessage, NtlmError> {
     let Some(header) = data.first_chunk::<32>() else {
         return Err(NtlmError::InvalidMessage("Type 2 message too short".into()));
     };
@@ -372,7 +381,10 @@ pub(crate) fn create_authenticate_message_internal(
 /// `domain` is used for the NTOWFv2 hash computation. `display_domain` (if Some)
 /// is used in the Domain security buffer of Type 3 (often empty for local
 /// accounts even when the hash uses the server's target domain).
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one argument per input of a Type 3; the callers are the two wrappers of this file"
+)]
 pub(crate) fn create_authenticate_message_full(
     challenge: &ChallengeMessage,
     username: &str,
@@ -671,8 +683,7 @@ pub(crate) fn create_authenticate_message_http(
 /// `type1_bytes` and `type2_bytes` are the raw NTLMSSP messages exchanged
 /// previously, used as input for the MIC HMAC.
 #[cfg(feature = "credssp")]
-#[allow(unreachable_pub)] // re-exported under the `credssp` feature for the CredSSP path
-pub fn create_authenticate_message_credssp(
+pub(crate) fn create_authenticate_message_credssp(
     challenge: &ChallengeMessage,
     username: &str,
     password: &str,

@@ -26,8 +26,7 @@ pub struct ReceiveOutput {
 ///
 /// Searches for a `<ShellId>` element (with or without namespace prefix) and
 /// returns its text content. Returns [`SoapError::MissingElement`] if not found.
-#[allow(unreachable_pub)] // re-exported under the `__internal` feature for fuzz targets
-pub fn parse_shell_id(xml: &str) -> Result<String, SoapError> {
+pub(crate) fn parse_shell_id(xml: &str) -> Result<String, SoapError> {
     extract_element_text(xml, "ShellId").ok_or_else(|| SoapError::MissingElement("ShellId".into()))
 }
 
@@ -35,8 +34,7 @@ pub fn parse_shell_id(xml: &str) -> Result<String, SoapError> {
 ///
 /// Searches for a `<CommandId>` element (with or without namespace prefix) and
 /// returns its text content. Returns [`SoapError::MissingElement`] if not found.
-#[allow(unreachable_pub)] // re-exported under the `__internal` feature for fuzz targets
-pub fn parse_command_id(xml: &str) -> Result<String, SoapError> {
+pub(crate) fn parse_command_id(xml: &str) -> Result<String, SoapError> {
     extract_element_text(xml, "CommandId")
         .ok_or_else(|| SoapError::MissingElement("CommandId".into()))
 }
@@ -52,8 +50,7 @@ pub fn parse_command_id(xml: &str) -> Result<String, SoapError> {
 /// decoder finished at its end. A document split across Receive responses is
 /// only reassembled by callers that keep a [`ClixmlDecoder`] per command over
 /// [`parse_receive_output_raw`].
-#[allow(unreachable_pub)] // re-exported under the `__internal` feature for fuzz targets
-pub fn parse_receive_output(xml: &str) -> Result<ReceiveOutput, SoapError> {
+pub(crate) fn parse_receive_output(xml: &str) -> Result<ReceiveOutput, SoapError> {
     let mut output = parse_receive_output_raw(xml)?;
     let mut decoder = ClixmlDecoder::new();
     let mut stderr = decoder.push(&output.stderr);
@@ -155,8 +152,7 @@ pub(crate) fn parse_enumerate_response(xml: &str) -> Result<(String, Option<Stri
 /// `Fault` element. Text that merely contains `Fault>` is not a fault.
 /// Extracts the fault code and reason text. Returns `Ok(())` if no fault is
 /// present.
-#[allow(unreachable_pub)] // re-exported under the `__internal` feature for fuzz targets
-pub fn check_soap_fault(xml: &str) -> Result<(), SoapError> {
+pub(crate) fn check_soap_fault(xml: &str) -> Result<(), SoapError> {
     if let Some(fault) = extract_soap_fault(xml) {
         return Err(fault);
     }

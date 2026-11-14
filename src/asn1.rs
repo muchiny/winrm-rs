@@ -3,10 +3,6 @@
 // Handles only the structures needed by CredSSP: TSRequest, TSCredentials,
 // TSPasswordCreds, SPNEGO NegTokenInit/NegTokenResp. Not a general-purpose
 // ASN.1 library.
-//
-// CredSSP is still WIP — some encoder/decoder helpers here are not yet
-// wired into a happy path. Silence dead_code at module level.
-#![allow(dead_code)]
 
 use crate::error::CredSspError;
 
@@ -15,7 +11,7 @@ const TAG_SEQUENCE: u8 = 0x30;
 const TAG_OCTET_STRING: u8 = 0x04;
 const TAG_INTEGER: u8 = 0x02;
 const TAG_ENUM: u8 = 0x0A;
-const TAG_OID: u8 = 0x06;
+#[cfg(any(test, feature = "__internal"))]
 const TAG_BIT_STRING: u8 = 0x03;
 
 // SPNEGO OID: 1.3.6.1.5.5.2
@@ -27,13 +23,33 @@ const NTLM_OID: &[u8] = &[
 
 /// Parsed TSRequest structure.
 #[derive(Debug, Clone)]
-#[allow(unreachable_pub)] // re-exported by `crate::__fuzz` under the `__internal` feature
+#[cfg_attr(
+    not(feature = "__internal"),
+    expect(
+        unreachable_pub,
+        reason = "public for the re-export in `crate::__fuzz`"
+    )
+)]
 pub struct TsRequest {
     pub version: u32,
     pub nego_token: Option<Vec<u8>>,
+    #[cfg_attr(
+        not(any(test, feature = "__internal")),
+        expect(
+            dead_code,
+            reason = "only a client sends it: read by the test server and the fuzz targets"
+        )
+    )]
     pub auth_info: Option<Vec<u8>>,
     pub pub_key_auth: Option<Vec<u8>>,
     pub error_code: Option<u32>,
+    #[cfg_attr(
+        not(any(test, feature = "__internal")),
+        expect(
+            dead_code,
+            reason = "only a client sends it: read by the test server and the fuzz targets"
+        )
+    )]
     pub client_nonce: Option<Vec<u8>>,
 }
 
@@ -177,12 +193,6 @@ fn ts_credentials_sizes(domain: &str, username: &str, password: &str) -> [usize;
     // `[0] { INTEGER 1 }` is 5 bytes, then `[1] { OCTET STRING { SEQUENCE } }`.
     let outer_content = 5usize.saturating_add(tlv_len(octet));
     [pwd_content, pwd_seq, octet, outer_content]
-}
-
-/// Exact size of the DER encoding of the TSCredentials.
-fn ts_credentials_len(domain: &str, username: &str, password: &str) -> usize {
-    let [_, _, _, outer_content] = ts_credentials_sizes(domain, username, password);
-    tlv_len(outer_content)
 }
 
 /// Encode TSCredentials (MS-CSSP 2.2.1.2).
@@ -488,11 +498,12 @@ pub(crate) fn decode_spnego_token(data: &[u8]) -> Result<Vec<u8>, CredSspError> 
 }
 
 /// Extract the `mechListMIC` (`[3] OCTET STRING`) from a SPNEGO NegTokenResp,
-/// if present.
+/// if present: [`decode_spnego_final`] without the `negState`.
 ///
-/// The server's final CredSSP token (in the pubKeyAuth TSRequest) is a
-/// NegTokenResp with negState accept-completed and a mechListMIC but no
-/// responseToken, so [`decode_spnego_token`] cannot be used for it.
+/// The client does not call it, it reads the server's final token with
+/// [`decode_spnego_final`]. The test server reads the client's MIC with it,
+/// and `fuzz_asn1_spnego` runs it.
+#[cfg(any(test, feature = "__internal"))]
 pub(crate) fn decode_spnego_mech_list_mic(data: &[u8]) -> Result<Option<Vec<u8>>, CredSspError> {
     decode_spnego_final(data).map(|(_, mic)| mic)
 }
@@ -552,6 +563,11 @@ pub(crate) fn decode_spnego_final(
 ///
 /// Navigates: Certificate → TBSCertificate → SubjectPublicKeyInfo → SubjectPublicKey (BIT STRING).
 /// Returns the raw public key bytes (without the BIT STRING unused-bits prefix byte).
+///
+/// The client does not call it: it reads the key with `x509-cert`
+/// (`auth/credssp.rs`). The test server uses this one as a second,
+/// independent reader, and `fuzz_asn1_cert` runs it on hostile bytes.
+#[cfg(any(test, feature = "__internal"))]
 pub(crate) fn extract_subject_public_key(cert_der: &[u8]) -> Result<Vec<u8>, CredSspError> {
     // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue }
     let (_, cert_seq, _) = read_tlv(cert_der)?;

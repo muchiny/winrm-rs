@@ -17,19 +17,22 @@
 use crate::auth::AuthTransport;
 use crate::error::WinrmError;
 
+#[cfg_attr(
+    not(feature = "kerberos"),
+    expect(
+        dead_code,
+        reason = "without the feature, `send_authenticated` fails before reading a field"
+    )
+)]
 pub(crate) struct KerberosAuth {
-    // Used by the `kerberos` feature impl; the non-feature stub discards it.
-    #[cfg_attr(not(feature = "kerberos"), allow(dead_code))]
-    pub(crate) service_principal: String, // e.g. "HTTP/win-server.corp.local"
+    /// The SPN the ticket is asked for, e.g. `HTTP/win-server.corp.local`.
+    pub(crate) service_principal: String,
     /// Largest response body read (see `transport::max_response_bytes`).
-    #[cfg_attr(not(feature = "kerberos"), allow(dead_code))]
     pub(crate) max_response_bytes: usize,
     /// Budget of one ticket request: the request budget of the client
     /// (`operation_timeout_secs + 10` seconds).
-    #[cfg_attr(not(feature = "kerberos"), allow(dead_code))]
     pub(crate) kdc_timeout: std::time::Duration,
     /// Ticket requests in flight for the client (see [`run_blocking_bounded`]).
-    #[cfg_attr(not(feature = "kerberos"), allow(dead_code))]
     pub(crate) kdc_slots: std::sync::Arc<tokio::sync::Semaphore>,
 }
 

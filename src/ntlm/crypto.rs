@@ -1,12 +1,6 @@
 // Cryptographic primitives for NTLMv2 authentication.
 //
 // Hash functions, RC4 cipher, AV_PAIR parsing, and encoding helpers.
-//
-// NOTE: Several constants and helpers here are only referenced from the
-// `credssp`-gated code path. Rather than scatter `#[cfg(feature = "credssp")]`
-// across every individual item, we silence `dead_code` for the whole file —
-// this is a low-level primitives module, not public API.
-#![allow(dead_code)]
 
 #[cfg(test)]
 use hmac::{Hmac, KeyInit, Mac};
@@ -18,6 +12,7 @@ pub(crate) const SIGNATURE: &[u8; 8] = b"NTLMSSP\0";
 
 // Negotiate flags (MS-NLMP 2.2.2.5)
 pub(crate) const NEGOTIATE_UNICODE: u32 = 0x0000_0001;
+#[cfg(feature = "credssp")]
 pub(crate) const NEGOTIATE_OEM: u32 = 0x0000_0002;
 pub(crate) const REQUEST_TARGET: u32 = 0x0000_0004;
 pub(crate) const NEGOTIATE_SIGN: u32 = 0x0000_0010;
@@ -61,6 +56,7 @@ pub(crate) const TYPE1_FLAGS: u32 = NEGOTIATE_UNICODE
 
 /// Flags required for NTLM inside CredSSP — needs sealing/key exchange.
 /// Matches what pyspnego/Windows SSPI sends: 0xe2088237
+#[cfg(feature = "credssp")]
 pub(crate) const TYPE1_FLAGS_CREDSSP: u32 = NEGOTIATE_UNICODE
     | NEGOTIATE_OEM
     | REQUEST_TARGET

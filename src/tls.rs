@@ -229,6 +229,10 @@ pub(crate) struct CertHandle {
     captured: Arc<Mutex<Captured>>,
     pinned: Arc<Mutex<Option<Vec<u8>>>>,
     /// The verifier has a target server name, so a pin can take effect.
+    #[cfg_attr(
+        not(any(test, feature = "kerberos")),
+        expect(dead_code, reason = "read by `pin`, which only Kerberos calls")
+    )]
     has_target: bool,
 }
 
@@ -242,13 +246,14 @@ impl CertHandle {
 
     /// Pin the verifier to `cert_der`: later handshakes with the target
     /// that present another end-entity certificate fail.
-    // Only Kerberos pins (and the tests); `expect` would be unfulfilled in
-    // test builds without the feature.
     ///
     /// Fails, pinning nothing, when the verifier has no target server name
     /// (the endpoint host is not a valid TLS server name): a pin could then
     /// not take effect, and the caller must not go on as if it did.
-    #[cfg_attr(not(feature = "kerberos"), allow(dead_code))]
+    #[cfg_attr(
+        not(any(test, feature = "kerberos")),
+        expect(dead_code, reason = "only Kerberos pins a certificate")
+    )]
     pub(crate) fn pin(&self, cert_der: Vec<u8>) -> Result<(), WinrmError> {
         if !self.has_target {
             return Err(WinrmError::AuthFailed(

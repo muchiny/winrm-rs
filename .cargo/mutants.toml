@@ -1,0 +1,27 @@
+# Settings of cargo-mutants for this crate (https://mutants.rs/), read by
+# every `cargo mutants` run: the `Mutants` workflow and a run on your machine.
+
+# On Linux, the test binary of a mutant runs with at most 8 GiB of address
+# space.
+#
+# A mutant can make a parser loop for ever while it allocates. cargo-mutants
+# replaces the body of `decode_length` (src/asn1.rs) with
+# `Ok((0, Vec::leak(vec![0])))`: the length decoder then never consumes its
+# input, the loop over a SEQUENCE never ends, and every turn leaks one
+# allocation. That took all the memory of a GitHub runner in under two
+# minutes, before the test timeout of cargo-mutants, and the runner was shut
+# down with its shard (run 43637215441, shard 0).
+#
+# With the limit, the allocation fails, the test binary aborts ("memory
+# allocation of 1 bytes failed") and the mutant is caught like any other.
+# The unmutated suite needs between 2 and 4 GiB on 32 cores. Cargo starts
+# the test binary through this command (`target.<cfg>.runner`), so the
+# compiler and the linker are not limited.
+#
+# `--config` on the command line wins over `CARGO_TARGET_<TRIPLE>_RUNNER`:
+# to run with another limit, or without `prlimit` (util-linux), change the
+# value here.
+additional_cargo_args = [
+    "--config",
+    "target.'cfg(target_os = \"linux\")'.runner = ['prlimit', '--as=8589934592']",
+]

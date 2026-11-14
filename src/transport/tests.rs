@@ -3700,7 +3700,7 @@ async fn kerberos_without_the_feature_sends_nothing_in_any_mode() {
             WinrmCredentials::new("u", "p", ""),
         )
         .unwrap();
-        assert!(transport.seals() == (encryption != EncryptionMode::Never));
+        assert_eq!(transport.seals(), encryption != EncryptionMode::Never);
         let err = transport
             .send_soap_raw("127.0.0.1", "<s:Envelope/>".into())
             .await

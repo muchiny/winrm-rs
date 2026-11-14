@@ -591,18 +591,15 @@ impl WinrmClientBuilder<Ready> {
     /// A host that cannot be used (see [`WinrmClient`]) is refused when a
     /// request is made, not here.
     pub fn build(self) -> Result<WinrmClient, WinrmError> {
-        // SAFETY: The typestate pattern guarantees that `credentials` is
-        // `Some` when `build()` is callable (state = Ready).
-        #[expect(
-            clippy::expect_used,
-            reason = "the typestate only exposes `build` once credentials are set"
-        )]
-        let mut client = WinrmClient::with_options(
-            self.config,
-            self.credentials
-                .expect("typestate guarantees credentials are set"),
-            self.options,
-        )?;
+        // The typestate only exposes `build` once the credentials are set
+        // (state = Ready), so no caller can reach this refusal. It is an
+        // error and not a panic: this crate has no panic of its own.
+        let Some(credentials) = self.credentials else {
+            return Err(WinrmError::AuthFailed(
+                "internal: a ready builder without credentials".into(),
+            ));
+        };
+        let mut client = WinrmClient::with_options(self.config, credentials, self.options)?;
         if let Some(hook) = self.before_send {
             client.transport.set_before_send(hook.0);
         }

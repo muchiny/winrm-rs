@@ -677,17 +677,18 @@ impl AuthTransport for KerberosAuth {
 
 #[cfg(not(feature = "kerberos"))]
 impl AuthTransport for KerberosAuth {
-    async fn send_authenticated(
+    // Not an `async fn`: the refusal is ready at once.
+    fn send_authenticated(
         &self,
         _http: &reqwest::Client,
         _url: &str,
         _body: String,
-    ) -> Result<String, WinrmError> {
-        Err(WinrmError::AuthFailed(
+    ) -> impl Future<Output = Result<String, WinrmError>> {
+        std::future::ready(Err(WinrmError::AuthFailed(
             "Kerberos auth requires the 'kerberos' feature: \
              cargo add winrm-rs --features kerberos"
                 .into(),
-        ))
+        )))
     }
 }
 

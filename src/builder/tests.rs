@@ -23,6 +23,22 @@ fn builder_keeps_its_auto_traits() {
     assert_send_sync::<WinrmClient>();
 }
 
+/// The typestate keeps a builder without credentials away from `build`.
+/// Should that ever stop being true, `build` refuses instead of panicking.
+#[test]
+fn build_without_credentials_is_an_error_not_a_panic() {
+    let mut builder = WinrmClient::builder(WinrmConfig::default())
+        .credentials(WinrmCredentials::new("u", "p", ""));
+    builder.credentials = None;
+    let Err(err) = builder.build() else {
+        panic!("built without credentials");
+    };
+    assert!(
+        matches!(err, WinrmError::AuthFailed(ref m) if m.contains("without credentials")),
+        "{err:?}"
+    );
+}
+
 #[tracing_test::traced_test]
 #[tokio::test]
 async fn log_soap_bodies_opt_in_logs_both_bodies() {

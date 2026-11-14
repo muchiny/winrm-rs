@@ -2089,17 +2089,18 @@ impl HttpTransport {
         }
     }
 
-    /// Without the `kerberos` feature there is no unsealed dedicated path.
+    /// Without the `kerberos` feature there is no unsealed dedicated path:
+    /// the refusal is ready at once, there is nothing to wait for.
     #[cfg(not(feature = "kerberos"))]
-    async fn send_plain_body(
+    fn send_plain_body(
         _conn: &mut AuthConn,
         _url: &str,
         _body: &str,
         _max_response_bytes: usize,
-    ) -> Result<String, SealedFailure> {
-        Err(SealedFailure::Error(WinrmError::AuthFailed(
+    ) -> std::future::Ready<Result<String, SealedFailure>> {
+        std::future::ready(Err(SealedFailure::Error(WinrmError::AuthFailed(
             "internal: unsealed exchange on a dedicated connection".into(),
-        )))
+        ))))
     }
 
     /// Send a request with NTLM over HTTPS, unsealed (TLS protects it): a

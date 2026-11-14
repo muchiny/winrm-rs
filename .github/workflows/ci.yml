@@ -526,6 +526,15 @@ jobs:
         with:
           # Use the 1.100.0 toolchain installed above, not a floating stable.
           rust-toolchain: manual
+          # A pull request is checked as a minor release would be: it may
+          # add to the API (a new `#[must_use]` counts as that), it may not
+          # break it. Left to derive the release type from `Cargo.toml`,
+          # the check takes every pull request for a patch release, since
+          # the version there is the last released one until the release
+          # commit sets the next. The Release workflow runs this check on
+          # the tagged commit without this input (`verify`, release.yml):
+          # the version chosen for a release is checked there.
+          release-type: minor
       - name: Breaking changes under a 1.x version
         if: steps.semver.outcome == 'failure'
         run: >-

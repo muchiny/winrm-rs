@@ -424,7 +424,8 @@ pub(crate) fn create_authenticate_message_full(
     let (exported_session_key, encrypted_random_session_key) = if with_key_exch {
         // CREDSSP_FIXED_RSK pins the session key for deterministic tests. It is
         // honoured only in debug builds with the internal `__internal` feature;
-        // every other build draws from the CSPRNG.
+        // every other build reads the key from the operating system, not from
+        // the thread-local generator (see `random_session_key`).
         let random_key: Zeroizing<[u8; 16]> = {
             #[cfg(all(debug_assertions, feature = "__internal"))]
             let from_env = std::env::var("CREDSSP_FIXED_RSK")
@@ -434,11 +435,7 @@ pub(crate) fn create_authenticate_message_full(
             let from_env: Option<[u8; 16]> = None;
             match from_env {
                 Some(key) => Zeroizing::new(key),
-                None => {
-                    let mut key = Zeroizing::new([0u8; 16]);
-                    rand::fill(&mut *key);
-                    key
-                }
+                None => random_session_key()?,
             }
         };
         let mut encrypted = *random_key;

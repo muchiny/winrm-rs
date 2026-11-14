@@ -595,6 +595,26 @@ impl Rc4State {
     }
 }
 
+/// A fresh 16-byte session key, read straight from the operating system.
+///
+/// Not `rand::fill`: that draws from the thread-local generator, whose state
+/// is never wiped and can produce its past output again until it reseeds
+/// (every 64 KiB), so a copy of the key would outlive the wiped session.
+/// `SysRng` keeps no state.
+pub(crate) fn random_session_key() -> Result<Zeroizing<[u8; 16]>, crate::error::NtlmError> {
+    use rand::TryRng;
+
+    let mut key = Zeroizing::new([0u8; 16]);
+    rand::rngs::SysRng
+        .try_fill_bytes(key.as_mut_slice())
+        .map_err(|e| {
+            crate::error::NtlmError::InvalidMessage(format!(
+                "the operating system's random source failed, no session key: {e}"
+            ))
+        })?;
+    Ok(key)
+}
+
 /// Parse exactly `N` bytes from `2 * N` hex digits.
 ///
 /// Used by the debug-only environment hooks that pin a random value. Returns
@@ -622,6 +642,17 @@ pub(crate) fn parse_fixed_hex<const N: usize>(s: &str) -> Option<[u8; N]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two draws differ and neither is the zeroed buffer the function starts
+    /// from: the key really comes from the random source.
+    #[test]
+    fn random_session_key_is_fresh_each_time() {
+        let first = random_session_key().unwrap();
+        let second = random_session_key().unwrap();
+        assert_ne!(*first, [0u8; 16]);
+        assert_ne!(*second, [0u8; 16]);
+        assert_ne!(*first, *second);
+    }
 
     #[test]
     fn parse_fixed_hex_rejects_odd_length_and_non_ascii() {

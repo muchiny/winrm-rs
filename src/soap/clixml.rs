@@ -13,8 +13,7 @@
 //!
 //! A marker only opens a document at the start of the stream or of a line,
 //! and only when `<Objs` follows it (after optional whitespace); anything
-//! else is plain stderr text, so a native tool printing `#< CLIXML` cannot
-//! swallow the rest of its output. A marker followed by another marker is
+//! else is plain stderr text. A marker followed by another marker is
 //! dropped (nested PowerShell writes its own marker into the outer stderr),
 //! and once a document closes, `<Objs` after optional whitespace opens the
 //! next one without a new marker.
@@ -31,7 +30,33 @@
 //! it. One marker is held at a time: another lone marker meanwhile is plain
 //! text where it stands.
 //!
-//! Two limits follow from deciding on the bytes alone. A document that
+//! Inside a document, CLIXML is recognised by the bytes `powershell.exe`
+//! writes, and only by them. `<S S="` starts a string record and
+//! `<Obj S="` an object record (the attribute names the stream), each up to
+//! its end tag; `<Objs` and the end of that name is the root tag of a
+//! document inside this one (nested PowerShell writes its own document to
+//! the same stderr, and its records are read like the others); `</Objs>`
+//! closes the innermost open document. A record is also well-formed XML,
+//! whose text and attribute values escape `<`: a `<` inside a tag, or a tag
+//! other than `</S>` inside a string record, shows that the bytes are not a
+//! record after all. Anything else found in a document (text, a tag of
+//! another name, an `<S>` that names no stream, a record that turns out not
+//! to be one) is stderr that something wrote while the document was open:
+//! `powershell.exe` sends its records in blocks, and a native command
+//! writes in between. It is released unchanged, except for the blank bytes
+//! right after a root tag or a record, which are dropped as they are
+//! between two records. So a native tool that prints `#< CLIXML` and
+//! `<Objs` itself opens a document, but the text after it is not swallowed,
+//! and text that only looks like the start of a record does not take in the
+//! records after it.
+//!
+//! Four limits follow from deciding on the bytes alone. Raw stderr text
+//! that holds a well-formed record, whole or cut by the end of the stream,
+//! is read as that record; an object record that nothing closes
+//! (`<Obj S="`, then well-formed tags and no matching `</Obj>`) holds what
+//! follows it, 16 MiB at most, and is dropped with it if the stream ends
+//! first, as an unfinished record is. The marker line of a document inside
+//! another one comes out as text. A document that
 //! follows raw stderr text without a newline (`[Console]::Error.Write('b')`
 //! then the document) is not recognised: `<Objs` is not at the start of a
 //! line, so it stays plain text, and leading spaces before `<Objs` on a line
@@ -70,8 +95,11 @@ enum Mode {
     Text,
     /// At a document's `<Objs ...>` start tag.
     Root,
-    /// Inside a document, before the next top-level record.
+    /// Inside a document, before its next record.
     Body,
+    /// Inside a document, in stderr text that is not a record: it is
+    /// released as it comes, up to the next `<`.
+    BodyText,
     /// Just after `</Objs>`: `<Objs` after optional whitespace opens another
     /// document.
     AfterDocument,
@@ -82,17 +110,12 @@ enum Mode {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Scan {
     /// Offset, from the item start, of the first byte not yet scanned: a `<`
-    /// whose `>` has not arrived, or the end of the buffer.
+    /// whose tag has not ended, or the end of the buffer.
     pos: usize,
-    /// Elements named like the item's root that are open at `pos`.
+    /// Elements named like the item that are open at `pos`.
     depth: usize,
-    /// Offset of the byte that ends the item's element name, once it has
-    /// arrived; the name is then not looked for again.
-    name_end: Option<usize>,
-    /// When `pos` is a `<` whose `>` has not arrived: how far the bytes after
-    /// it are known to hold no `>`. While `name_end` is `None` (then `pos` is
-    /// 0): how far they are known to hold no byte that ends a name (which
-    /// includes `>`). Not above `pos` otherwise.
+    /// When `pos` is a `<` whose tag has not ended: how far the bytes after
+    /// it are known to hold neither `<` nor `>`. Not above `pos` otherwise.
     searched: usize,
 }
 
@@ -121,6 +144,9 @@ pub(crate) struct ClixmlDecoder {
     /// the next document without a marker of its own drops it, `finish`
     /// releases it otherwise.
     held_marker: Option<&'static [u8]>,
+    /// Documents open around the current one: each `<Objs ...>` found inside
+    /// a document adds one, each `</Objs>` closes the innermost.
+    nested: usize,
 }
 
 impl ClixmlDecoder {
@@ -131,6 +157,7 @@ impl ClixmlDecoder {
             scan: Scan::default(),
             at_line_start: true,
             held_marker: None,
+            nested: 0,
         }
     }
 
@@ -273,30 +300,52 @@ impl ClixmlDecoder {
                     if body.is_empty() {
                         return out;
                     }
-                    if body.first() != Some(&b'<') {
-                        // Text between records carries nothing; skip to the
-                        // next tag.
-                        let skip = find_byte_from(body, 0, b'<').unwrap_or(body.len());
-                        *start = start.saturating_add(skip);
-                        continue;
-                    }
+                    let kind = match classify_item(body) {
+                        Item::Tag(kind) => kind,
+                        Item::End => {
+                            *start = start.saturating_add(DOCUMENT_END.len());
+                            self.close_document();
+                            continue;
+                        }
+                        Item::Wait if !eof => return out,
+                        Item::Wait | Item::Text => {
+                            // Not CLIXML: stderr written while the document
+                            // is open. Its first byte goes out here, the rest
+                            // in `BodyText`.
+                            self.emit_text(&mut out, start, 1);
+                            self.enter(Mode::BodyText);
+                            continue;
+                        }
+                    };
                     let window = body.get(..MAX_PENDING).unwrap_or(body);
-                    match scan_item(window, self.scan) {
-                        Step::Complete {
-                            len,
-                            end_of_document,
-                        } => {
-                            if !end_of_document {
-                                out.extend(decode_record(window.get(..len).unwrap_or_default()));
+                    match scan_item(window, kind, self.scan) {
+                        Step::Complete { len } => {
+                            let item = window.get(..len).unwrap_or_default();
+                            if kind != Kind::Root {
+                                out.extend(decode_record(item));
+                            } else if !item.ends_with(b"/>") {
+                                // A document inside this one: its root tag
+                                // is framing, its records are read like the
+                                // others.
+                                self.nested = self.nested.saturating_add(1);
                             }
                             *start = start.saturating_add(len);
-                            self.enter(if end_of_document {
-                                Mode::AfterDocument
-                            } else {
-                                Mode::Body
-                            });
+                            self.enter(Mode::Body);
+                        }
+                        Step::Text { len } => {
+                            // Not well-formed, so not a record: these bytes
+                            // are text, and the `<` after them is read
+                            // afresh.
+                            self.emit_text(&mut out, start, len);
+                            self.enter(Mode::Body);
                         }
                         Step::Partial(_) if body.len() > MAX_PENDING => self.give_up(),
+                        Step::Partial(_) if eof && kind == Kind::Root => {
+                            // No `>` came: nothing shows it was a root tag.
+                            let rest = self.pending.len().saturating_sub(*start);
+                            self.emit_text(&mut out, start, rest);
+                            return out;
+                        }
                         Step::Partial(_) if eof => {
                             out.extend(decode_record(body));
                             *start = self.pending.len();
@@ -308,6 +357,16 @@ impl ClixmlDecoder {
                         }
                     }
                 }
+                Mode::BodyText => {
+                    // Release the text up to the next `<`, which may start a
+                    // record or a root tag: `Body` decides.
+                    let next_tag = find_byte_from(view, 0, b'<');
+                    self.emit_text(&mut out, start, next_tag.unwrap_or(view.len()));
+                    if next_tag.is_none() {
+                        return out;
+                    }
+                    self.enter(Mode::Body);
+                }
             }
         }
     }
@@ -318,11 +377,24 @@ impl ClixmlDecoder {
         self.scan = Scan::default();
     }
 
-    /// Abandon the current document after an oversized record: from here on
-    /// its bytes are plain text.
+    /// Leave the document that just ended: back to the one around it, or
+    /// past the outermost one.
+    fn close_document(&mut self) {
+        match self.nested.checked_sub(1) {
+            Some(around) => {
+                self.nested = around;
+                self.enter(Mode::Body);
+            }
+            None => self.enter(Mode::AfterDocument),
+        }
+    }
+
+    /// Abandon the current document, and those around it, after an oversized
+    /// record: from here on its bytes are plain text.
     fn give_up(&mut self) {
         self.enter(Mode::Text);
         self.at_line_start = false;
+        self.nested = 0;
     }
 
     /// Copy the `n` bytes of `pending` at `start` to `out` as plain text and
@@ -421,6 +493,67 @@ fn next_line(buf: &[u8], from: usize) -> Option<usize> {
     find_byte_from(buf, from, b'\n')?.checked_add(1)
 }
 
+/// What a `<` at the front of a document body starts, when it is CLIXML.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    /// `<S S="`: a string record, the text of one stream.
+    String,
+    /// `<Obj S="`: an object record (progress, information).
+    Object,
+    /// `<Objs`: the root tag of a document inside this one.
+    Root,
+}
+
+/// What starts at the front of a document body, after the blank bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Item {
+    /// A record or a root tag, to scan up to its end.
+    Tag(Kind),
+    /// `</Objs>`: the end of the innermost open document.
+    End,
+    /// Anything else: stderr text that is not part of the document.
+    Text,
+    /// The first bytes of one of the above; the next ones will tell.
+    Wait,
+}
+
+/// How a string record starts, as `powershell.exe` writes it: the name, one
+/// space and the attribute that names its stream.
+const STRING_START: &[u8] = b"<S S=\"";
+/// How an object record starts, likewise.
+const OBJECT_START: &[u8] = b"<Obj S=\"";
+const DOCUMENT_END: &[u8] = b"</Objs>";
+
+/// Classify the bytes at the front of a document body. Only the bytes
+/// decide: `Wait` is returned while they are the start of one of the four
+/// things that are CLIXML there and do not yet tell which, or whether.
+fn classify_item(body: &[u8]) -> Item {
+    for (start, item) in [
+        (STRING_START, Item::Tag(Kind::String)),
+        (OBJECT_START, Item::Tag(Kind::Object)),
+        (DOCUMENT_END, Item::End),
+    ] {
+        if body.starts_with(start) {
+            return item;
+        }
+        if start.starts_with(body) {
+            return Item::Wait;
+        }
+    }
+    match body.strip_prefix(DOCUMENT_START).map(<[u8]>::first) {
+        Some(Some(&next)) if ends_name(next) => Item::Tag(Kind::Root),
+        Some(None) => Item::Wait,
+        // A longer name (`<Objsx`), or the start of none of the four: the
+        // first bytes of `<Objs` are those of `<Obj S="` and waited above.
+        Some(Some(_)) | None => Item::Text,
+    }
+}
+
+/// Whether `byte` ends an element name: ASCII whitespace, `/` or `>`.
+fn ends_name(byte: u8) -> bool {
+    byte.is_ascii_whitespace() || byte == b'/' || byte == b'>'
+}
+
 /// Position of the first `byte` in `buf` at or after `from`.
 fn find_byte_from(buf: &[u8], from: usize, byte: u8) -> Option<usize> {
     let pos = buf.get(from..)?.iter().position(|&b| b == byte)?;
@@ -456,53 +589,34 @@ fn partial_document_len(buf: &[u8], at_line_start: bool) -> usize {
         .unwrap_or(0)
 }
 
-/// Result of scanning the top-level item at the front of a document body.
+/// Result of scanning the record or root tag at the front of a document
+/// body.
 #[derive(Debug, PartialEq, Eq)]
 enum Step {
-    /// The item is complete and `len` bytes long; `end_of_document` when it
-    /// is the `</Objs>` closing the document.
-    Complete { len: usize, end_of_document: bool },
+    /// The item is complete and `len` bytes long.
+    Complete { len: usize },
+    /// The item is not well-formed, so it is not CLIXML: its first `len`
+    /// bytes (at least one) are text, and a `<` follows them.
+    Text { len: usize },
     /// The item has not ended yet; resume the scan from here.
     Partial(Scan),
 }
 
 /// Scan the item starting with `<` at the front of `item`, resuming from
-/// `scan`: an element up to its matching end tag (counting nested elements
-/// of the same name), or a lone tag (`</...>`, `<!...>`, `<?...>`).
+/// `scan`: a root tag up to its `>`, a record up to its matching end tag
+/// (counting, in an object record, the elements of the same name).
 ///
-/// Raw `<` and `>` only delimit tags in well-formed CLIXML, where text
-/// escapes them; a malformed stream still scans deterministically.
-fn scan_item(item: &[u8], scan: Scan) -> Step {
-    let name_end = match scan.name_end {
-        Some(end) => end,
-        None => match name_end_from(item, scan.searched.max(1)) {
-            Some(end) => end,
-            None => {
-                return Step::Partial(Scan {
-                    searched: item.len(),
-                    ..Scan::default()
-                });
-            }
-        },
+/// `powershell.exe` writes well-formed XML, where text and attribute values
+/// escape `<`: a tag reaches its `>` before any other `<`, and a string
+/// record holds no tag but its own end tag. Bytes that break either rule
+/// are not a record, and what was scanned of them is text. So a `<S S="`
+/// that raw stderr happens to hold cannot take in the records after it.
+fn scan_item(item: &[u8], kind: Kind, scan: Scan) -> Step {
+    let name: &[u8] = match kind {
+        Kind::String => b"S",
+        Kind::Object => b"Obj",
+        Kind::Root => ROOT,
     };
-    let name = item.get(1..name_end).unwrap_or_default();
-    let lone_tag = matches!(item.get(1), Some(b'/' | b'!' | b'?'));
-    if lone_tag {
-        let from = scan.pos.max(1);
-        return match find_byte_from(item, from, b'>') {
-            Some(end) => Step::Complete {
-                len: end.saturating_add(1),
-                end_of_document: item.get(2..).and_then(element_name) == Some(ROOT)
-                    && item.get(1) == Some(&b'/'),
-            },
-            None => Step::Partial(Scan {
-                pos: item.len(),
-                depth: 0,
-                name_end: Some(name_end),
-                searched: item.len(),
-            }),
-        };
-    }
     let mut pos = scan.pos;
     let mut depth = scan.depth;
     loop {
@@ -510,69 +624,68 @@ fn scan_item(item: &[u8], scan: Scan) -> Step {
             return Step::Partial(Scan {
                 pos: item.len(),
                 depth,
-                name_end: Some(name_end),
                 searched: item.len(),
             });
         };
         // The bytes of a `<` left open by the previous push were already
-        // searched for its `>`; only the new ones are looked at.
-        let gt_from = if lt == scan.pos {
-            scan.searched.max(lt)
+        // searched for the end of its tag; only the new ones are looked at.
+        let after_lt = lt.saturating_add(1);
+        let from = if lt == scan.pos {
+            scan.searched.max(after_lt)
         } else {
-            lt
+            after_lt
         };
-        let Some(gt) = find_byte_from(item, gt_from, b'>') else {
+        let Some(end) = find_tag_end(item, from) else {
             return Step::Partial(Scan {
                 pos: lt,
                 depth,
-                name_end: Some(name_end),
                 searched: item.len(),
             });
         };
-        let tag = item.get(lt..=gt).unwrap_or_default();
-        let len = gt.saturating_add(1);
-        if let Some(closing) = tag.strip_prefix(b"</") {
-            if element_name(closing) == Some(name) {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    return Step::Complete {
-                        len,
-                        end_of_document: false,
-                    };
-                }
+        if item.get(end) != Some(&b'>') {
+            // Another `<` inside the tag.
+            return Step::Text { len: end };
+        }
+        let tag = item.get(lt..=end).unwrap_or_default();
+        let len = end.saturating_add(1);
+        let closing = tag.strip_prefix(b"</");
+        if lt == 0 {
+            // The item's own start tag.
+            if kind == Kind::Root || tag.ends_with(b"/>") {
+                return Step::Complete { len };
             }
-        } else if tag.get(1..).and_then(element_name) == Some(name) {
-            if tag.ends_with(b"/>") {
-                if depth == 0 {
-                    return Step::Complete {
-                        len,
-                        end_of_document: false,
-                    };
-                }
-            } else {
-                depth = depth.saturating_add(1);
+            depth = 1;
+        } else if closing.and_then(element_name) == Some(name) {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return Step::Complete { len };
             }
+        } else if kind == Kind::String {
+            // A tag that is not the end tag, inside a string record.
+            return Step::Text { len: lt };
+        } else if closing.is_none()
+            && !tag.ends_with(b"/>")
+            && tag.get(1..).and_then(element_name) == Some(name)
+        {
+            depth = depth.saturating_add(1);
         }
         pos = len;
     }
 }
 
-/// Offset of the first byte at or after `from` that ends an element name
-/// (ASCII whitespace, `/` or `>`).
-fn name_end_from(item: &[u8], from: usize) -> Option<usize> {
-    let pos = item
+/// Position of the first `<` or `>` in `buf` at or after `from`.
+fn find_tag_end(buf: &[u8], from: usize) -> Option<usize> {
+    let pos = buf
         .get(from..)?
         .iter()
-        .position(|&b| b.is_ascii_whitespace() || b == b'/' || b == b'>')?;
+        .position(|&b| b == b'<' || b == b'>')?;
     from.checked_add(pos)
 }
 
 /// The element name at the start of `tag` (the bytes after `<` or `</`), or
 /// `None` while the byte that ends it has not arrived.
 fn element_name(tag: &[u8]) -> Option<&[u8]> {
-    let end = tag
-        .iter()
-        .position(|&b| b.is_ascii_whitespace() || b == b'/' || b == b'>')?;
+    let end = tag.iter().position(|&b| ends_name(b))?;
     tag.get(..end)
 }
 
@@ -749,6 +862,14 @@ fn parse_escape(s: &str) -> Option<u16> {
 /// KiB, so a record reaches the client when its block does. Error text comes
 /// as is, warning, verbose and debug text with the console prefixes `WARNING: `,
 /// `VERBOSE: ` and `DEBUG: `; progress and information records are dropped.
+/// Inside a document, bytes that are not part of a record (raw stderr
+/// written while the document is open) pass through, without the blank
+/// bytes that follow a record. A record is told by its first bytes
+/// (`<S S="`, `<Obj S="`) and by being well-formed, so raw text is read as
+/// a record only when it holds a whole one; an `<Obj S="` that nothing
+/// closes holds what follows it, like a record still arriving. A document
+/// inside another one (nested `powershell.exe`) is decoded too; its
+/// `#< CLIXML` line comes out as text.
 /// Bytes outside a CLIXML document pass through unchanged, with one
 /// exception: raw stderr can arrive between the `#< CLIXML` line and its
 /// `<Objs>` document (Windows PowerShell 5.1 writes the document only at
@@ -1491,7 +1612,9 @@ mod tests {
         }
     }
 
-    /// An inner `<` whose `>` comes 8 MiB later, pushed 1 KiB at a time.
+    /// An inner `<` whose `>` comes 8 MiB later, pushed 1 KiB at a time. A
+    /// string record holds no tag but its end tag, so once the `>` shows
+    /// this is one, the record is text: all of it comes out as it stands.
     #[test]
     fn stderr_decoder_scans_an_unclosed_inner_tag_in_linear_time() {
         use std::time::{Duration, Instant};
@@ -1505,130 +1628,475 @@ mod tests {
         out.extend(decoder.push(b">x</S></Objs>"));
         out.extend(decoder.finish());
         assert!(started.elapsed() < Duration::from_secs(5));
-        // The record's text stops at its first `<`.
-        assert_eq!(out, b"a");
+        assert_eq!(
+            out.len(),
+            "<S S=\"Error\">a<".len() + 8192 * 1024 + ">x</S>".len()
+        );
+        assert!(out.starts_with(b"<S S=\"Error\">a<bbb") && out.ends_with(b"bbb>x</S>"));
     }
 
-    /// A record whose element name runs for 8 MiB, pushed 1 KiB at a time.
+    /// A tag whose name runs for 8 MiB, pushed 1 KiB at a time. It is not a
+    /// record (`S`, `Obj`), so it is stderr text: each push releases its
+    /// bytes, and nothing is held or rescanned.
     #[test]
-    fn stderr_decoder_scans_a_long_element_name_in_linear_time() {
+    fn stderr_decoder_passes_a_long_unknown_tag_through_in_linear_time() {
         use std::time::{Duration, Instant};
         let started = Instant::now();
         let mut decoder = ClixmlDecoder::new();
         let mut out = decoder.push(b"#< CLIXML\r\n<Objs Version=\"1.1.0.1\"><");
         let slice = vec![b'a'; 1024];
         for _ in 0..8192 {
-            out.extend(decoder.push(&slice));
+            let ready = decoder.push(&slice);
+            assert!(!ready.is_empty(), "the text is held back");
+            out.extend(ready);
         }
         out.extend(decoder.push(b" /></Objs>"));
         out.extend(decoder.finish());
         assert!(started.elapsed() < Duration::from_secs(5));
-        assert!(out.is_empty(), "{} bytes", out.len());
+        assert_eq!(out.len(), 1 + 8192 * 1024 + 3);
+        assert!(out.starts_with(b"<aaaa") && out.ends_with(b"aaaa />"));
     }
 
-    /// `scan_item` as it was before scans resumed inside a tag, for fresh
-    /// scans only (the `Scan` it returns is not compared).
-    fn reference_scan_item(item: &[u8], scan: Scan) -> Step {
-        let partial_at_start = Step::Partial(Scan::default());
-        let Some(name) = item.get(1..).and_then(element_name) else {
-            return partial_at_start;
-        };
-        let lone_tag = matches!(item.get(1), Some(b'/' | b'!' | b'?'));
-        if lone_tag {
-            let from = scan.pos.max(1);
-            return match find_byte_from(item, from, b'>') {
-                Some(end) => Step::Complete {
-                    len: end.saturating_add(1),
-                    end_of_document: item.get(2..).and_then(element_name) == Some(ROOT)
-                        && item.get(1) == Some(&b'/'),
-                },
-                None => Step::Partial(Scan {
-                    pos: item.len(),
-                    depth: 0,
-                    ..Scan::default()
-                }),
-            };
+    /// Raw stderr written while a document is open (Windows PowerShell 5.1
+    /// sends its records in blocks, and a native command writes in between)
+    /// is not a record: it passes through, and the records around it still
+    /// decode.
+    #[test]
+    fn raw_text_inside_a_document_passes_through() {
+        assert_eq!(
+            decode(
+                b"#< CLIXML\r\n<Objs Version=\"1.1.0.1\">\r\nreal error text\r\n\
+<S S=\"Error\">first_x000D__x000A_</S>native: failed\n<S S=\"warning\">careful</S></Objs>"
+            ),
+            "real error text\r\nfirst\r\nnative: failed\nWARNING: careful\r\n"
+        );
+        // A marker and `<Objs>` printed by a native tool open a document,
+        // and the text after them is still not swallowed.
+        assert_eq!(
+            decode(b"#< CLIXML\n<Objs>\nreal error text\n"),
+            "real error text\n"
+        );
+    }
+
+    /// A `<` that starts neither a record nor a root tag is text: `a < b`,
+    /// `<stdin>:1: error`, another element, an `<S>` or `<Obj>` that does not
+    /// name a stream. It is released by the push that brings it, not held
+    /// until an end tag that never comes.
+    #[test]
+    fn a_tag_that_is_not_a_record_is_text() {
+        let open: &[u8] =
+            b"#< CLIXML\r\n<Objs Version=\"1.1.0.1\"><S S=\"Error\">e_x000D__x000A_</S>";
+        for raw in [
+            "a < b\n",
+            "<stdin>:1:5: error: expected ';'\n",
+            "<none>\n",
+            "<x>hidden?</x>\n",
+            "<Small>s</Small>",
+            "expected Vec<S>, found Vec<T>\n",
+            "value <S x> more",
+            "value <S x",
+            "<S>s</S>",
+            "<S/>",
+            "<S N=\"x\">named</S>",
+            "<S\tS=\"Error\">tab</S>",
+            "<s S=\"Error\">case</s>",
+            "<Obj>",
+            "<Obj RefId=\"0\">",
+            "<Obj\nS=\"progress\"/>",
+            "<Objsx>",
+            "</S>",
+            "</Obj>",
+            "</Objs >",
+            "see </Objs here",
+            "<!-- c -->",
+            "<?php ?>",
+            "<",
+            "<<x",
+        ] {
+            let mut decoder = ClixmlDecoder::new();
+            let mut out = decoder.push(open);
+            assert_eq!(out, b"e\r\n");
+            out.extend(decoder.push(raw.as_bytes()));
+            out.extend(decoder.push(b"."));
+            assert_eq!(
+                String::from_utf8_lossy(&out),
+                format!("e\r\n{raw}."),
+                "{raw:?} was not released by the push after it"
+            );
+            out.extend(decoder.push(b"<S S=\"Error\">after</S></Objs>tail"));
+            out.extend(decoder.finish());
+            assert_eq!(
+                String::from_utf8_lossy(&out),
+                format!("e\r\n{raw}.aftertail"),
+                "{raw:?}"
+            );
         }
-        let mut pos = scan.pos;
-        let mut depth = scan.depth;
-        loop {
-            let Some(lt) = find_byte_from(item, pos, b'<') else {
-                return Step::Partial(Scan {
-                    pos: item.len(),
-                    depth,
-                    ..Scan::default()
-                });
-            };
-            let Some(gt) = find_byte_from(item, lt, b'>') else {
-                return Step::Partial(Scan {
-                    pos: lt,
-                    depth,
-                    ..Scan::default()
-                });
-            };
-            let tag = item.get(lt..=gt).unwrap_or_default();
-            let len = gt.saturating_add(1);
-            if let Some(closing) = tag.strip_prefix(b"</") {
-                if element_name(closing) == Some(name) {
-                    depth = depth.saturating_sub(1);
-                    if depth == 0 {
-                        return Step::Complete {
-                            len,
-                            end_of_document: false,
-                        };
-                    }
-                }
-            } else if tag.get(1..).and_then(element_name) == Some(name) {
-                if tag.ends_with(b"/>") {
-                    if depth == 0 {
-                        return Step::Complete {
-                            len,
-                            end_of_document: false,
-                        };
-                    }
-                } else {
-                    depth = depth.saturating_add(1);
-                }
+    }
+
+    /// Raw stderr can hold the very bytes a record or a root tag starts
+    /// with. What follows them then shows they are not one (a `<` inside
+    /// the tag, a tag inside a string record), and they come out as text:
+    /// the records after them are not taken in.
+    #[test]
+    fn a_record_start_in_raw_text_does_not_take_in_what_follows() {
+        for raw in [
+            "literal <S S=\"x\">junk",
+            "literal <S S=\"Error\">junk <b>bold</b>",
+            "literal <S S=\"Error\" <",
+            "literal <Obj S=\"x\"> <a <b",
+            "literal <Obj S=\"x\" <",
+            "see <Objs here",
+            "see <Objs here\r\n and there ",
+        ] {
+            let stream = format!(
+                "#< CLIXML\r\n<Objs Version=\"1.1.0.1\"><S S=\"Error\">e</S>{raw}\
+<S S=\"Error\">real_x000D__x000A_</S><S S=\"warning\">w</S></Objs>\r\ntail"
+            );
+            let whole = decode(stream.as_bytes());
+            assert_eq!(
+                whole,
+                format!("e{raw}real\r\nWARNING: w\r\n\r\ntail"),
+                "{raw:?}"
+            );
+            let bytes: Vec<&[u8]> = stream.as_bytes().chunks(1).collect();
+            assert_eq!(decode_chunks(&bytes), whole, "{raw:?} one byte at a time");
+        }
+    }
+
+    /// The limit that is left: raw text that is itself a whole record is
+    /// read as one, and an object record that nothing closes holds what
+    /// follows it, which is dropped with it when the stream ends.
+    #[test]
+    fn a_whole_record_in_raw_text_is_read_as_a_record() {
+        let open = "#< CLIXML\r\n<Objs Version=\"1.1.0.1\">";
+        assert_eq!(
+            decode(format!("{open}raw <S S=\"warning\">w</S> tail</Objs>").as_bytes()),
+            "raw WARNING: w\r\ntail"
+        );
+        assert_eq!(
+            decode(format!("{open}raw <S S=\"other\">gone</S> tail</Objs>").as_bytes()),
+            "raw tail"
+        );
+        assert_eq!(
+            decode(
+                format!("{open}raw <Obj S=\"x\"> open <S S=\"Error\">lost</S></Objs>").as_bytes()
+            ),
+            "raw "
+        );
+    }
+
+    /// Many start tags, then a `<` that makes them text: they are scanned
+    /// once and released together, not rescanned from each one.
+    #[test]
+    fn a_long_run_of_start_tags_that_is_not_a_record_decodes_in_linear_time() {
+        use std::time::{Duration, Instant};
+        for tag in ["<Obj S=\"a\">", "<S S=\"a\">"] {
+            let mut stream = b"#< CLIXML\r\n<Objs>".to_vec();
+            let tags = tag.repeat(200_000);
+            stream.extend_from_slice(tags.as_bytes());
+            stream.extend_from_slice(b"<<");
+            let started = Instant::now();
+            let whole = decode(&stream);
+            let mut decoder = ClixmlDecoder::new();
+            let mut sliced = Vec::new();
+            for slice in stream.chunks(1000) {
+                sliced.extend(decoder.push(slice));
             }
-            pos = len;
+            sliced.extend(decoder.finish());
+            assert!(started.elapsed() < Duration::from_secs(5), "{tag}");
+            assert_eq!(whole, format!("{tags}<<"), "{tag}");
+            assert_eq!(sliced, whole.as_bytes(), "{tag}");
+        }
+    }
+
+    /// Blank bytes between records are still dropped, and so are complete
+    /// records that are not one of the four text streams: a well-formed
+    /// document decodes as before.
+    #[test]
+    fn blank_bytes_and_other_records_inside_a_document_are_still_dropped() {
+        assert_eq!(
+            decode(
+                b"#< CLIXML\r\n<Objs Version=\"1.1.0.1\">\r\n  <S S=\"Error\">a</S>\r\n\t\
+<Obj S=\"progress\" RefId=\"0\"><Obj N=\"in\"><S N=\"m\">p</S></Obj></Obj> \
+<S S=\"information\">i</S><S S=\"Error\"/><Obj S=\"information\" RefId=\"1\"/>\
+<S S=\"Error\">b</S>\r\n</Objs>"
+            ),
+            "ab"
+        );
+    }
+
+    /// The bytes that tell a record from text can be cut anywhere: the
+    /// decoder waits for them, and at the end of the stream what is left is
+    /// text. Blank bytes are dropped before a record and before text alike
+    /// (`one` and `a` join); inside text they stay.
+    #[test]
+    fn text_inside_a_document_decodes_the_same_at_every_two_cuts() {
+        let s: &[u8] = b"#< CLIXML\r\n<Objs Version=\"1.1.0.1\"> \r\n lead  text \r\n\
+<S S=\"Error\">one</S> a < b <Small>x</Small> <Objx/><O<Ob<Obj<S S=\"warning\">two</S>\
+</Obj</Objsx> <S>s</S><Objs ><S S=\"Error\">in</S> t </Objs><Obj/> <S S=\"Error\">x<b>y</S>\
+<Obj S=\"p\"><a <b></Obj></Objs>\r\nafter<S";
+        let whole = decode(s);
+        assert_eq!(
+            whole,
+            "lead  text \r\nonea < b <Small>x</Small> <Objx/><O<Ob<ObjWARNING: two\r\n\
+</Obj</Objsx> <S>s</S>int <Obj/> <S S=\"Error\">x<b>y</S><Obj S=\"p\"><a <b></Obj>\r\nafter<S"
+        );
+        for i in 0..=s.len() {
+            for j in i..=s.len() {
+                assert_eq!(
+                    decode_chunks(&[&s[..i], &s[i..j], &s[j..]]),
+                    whole,
+                    "cuts at {i},{j}"
+                );
+            }
+        }
+    }
+
+    /// At the end of the stream, bytes that could still have become a record
+    /// or a root tag are released as they stand; an unterminated record
+    /// keeps the rule it had (the text of a stream record, nothing for
+    /// another one).
+    #[test]
+    fn end_of_stream_inside_a_document() {
+        let open = "#< CLIXML\r\n<Objs Version=\"1.1.0.1\">";
+        for (tail, text) in [
+            ("<", "<"),
+            ("<S", "<S"),
+            ("<S S=", "<S S="),
+            ("<O", "<O"),
+            ("<Obj", "<Obj"),
+            ("<Obj S", "<Obj S"),
+            ("<Objs", "<Objs"),
+            ("<Objs Version=\"1.1.0.1\"", "<Objs Version=\"1.1.0.1\""),
+            ("</Obj", "</Obj"),
+            ("</Objs", "</Objs"),
+            ("</Objs>", ""),
+            ("text", "text"),
+            ("<S>cut sh", "<S>cut sh"),
+            ("<S S=\"Error\"", ""),
+            ("<S S=\"Error\">cut sh", "cut sh"),
+            ("<S S=\"Error\">cut<", "cut"),
+            ("<S S=\"Error\">cut</", "cut"),
+            ("<S S=\"progress\">p", ""),
+            ("<Obj S=\"progress\"><TN>", ""),
+        ] {
+            assert_eq!(decode(format!("{open}{tail}").as_bytes()), text, "{tail:?}");
+        }
+    }
+
+    #[test]
+    fn classify_item_tells_records_from_text() {
+        let lossy = String::from_utf8_lossy;
+        for (item, kind) in [
+            (&b"<S S=\"Error\">"[..], Item::Tag(Kind::String)),
+            (b"<S S=\"", Item::Tag(Kind::String)),
+            (b"<Obj S=\"progress\" RefId=\"0\">", Item::Tag(Kind::Object)),
+            (b"<Obj S=\"", Item::Tag(Kind::Object)),
+            (b"<Objs>", Item::Tag(Kind::Root)),
+            (b"<Objs/>", Item::Tag(Kind::Root)),
+            (b"<Objs\n", Item::Tag(Kind::Root)),
+            (b"<Objs Version=\"1.1.0.1\">", Item::Tag(Kind::Root)),
+            (b"</Objs>", Item::End),
+            (b"</Objs>tail", Item::End),
+        ] {
+            assert_eq!(classify_item(item), kind, "{:?}", lossy(item));
+        }
+        for wait in [
+            &b"<"[..],
+            b"<S",
+            b"<S ",
+            b"<S S",
+            b"<S S=",
+            b"<O",
+            b"<Ob",
+            b"<Obj",
+            b"<Obj ",
+            b"<Obj S",
+            b"<Obj S=",
+            b"<Objs",
+            b"</",
+            b"</O",
+            b"</Objs",
+        ] {
+            assert_eq!(classify_item(wait), Item::Wait, "{:?}", lossy(wait));
+        }
+        for text in [
+            &b"x"[..],
+            b"< S>",
+            b"<s S=\"Error\">",
+            b"<S>",
+            b"<S/>",
+            b"<S\tS=\"Error\">",
+            b"<S  S=\"Error\">",
+            b"<S N=\"x\">",
+            b"<S S='Error'>",
+            b"<Sx>",
+            b"<Obj>",
+            b"<Obj/>",
+            b"<Obj RefId=\"0\">",
+            b"<Obj\nS=\"progress\">",
+            b"<Objx",
+            b"<Objsx",
+            b"</S>",
+            b"</Obj>",
+            b"</Objs >",
+            b"</Objsx",
+            b"<!",
+            b"<?",
+            b"<\xC3\xA9>",
+        ] {
+            assert_eq!(classify_item(text), Item::Text, "{:?}", lossy(text));
+        }
+    }
+
+    /// Nested `powershell.exe` writes its marker and its document to the
+    /// same stderr. When the outer document is already open, the inner one
+    /// is read inside it: its records decode, its `</Objs>` closes it alone,
+    /// and the outer records after it still decode. Its marker line is text.
+    #[test]
+    fn a_document_inside_a_document_is_decoded() {
+        let s: &[u8] =
+            b"#< CLIXML\r\n<Objs Version=\"1.1.0.1\"><S S=\"Error\">outer 1_x000D__x000A_</S>\
+#< CLIXML\r\n<Objs Version=\"1.1.0.1\" xmlns=\"http://schemas.microsoft.com/powershell/2004/04\">\
+<S S=\"Error\">inner_x000D__x000A_</S><Obj S=\"progress\" RefId=\"0\"><Objs>not a root</Objs></Obj>\
+</Objs><S S=\"warning\">outer 2</S><Objs/><Objs><Objs><S S=\"debug\">deep</S></Objs>\r\n</Objs>\
+<S S=\"Error\">outer 3</S></Objs>\r\ntail <S S=\"Error\">raw</S>";
+        let whole = decode(s);
+        assert_eq!(
+            whole,
+            "outer 1\r\n#< CLIXML\r\ninner\r\nWARNING: outer 2\r\nDEBUG: deep\r\nouter 3\
+\r\ntail <S S=\"Error\">raw</S>"
+        );
+        for i in 0..=s.len() {
+            assert_eq!(decode_chunks(&[&s[..i], &s[i..]]), whole, "cut at {i}");
+        }
+        let bytes: Vec<&[u8]> = s.chunks(1).collect();
+        assert_eq!(decode_chunks(&bytes), whole, "one byte at a time");
+    }
+
+    /// A root tag that nothing closes keeps the decoder inside a document:
+    /// the records after it still decode, whatever `</Objs>` is missing.
+    #[test]
+    fn an_unclosed_document_inside_a_document_keeps_decoding() {
+        assert_eq!(
+            decode(
+                b"#< CLIXML\n<Objs><S S=\"Error\">a</S><Objs><S S=\"Error\">b</S></Objs>\
+<S S=\"Error\">c</S><Objs Version=\"1.1.0.1\"><S S=\"Error\">d</S>"
+            ),
+            "abcd"
+        );
+    }
+
+    /// Giving up on an oversized record leaves every open document: the
+    /// next one starts from nothing.
+    #[test]
+    fn giving_up_inside_a_nested_document_forgets_the_nesting() {
+        let mut d = ClixmlDecoder::new();
+        let mut out = d.push(b"#< CLIXML\r\n<Objs><Objs><Objs><S S=\"Error\">");
+        out.extend(d.push(&vec![b'x'; MAX_PENDING + 1]));
+        assert!(
+            out.starts_with(b"<S S=\"Error\">xxx"),
+            "{:?}",
+            out.get(..32)
+        );
+        assert_eq!(d.nested, 0);
+        // One `</Objs>` closes the new document: what follows it is text,
+        // not a record of a document still open around it.
+        let mut out =
+            d.push(b"\r\n#< CLIXML\r\n<Objs><S S=\"Error\">a</S></Objs>.<S S=\"Error\">raw</S>");
+        out.extend(d.finish());
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "\r\na.<S S=\"Error\">raw</S>"
+        );
+    }
+
+    /// `scan_item` without the resuming: one pass over the whole item.
+    /// `None` stands for `Step::Partial`.
+    fn reference_scan_item(item: &[u8], kind: Kind) -> Option<Step> {
+        let name: &[u8] = match kind {
+            Kind::String => b"S",
+            Kind::Object => b"Obj",
+            Kind::Root => b"Objs",
+        };
+        let mut depth = 0usize;
+        let mut pos = 0;
+        loop {
+            let lt = pos + item[pos..].iter().position(|&b| b == b'<')?;
+            let end = lt
+                + 1
+                + item[lt + 1..]
+                    .iter()
+                    .position(|&b| b == b'<' || b == b'>')?;
+            if item[end] == b'<' {
+                return Some(Step::Text { len: end });
+            }
+            let tag = &item[lt..=end];
+            let name_of = |rest: &[u8]| {
+                let stop = rest
+                    .iter()
+                    .position(|b| b.is_ascii_whitespace() || matches!(b, b'/' | b'>'));
+                stop.map(|stop| rest[..stop].to_vec())
+            };
+            let is_end_tag = tag.starts_with(b"</") && name_of(&tag[2..]).as_deref() == Some(name);
+            let is_start_tag = !tag.starts_with(b"</")
+                && !tag.ends_with(b"/>")
+                && name_of(&tag[1..]).as_deref() == Some(name);
+            if lt == 0 {
+                if kind == Kind::Root || tag.ends_with(b"/>") {
+                    return Some(Step::Complete { len: end + 1 });
+                }
+                depth = 1;
+            } else if is_end_tag {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(Step::Complete { len: end + 1 });
+                }
+            } else if kind == Kind::String {
+                return Some(Step::Text { len: lt });
+            } else if is_start_tag {
+                depth += 1;
+            }
+            pos = end + 1;
         }
     }
 
     proptest::proptest! {
         /// Scanning a growing item and resuming from the returned `Scan` gives
-        /// what a fresh scan of the same prefix gives, and what the scan gave
-        /// before it resumed inside tags.
+        /// what a fresh scan of the same prefix gives, and what one plain
+        /// pass over it gives.
         #[test]
         fn scan_item_resumed_matches_a_fresh_scan(
+            kind in proptest::sample::select(vec![Kind::String, Kind::Object, Kind::Root]),
             parts in proptest::collection::vec(
                 proptest::sample::select(vec![
-                    "S S=\"Error\">", "<S>", "</S>", "<S/>", "<Obj>", "</Obj>",
-                    "<", ">", "/", " ", "a", "S", "!", "?",
+                    "S S=\"Error\">", "<S>", "</S>", "<S/>", "<Obj>", "</Obj>", "<Obj/>", "</Objs>",
+                    "<", ">", "/", " ", "a", "S", "Obj", "!", "?",
                 ]),
                 1..24,
             ),
             cuts in proptest::collection::vec(0usize..256, 0..8),
         ) {
             let item = format!("<{}", parts.concat()).into_bytes();
-            let mut ends: Vec<usize> = cuts.iter().map(|c| c % (item.len() + 1)).collect();
+            let mut ends: Vec<usize> = cuts.iter().map(|c| 1 + c % item.len()).collect();
             ends.push(item.len());
             ends.sort_unstable();
             ends.dedup();
             let mut scan = Scan::default();
             for &end in &ends {
                 let prefix = &item[..end];
-                let resumed = scan_item(prefix, scan);
-                let fresh = scan_item(prefix, Scan::default());
-                let reference = reference_scan_item(prefix, Scan::default());
+                let resumed = scan_item(prefix, kind, scan);
+                let fresh = scan_item(prefix, kind, Scan::default());
+                let reference = reference_scan_item(prefix, kind);
                 match &resumed {
-                    Step::Complete { .. } => {
+                    Step::Complete { .. } | Step::Text { .. } => {
                         proptest::prop_assert_eq!(&resumed, &fresh);
-                        proptest::prop_assert_eq!(&resumed, &reference);
+                        proptest::prop_assert_eq!(Some(&resumed), reference.as_ref());
                         break;
                     }
                     Step::Partial(next) => {
                         proptest::prop_assert!(matches!(fresh, Step::Partial(_)), "{:?} vs {:?}", resumed, fresh);
-                        proptest::prop_assert!(matches!(reference, Step::Partial(_)), "{:?} vs {:?}", resumed, reference);
+                        proptest::prop_assert!(reference.is_none(), "{:?} vs {:?}", resumed, reference);
                         scan = *next;
                     }
                 }

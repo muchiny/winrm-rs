@@ -2158,9 +2158,15 @@ impl HttpTransport {
                     tokio::time::sleep(delay).await;
                 }
                 Err(e) => {
-                    let proxied = self.route.proxy_for(&self.endpoint(host)).is_some();
-                    if let Some(hint) = connect_hint(&self.config, proxied, &e) {
-                        tracing::warn!(host = %log_host(host), "{hint}");
+                    // Only a connect error can get the hint. Every other
+                    // error comes through here too (the timeout of each
+                    // silent Receive poll, for one): the proxy route is not
+                    // looked up for those.
+                    if matches!(&e, WinrmError::Http(err) if err.is_connect()) {
+                        let proxied = self.route.proxy_for(&self.endpoint(host)).is_some();
+                        if let Some(hint) = connect_hint(&self.config, proxied, &e) {
+                            tracing::warn!(host = %log_host(host), "{hint}");
+                        }
                     }
                     return Err(e);
                 }

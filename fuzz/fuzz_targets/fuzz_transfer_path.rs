@@ -70,6 +70,25 @@ fn final_name(path: &str) -> Option<String> {
     stack.pop()
 }
 
+/// The characters Windows path handling drops from the end of a path or of a
+/// component, stated independently of the implementation: space, dot, TAB
+/// and no-break space.
+fn dropped_at_end(c: char) -> bool {
+    matches!(c, ' ' | '.' | '\t' | '\u{a0}')
+}
+
+/// Whether a component after the drive, other than `.` and `..`, holds only
+/// such characters (`. `, `...`, a lone space): Windows reads it as nothing,
+/// as `.` or as `..` depending on the code that opens the path, so
+/// `LocalDrive` refuses the path.
+fn has_blank_component(path: &str) -> bool {
+    let mut parts = path.split(|c| c == '\\' || c == '/');
+    let _drive = parts.next();
+    parts.any(|part| {
+        !part.is_empty() && part != "." && part != ".." && part.chars().all(dropped_at_end)
+    })
+}
+
 /// The DOS device names, stated independently of the implementation.
 const FIXED_DEVICES: [&str; 6] = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"];
 const PORT_DIGITS: [char; 13] = [
@@ -77,13 +96,14 @@ const PORT_DIGITS: [char; 13] = [
 ];
 
 /// Whether a drive-absolute path ends in a DOS device name: the final name,
-/// trailing spaces and dots dropped, cut before its first `.` or `:`,
-/// trailing spaces dropped again, compared without ASCII case.
+/// trailing spaces, dots, TABs and no-break spaces dropped, cut before its
+/// first `.` or `:`, trailing spaces dropped again, compared without ASCII
+/// case.
 fn ends_in_device(path: &str) -> bool {
     let Some(name) = final_name(path) else {
         return false;
     };
-    let name = name.trim_end_matches(|c| c == ' ' || c == '.');
+    let name = name.trim_end_matches(dropped_at_end);
     let cut = name.find(|c| c == '.' || c == ':').unwrap_or(name.len());
     let stem = name.get(..cut).unwrap_or(name).trim_end_matches(' ');
     if FIXED_DEVICES.iter().any(|d| stem.eq_ignore_ascii_case(d)) {
@@ -115,12 +135,14 @@ fuzz_target!(|data: &[u8]| {
     // the DOS device names, in both directions: it accepts exactly the paths
     // the base check accepts that are a letter, `:`, then `\` or `/` (so
     // `\\?\C:\x`, `\\host\share`, `C:x`, `\x` and relative paths are all
-    // refused) and whose final name, after `.` and `..`, is not a device
-    // (so `C:\NUL` and `C:\x\LPT1\.` are refused).
+    // refused), that have no component made only of dots and blanks (so
+    // `C:\x\LPT1\. ` and `C:\x\LPT1\a\...` are refused) and whose final
+    // name, after `.` and `..`, is not a device (so `C:\NUL` and
+    // `C:\x\LPT1\.` are refused).
     assert_eq!(
         validate_remote_path_for(path, RemotePathPolicy::LocalDrive).is_ok(),
-        accepted && drive_absolute(path) && !ends_in_device(path),
-        "LocalDrive differs from the base check plus the drive-absolute grammar minus device names"
+        accepted && drive_absolute(path) && !has_blank_component(path) && !ends_in_device(path),
+        "LocalDrive differs from the base check plus the drive-absolute grammar minus blank components and device names"
     );
     // `Any` is the base check.
     assert_eq!(

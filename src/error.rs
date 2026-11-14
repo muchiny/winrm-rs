@@ -179,7 +179,9 @@ pub enum NtlmError {
     /// - NTLM over HTTPS cannot compute the channel binding: no server
     ///   certificate reported, several certificates seen, or a certificate
     ///   whose signature algorithm defines no binding hash (Ed25519, unknown
-    ///   algorithms).
+    ///   algorithms);
+    /// - the operating system's random source fails while the session key is
+    ///   drawn.
     #[error("NTLM error: {0}")]
     InvalidMessage(String),
 }

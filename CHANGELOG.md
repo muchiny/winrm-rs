@@ -269,10 +269,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   feature on). No behaviour change.
 - **`clippy::pedantic` is on for the whole crate**, tests included, and CI
   refuses its warnings like the others. What the code does not follow is
-  an `#[expect]` with its reason: four, all in the library, two of them
-  in the fuzz surface. Test code is exempt from three lints of the group
-  beside `too_many_lines`: `similar_names`, `cast_possible_truncation` and
-  `assert_is_empty`. What a user of the crate can see of it:
+  an `#[expect]` with its reason: five, all in the library, two of them
+  in the fuzz surface and one that only a build outside Unix needs. Test
+  code is exempt from three lints of the group beside `too_many_lines`:
+  `similar_names`, `cast_possible_truncation` and `assert_is_empty`. What
+  a user of the crate can see of it:
   - `#[must_use]` on two types, `WinrmClientBuilder` (it does nothing
     until `build`) and `Shell` (dropped without `close`, it stays open on
     the server), and on the functions that only return a value:

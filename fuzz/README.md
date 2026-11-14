@@ -50,18 +50,18 @@ drives; "invariant" is what it asserts beyond *must not panic*.
 
 | Target | Source | Invariant |
 |---|---|---|
-| `fuzz_soap_parse` | `soap/parser.rs` response parsers | decoded streams fit in the response; a fault is never read as success |
-| `fuzz_soap_enumerate` | `parse_enumerate_response` | an `EndOfSequence` element after the document clears the context; escaped item text never does and is never a fault; the context cannot add XML elements to the next `Pull` |
+| `fuzz_soap_parse` | `soap/parser.rs` response parsers, and the reader they share (`soap/xml.rs`, over `quick-xml`) | decoded streams fit in the response; an id is text of the response; a response is a fault for a parser of an answer when it is one for `check_soap_fault`, and it is the same fault; the check of the transport (`check_answer`) misses no fault and refuses nothing a parser reads |
+| `fuzz_soap_enumerate` | `parse_enumerate_response` | a response that is a fault is never a page, and a page is never read from a response the transport refuses; an `EndOfSequence` element after a response that is read, in an element that holds both, clears the context and keeps the items; escaped item text never does and is never a fault; the context cannot add XML elements to the next `Pull` |
 | `fuzz_soap_envelope` | all envelope builders, the five PSRP ones included (shell creation with `creationXml`, command, receive, send, signal) | **no input can add XML markup** — tag counts match an empty-input baseline |
 | `fuzz_xml_escape` | `envelope::xml_escape` | complete (no raw markup survives) and reversible |
-| `fuzz_clixml_stderr` | `soap/clixml.rs::ClixmlDecoder` | output does not depend on how stderr is sliced; plain stderr passes through; output ≤ 3× input |
+| `fuzz_clixml_stderr` | `soap/clixml.rs::ClixmlDecoder` | output does not depend on how stderr is sliced; plain stderr passes through, and so does raw text between the records of an open document, even when it looks like the start of a record; a document inside another one is decoded; output ≤ 3× input |
 
 ### Input validation
 
 | Target | Source | Invariant |
 |---|---|---|
 | `fuzz_transport_host` | `transport::sanitize_host`, `transport::validate_host` | no `/` or `@` survives; the rebuilt URL has one authority; an accepted host has no `?`, `#`, `\`, whitespace or control character, and its endpoint URL (when the URL parser takes it) reads back with that host, the port, `/wsman`, and no userinfo, query or fragment |
-| `fuzz_transfer_path` | `validate_remote_path`, `validate_remote_path_for`, `escape_ps_single_quoted`, `quote_powershell_string` | accepted paths are bounded and control-free; LocalDrive accepts only drive-absolute paths and refuses DOS device names (last component after resolving `.` and `..`); every PowerShell single quote (U+0027, U+2018, U+2019, U+201A, U+201B) is doubled with itself and collapses back to the input; `quote_powershell_string` wraps that escape in one pair of ASCII single quotes and its inner part collapses back to the input |
+| `fuzz_transfer_path` | `validate_remote_path`, `validate_remote_path_for`, `escape_ps_single_quoted`, `quote_powershell_string` | accepted paths are bounded and control-free; LocalDrive accepts only drive-absolute paths and refuses DOS device names (last component after resolving `.` and `..`) and components made only of dots and blanks; every PowerShell single quote (U+0027, U+2018, U+2019, U+201A, U+201B) is doubled with itself and collapses back to the input; `quote_powershell_string` wraps that escape in one pair of ASCII single quotes and its inner part collapses back to the input |
 | `fuzz_powershell_encode` | `command::encode_powershell_command` | output is ASCII base64 and roundtrips |
 
 ### CredSSP ASN.1 / DER — pre-authentication attack surface
@@ -129,8 +129,9 @@ The nightly `long-inputs` job (`fuzz.yml`) fuzzes the three Receive-path
 parsers (`fuzz_soap_parse`, `fuzz_soap_enumerate`, `fuzz_clixml_stderr`) with
 inputs up to 2 MiB (the default `max_response_bytes`) and a 10 s per-input
 timeout, so a superlinear parse shows up as a timeout. Turn every input it
-reports into a time-bounded unit test next to
-`extract_element_text_is_linear_on_unclosed_tags`, then fix the parser.
+reports into a time-bounded unit test next to `many_elements_are_read_once`
+(`src/soap/parser/tests.rs`) or `decode_entities_is_linear_on_ampersand_runs`
+(`src/soap/clixml/tests.rs`), then fix the parser.
 
 To reproduce locally, one target at a time:
 

@@ -85,17 +85,20 @@ impl<'a> OutgoingRequest<'a> {
     /// converted to punycode (the URL parser converts a Unicode name), and
     /// with a proxy it is the WinRM host, not the TCP peer. Compare it
     /// case-insensitively and strip a trailing dot before using it as a key.
+    #[must_use]
     pub fn host(&self) -> &'a str {
         self.host
     }
 
     /// The `wsa:Action` URI as sent; empty for a body without one (no
     /// request this crate builds).
+    #[must_use]
     pub fn action(&self) -> &'a str {
         self.action
     }
 
     /// The [`RequestKind`] of [`Self::action`].
+    #[must_use]
     pub fn kind(&self) -> RequestKind {
         self.kind
     }
@@ -103,6 +106,7 @@ impl<'a> OutgoingRequest<'a> {
     /// 0 for the first try, `n` for the n-th retry
     /// ([`WinrmConfig::max_retries`](crate::WinrmConfig::max_retries)); each
     /// attempt is a separate approval.
+    #[must_use]
     pub fn attempt(&self) -> u32 {
         self.attempt
     }

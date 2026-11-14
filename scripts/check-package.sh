@@ -9,13 +9,17 @@
 # Any other `src/test_*.rs` fails this check. `tests/` subdirectories are
 # refused: add one to the allowlist only on purpose.
 #
+# The `.xml` files of `src/soap/parser/fixtures/` (answers captured from real
+# servers) ship for the same reason: `src/soap/parser/tests.rs` includes them
+# at compile time. Nothing else that is not Rust is allowed under `src/`.
+#
 # Exit 0 when every listed path is allowed and every required path is present;
 # exit 1 otherwise, with one stderr line per problem.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-allow='^(\.cargo_vcs_info\.json|Cargo\.(toml|toml\.orig|lock)|LICENSE-(MIT|APACHE)|README\.md|CHANGELOG\.md|(src|examples)/.+\.rs|tests/[^/]+\.rs)$'
+allow='^(\.cargo_vcs_info\.json|Cargo\.(toml|toml\.orig|lock)|LICENSE-(MIT|APACHE)|README\.md|CHANGELOG\.md|(src|examples)/.+\.rs|src/soap/parser/fixtures/[^/]+\.xml|tests/[^/]+\.rs)$'
 required=(Cargo.toml Cargo.lock README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE src/lib.rs)
 
 list=$(cargo package --list --locked --allow-dirty)

@@ -52,8 +52,9 @@ scripts/test-release-ci-status.sh
 
 # Lint
 cargo clippy --all-targets -- -D warnings
-cargo clippy --all-targets --features kerberos -- -D warnings
 cargo clippy --all-targets --all-features -- -D warnings
+# What CI runs: the same under every feature combination (needs cargo-hack)
+cargo hack clippy --feature-powerset --exclude-features default --all-targets -- -D warnings
 
 # Format (requires nightly). fuzz/ is a crate of its own: check it too.
 cargo +nightly fmt --check
@@ -99,7 +100,8 @@ We follow [Conventional Commits](https://www.conventionalcommits.org/):
 - Run `cargo +nightly fmt` before committing
 - Follow existing patterns in the codebase
 - Use `tracing` for logging, not `println!`
-- No `unwrap`, `expect`, `panic!`, unchecked indexing, unchecked arithmetic or `as` casts in library code: Cargo.toml sets these Clippy lints and CI denies warnings. Tests are exempt. A justified exception is an `#[expect(clippy::..., reason = "...")]` on the smallest item that needs it
+- No `unwrap`, `expect`, `panic!`, unchecked indexing, unchecked arithmetic or `as` casts in library code: Cargo.toml sets these Clippy lints and CI denies warnings. Tests are exempt. A justified exception is an `#[expect(clippy::..., reason = "...")]` on the smallest item that needs it, never an `#[allow]` (Clippy refuses it). When the lint only fires without a feature, the `#[expect]` goes in a `cfg_attr` with that condition; code that only the tests and the fuzz targets call is gated on `cfg(any(test, feature = "__internal"))` instead
+- A function of the library is at most 100 lines (`clippy::too_many_lines`): split a longer one into named steps. Tests are exempt.
 - Wrap secrets with `secrecy::SecretString` and zeroize sensitive data
 
 ## CredSSP differential against pyspnego
@@ -122,6 +124,7 @@ a production host.
 ## Dependency review
 
 - `cargo vet --locked` is a required check. A bump that brings a crate version nobody has audited fails it, Dependabot's included, because Dependabot cannot certify. On the PR branch, `cargo vet` lists what is missing. Audit it and run `cargo vet certify <crate> <version>`, or record a deliberate, dated decision with `cargo vet add-exemption <crate> <version>`, then commit `supply-chain/`.
+- The audits of six organizations are imported (`[imports]` in `supply-chain/config.toml`): Mozilla, Google, the Bytecode Alliance, Embark Studios, ISRG and Zcash. `supply-chain/imports.lock` is the copy of them that `--locked` checks against. `cargo vet` without `--locked` fetches their current audits, so run it first after a bump: a new version may already be covered. `cargo vet prune` then drops the exemptions that an audit replaces.
 - `.github/workflows/advisories.yml` runs `cargo deny --all-features --locked check advisories` every day. A failure means a new RustSec advisory or a yanked dependency: bump the dependency, or add a `deny.toml` `ignore` entry with a reason and `revue avant AAAA-MM-JJ`. GitHub disables scheduled workflows after 60 days without repository activity; re-enable it from the Actions tab if that happens.
 
 ## Releasing (maintainers)

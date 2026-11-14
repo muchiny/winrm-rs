@@ -1,6 +1,6 @@
 //! Streaming the output of a long-running command.
 //!
-//! Usage: WINRM_HOST=win-server WINRM_USER=admin WINRM_PASS=password cargo run --example streaming
+//! Usage: `WINRM_HOST=win-server WINRM_USER=admin WINRM_PASS=password cargo run --example streaming`
 //!
 //! `run_command` and `run_powershell` return once the command has ended. To
 //! show output while the command runs, open a shell, start the command with

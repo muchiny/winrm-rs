@@ -60,6 +60,16 @@ cargo add winrm-rs
 cargo add winrm-rs --features kerberos
 ```
 
+**Upgrading from 2.x: 3.0 breaks the error types.** `WinrmError` now says
+what failed by its variant: `AuthFailed` and `NtlmError::InvalidMessage` are
+gone (refused credentials are `AuthRejected`, a configuration that cannot
+work is `Config`, and so on), `Transfer` holds a `TransferError`, and the
+error enums, `AuthMethod` and `EncryptionMode` are `#[non_exhaustive]`. A
+program that matches on these types has to be adapted; one that only shows
+an error or passes it on with `?` compiles as it is. See *Upgrading from
+2.x* in the [CHANGELOG](CHANGELOG.md) for the table of variants and the
+migration, and [Handling errors](#handling-errors) below.
+
 Upgrading from 1.x: 2.0 changes defaults (HTTPS on 5986, proxy environment
 variables read only on request, drive-absolute transfer paths only,
 non-interactive PowerShell) and the types of `WinrmConfig::port` and
@@ -486,8 +496,9 @@ winrm-rs logs through `tracing`. Below `trace` it logs no command text, argument
 | **v1.0** | Stable public API, TLS channel binding, CI/CD | Done |
 | **v1.4** | `before_send` request hook | Done |
 | **v2.0** | HTTPS on 5986 by default, `WinrmConfig::https()` / `http()` presets, opt-in environment proxies and SOAP body logging | Done |
-| **v2.1** | MSRV 1.99, four more runnable examples | **Current** |
-| **v2.x** | CredSSP stabilization (`--features credssp`) | Planned |
+| **v2.1** | MSRV 1.99, four more runnable examples | Done |
+| **v3.0** | Errors typed by cause (breaking), server answers read with an XML parser, host-side check of transfer paths, MSRV 1.100 | **Current** |
+| **v3.x** | CredSSP stabilization (`--features credssp`) | Planned |
 
 ## Comparison
 

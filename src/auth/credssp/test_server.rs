@@ -19,7 +19,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use sha2::{Digest, Sha256};
 
-use super::{MemBio, OpenSslMemTls};
+use super::tls::OpenSslMemTls;
 use crate::asn1;
 use crate::ntlm::SealingSession;
 use crate::test_ntlm_server::exported_session_key;
@@ -303,7 +303,7 @@ const DROPPED: &[u8] =
 /// The inner TLS 1.2 acceptor, on `RSA_CERT_PEM`, in memory mode.
 fn inner_acceptor() -> Result<OpenSslMemTls, String> {
     use openssl::pkey::PKey;
-    use openssl::ssl::{Ssl, SslAcceptor, SslMethod, SslStream, SslVersion};
+    use openssl::ssl::{Ssl, SslAcceptor, SslMethod, SslVersion};
     // OpenSSL's owned certificate.
     type Certificate = <openssl::x509::X509Ref as ToOwned>::Owned;
 
@@ -322,12 +322,7 @@ fn inner_acceptor() -> Result<OpenSslMemTls, String> {
     let acceptor = builder.build();
     let mut ssl = Ssl::new(acceptor.context()).map_err(e)?;
     ssl.set_accept_state();
-    let bio = MemBio {
-        incoming: std::collections::VecDeque::new(),
-        outgoing: Vec::new(),
-    };
-    let ssl = SslStream::new(ssl, bio).map_err(e)?;
-    Ok(OpenSslMemTls { ssl })
+    OpenSslMemTls::over_memory(ssl).map_err(e)
 }
 
 /// The SubjectPublicKey of the inner certificate, read with the crate's own

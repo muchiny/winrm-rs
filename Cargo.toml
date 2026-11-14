@@ -33,8 +33,8 @@ kerberos = ["dep:cross-krb5"]
 # The OpenSSL dependency is required for the inner TLS 1.2
 # in-memory handshake: a `rustls` implementation was attempted and the
 # Microsoft CredSSP server silently drops the context after Type3 +
-# pubKeyAuth. See the comment block in `src/auth/credssp.rs` around the
-# `build_inner_openssl_tls` function for the full background.
+# pubKeyAuth. See `OpenSslMemTls` in `src/auth/credssp/tls.rs` and the
+# comment at the head of `src/auth/credssp.rs` for the full background.
 credssp = ["dep:tokio-rustls", "dep:x509-cert", "dep:openssl"]
 # Internal-only. Re-exports crate internals needed by `fuzz/` targets.
 # NOT part of the public API. Do not enable from downstream code — any

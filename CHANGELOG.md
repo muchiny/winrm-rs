@@ -241,6 +241,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   change: same requests in the same order, same error messages. The
   debug-only `CREDSSP_DUMP` lines keep their names; `inner_cert_der` now
   comes first.
+- `src/auth/credssp.rs` (1 818 lines) is now a module of six files, one per
+  part: `endpoint.rs` (the endpoint URL), `tunnel.rs` (the TCP stream,
+  direct or through a `CONNECT` or SOCKS5 proxy), `tls.rs` (the TLS
+  contexts of a client and the in-memory inner session), `connection.rs`
+  (the one HTTPS connection of an exchange), `http.rs` (its HTTP/1.1
+  responses) and `handshake.rs` (the handshake, up to the delegation).
+  `credssp.rs` keeps `CredSspAuth`. The tests of each part are next to it;
+  the exchanges against the in-process acceptor stay in
+  `src/auth/credssp/tests.rs`. The code is moved, not rewritten: same
+  requests, same error messages, same tests under new paths. Two things
+  go: the `#[cfg(feature = "credssp")]` attributes on single items, which
+  repeated the gate `src/auth/mod.rs` puts on the module, and the
+  `AuthTransport` implementation for a build without the feature, which
+  that gate kept from ever being compiled. No API change.
 - The NTLM Type 3 builder always exchanges a session key and sets
   `NEGOTIATE_KEY_EXCH` itself. Its branch without a key exchange, where
   the exported key is the session base key, could not be reached (both

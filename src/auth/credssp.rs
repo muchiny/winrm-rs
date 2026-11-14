@@ -1,9 +1,10 @@
 // CredSSP authentication transport for WinRM (MS-CSSP).
 //
 // **STATUS: EXPERIMENTAL.** Validated end-to-end against Windows Server
-// 2025 (live test `credssp_run_command_whoami`). Still experimental:
-// validated on a single host generation, and the inner TLS leg pulls
-// OpenSSL.
+// 2016, 2019, 2022 and 2025 (the `credssp` tests of
+// `tests/integration_real.rs`, which skip themselves on Server 2012 R2: its
+// HTTPS listener shares no cipher suite with rustls). The inner TLS leg
+// pulls OpenSSL.
 //
 // This implements the CredSSP protocol with TLS-in-TLS architecture:
 //

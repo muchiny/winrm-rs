@@ -826,12 +826,12 @@ pub enum AuthMethod {
     /// configured in Active Directory, avoids sending the password; it works
     /// with [`AuthMethod::Kerberos`] to the first hop.
     ///
-    /// Validated live against Windows Server 2025 (`credssp_run_command_whoami`
-    /// in `tests/integration_real.rs`). Not validated on Windows Server 2012 R2:
-    /// its SCHANNEL pairs AES-GCM only with static-RSA key exchange, which
-    /// `rustls` does not support, so the HTTPS leg shares no cipher suite with
-    /// a default 2012 R2 listener and the live test skips there (it was not
-    /// measured on 2012 R2 in the latest validation round either).
+    /// Validated live against Windows Server 2016, 2019, 2022 and 2025 (the
+    /// `credssp` tests of `tests/integration_real.rs`). Not validated on
+    /// Windows Server 2012 R2: its SCHANNEL pairs AES-GCM only with static-RSA
+    /// key exchange, which `rustls` does not support, so the HTTPS leg shares
+    /// no cipher suite with a default 2012 R2 listener and the live tests skip
+    /// there.
     ///
     /// # Limitations in this release
     ///

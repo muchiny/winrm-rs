@@ -27,9 +27,9 @@ include = [
 default = []
 kerberos = ["dep:cross-krb5"]
 # CredSSP (double-hop delegation). Experimental: validated end-to-end against
-# Windows Server 2025 (live test `credssp_run_command_whoami`); Server 2012 R2 is
-# skipped because its SCHANNEL pairs GCM only with static-RSA key exchange,
-# which rustls does not support, and was not measured in the latest round.
+# Windows Server 2016, 2019, 2022 and 2025 (the live tests named `credssp`);
+# Server 2012 R2 is skipped because its SCHANNEL pairs GCM only with
+# static-RSA key exchange, which rustls does not support.
 # The OpenSSL dependency is required for the inner TLS 1.2
 # in-memory handshake: a `rustls` implementation was attempted and the
 # Microsoft CredSSP server silently drops the context after Type3 +

@@ -294,6 +294,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Documentation
 
+- CredSSP is validated on four generations of Windows Server, not one: the
+  live tests named `credssp` (the handshake and a command, a large
+  response, the `CONNECT` and SOCKS5 tunnels, a request a `before_send`
+  hook refuses, a command that prints nothing) pass against Server 2016,
+  2019, 2022 and 2025. The README, the crate documentation,
+  `AuthMethod::CredSsp` and `Cargo.toml` said "Server 2025; not yet
+  exercised on other host generations". Server 2012 R2 stays out: its
+  HTTPS listener shares no cipher suite with `rustls`, and those tests skip
+  there. The feature keeps its "experimental" label.
 - README: the `credssp` section names `openssl-sys` 0.9.118, the version in
   the lockfile since 2.1.0, which builds against LibreSSL up to 4.4. The
   `WinrmConfig` table gains the five fields it left out (`codepage`,

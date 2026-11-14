@@ -565,7 +565,7 @@ pub(crate) fn decode_spnego_final(
 /// Returns the raw public key bytes (without the BIT STRING unused-bits prefix byte).
 ///
 /// The client does not call it: it reads the key with `x509-cert`
-/// (`auth/credssp.rs`). The test server uses this one as a second,
+/// (`auth/credssp/handshake.rs`). The test server uses this one as a second,
 /// independent reader, and `fuzz_asn1_cert` runs it on hostile bytes.
 #[cfg(any(test, feature = "__internal"))]
 pub(crate) fn extract_subject_public_key(cert_der: &[u8]) -> Result<Vec<u8>, CredSspError> {

@@ -84,12 +84,13 @@
 //! - **`credssp`** -- *Experimental.* Enables `CredSSP` authentication for
 //!   double-hop delegation. Links the host's OpenSSL through `openssl-sys`
 //!   (required because Microsoft's `CredSSP` server has proven incompatible
-//!   with `rustls` in-memory TLS — see `src/auth/credssp.rs`).
+//!   with `rustls` in-memory TLS — see `src/auth/credssp/tls.rs`).
 //!   The inner `CredSSP` TLS client parses server-controlled records before
 //!   authentication, so that library must still receive security fixes
 //!   (README, "`credssp` and the host OpenSSL").
-//!   Validated end-to-end against Windows Server 2025; not yet exercised
-//!   on other host generations.
+//!   Validated end-to-end against Windows Server 2016, 2019, 2022 and
+//!   2025; not against Server 2012 R2, whose HTTPS listener shares no
+//!   cipher suite with `rustls`.
 //!   Delegates your cleartext password to the target: use it only toward
 //!   hosts you trust as much as the account.
 //!

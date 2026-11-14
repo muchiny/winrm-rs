@@ -174,6 +174,8 @@ fn encode_length_very_long() {
     let l = encode_length(70000);
     assert_eq!(l[0], 0x83);
     assert_eq!(l.len(), 4);
+    // The first length the 2-byte form cannot hold.
+    assert_eq!(encode_length(0x1_0000), vec![0x83, 0x01, 0x00, 0x00]);
 }
 
 // The 3-byte arm used to be the fallback for every larger length, which

@@ -543,6 +543,30 @@ fn receive_psrp_request_without_command_id() {
     assert!(!xml.contains("CommandId"));
 }
 
+/// One `Arguments` element per line after the command: no empty line before
+/// the first, a line break between two.
+#[test]
+fn execute_command_request_with_uri_writes_one_argument_per_line() {
+    let xml = execute_command_request_with_uri(
+        "http://host:5985/wsman",
+        "SHELL-1",
+        "Get-Process",
+        &["-Name", "svchost"],
+        60,
+        153_600,
+        "http://schemas.microsoft.com/powershell/Custom",
+    );
+    assert!(
+        xml.contains(
+            "      <rsp:Command>Get-Process</rsp:Command>\n      \
+             <rsp:Arguments>-Name</rsp:Arguments>\n      \
+             <rsp:Arguments>svchost</rsp:Arguments>\n    \
+             </rsp:CommandLine>"
+        ),
+        "{xml}"
+    );
+}
+
 #[test]
 fn execute_command_request_with_uri_contains_required_elements() {
     let custom_uri = "http://schemas.microsoft.com/powershell/Custom";

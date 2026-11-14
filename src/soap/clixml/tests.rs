@@ -197,6 +197,15 @@ fn decodes_xml_entities_and_any_x_escape() {
     );
 }
 
+/// `_xHHHH_` is an escape only with four hexadecimal digits and its closing
+/// underscore; anything else is text, a sign in place of a digit included.
+#[test]
+fn an_x_escape_needs_four_hex_digits_and_its_closing_underscore() {
+    let doc =
+        b"#< CLIXML\r\n<Objs><S S=\"Error\">a_x0041 b_x0041- c_x+041_ d_x004_ e_x00G1_</S></Objs>";
+    assert_eq!(decode(doc), "a_x0041 b_x0041- c_x+041_ d_x004_ e_x00G1_");
+}
+
 #[test]
 fn decodes_surrogate_pair_escape() {
     let doc = b"#< CLIXML\r\n<Objs><S S=\"Error\">_xD83D__xDE00_</S></Objs>";

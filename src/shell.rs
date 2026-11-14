@@ -134,7 +134,7 @@ impl<'a> Shell<'a> {
     /// `2 * operation_timeout_secs`. When that deadline passes, or the output
     /// exceeds `max_output_bytes`, the command is told to terminate and the
     /// error is returned ([`WinrmError::Timeout`] with
-    /// `2 * operation_timeout_secs`, or [`WinrmError::Transfer`]); the shell
+    /// `2 * operation_timeout_secs`, or [`WinrmError::OutputLimit`]); the shell
     /// stays open. The terminate request is best effort, bounded by
     /// `operation_timeout_secs` capped at 10 s, so the call can take that
     /// much longer than the deadline. A command that must run longer belongs
@@ -152,7 +152,7 @@ impl<'a> Shell<'a> {
     ///
     /// The [errors of a request](crate::WinrmClient#errors-of-a-request),
     /// from the Execute or a Receive; [`WinrmError::Timeout`] when the
-    /// deadline passes; [`WinrmError::Transfer`] when the output exceeds
+    /// deadline passes; [`WinrmError::OutputLimit`] when the output exceeds
     /// `max_output_bytes`. An exit code other than zero is not an error: it
     /// is in the [`CommandOutput`].
     pub async fn run_command(
@@ -233,9 +233,10 @@ impl<'a> Shell<'a> {
             }
             Ok(Ok(Polled::OverCap(cap))) => {
                 self.terminate_best_effort(&command_id).await;
-                Err(WinrmError::Transfer(format!(
-                    "command output exceeded max_output_bytes ({cap})"
-                )))
+                Err(WinrmError::OutputLimit {
+                    what: "command output",
+                    limit: cap,
+                })
             }
             // A failed Receive says nothing about the command: no signal.
             Ok(Err(e)) => Err(e),

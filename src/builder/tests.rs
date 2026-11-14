@@ -34,7 +34,7 @@ fn build_without_credentials_is_an_error_not_a_panic() {
         panic!("built without credentials");
     };
     assert!(
-        matches!(err, WinrmError::AuthFailed(ref m) if m.contains("without credentials")),
+        matches!(err, WinrmError::Internal(ref m) if m.contains("without credentials")),
         "{err:?}"
     );
 }
@@ -183,10 +183,10 @@ fn tls_options_are_kept_across_credentials() {
     .credentials(WinrmCredentials::new("u", "p", ""))
     .build();
     match result {
-        Err(WinrmError::AuthFailed(m)) => {
+        Err(WinrmError::Config(m)) => {
             assert!(m.contains("/nonexistent/winrm-rs/ca.pem"), "{m}");
         }
-        other => panic!("expected AuthFailed, got {:?}", other.map(|_| ())),
+        other => panic!("expected Config, got {:?}", other.map(|_| ())),
     }
 }
 
@@ -207,8 +207,8 @@ fn pins_accumulate_across_credentials() {
         vec!["aa".to_string(), "bb".repeat(32)]
     );
     match builder.build() {
-        Err(WinrmError::AuthFailed(m)) => assert!(m.contains("got 2"), "{m}"),
-        other => panic!("expected AuthFailed, got {:?}", other.map(|_| ())),
+        Err(WinrmError::Config(m)) => assert!(m.contains("got 2"), "{m}"),
+        other => panic!("expected Config, got {:?}", other.map(|_| ())),
     }
 }
 

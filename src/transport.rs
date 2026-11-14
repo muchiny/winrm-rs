@@ -343,9 +343,7 @@ fn seals_for(config: &WinrmConfig) -> bool {
 /// The slot a dedicated route was given: always `Some` from
 /// [`HttpTransport::send_soap_with_retry`], else an internal error.
 fn dedicated_slot(slot: Option<SlotGuard>) -> Result<SlotGuard, WinrmError> {
-    slot.ok_or_else(|| {
-        WinrmError::AuthFailed("internal: dedicated path without a connection slot".into())
-    })
+    slot.ok_or_else(|| WinrmError::Internal("dedicated path without a connection slot".into()))
 }
 
 /// The security context that seals a connection's messages.
@@ -408,16 +406,6 @@ fn method_name(method: &AuthMethod) -> &'static str {
         AuthMethod::Basic => "Basic",
         AuthMethod::Certificate => "Certificate",
         AuthMethod::CredSsp => "CredSSP",
-    }
-}
-
-/// Error for a failure of a sealed or dedicated-connection exchange:
-/// [`WinrmError::Ntlm`] for NTLM (as before), [`WinrmError::AuthFailed`]
-/// otherwise (Kerberos has no dedicated variant).
-fn method_error(method: &AuthMethod, msg: String) -> WinrmError {
-    match method {
-        AuthMethod::Ntlm => WinrmError::Ntlm(crate::error::NtlmError::InvalidMessage(msg)),
-        _ => WinrmError::AuthFailed(msg),
     }
 }
 
@@ -703,7 +691,7 @@ pub(crate) fn log_host(host: &str) -> String {
 /// IPv4 host, and the error names the dotted-quad form to pass instead.
 pub(crate) fn validate_host(host: &str) -> Result<(), WinrmError> {
     if sanitize_host(host) != host {
-        return Err(WinrmError::AuthFailed(format!(
+        return Err(WinrmError::Config(format!(
             "invalid host {:?}: pass a bare host name or address, without scheme, user info, \
              path or port (the port is WinrmConfig::port)",
             crate::error::excerpt_chars(&redact_userinfo(host), 64)
@@ -728,7 +716,7 @@ pub(crate) fn validate_host(host: &str) -> Result<(), WinrmError> {
             })
     };
     if !valid {
-        return Err(WinrmError::AuthFailed(format!(
+        return Err(WinrmError::Config(format!(
             // Debug form: shows whitespace and control characters.
             "invalid host {:?}: expected a host name, an IPv4 address or a bracketed IPv6 \
              literal (letters, digits, '-', '_' and '.')",
@@ -766,7 +754,7 @@ fn embedded_ipv4(addr: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
 /// can avoid it.
 fn check_parser_keeps_host(host: &str) -> Result<(), WinrmError> {
     let refuse = |read_as: &str| {
-        WinrmError::AuthFailed(format!(
+        WinrmError::Config(format!(
             "invalid host {:?}: the URL parser reads it as {:?}; pass that form",
             crate::error::excerpt_chars(host, 64),
             crate::error::excerpt_chars(read_as, 64)
@@ -784,7 +772,7 @@ fn check_parser_keeps_host(host: &str) -> Result<(), WinrmError> {
             .parse::<std::net::Ipv6Addr>()
             .map_err(|_| refuse(read_as))?;
         if let Some(v4) = embedded_ipv4(addr) {
-            return Err(WinrmError::AuthFailed(format!(
+            return Err(WinrmError::Config(format!(
                 "invalid host {:?}: an IPv6 literal that stands for the IPv4 address {v4}; \
                  pass {:?}",
                 crate::error::excerpt_chars(host, 64),
@@ -870,7 +858,7 @@ fn check_encryption_policy(config: &WinrmConfig) -> Result<(), WinrmError> {
         && !config.use_tls
         && config.encryption != EncryptionMode::Never
     {
-        return Err(WinrmError::AuthFailed(
+        return Err(WinrmError::Config(
             "Basic auth over HTTP sends the password and every SOAP body in cleartext: use \
              HTTPS (use_tls = true), or set encryption = EncryptionMode::Never to accept \
              plaintext"
@@ -880,7 +868,7 @@ fn check_encryption_policy(config: &WinrmConfig) -> Result<(), WinrmError> {
     if config.encryption == EncryptionMode::Always
         && !matches!(config.auth_method, AuthMethod::Ntlm | AuthMethod::Kerberos)
     {
-        return Err(WinrmError::AuthFailed(format!(
+        return Err(WinrmError::Config(format!(
             "EncryptionMode::Always: winrm-rs seals SOAP bodies only with NTLM and \
              Kerberos and does not seal {}; use EncryptionMode::Auto, where HTTPS protects \
              the bodies",
@@ -904,17 +892,18 @@ fn load_client_auth(config: &WinrmConfig) -> Result<Option<ClientAuthCert>, Winr
     // Checked before any file is read: over plain HTTP there is no handshake
     // to present the certificate in.
     if !config.use_tls {
-        return Err(WinrmError::AuthFailed(
+        return Err(WinrmError::Config(
             "Certificate auth requires HTTPS (set use_tls = true)".into(),
         ));
     }
-    let cert_path = config.client_cert_pem.as_deref().ok_or_else(|| {
-        WinrmError::AuthFailed("Certificate auth requires client_cert_pem".into())
-    })?;
+    let cert_path = config
+        .client_cert_pem
+        .as_deref()
+        .ok_or_else(|| WinrmError::Config("Certificate auth requires client_cert_pem".into()))?;
     let key_path = config
         .client_key_pem
         .as_deref()
-        .ok_or_else(|| WinrmError::AuthFailed("Certificate auth requires client_key_pem".into()))?;
+        .ok_or_else(|| WinrmError::Config("Certificate auth requires client_key_pem".into()))?;
     crate::tls::load_client_auth_cert(cert_path, key_path).map(Some)
 }
 
@@ -953,11 +942,9 @@ fn origin_client_tls(
         .dangerous()
         .with_custom_certificate_verifier(verifier);
     match client_auth {
-        Some(ClientAuthCert { chain, key }) => {
-            builder.with_client_auth_cert(chain, key).map_err(|e| {
-                WinrmError::AuthFailed(format!("client certificate and key rejected: {e}"))
-            })
-        }
+        Some(ClientAuthCert { chain, key }) => builder
+            .with_client_auth_cert(chain, key)
+            .map_err(|e| WinrmError::Config(format!("client certificate and key rejected: {e}"))),
         None => Ok(builder.with_no_client_auth()),
     }
 }
@@ -1029,7 +1016,7 @@ impl HttpTransport {
     ///
     /// Builds the underlying HTTP client with the configured timeouts and TLS
     /// settings. Returns [`WinrmError::Http`] if the HTTP client cannot be
-    /// constructed, and [`WinrmError::AuthFailed`] if the authentication
+    /// constructed, and [`WinrmError::Config`] if the authentication
     /// method cannot be set up: Certificate or CredSSP without HTTPS, CredSSP
     /// or Basic over HTTPS with `accept_invalid_certs`, Certificate auth
     /// without a usable certificate and key, a crypto
@@ -1052,7 +1039,7 @@ impl HttpTransport {
         warn_plain_http(&config);
 
         if matches!(config.auth_method, AuthMethod::CredSsp) && !config.use_tls {
-            return Err(WinrmError::AuthFailed(
+            return Err(WinrmError::Config(
                 "CredSSP requires HTTPS (set use_tls = true)".into(),
             ));
         }
@@ -1087,7 +1074,7 @@ impl HttpTransport {
         // runs only behind a verifier that authenticates the server.
         let outer_authenticated = !config.accept_invalid_certs;
         if matches!(config.auth_method, AuthMethod::CredSsp) && !outer_authenticated {
-            return Err(WinrmError::AuthFailed(CREDSSP_UNAUTHENTICATED_TLS.into()));
+            return Err(WinrmError::Config(CREDSSP_UNAUTHENTICATED_TLS.into()));
         }
         // Basic sends the password itself: over HTTPS it goes only to a
         // server whose certificate is verified. Over plain HTTP the
@@ -1096,7 +1083,7 @@ impl HttpTransport {
             && config.use_tls
             && config.accept_invalid_certs
         {
-            return Err(WinrmError::AuthFailed(BASIC_UNVERIFIED_TLS.into()));
+            return Err(WinrmError::Config(BASIC_UNVERIFIED_TLS.into()));
         }
         // The names whose handshakes do not get the endpoint's own
         // verification (see `ProxyRoutingVerifier`): a host with one of them
@@ -1236,7 +1223,7 @@ impl HttpTransport {
         {
             let host = log_host(host);
             let pinned = !self.options.tls.pins.is_empty();
-            return Err(WinrmError::AuthFailed(if pinned {
+            return Err(WinrmError::Config(if pinned {
                 format!(
                     "pin_server_certificate_sha256: host {host} has the name of an https:// \
                      proxy; the pin cannot be applied to it, refusing"
@@ -1383,7 +1370,7 @@ impl HttpTransport {
                     password: Zeroizing::new(self.credentials.password.expose_secret().to_string()),
                     domain: self.credentials.domain.clone(),
                     tls: Arc::clone(self.credssp_tls.as_ref().ok_or_else(|| {
-                        WinrmError::AuthFailed("CredSSP requires HTTPS (set use_tls = true)".into())
+                        WinrmError::Config("CredSSP requires HTTPS (set use_tls = true)".into())
                     })?),
                     opts: CredSspConnOptions::from_config(&self.config),
                     dial: self.credssp_dial_for(url)?,
@@ -1391,7 +1378,7 @@ impl HttpTransport {
                 auth.send_authenticated(&self.http, url, body).await
             }
             #[cfg(not(feature = "credssp"))]
-            Route::CredSsp => Err(WinrmError::AuthFailed(
+            Route::CredSsp => Err(WinrmError::Config(
                 "CredSSP authentication requires the `credssp` cargo feature".into(),
             )),
         }
@@ -1409,7 +1396,7 @@ impl HttpTransport {
     /// route's dial for this URL ([`proxy::ProxyRoute::credssp_dial`] with
     /// `use_env`): the environment's proxy for `https://` endpoints, subject
     /// to `NO_PROXY` for the URL's host. An `https://` or `socks4://` proxy
-    /// from the environment is refused here ([`WinrmError::AuthFailed`]),
+    /// from the environment is refused here ([`WinrmError::Config`]),
     /// before anything is sent.
     ///
     /// The stored dial is shared, not copied, so the proxy credentials it
@@ -1456,7 +1443,7 @@ impl HttpTransport {
             .rsplit_once(':')
             .map_or(authority, |(host, _)| host);
         let parsed = url_host(url).ok_or_else(|| {
-            WinrmError::AuthFailed(
+            WinrmError::Config(
                 "Kerberos: the endpoint URL has no host to name the service principal".into(),
             )
         })?;
@@ -1786,14 +1773,11 @@ impl HttpTransport {
                 conn.session = Some(session);
                 return Ok(conn);
             }
-            Err(method_error(
-                method,
-                format!(
-                    "the server closes the connection right after {} authentication, so no \
-                     message can use the session bound to it",
-                    method_name(method)
-                ),
-            ))
+            Err(WinrmError::Connection(format!(
+                "the server closes the connection right after {} authentication, so no \
+                 message can use the session bound to it",
+                method_name(method)
+            )))
         };
         tokio::time::timeout(budget, handshake)
             .await
@@ -1827,8 +1811,8 @@ impl HttpTransport {
                     self.kerberos_auth(url)?.establish(http, cert, url).await?;
                 Ok((Sealer::Kerberos(session), closing))
             }
-            _ => Err(WinrmError::AuthFailed(
-                "internal: message encryption requested for an auth method without it".into(),
+            _ => Err(WinrmError::Internal(
+                "message encryption requested for an auth method without it".into(),
             )),
         }
     }
@@ -1913,18 +1897,14 @@ impl HttpTransport {
                 Err(WinrmError::Soap(fault))
             }
             Err(SealedFailure::Unauthorized) => {
-                let method = &self.config.auth_method;
-                let name = method_name(method);
+                let name = method_name(&self.config.auth_method);
                 let kind = if sealed { "sealed " } else { "" };
-                Err(method_error(
-                    method,
-                    format!(
-                        "HTTP 401 to a {kind}{name} request on an authenticated connection: the \
-                         connection no longer carries the {name} session (usually the server \
-                         closed an idle connection), but a 401 does not prove the request did \
-                         not run; it was NOT resent: retry the call if it is safe to run again"
-                    ),
-                ))
+                Err(WinrmError::Connection(format!(
+                    "HTTP 401 to a {kind}{name} request on an authenticated connection: the \
+                     connection no longer carries the {name} session (usually the server \
+                     closed an idle connection), but a 401 does not prove the request did \
+                     not run; it was NOT resent: retry the call if it is safe to run again"
+                )))
             }
             Err(SealedFailure::Error(e)) => Err(e),
         }
@@ -1971,21 +1951,18 @@ impl HttpTransport {
         max_response_bytes: usize,
     ) -> Result<String, SealedFailure> {
         let Some(session) = conn.session.as_mut() else {
-            return Err(SealedFailure::Error(WinrmError::AuthFailed(
-                "internal: sealed exchange on a connection without a sealing session".into(),
+            return Err(SealedFailure::Error(WinrmError::Internal(
+                "sealed exchange on a connection without a sealing session".into(),
             )));
         };
-        let method = session.auth_method();
-        let name = method_name(&method);
+        let name = method_name(&session.auth_method());
+        // Every envelope of this crate carries a MessageID (`soap::envelope`).
         if session.binds_answers_by_relates_to() && crate::soap::parser::message_id(body).is_none()
         {
-            return Err(SealedFailure::Error(method_error(
-                &method,
-                format!(
-                    "{name} message encryption: the request carries no wsa:MessageID, so its \
-                     sealed answer could not be bound to it; not sent"
-                ),
-            )));
+            return Err(SealedFailure::Error(WinrmError::Internal(format!(
+                "{name} message encryption: the request carries no wsa:MessageID, so its \
+                 sealed answer could not be bound to it; not sent"
+            ))));
         }
         let (content_type, sealed) = session.seal(body).map_err(SealedFailure::Error)?;
         let resp = conn
@@ -2020,25 +1997,19 @@ impl HttpTransport {
         // 500) included. An error answer that is not sealed is not trusted:
         // its body is neither parsed nor quoted.
         if !status.is_success() && !labelled_sealed {
-            return Err(SealedFailure::Error(method_error(
-                &method,
-                format!(
-                    "server answered a sealed {name} request without sealing: HTTP {status} \
-                     ({} bytes)",
-                    bytes.len()
-                ),
-            )));
+            return Err(SealedFailure::Error(WinrmError::Protocol(format!(
+                "server answered a sealed {name} request without sealing: HTTP {status} \
+                 ({} bytes)",
+                bytes.len()
+            ))));
         }
         let text = session.unseal(&bytes).map_err(SealedFailure::Error)?;
         if session.binds_answers_by_relates_to() {
             crate::soap::parser::check_relates_to(body, &text).map_err(|e| {
-                SealedFailure::Error(method_error(
-                    &method,
-                    format!(
-                        "{name} message encryption: the sealed answer does not answer this \
-                         request: {e}"
-                    ),
-                ))
+                SealedFailure::Error(WinrmError::Protocol(format!(
+                    "{name} message encryption: the sealed answer does not answer this \
+                     request: {e}"
+                )))
             })?;
         }
         if status.is_success() {
@@ -2049,10 +2020,10 @@ impl HttpTransport {
         {
             return Err(SealedFailure::Fault(fault));
         }
-        Err(SealedFailure::Error(WinrmError::AuthFailed(format!(
-            "HTTP {status}: {}",
-            crate::auth::excerpt(&text)
-        ))))
+        Err(SealedFailure::Error(crate::error::status_error(
+            status.as_u16(),
+            format!("HTTP {status}: {}", crate::auth::excerpt(&text)),
+        )))
     }
 
     /// One exchange on an authenticated dedicated connection without sealing
@@ -2101,8 +2072,8 @@ impl HttpTransport {
         _body: &str,
         _max_response_bytes: usize,
     ) -> std::future::Ready<Result<String, SealedFailure>> {
-        std::future::ready(Err(SealedFailure::Error(WinrmError::AuthFailed(
-            "internal: unsealed exchange on a dedicated connection".into(),
+        std::future::ready(Err(SealedFailure::Error(WinrmError::Internal(
+            "unsealed exchange on a dedicated connection".into(),
         ))))
     }
 
@@ -2293,7 +2264,7 @@ const CONNECT_HINT: &str = "could not connect to the host on the default HTTPS p
 /// 5986, and plain HTTP is not the fix for it.
 ///
 /// Never fires for CredSSP: its connection failures are reported as
-/// [`WinrmError::AuthFailed`] or [`WinrmError::Timeout`], not
+/// [`WinrmError::Connection`] or [`WinrmError::Timeout`], not
 /// [`WinrmError::Http`].
 fn connect_hint(config: &WinrmConfig, proxied: bool, err: &WinrmError) -> Option<&'static str> {
     let connect_failed = matches!(err, WinrmError::Http(e) if e.is_connect() && !is_tls_failure(e));

@@ -539,7 +539,7 @@ fn credssp_dial_follows_the_explicit_proxy() {
 #[test]
 fn credssp_dial_refuses_https_and_socks4_proxies() {
     let refused = |proxy: &str| match explicit_route(proxy).credssp_dial(EP, false) {
-        Err(WinrmError::AuthFailed(m)) => m,
+        Err(WinrmError::Config(m)) => m,
         other => panic!("{proxy}: {other:?}"),
     };
     assert_eq!(
@@ -577,7 +577,7 @@ fn credssp_dial_refuses_https_and_socks4_proxies() {
 #[test]
 fn credssp_dial_refuses_an_explicit_proxy_without_a_route() {
     match explicit_route("http://user:s3cret@127.0.0.1:3128").credssp_dial("not a url", false) {
-        Err(WinrmError::AuthFailed(m)) => {
+        Err(WinrmError::Config(m)) => {
             assert!(m.contains("gives no route"), "{m}");
             assert!(m.contains("127.0.0.1:3128") && !m.contains("s3cret"), "{m}");
         }

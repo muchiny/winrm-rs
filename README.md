@@ -380,6 +380,40 @@ client's check nor the host's sees a symbolic link or a junction on the
 host, which can still lead to a share, and the policy does not limit which
 local files a path names.
 
+### Handling errors
+
+`WinrmError` says what failed by its variant, so a program decides without
+reading a message:
+
+```rust
+use winrm_rs::WinrmError;
+
+match client.run_powershell("win-server", "Get-Service").await {
+    Ok(output) => println!("{}", String::from_utf8_lossy(&output.stdout)),
+    // The server refuses the credentials, or the method: ask for them again.
+    Err(WinrmError::AuthRejected(why)) => eprintln!("refused: {why}"),
+    // Nothing was sent: the configuration cannot work as written.
+    Err(WinrmError::Config(why)) => eprintln!("fix the configuration: {why}"),
+    // The network path, or a deadline.
+    Err(e @ (WinrmError::Http(_) | WinrmError::Connection(_) | WinrmError::Timeout(_))) => {
+        eprintln!("not reached: {e}");
+    }
+    // What the server answered: an HTTP status, or a SOAP fault with its code.
+    Err(WinrmError::HttpStatus { status, message }) => eprintln!("HTTP {status}: {message}"),
+    Err(WinrmError::Soap(fault)) => eprintln!("WinRM fault: {fault}"),
+    Err(e) => return Err(e.into()),
+}
+```
+
+The enum is `#[non_exhaustive]`, so the last arm stays. The other variants
+are `AuthFailed` (the authentication failed for another reason than the
+server's refusal: a Kerberos ticket, a pinned certificate that does not
+match), `Protocol`, `Ntlm` and `CredSsp` (an answer that does not follow the
+protocol or does not verify), `OutputLimit` (`max_output_bytes`), `Transfer`
+(a `TransferError`: the remote path, the local file, the host's refusal),
+`Cancelled` and `Internal`. The messages are for people: their wording can
+change between releases.
+
 ### Runnable examples
 
 The [`examples/`](examples) directory holds complete programs, configured

@@ -12,7 +12,7 @@ use crate::command::{
     CommandOutput, NON_INTERACTIVE_FLAGS, POWERSHELL_EXE, encode_powershell_command,
     escape_ps_single_quoted,
 };
-use crate::error::WinrmError;
+use crate::error::{TransferError, WinrmError};
 use crate::shell::Shell;
 
 /// File transfer chunk size (raw bytes before encoding).
@@ -52,16 +52,21 @@ const MAX_REMOTE_PATH_LEN: usize = 260;
 /// by default.
 pub(crate) fn validate_remote_path(path: &str) -> Result<(), WinrmError> {
     if path.len() > MAX_REMOTE_PATH_LEN {
-        return Err(WinrmError::Transfer(format!(
+        return Err(path_refused(format!(
             "remote path exceeds {MAX_REMOTE_PATH_LEN} characters"
         )));
     }
     if path.chars().any(|c| c.is_control() && c != '\t') {
-        return Err(WinrmError::Transfer(
+        return Err(path_refused(
             "remote path contains control characters".into(),
         ));
     }
     Ok(())
+}
+
+/// The error for a remote path refused before anything is sent.
+fn path_refused(why: String) -> WinrmError {
+    WinrmError::Transfer(TransferError::RemotePath(why))
 }
 
 /// Which `remote_path` forms the transfer methods accept.
@@ -152,18 +157,18 @@ pub(crate) fn validate_remote_path_for(
         RemotePathPolicy::Any => Ok(()),
         RemotePathPolicy::LocalDrive => {
             if !matches!(path.as_bytes(), [d, b':', b'\\' | b'/', ..] if d.is_ascii_alphabetic()) {
-                return Err(WinrmError::Transfer(format!(
+                return Err(path_refused(format!(
                     "remote path {path:?} is not a drive-absolute path (RemotePathPolicy::LocalDrive)"
                 )));
             }
             if has_blank_component(path) {
-                return Err(WinrmError::Transfer(format!(
+                return Err(path_refused(format!(
                     "remote path {path:?} has a component made only of dots and blanks \
                      (RemotePathPolicy::LocalDrive)"
                 )));
             }
             if names_dos_device(path) {
-                return Err(WinrmError::Transfer(format!(
+                return Err(path_refused(format!(
                     "remote path {path:?} ends in a DOS device name (RemotePathPolicy::LocalDrive)"
                 )));
             }
@@ -395,10 +400,10 @@ impl WinrmClient {
                 .run_command(POWERSHELL_EXE, &transfer_args(&encoded))
                 .await?;
             if output.exit_code != 0 {
-                return Err(WinrmError::Transfer(format!(
+                return Err(WinrmError::Transfer(TransferError::Host(format!(
                     "upload chunk {i} failed: {}",
                     crate::auth::excerpt(&String::from_utf8_lossy(&output.stderr))
-                )));
+                ))));
             }
         }
         Ok(())
@@ -611,7 +616,7 @@ fn upload_chunk_len(escaped_path: &str, policy: RemotePathPolicy) -> Result<usiz
             <= CMD_LINE_BUDGET
     };
     if !fits(1) {
-        return Err(WinrmError::Transfer(
+        return Err(path_refused(
             "remote path too long for a transfer command line".into(),
         ));
     }
@@ -731,15 +736,25 @@ fn download_script(remote_path: &str, policy: RemotePathPolicy) -> String {
 /// Check a download's exit code and decode the base64 its script printed.
 fn decode_download(output: &CommandOutput) -> Result<Vec<u8>, WinrmError> {
     if output.exit_code != 0 {
-        return Err(WinrmError::Transfer(format!(
+        return Err(WinrmError::Transfer(TransferError::Host(format!(
             "download failed: {}",
             crate::auth::excerpt(&String::from_utf8_lossy(&output.stderr))
-        )));
+        ))));
     }
 
     let b64 = String::from_utf8_lossy(&output.stdout);
     B64.decode(b64.trim_ascii())
-        .map_err(|e| WinrmError::Transfer(format!("base64 decode of downloaded file: {e}")))
+        .map_err(|e| WinrmError::Transfer(TransferError::Decode(e.to_string())))
+}
+
+/// The error for a blocking task that did not return what it was to do
+/// with the local file at `path` (`what`: "reads", "writes"): it panicked,
+/// or the runtime is shutting down.
+fn blocking_task_failed(what: &str, path: &Path, e: &tokio::task::JoinError) -> WinrmError {
+    WinrmError::Internal(format!(
+        "the task that {what} local file {} did not finish: {e}",
+        path.display()
+    ))
 }
 
 /// Read a whole local file on tokio's blocking pool.
@@ -747,10 +762,12 @@ async fn read_local(path: &Path) -> Result<Vec<u8>, WinrmError> {
     let owned = path.to_path_buf();
     tokio::task::spawn_blocking(move || std::fs::read(&owned))
         .await
-        .map_err(|e| e.to_string())
-        .and_then(|read| read.map_err(|e| e.to_string()))
-        .map_err(|e| {
-            WinrmError::Transfer(format!("failed to read local file {}: {e}", path.display()))
+        .map_err(|e| blocking_task_failed("reads", path, &e))?
+        .map_err(|error| {
+            WinrmError::Transfer(TransferError::LocalRead {
+                path: path.to_path_buf(),
+                error,
+            })
         })
 }
 
@@ -1116,13 +1133,12 @@ async fn store_download(local_path: &Path, data: Vec<u8>) -> Result<(), WinrmErr
     let owned = local_path.to_path_buf();
     tokio::task::spawn_blocking(move || replace_local_file(&owned, &data))
         .await
-        .map_err(|e| e.to_string())
-        .and_then(|written| written.map_err(|e| e.to_string()))
-        .map_err(|e| {
-            WinrmError::Transfer(format!(
-                "failed to write local file {}: {e}",
-                local_path.display()
-            ))
+        .map_err(|e| blocking_task_failed("writes", local_path, &e))?
+        .map_err(|error| {
+            WinrmError::Transfer(TransferError::LocalWrite {
+                path: local_path.to_path_buf(),
+                error,
+            })
         })
 }
 

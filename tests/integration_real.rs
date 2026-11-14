@@ -65,8 +65,8 @@
 
 use std::time::{Duration, Instant};
 use winrm_rs::{
-    AuthMethod, CancellationToken, EncryptionMode, RemotePathPolicy, SecretString, WinrmClient,
-    WinrmConfig, WinrmCredentials, WinrmError,
+    AuthMethod, CancellationToken, EncryptionMode, RemotePathPolicy, SecretString, TransferError,
+    WinrmClient, WinrmConfig, WinrmCredentials, WinrmError,
 };
 
 fn test_client() -> Option<(WinrmClient, String)> {
@@ -903,7 +903,7 @@ async fn network_drive_is_refused_by_the_host_under_local_drive() {
     if short_name.contains('~') {
         println!("by short name: {refused_short:?}");
         match refused_short {
-            Err(WinrmError::Transfer(m)) => {
+            Err(WinrmError::Transfer(TransferError::Host(m))) => {
                 let refusal = format!(
                     "RemotePathPolicy::LocalDrive refuses '{by_short_name}' (drive type 'Network')"
                 );
@@ -925,7 +925,7 @@ async fn network_drive_is_refused_by_the_host_under_local_drive() {
     ] {
         println!("{what}: {result:?}");
         match result {
-            Err(WinrmError::Transfer(m)) => assert!(
+            Err(WinrmError::Transfer(TransferError::Host(m))) => assert!(
                 m.contains(
                     r"RemotePathPolicy::LocalDrive refuses 'T:\winrm-rs-t.bin' (drive type 'Network')"
                 ),
@@ -1298,10 +1298,7 @@ async fn max_output_bytes_aborts_and_releases_shell() {
     let after = open_shell_count_with_idle_timeout(&counter, &host, marker).await;
     eprintln!("marked open shells: before={before} after={after}");
 
-    assert!(
-        matches!(&err, WinrmError::Transfer(m) if m.contains("max_output_bytes")),
-        "{err}"
-    );
+    assert!(matches!(&err, WinrmError::OutputLimit { .. }), "{err}");
     assert_eq!(after, before, "shell leaked after max_output_bytes abort");
 }
 
@@ -1420,7 +1417,7 @@ async fn shell_run_command_terminates_on_cap_and_deadline() {
         )
         .await
         .unwrap_err();
-    assert!(matches!(err, WinrmError::Transfer(_)), "got {err:?}");
+    assert!(matches!(err, WinrmError::OutputLimit { .. }), "got {err:?}");
     let left = wait_until_no_process_matches(&observer, &host, "%1..1000000%").await;
     shell.close().await.expect("close shell");
     assert_eq!(left, "0", "the capped command is still running");
@@ -1542,8 +1539,8 @@ async fn max_output_bytes_counts_raw_clixml_stderr() {
         .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let err = client.run_powershell(&host, SCRIPT).await.unwrap_err();
     assert!(
-        matches!(&err, WinrmError::Transfer(m) if m.contains("max_output_bytes")),
-        "expected Transfer(max_output_bytes), got: {err}"
+        matches!(&err, WinrmError::OutputLimit { .. }),
+        "expected the output limit error, got: {err}"
     );
 }
 
@@ -4686,7 +4683,7 @@ async fn certificate_auth_unmapped_cert_is_rejected() {
     let result = result.expect("rogue certificate request hung for 30 s");
     match result {
         Ok(out) => panic!("unmapped certificate authenticated: {out:?}"),
-        Err(WinrmError::AuthFailed(msg)) => {
+        Err(WinrmError::AuthRejected(msg)) => {
             assert!(msg.contains("HTTP 401"), "expected a 401 rejection: {msg}");
         }
         // A server may also refuse the certificate during the handshake.
@@ -4696,6 +4693,72 @@ async fn certificate_auth_unmapped_cert_is_rejected() {
         Err(e) => panic!("expected a 401 or a TLS-level rejection, got: {e}"),
     }
     assert!(elapsed < Duration::from_secs(30), "took {elapsed:?}");
+}
+
+// === Refused credentials ===
+
+/// Credentials the server refuses are `WinrmError::AuthRejected` whatever
+/// the method: the variant a caller matches on to ask for them again, where
+/// any other failure is one to report or to retry. Each method meets the
+/// refusal at another step: Basic on its first answer, NTLM after its
+/// Type 3, CredSSP after the NTLM exchange inside its TLS session.
+///
+/// The account does not exist, so that no real account moves towards a
+/// lockout: Windows answers a wrong password and an unknown account alike.
+#[tokio::test]
+#[ignore = "needs the Windows bench: see the head of this file"]
+async fn refused_credentials_are_auth_rejected_by_every_method() {
+    let (host, basic, _) = test_settings().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let unknown = || WinrmCredentials::new("winrm-rs-no-such-account", "no-such-password", "");
+    // The bench listener is self-signed: pinned, as Basic and CredSSP need.
+    let over_https = |auth_method| {
+        WinrmClient::builder(WinrmConfig {
+            auth_method,
+            use_tls: true,
+            port: Some(https_test_port()),
+            ..Default::default()
+        })
+        .pin_server_certificate_sha256(&bench_https_pin().expect("WINRM_TEST_HTTPS_CERT_SHA256"))
+        .credentials(unknown())
+        .build()
+    };
+    let mut clients = vec![
+        (
+            "Basic over HTTP",
+            WinrmClient::new(basic.clone(), unknown()),
+        ),
+        (
+            "NTLM over HTTP",
+            WinrmClient::new(
+                WinrmConfig {
+                    auth_method: AuthMethod::Ntlm,
+                    encryption: EncryptionMode::Auto,
+                    ..basic
+                },
+                unknown(),
+            ),
+        ),
+    ];
+    if is_server_2012_r2().await {
+        eprintln!(
+            "SKIP the HTTPS cases: no TLS cipher suite shared with Server 2012 R2 (see basic_over_https_works)"
+        );
+    } else {
+        clients.push(("Basic over HTTPS", over_https(AuthMethod::Basic)));
+        clients.push(("NTLM over HTTPS", over_https(AuthMethod::Ntlm)));
+        #[cfg(feature = "credssp")]
+        clients.push(("CredSSP", over_https(AuthMethod::CredSsp)));
+    }
+    let mut wrong = Vec::new();
+    for (label, client) in clients {
+        let client = client.unwrap_or_else(|e| panic!("{label}: build: {e}"));
+        let outcome = client.run_command(&host, "whoami", &[]).await;
+        eprintln!("{label}: {outcome:?}");
+        if !matches!(outcome, Err(WinrmError::AuthRejected(_))) {
+            wrong.push(format!("{label}: {outcome:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "not AuthRejected: {wrong:#?}");
 }
 
 // === Kerberos (domain controller bench) ===
@@ -4951,7 +5014,7 @@ async fn dc_allow_unencrypted(
     match text.as_str() {
         "true" => Ok(true),
         "false" => Ok(false),
-        other => Err(WinrmError::Transfer(format!(
+        other => Err(WinrmError::Protocol(format!(
             "unexpected AllowUnencrypted output {other:?}, stderr {:?}",
             String::from_utf8_lossy(&out.stderr)
         ))),
@@ -5582,8 +5645,8 @@ async fn kerberos_channel_binding_through_a_tls_relay_is_refused() {
             .expect_err("a binding to the relay's certificate must be refused");
         eprintln!("{mode:?} through the relay: {err}");
         assert!(
-            err.to_string().contains("Kerberos authentication rejected"),
-            "{mode:?}: {err}"
+            matches!(&err, WinrmError::AuthRejected(m) if m.contains("Kerberos authentication rejected")),
+            "{mode:?}: {err:?}"
         );
     }
     let (with_body, _) = relay.bodies();
@@ -5745,8 +5808,8 @@ async fn kerberos_over_https_with_dc_cbt_strict() {
             .expect_err("relay binding refused under Strict");
         eprintln!("through the relay under Strict: {err}");
         assert!(
-            err.to_string().contains("Kerberos authentication rejected"),
-            "{err}"
+            matches!(&err, WinrmError::AuthRejected(m) if m.contains("Kerberos authentication rejected")),
+            "{err:?}"
         );
         assert_split_relay_fails_at_the_handshake().await;
     })

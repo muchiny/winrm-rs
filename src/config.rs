@@ -98,7 +98,7 @@ pub struct WinrmConfig {
     /// turns that off.
     ///
     /// With [`AuthMethod::CredSsp`], building the client fails with
-    /// `AuthFailed`: CredSSP refuses `accept_invalid_certs = true`. Set it to
+    /// [`WinrmError::Config`](crate::WinrmError::Config): CredSSP refuses `accept_invalid_certs = true`. Set it to
     /// false and either pin the listener certificate with
     /// [`pin_server_certificate_sha256`](crate::WinrmClientBuilder::pin_server_certificate_sha256)
     /// or trust its CA with
@@ -107,7 +107,7 @@ pub struct WinrmConfig {
     /// connection.
     ///
     /// With [`AuthMethod::Basic`] over HTTPS, building the client fails with
-    /// `AuthFailed`: Basic sends the password to a server whose certificate
+    /// [`WinrmError::Config`](crate::WinrmError::Config): Basic sends the password to a server whose certificate
     /// is not verified. Pin the certificate or add a root instead, as for
     /// CredSSP. Since 2.0; 1.x only logged a WARN.
     pub accept_invalid_certs: bool,
@@ -152,7 +152,7 @@ pub struct WinrmConfig {
     /// chunk), so a timeout, a reset or a dropped connection after sending is
     /// returned, as are authentication errors and SOAP faults. A CredSSP
     /// connection error is
-    /// [`WinrmError::AuthFailed`](crate::WinrmError::AuthFailed) or
+    /// [`WinrmError::Connection`](crate::WinrmError::Connection) or
     /// [`WinrmError::Timeout`](crate::WinrmError::Timeout), never
     /// `WinrmError::Http`, so it is not retried.
     pub max_retries: u32,
@@ -309,7 +309,7 @@ pub struct WinrmConfig {
     ///
     /// Prevents a malicious or runaway server from exhausting client memory
     /// by streaming an unbounded base64 chunk sequence. When the cap is
-    /// reached the call returns [`crate::error::WinrmError::Transfer`]:
+    /// reached the call returns [`crate::error::WinrmError::OutputLimit`]:
     /// - [`WinrmClient::run_command`](crate::WinrmClient::run_command),
     ///   [`run_powershell`](crate::WinrmClient::run_powershell) and their
     ///   `_with_timeout` / `_with_cancel` variants (so `download_file` too)
@@ -585,6 +585,7 @@ impl std::fmt::Debug for EnvVarNames<'_> {
 /// `accept_invalid_certs`, and [`Self::Never`] is the way back if that
 /// fails.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
 pub enum EncryptionMode {
     /// Seal every SOAP body over HTTP (NTLM and Kerberos), and over HTTPS
     /// when [`WinrmConfig::accept_invalid_certs`] is set; over HTTPS with a
@@ -603,7 +604,7 @@ pub enum EncryptionMode {
     ///
     /// NTLM and Kerberos only: with Basic, Certificate or CredSSP, which
     /// winrm-rs cannot seal, building the client fails with
-    /// [`WinrmError::AuthFailed`](crate::WinrmError::AuthFailed). For those
+    /// [`WinrmError::Config`](crate::WinrmError::Config). For those
     /// methods the protection is TLS (HTTPS): use [`Self::Auto`].
     Always,
     /// Never seal: over HTTP, SOAP bodies (commands, their output, file
@@ -643,7 +644,7 @@ pub enum EncryptionMode {
 pub enum ProxySessionAuth {
     /// Refuse to authenticate with [`EncryptionMode::Never`] through a proxy
     /// that does not announce the header: the authentication fails with
-    /// [`WinrmError::AuthFailed`](crate::WinrmError::AuthFailed) and nothing
+    /// [`WinrmError::Connection`](crate::WinrmError::Connection) and nothing
     /// more is sent. Sealed requests only log a WARN, once per endpoint:
     /// they stay protected, but the server must keep `AllowUnencrypted =
     /// false`. `Never` is refused because it needs `AllowUnencrypted = true`
@@ -672,13 +673,14 @@ pub enum TlsProvider {
     /// The provider the application installed with
     /// `rustls::crypto::CryptoProvider::install_default` (for example
     /// aws-lc-rs in FIPS mode). Building fails with
-    /// [`WinrmError::AuthFailed`](crate::WinrmError::AuthFailed) when none is
+    /// [`WinrmError::Config`](crate::WinrmError::Config) when none is
     /// installed.
     ProcessDefault,
 }
 
 /// Authentication method for the WinRM HTTP transport.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum AuthMethod {
     /// HTTP Basic authentication. Credentials are sent as a base64-encoded
     /// `Authorization` header on every request. Only safe over HTTPS. Over
@@ -687,7 +689,7 @@ pub enum AuthMethod {
     /// through an SSH or port-forward tunnel, which the client cannot see.
     ///
     /// Over HTTPS with [`WinrmConfig::accept_invalid_certs`], building the
-    /// client fails with `AuthFailed`: the password would go to a server
+    /// client fails with [`WinrmError::Config`](crate::WinrmError::Config): the password would go to a server
     /// whose certificate is not verified. Pin the certificate
     /// ([`pin_server_certificate_sha256`](crate::WinrmClientBuilder::pin_server_certificate_sha256))
     /// or add a root
@@ -770,7 +772,7 @@ pub enum AuthMethod {
     /// (MS-WSMV), which tells WinRM to authenticate with that certificate. The
     /// server must trust the issuing CA and map the certificate to a local
     /// account (`WSMan:\localhost\ClientCertificate`). Building the client
-    /// fails with [`WinrmError::AuthFailed`](crate::WinrmError::AuthFailed)
+    /// fails with [`WinrmError::Config`](crate::WinrmError::Config)
     /// when `use_tls` is `false` (no TLS handshake to present the certificate
     /// in), and when a file is missing, not a regular file, over 1 MiB, holds
     /// no certificate or no key, holds an encrypted key (unencrypted keys
@@ -793,7 +795,7 @@ pub enum AuthMethod {
     /// `credssp` cargo feature and HTTPS (`use_tls = true`): building the
     /// client with `use_tls = false`, or sending a request without the
     /// feature, fails with
-    /// [`WinrmError::AuthFailed`](crate::WinrmError::AuthFailed).
+    /// [`WinrmError::Config`](crate::WinrmError::Config).
     ///
     /// # Security
     ///
@@ -802,7 +804,7 @@ pub enum AuthMethod {
     /// domain-joined computer can complete the NTLM exchange inside CredSSP
     /// through a domain controller. CredSSP refuses `accept_invalid_certs =
     /// true`: building the client fails with
-    /// [`WinrmError::AuthFailed`](crate::WinrmError::AuthFailed). Set it to
+    /// [`WinrmError::Config`](crate::WinrmError::Config). Set it to
     /// false and either pin the listener certificate with
     /// `pin_server_certificate_sha256` or trust its CA with
     /// `add_root_certificates_pem`. The CredSSP connection uses the same
@@ -844,7 +846,7 @@ pub enum AuthMethod {
     /// apply these
     /// [`WinrmConfig`] fields:
     /// - `max_retries`: a CredSSP connection error is
-    ///   [`WinrmError::AuthFailed`](crate::WinrmError::AuthFailed) or
+    ///   [`WinrmError::Connection`](crate::WinrmError::Connection) or
     ///   [`WinrmError::Timeout`](crate::WinrmError::Timeout), never
     ///   `WinrmError::Http`, so it is not retried.
     CredSsp,

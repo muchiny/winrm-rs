@@ -59,7 +59,7 @@ fn internal_session_refuses_sequence_exhaustion() {
         u32::MAX
     );
     let err = s.seal(b"one too many").unwrap_err();
-    assert!(matches!(err, NtlmError::InvalidMessage(ref m) if m.contains("exhausted")));
+    assert!(matches!(err, NtlmError::Session(ref m) if m.contains("exhausted")));
     assert!(
         s.sign(b"after").is_err(),
         "an exhausted session stays poisoned"
@@ -79,7 +79,7 @@ fn unseal_after_a_failed_mech_list_mic_is_refused() {
     let good = SealingSession::server_side(&key).seal(b"first").unwrap();
     let err = client.unseal(&good).unwrap_err();
     assert!(
-        matches!(err, NtlmError::InvalidMessage(ref m) if m.contains("unusable")),
+        matches!(err, NtlmError::Session(ref m) if m.contains("unusable")),
         "a session that failed a mechListMIC stays failed: {err}"
     );
 }
@@ -94,7 +94,7 @@ fn unseal_refuses_server_sequence_exhaustion() {
     let last = server.seal(b"last").unwrap();
     assert_eq!(client.unseal(&last).unwrap(), b"last", "seq u32::MAX");
     let err = client.unseal(&last).unwrap_err();
-    assert!(matches!(err, NtlmError::InvalidMessage(ref m) if m.contains("exhausted")));
+    assert!(matches!(err, NtlmError::Session(ref m) if m.contains("exhausted")));
     assert!(
         client.seal(b"to server").is_err(),
         "server-side exhaustion poisons the whole session"
@@ -111,7 +111,7 @@ fn verify_mech_list_mic_refuses_server_sequence_exhaustion() {
     let mic = server.sign_mech_list_mic(b"mechs").unwrap();
     client.verify_mech_list_mic(b"mechs", &mic).unwrap();
     let err = client.verify_mech_list_mic(b"mechs", &mic).unwrap_err();
-    assert!(matches!(err, NtlmError::InvalidMessage(ref m) if m.contains("exhausted")));
+    assert!(matches!(err, NtlmError::Session(ref m) if m.contains("exhausted")));
     assert!(
         client.sign(b"to server").is_err(),
         "server-side exhaustion poisons the whole session"

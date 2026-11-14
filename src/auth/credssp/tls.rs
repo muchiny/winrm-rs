@@ -194,7 +194,7 @@ fn inner_openssl_connector() -> Result<openssl::ssl::SslConnector, WinrmError> {
     use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
 
     let mut builder = SslConnector::builder(SslMethod::tls_client())
-        .map_err(|e| WinrmError::AuthFailed(format!("SslConnector: {e}")))?;
+        .map_err(|e| WinrmError::Config(format!("CredSSP inner TLS: SslConnector: {e}")))?;
     // SslVerifyMode::NONE is intentional (MS-CSSP 1.3: the server is
     // anonymous at this point, and Windows presents a self-signed
     // certificate on this inner channel).
@@ -210,10 +210,10 @@ fn inner_openssl_connector() -> Result<openssl::ssl::SslConnector, WinrmError> {
     // Force TLS 1.2 to match what Microsoft CredSSP server expects.
     builder
         .set_min_proto_version(Some(openssl::ssl::SslVersion::TLS1_2))
-        .map_err(|e| WinrmError::AuthFailed(format!("min ver: {e}")))?;
+        .map_err(|e| WinrmError::Config(format!("CredSSP inner TLS: min ver: {e}")))?;
     builder
         .set_max_proto_version(Some(openssl::ssl::SslVersion::TLS1_2))
-        .map_err(|e| WinrmError::AuthFailed(format!("max ver: {e}")))?;
+        .map_err(|e| WinrmError::Config(format!("CredSSP inner TLS: max ver: {e}")))?;
     Ok(builder.build())
 }
 

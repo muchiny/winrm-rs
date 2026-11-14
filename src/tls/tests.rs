@@ -298,9 +298,9 @@ fn server_verifiers_refuse_a_pin_with_accept_invalid_certs_or_without_tls() {
     };
     let message =
         |use_tls, accept_invalid| match server_verifiers(&opts, use_tls, accept_invalid, &[], &p) {
-            Err(WinrmError::AuthFailed(m)) => m,
-            Err(e) => panic!("expected AuthFailed, got {e:?}"),
-            Ok(_) => panic!("expected AuthFailed, got Ok"),
+            Err(WinrmError::Config(m)) => m,
+            Err(e) => panic!("expected Config, got {e:?}"),
+            Ok(_) => panic!("expected Config, got Ok"),
         };
     assert_eq!(
         message(true, true),
@@ -368,8 +368,8 @@ fn server_verifiers_route_only_when_origin_and_proxy_differ() {
 fn platform_roots_error_names_the_option() {
     let e = rustls::Error::General("No CA certificates were loaded from the system".into());
     match platform_verifier(Err(e)) {
-        Err(WinrmError::AuthFailed(m)) => assert!(m.contains("platform_roots(true)"), "{m}"),
-        other => panic!("expected AuthFailed, got {:?}", other.map(|_| ())),
+        Err(WinrmError::Config(m)) => assert!(m.contains("platform_roots(true)"), "{m}"),
+        other => panic!("expected Config, got {:?}", other.map(|_| ())),
     }
 }
 
@@ -396,8 +396,8 @@ fn platform_roots_flag_replaces_the_webpki_roots() {
             // The platform verifier wraps a WebPKI one in a `Verifier`.
             assert!(origin.starts_with("Verifier {"), "{origin}");
         }
-        Err(WinrmError::AuthFailed(m)) => assert!(m.contains("platform_roots(true)"), "{m}"),
-        Err(e) => panic!("expected AuthFailed, got {e:?}"),
+        Err(WinrmError::Config(m)) => assert!(m.contains("platform_roots(true)"), "{m}"),
+        Err(e) => panic!("expected Config, got {e:?}"),
     }
 }
 
@@ -654,7 +654,7 @@ fn parse_sha256_fingerprint_accepts_colons_and_case() {
 #[test]
 fn parse_sha256_fingerprint_rejects_wrong_length_and_non_hex() {
     let err = |s: &str| match parse_sha256_fingerprint(s) {
-        Err(WinrmError::AuthFailed(m)) => m,
+        Err(WinrmError::Config(m)) => m,
         other => panic!("{s:?}: {other:?}"),
     };
     assert!(err(&"a".repeat(62)).contains("expected 64 hex digits (SHA-256), got 62"));

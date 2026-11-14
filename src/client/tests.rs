@@ -119,9 +119,11 @@ async fn send_basic_auth_failure() {
 
     let client = WinrmClient::new(basic_config(port), test_creds()).unwrap();
     let result = client.create_shell("127.0.0.1").await;
-    assert!(result.is_err());
-    let err = format!("{}", result.unwrap_err());
-    assert!(err.contains("auth failed") || err.contains("401"));
+    let err = result.unwrap_err();
+    assert!(
+        matches!(&err, WinrmError::AuthRejected(m) if m.starts_with("HTTP 401")),
+        "{err:?}"
+    );
 }
 
 #[tokio::test]
@@ -425,9 +427,11 @@ async fn ntlm_rejected_credentials() {
 
     let client = WinrmClient::new(ntlm_config(port), test_creds()).unwrap();
     let result = client.create_shell("127.0.0.1").await;
-    assert!(result.is_err());
-    let err = format!("{}", result.unwrap_err());
-    assert!(err.contains("auth") || err.contains("rejected"));
+    let err = result.unwrap_err();
+    assert!(
+        matches!(&err, WinrmError::AuthRejected(m) if m.starts_with("NTLM authentication rejected")),
+        "{err:?}"
+    );
 }
 
 #[tokio::test]
@@ -443,9 +447,14 @@ async fn ntlm_unexpected_status_on_negotiate() {
 
     let client = WinrmClient::new(ntlm_config(port), test_creds()).unwrap();
     let result = client.create_shell("127.0.0.1").await;
-    assert!(result.is_err());
-    let err = format!("{}", result.unwrap_err());
-    assert!(err.contains("expected 401"));
+    let err = result.unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            WinrmError::HttpStatus { status: 200, message } if message.contains("expected 401")
+        ),
+        "{err:?}"
+    );
 }
 
 #[tokio::test]
@@ -461,9 +470,42 @@ async fn ntlm_missing_www_authenticate() {
 
     let client = WinrmClient::new(ntlm_config(port), test_creds()).unwrap();
     let result = client.create_shell("127.0.0.1").await;
-    assert!(result.is_err());
-    let err = format!("{}", result.unwrap_err());
-    assert!(err.contains("WWW-Authenticate") || err.contains("auth"));
+    let err = result.unwrap_err();
+    assert!(
+        matches!(&err, WinrmError::AuthRejected(m) if m.contains("carries no Negotiate challenge")),
+        "{err:?}"
+    );
+}
+
+/// A 401 that offers no `Negotiate` token (the server's other methods, or
+/// `Negotiate` alone) is the server's refusal of NTLM. A token that is not
+/// base64 is a malformed message. Either way no Type 3 is sent.
+#[tokio::test]
+async fn ntlm_401_without_a_challenge_is_a_refusal_and_a_bad_token_is_not() {
+    for (challenge, refusal) in [
+        ("Basic realm=\"WSMAN\"", true),
+        ("Negotiate", true),
+        ("Negotiate not*base64", false),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401).insert_header("WWW-Authenticate", challenge))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = WinrmClient::new(ntlm_config(server.address().port()), test_creds()).unwrap();
+        let err = client.create_shell("127.0.0.1").await.unwrap_err();
+        let expected = if refusal {
+            matches!(&err, WinrmError::AuthRejected(m) if m.contains("carries no Negotiate challenge"))
+        } else {
+            matches!(
+                &err,
+                WinrmError::Ntlm(crate::error::NtlmError::InvalidMessage(m))
+                    if m.starts_with("base64 decode: ")
+            )
+        };
+        assert!(expected, "{challenge}: {err:?}");
+    }
 }
 
 #[tokio::test]
@@ -496,9 +538,11 @@ async fn ntlm_non_success_after_auth() {
 
     let client = WinrmClient::new(ntlm_config(port), test_creds()).unwrap();
     let result = client.create_shell("127.0.0.1").await;
-    assert!(result.is_err());
-    let err = format!("{}", result.unwrap_err());
-    assert!(err.contains("500") || err.contains("Internal"));
+    let err = result.unwrap_err();
+    assert!(
+        matches!(&err, WinrmError::HttpStatus { status: 500, .. }),
+        "{err:?}"
+    );
 }
 
 #[tokio::test]
@@ -1368,7 +1412,7 @@ fn proxy_config_is_preserved() {
 
 #[test]
 fn winrm_error_transfer_display() {
-    let err = WinrmError::Transfer("upload chunk 3 failed".into());
+    let err = WinrmError::Transfer(crate::TransferError::Host("upload chunk 3 failed".into()));
     assert_eq!(
         format!("{err}"),
         "file transfer error: upload chunk 3 failed"
@@ -2657,7 +2701,10 @@ async fn upload_file_with_local_drive_policy_sends_nothing_for_a_unc_path() {
         .await;
 
     assert!(
-        matches!(result, Err(WinrmError::Transfer(_))),
+        matches!(
+            result,
+            Err(WinrmError::Transfer(crate::TransferError::RemotePath(_)))
+        ),
         "got {result:?}"
     );
     assert!(server.received_requests().await.unwrap().is_empty());
@@ -2692,7 +2739,7 @@ async fn every_transfer_entry_point_applies_the_remote_path_policy() {
     ];
     for (name, result) in results {
         match result {
-            Err(WinrmError::Transfer(m)) => {
+            Err(WinrmError::Transfer(crate::TransferError::RemotePath(m))) => {
                 assert!(m.contains("RemotePathPolicy::LocalDrive"), "{name}: {m}");
             }
             other => panic!("{name}: expected Transfer, got {other:?}"),
@@ -2715,7 +2762,7 @@ async fn any_policy_sends_a_unc_path_to_the_host() {
     let result = client
         .download_file("127.0.0.1", r"\\other\share\f", &local)
         .await;
-    if let Err(WinrmError::Transfer(m)) = &result {
+    if let Err(WinrmError::Transfer(crate::TransferError::RemotePath(m))) = &result {
         assert!(!m.contains("RemotePathPolicy"), "{m}");
     }
     assert!(result.is_err(), "the mock server answers nothing useful");
@@ -2744,8 +2791,8 @@ async fn kerberos_auth_dispatch_returns_auth_error() {
         "error should specifically mention kerberos feature, got: {err_msg}"
     );
     assert!(
-        matches!(err, WinrmError::AuthFailed(_)),
-        "error variant should be AuthFailed, got: {err:?}"
+        matches!(err, WinrmError::Config(_)),
+        "error variant should be Config, got: {err:?}"
     );
 }
 
@@ -3232,7 +3279,7 @@ async fn run_wql_caps_items_at_max_output_bytes() {
         .await
         .unwrap_err();
     assert!(
-        matches!(&err, WinrmError::Transfer(msg) if msg.contains("max_output_bytes (1024)")),
+        matches!(&err, WinrmError::OutputLimit { limit: 1024, .. }),
         "expected Transfer cap error, got: {err}"
     );
 }
@@ -3261,7 +3308,7 @@ async fn run_wql_refuses_an_oversized_enumerate_answer_before_any_pull() {
         .await
         .unwrap_err();
     assert!(
-        matches!(&err, WinrmError::Transfer(msg) if msg.contains("max_output_bytes (1024)")),
+        matches!(&err, WinrmError::OutputLimit { limit: 1024, .. }),
         "expected Transfer cap error, got: {err}"
     );
     let requests = server.received_requests().await.unwrap();
@@ -3276,11 +3323,14 @@ fn check_wql_cap_accepts_items_up_to_the_cap() {
     assert!(check_wql_cap("12345678", Some(8)).is_ok());
     assert!(matches!(
         check_wql_cap("123456789", Some(8)),
-        Err(WinrmError::Transfer(msg)) if msg.contains("max_output_bytes (8)")
+        Err(WinrmError::OutputLimit {
+            what: "WQL enumeration",
+            limit: 8
+        })
     ));
     assert!(matches!(
         check_wql_cap("x", Some(0)),
-        Err(WinrmError::Transfer(_))
+        Err(WinrmError::OutputLimit { limit: 0, .. })
     ));
     assert!(check_wql_cap(&"x".repeat(4096), None).is_ok());
 }
@@ -3319,7 +3369,7 @@ async fn run_wql_caps_items_of_the_enumerate_answer() {
         .await
         .unwrap_err();
     assert!(
-        matches!(&err, WinrmError::Transfer(msg) if msg.contains("max_output_bytes (1024)")),
+        matches!(&err, WinrmError::OutputLimit { limit: 1024, .. }),
         "expected Transfer cap error, got: {err}"
     );
 
@@ -3385,8 +3435,8 @@ async fn run_in_shell_caps_output_at_max_output_bytes() {
         .await
         .unwrap_err();
     assert!(
-        matches!(err, WinrmError::Transfer(_)),
-        "expected Transfer cap error, got: {err}"
+        matches!(err, WinrmError::OutputLimit { .. }),
+        "expected the output limit error, got: {err}"
     );
 }
 

@@ -40,7 +40,7 @@ use crate::transport::{HttpTransport, TransportOptions};
 /// `[fe80::1]`. The scheme comes from [`WinrmConfig::use_tls`] and the port
 /// from [`WinrmConfig::effective_port`]. A host with a scheme, user info, a path, a
 /// port, or a character that would end the URL authority is refused with
-/// [`WinrmError::AuthFailed`] before anything is sent.
+/// [`WinrmError::Config`] before anything is sent.
 ///
 /// The host must also be written the way the URL parser keeps it, so that
 /// the host on the wire is the one you passed: an IPv4 address in dotted-quad
@@ -55,20 +55,28 @@ use crate::transport::{HttpTransport, TransportOptions};
 ///
 /// Every method that sends a request can fail with:
 ///
-/// - [`WinrmError::AuthFailed`]: the `host` is refused (above); the
-///   authentication fails (credentials rejected, a message of the handshake
-///   refused, a check of the proxy or of the server's certificate); or the
-///   server answers an HTTP status that is neither a success nor a SOAP
-///   fault. One exception: with NTLM message encryption, the default over
-///   plain HTTP, an error status whose answer the server did not seal is
-///   [`WinrmError::Ntlm`];
+/// - [`WinrmError::Config`]: the `host` is refused (above), or the
+///   configuration does not allow the request (CredSSP without its cargo
+///   feature, a proxy CredSSP cannot go through); nothing was sent;
 /// - [`WinrmError::Http`]: the connection, the TLS handshake or the HTTP
-///   exchange fails or times out;
-/// - [`WinrmError::Ntlm`]: the cases listed on
-///   [`NtlmError::InvalidMessage`](crate::NtlmError::InvalidMessage), a
-///   malformed message of the handshake and a sealed answer that does not
-///   unseal among them. [`WinrmError::CredSsp`]: a message of that protocol
-///   is malformed or fails its checks;
+///   exchange fails or times out. [`WinrmError::Connection`]: the same for
+///   the connection of CredSSP, a proxy that does not keep an authenticated
+///   connection, and an authenticated NTLM or Kerberos connection the
+///   server closed;
+/// - [`WinrmError::AuthRejected`]: the server refuses the credentials or
+///   the method (HTTP 401, or with CredSSP the NTSTATUS of a refused
+///   logon). [`WinrmError::AuthFailed`]: the authentication fails otherwise
+///   (no Kerberos ticket, a server that does not prove who it is, a pinned
+///   certificate that does not match);
+/// - [`WinrmError::HttpStatus`]: the server answers an HTTP status that is
+///   neither a success, nor a SOAP fault, nor a 401;
+/// - [`WinrmError::Protocol`]: an answer that does not follow the protocol
+///   or cannot be trusted, such as an answer to a sealed request that the
+///   server did not seal. [`WinrmError::Ntlm`]: a malformed NTLM message, a
+///   signature that does not verify
+///   ([`NtlmError::BadSignature`](crate::NtlmError::BadSignature)), a
+///   channel binding that cannot be computed. [`WinrmError::CredSsp`]: a
+///   message of that protocol is malformed or fails its checks;
 /// - [`WinrmError::Soap`]: the server answers a fault
 ///   ([`SoapError::Fault`](crate::SoapError::Fault)), or a body that is not
 ///   an XML document, is larger than the response limit, or is not built
@@ -109,7 +117,7 @@ impl WinrmClient {
     /// # Errors
     ///
     /// [`WinrmError::Http`] if the HTTP client cannot be constructed.
-    /// [`WinrmError::AuthFailed`] for a configuration refused before anything
+    /// [`WinrmError::Config`] for a configuration refused before anything
     /// is sent: Basic over plain HTTP without `EncryptionMode::Never`; Basic
     /// over HTTPS with `accept_invalid_certs`; `EncryptionMode::Always` with
     /// a method that does not seal; Certificate or CredSSP without
@@ -498,7 +506,7 @@ impl WinrmClient {
     /// # Errors
     ///
     /// The [errors of a request](Self#errors-of-a-request), from the Create,
-    /// the Execute or a Receive, and [`WinrmError::Transfer`] once the output
+    /// the Execute or a Receive, and [`WinrmError::OutputLimit`] once the output
     /// exceeds
     /// [`max_output_bytes`](crate::WinrmConfig::max_output_bytes) (the
     /// command is then told to terminate). An exit code other than zero is
@@ -742,9 +750,10 @@ impl WinrmClient {
                 && received > cap
             {
                 self.signal_terminate(host, shell_id, command_id).await.ok();
-                return Err(WinrmError::Transfer(format!(
-                    "command output exceeded max_output_bytes ({cap})"
-                )));
+                return Err(WinrmError::OutputLimit {
+                    what: "command output",
+                    limit: cap,
+                });
             }
 
             if output.exit_code.is_some() {
@@ -993,7 +1002,7 @@ impl WinrmClient {
     ///
     /// The [errors of a request](Self#errors-of-a-request), from the
     /// Enumerate or a Pull (a query the server refuses is a fault), and
-    /// [`WinrmError::Transfer`] once the items collected exceed
+    /// [`WinrmError::OutputLimit`] once the items collected exceed
     /// [`max_output_bytes`](crate::WinrmConfig::max_output_bytes).
     #[tracing::instrument(
         level = "debug",
@@ -1280,9 +1289,10 @@ impl WinrmClient {
 /// `max_output_bytes` (`cap`); `None` means no cap.
 fn check_wql_cap(items: &str, cap: Option<usize>) -> Result<(), WinrmError> {
     match cap {
-        Some(cap) if items.len() > cap => Err(WinrmError::Transfer(format!(
-            "WQL enumeration exceeded max_output_bytes ({cap})"
-        ))),
+        Some(cap) if items.len() > cap => Err(WinrmError::OutputLimit {
+            what: "WQL enumeration",
+            limit: cap,
+        }),
         _ => Ok(()),
     }
 }

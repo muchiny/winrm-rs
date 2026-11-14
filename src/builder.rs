@@ -55,7 +55,7 @@ impl<S> WinrmClientBuilder<S> {
     /// installs one.
     ///
     /// A missing process provider with [`TlsProvider::ProcessDefault`] is
-    /// reported as [`WinrmError::AuthFailed`], like the other TLS setup
+    /// reported as [`WinrmError::Config`], like the other TLS setup
     /// errors, since `WinrmError` has no dedicated variant.
     pub fn tls_provider(mut self, provider: TlsProvider) -> Self {
         self.options.tls.provider = Some(provider);
@@ -70,7 +70,7 @@ impl<S> WinrmClientBuilder<S> {
     /// The file must be a regular file of at most 1 MiB holding at least one
     /// `CERTIFICATE` section; other sections are ignored. It is read by
     /// [`build`](WinrmClientBuilder::build), which fails with
-    /// [`WinrmError::AuthFailed`] naming the file when it cannot be read or a
+    /// [`WinrmError::Config`] naming the file when it cannot be read or a
     /// certificate is not a usable trust anchor.
     ///
     /// The usual checks still apply. The listener certificate must name the
@@ -101,7 +101,7 @@ impl<S> WinrmClientBuilder<S> {
     /// revocation server it cannot reach can add up to 10 s to the first
     /// handshake of each new chain on an air-gapped host. On Linux,
     /// [`build`](WinrmClientBuilder::build) fails with
-    /// [`WinrmError::AuthFailed`] when the system store holds no certificate
+    /// [`WinrmError::Config`] when the system store holds no certificate
     /// and no root file was added.
     pub fn platform_roots(mut self, enabled: bool) -> Self {
         self.options.tls.platform_roots = enabled;
@@ -129,7 +129,7 @@ impl<S> WinrmClientBuilder<S> {
     /// for `https://` endpoints; the operating system's proxy is never used.
     ///
     /// [`build`](WinrmClientBuilder::build) fails with
-    /// [`WinrmError::AuthFailed`] for a malformed fingerprint, with
+    /// [`WinrmError::Config`] for a malformed fingerprint, with
     /// `accept_invalid_certs = true` (the pin replaces it) and with
     /// `use_tls = false`.
     ///
@@ -490,9 +490,11 @@ impl WinrmClientBuilder<Ready> {
     /// [`EncryptionMode::Never`](crate::EncryptionMode::Never) through such a
     /// proxy and logs a WARN for sealed requests;
     /// [`ProxySessionAuth::Require`] refuses both. A refusal is
-    /// [`WinrmError::AuthFailed`], returned before the client completes the
-    /// authentication. SOCKS proxies, `https://` endpoints and direct
-    /// connections are never checked.
+    /// [`WinrmError::Connection`], returned before the client completes the
+    /// authentication; with Kerberos, when the answer to read the header
+    /// from is not the server's 401, it is [`WinrmError::HttpStatus`] with
+    /// the status that came instead. SOCKS proxies, `https://` endpoints and
+    /// direct connections are never checked.
     pub fn proxy_session_auth(mut self, policy: ProxySessionAuth) -> Self {
         self.options.proxy_session_auth = policy;
         self
@@ -561,7 +563,7 @@ impl WinrmClientBuilder<Ready> {
     /// # Errors
     ///
     /// [`WinrmError::Http`] if the underlying HTTP client cannot be
-    /// constructed. [`WinrmError::AuthFailed`] when the configuration is
+    /// constructed. [`WinrmError::Config`] when the configuration is
     /// refused before anything is sent:
     ///
     /// - `AuthMethod::Basic` over plain HTTP, unless `encryption` is
@@ -596,8 +598,8 @@ impl WinrmClientBuilder<Ready> {
         // error and not a panic: the library holds no `unwrap`, `expect`,
         // `panic!` or `unreachable!` (`[lints.clippy]` of `Cargo.toml`).
         let Some(credentials) = self.credentials else {
-            return Err(WinrmError::AuthFailed(
-                "internal: a ready builder without credentials".into(),
+            return Err(WinrmError::Internal(
+                "a ready builder without credentials".into(),
             ));
         };
         let mut client = WinrmClient::with_options(self.config, credentials, self.options)?;

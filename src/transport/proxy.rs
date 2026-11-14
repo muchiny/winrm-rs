@@ -223,7 +223,7 @@ impl ProxyRoute {
     ///
     /// The credentials are those `reqwest` would send: the URL's user info,
     /// percent-decoded. An `https://` or `socks4://` / `socks4a://` proxy is
-    /// refused ([`WinrmError::AuthFailed`]), and so is a SOCKS5 user name or
+    /// refused ([`WinrmError::Config`]), and so is a SOCKS5 user name or
     /// password longer than RFC 1929 allows (255 bytes).
     #[cfg(feature = "credssp")]
     pub(crate) fn credssp_dial(
@@ -239,7 +239,7 @@ impl ProxyRoute {
             // the endpoint or the proxy could not be read, and connecting
             // directly would silently leave the proxy out.
             if let Some(explicit) = &self.explicit {
-                return Err(WinrmError::AuthFailed(format!(
+                return Err(WinrmError::Config(format!(
                     "CredSSP: the proxy {} gives no route to this endpoint; not connecting \
                      directly",
                     redact_userinfo(explicit)
@@ -250,7 +250,7 @@ impl ProxyRoute {
         let uri = intercept.uri();
         let scheme = uri.scheme_str().unwrap_or_default();
         let refused = |what: &str| {
-            WinrmError::AuthFailed(format!(
+            WinrmError::Config(format!(
                 "CredSSP: {what} is not supported; use an http:// or socks5:// proxy, or \
                  connect directly"
             ))
@@ -285,7 +285,7 @@ impl ProxyRoute {
         }
         let user_pass = match intercept.raw_auth() {
             Some((user, pass)) if user.len() > 255 || pass.len() > 255 => {
-                return Err(WinrmError::AuthFailed(SOCKS5_CREDENTIALS_TOO_LONG.into()));
+                return Err(WinrmError::Config(SOCKS5_CREDENTIALS_TOO_LONG.into()));
             }
             Some((user, pass)) => Some((
                 Zeroizing::new(user.to_string()),
@@ -437,7 +437,7 @@ impl ProxyGate {
     /// The check on the answer that should be the server's 401 (`status`
     /// and `headers`, as relayed by the proxy): [`Self::check`] on a 401.
     /// Any other status says nothing about the proxy: it is refused when
-    /// refusing ([`WinrmError::AuthFailed`] naming the status), and passes
+    /// refusing ([`WinrmError::HttpStatus`] with that status), and passes
     /// silently otherwise.
     pub(crate) fn check_answer(
         &self,
@@ -449,19 +449,23 @@ impl ProxyGate {
         }
         if self.refuse {
             let proxy = &self.proxy;
-            return Err(WinrmError::AuthFailed(format!(
-                "the proxy check got {status} instead of the server's 401 through the proxy \
-                 {proxy}, so whether it announces `Proxy-Support: Session-Based-Authentication` \
-                 (RFC 4559 section 6) is unknown; nothing more was sent. Use HTTPS or a SOCKS \
-                 proxy, or choose with WinrmClientBuilder::proxy_session_auth"
-            )));
+            return Err(WinrmError::HttpStatus {
+                status: status.as_u16(),
+                message: format!(
+                    "the proxy check got {status} instead of the server's 401 through the \
+                     proxy {proxy}, so whether it announces `Proxy-Support: \
+                     Session-Based-Authentication` (RFC 4559 section 6) is unknown; nothing \
+                     more was sent. Use HTTPS or a SOCKS proxy, or choose with \
+                     WinrmClientBuilder::proxy_session_auth"
+                ),
+            });
         }
         Ok(())
     }
 
     /// The check on the server's 401: `Ok` when the proxy announced
     /// session-based authentication with it (`supports`). Otherwise
-    /// [`WinrmError::AuthFailed`] when refusing, else `Ok` with a WARN the
+    /// [`WinrmError::Connection`] when refusing, else `Ok` with a WARN the
     /// first time for this endpoint.
     pub(crate) fn check(&self, supports: bool) -> Result<(), WinrmError> {
         if supports {
@@ -469,7 +473,7 @@ impl ProxyGate {
         }
         let proxy = &self.proxy;
         if self.refuse {
-            return Err(WinrmError::AuthFailed(format!(
+            return Err(WinrmError::Connection(format!(
                 "the proxy {proxy} did not announce `Proxy-Support: Session-Based-Authentication` \
                  with the server's 401 (RFC 4559 section 6), so it may share this client's \
                  authenticated server connection with its other users; nothing more was sent. \
@@ -539,7 +543,7 @@ const DEFAULT_SOCKS_PORT: u16 = 1080;
 /// replaced.
 pub(crate) fn parse_proxy_url(raw: &str) -> Result<reqwest::Url, WinrmError> {
     let invalid = || {
-        WinrmError::AuthFailed(format!(
+        WinrmError::Config(format!(
             "invalid proxy URL {:?}: expected scheme://host[:port] with scheme http, https, \
              socks4, socks4a, socks5 or socks5h",
             excerpt_chars(&redact_userinfo(raw), 64)

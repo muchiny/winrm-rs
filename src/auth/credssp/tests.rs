@@ -128,7 +128,8 @@ async fn a_round_without_a_usable_token_is_refused() {
         (
             1,
             NO_TOKEN,
-            "CredSSP: TLS handshake round 1: no CredSSP token in response",
+            "CredSSP: the server's 401 to the first round carries no CredSSP token: it does \
+             not accept CredSSP",
         ),
         (1, NOT_BASE64, "CredSSP: bad base64 in handshake: "),
         (
@@ -148,13 +149,26 @@ async fn a_round_without_a_usable_token_is_refused() {
         (
             4,
             NO_TOKEN,
-            "CredSSP: server dropped the context after NTLM AUTHENTICATE + pubKeyAuth",
+            "CredSSP: the server answered the NTLM authenticate and the pubKeyAuth with a 401 \
+             without a CredSSP token: it refused the credentials or the binding",
         ),
         (4, NOT_BASE64, "CredSSP: bad b64 auth: "),
     ] {
         let (err, log) = refused(Fault::RawAnswer(rank, answer), 1 << 20).await;
-        let WinrmError::AuthFailed(message) = &err else {
-            panic!("request {rank}: {err:?}");
+        // A status other than the 401 of a handshake round keeps its code. A
+        // 401 without a token is the server's refusal on the first round (it
+        // does not accept CredSSP) and after the NTLM authenticate (it
+        // refuses what it carried). The rest is an answer that does not
+        // follow the protocol.
+        let refusal = answer == NO_TOKEN && matches!(rank, 1 | 4);
+        let message = match &err {
+            WinrmError::HttpStatus {
+                status: 200,
+                message,
+            } if answer == OK => message,
+            WinrmError::AuthRejected(message) if refusal => message,
+            WinrmError::Protocol(message) if answer != OK && !refusal => message,
+            other => panic!("request {rank}: {other:?}"),
         };
         assert!(message.starts_with(expected), "request {rank}: {message}");
         assert_eq!(rounds(&log).len(), rank, "{message}");
@@ -177,10 +191,15 @@ async fn the_answer_to_the_delegation_round_is_checked() {
         let err = run(&mock_auth(no_verify(), 1 << 20), port, BODY)
             .await
             .unwrap_err();
-        assert!(
-            matches!(&err, WinrmError::AuthFailed(message) if message == expected),
-            "{err:?}"
-        );
+        let message = match &err {
+            WinrmError::AuthRejected(message) if answer == REFUSED => message,
+            WinrmError::HttpStatus {
+                status: 503,
+                message,
+            } if answer == BUSY => message,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(message, expected);
         assert_eq!(rounds(&log.lock().unwrap()).len(), 5);
     }
 }
@@ -345,21 +364,68 @@ async fn server_pubkeyauth_mismatch_is_refused_before_delegation() {
 async fn missing_server_pubkeyauth_is_refused_before_delegation() {
     let (err, _) = refused(Fault::NoPubKeyAuth, 1 << 20).await;
     assert!(
-        matches!(&err, WinrmError::AuthFailed(m) if m.contains("no pubKeyAuth")),
+        matches!(&err, WinrmError::Protocol(m) if m.contains("no pubKeyAuth")),
         "{err:?}"
     );
 }
 
 #[tokio::test]
 async fn error_code_in_challenge_round_is_server_error() {
-    let (err, _) = refused(Fault::ErrorCodeAtChallenge(0xC000_006D), 1 << 20).await;
+    // STATUS_NOT_SUPPORTED: an error, not the refusal of a logon.
+    let (err, _) = refused(Fault::ErrorCodeAtChallenge(0xC000_00BB), 1 << 20).await;
     assert!(
         matches!(
             err,
-            WinrmError::CredSsp(CredSspError::ServerError(0xC000_006D))
+            WinrmError::CredSsp(CredSspError::ServerError(0xC000_00BB))
         ),
         "{err:?}"
     );
+}
+
+/// The NTSTATUS of a refused logon is the refusal of the credentials, as
+/// the 401 of the other methods: Windows Server 2016 to 2025 answer an
+/// unknown account with `STATUS_LOGON_FAILURE`.
+#[tokio::test]
+async fn error_code_of_a_refused_logon_is_auth_rejected() {
+    for (code, name) in [
+        (0xC000_0064, "STATUS_NO_SUCH_USER"),
+        (0xC000_006A, "STATUS_WRONG_PASSWORD"),
+        (0xC000_006D, "STATUS_LOGON_FAILURE"),
+        (0xC000_006E, "STATUS_ACCOUNT_RESTRICTION"),
+        (0xC000_006F, "STATUS_INVALID_LOGON_HOURS"),
+        (0xC000_0070, "STATUS_INVALID_WORKSTATION"),
+        (0xC000_0071, "STATUS_PASSWORD_EXPIRED"),
+        (0xC000_0072, "STATUS_ACCOUNT_DISABLED"),
+        (0xC000_015B, "STATUS_LOGON_TYPE_NOT_GRANTED"),
+        (0xC000_0193, "STATUS_ACCOUNT_EXPIRED"),
+        (0xC000_0224, "STATUS_PASSWORD_MUST_CHANGE"),
+        (0xC000_0234, "STATUS_ACCOUNT_LOCKED_OUT"),
+    ] {
+        let (err, log) = refused(Fault::ErrorCodeAtPubKey(code), 1 << 20).await;
+        let expected = format!("CredSSP: the server refused the logon: {name} ({code:#010x})");
+        assert!(
+            matches!(&err, WinrmError::AuthRejected(m) if *m == expected),
+            "{code:#010x}: {err:?}"
+        );
+        assert!(
+            !log.iter().any(|e| matches!(e, Event::Delegated { .. })),
+            "{code:#010x}: {log:?}"
+        );
+    }
+    // Its neighbours are not refusals of a logon.
+    for code in [
+        0xC000_0063,
+        0xC000_006B,
+        0xC000_0073,
+        0xC000_0233,
+        0x0000_006D,
+    ] {
+        let (err, _) = refused(Fault::ErrorCodeAtPubKey(code), 1 << 20).await;
+        assert!(
+            matches!(err, WinrmError::CredSsp(CredSspError::ServerError(got)) if got == code),
+            "{code:#010x}: {err:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -378,7 +444,7 @@ async fn error_code_in_pubkey_round_is_server_error() {
 async fn final_token_without_mech_list_mic_is_refused_before_delegation() {
     let (err, _) = refused(Fault::NoMechListMic, 1 << 20).await;
     assert!(
-        matches!(&err, WinrmError::AuthFailed(m)
+        matches!(&err, WinrmError::Protocol(m)
                 if m == "CredSSP: server omitted mechListMIC (RFC 4178 §5)"),
         "{err:?}"
     );
@@ -388,7 +454,7 @@ async fn final_token_without_mech_list_mic_is_refused_before_delegation() {
 async fn reject_neg_state_is_refused_before_delegation() {
     let (err, _) = refused(Fault::NegStateReject, 1 << 20).await;
     assert!(
-        matches!(&err, WinrmError::AuthFailed(m)
+        matches!(&err, WinrmError::Protocol(m)
                 if m == "CredSSP: server final SPNEGO state 2 is not accept-completed"),
         "{err:?}"
     );
@@ -398,7 +464,7 @@ async fn reject_neg_state_is_refused_before_delegation() {
 async fn final_ts_request_without_nego_token_is_refused_before_delegation() {
     let (err, _) = refused(Fault::NoFinalNegoToken, 1 << 20).await;
     assert!(
-        matches!(&err, WinrmError::AuthFailed(m)
+        matches!(&err, WinrmError::Protocol(m)
                 if m == "CredSSP: server sent no final SPNEGO token"),
         "{err:?}"
     );
@@ -410,7 +476,7 @@ async fn tampered_mech_list_mic_is_refused_before_delegation() {
     assert!(
         matches!(
             &err,
-            WinrmError::Ntlm(crate::error::NtlmError::InvalidMessage(m))
+            WinrmError::Ntlm(crate::error::NtlmError::BadSignature(m))
                 if m == "mechListMIC checksum mismatch"
         ),
         "{err:?}"
@@ -442,7 +508,7 @@ async fn body_of_exactly_the_cap_is_accepted() {
 async fn oversized_head_is_refused() {
     let (err, _) = refused(Fault::OversizedHead, 1 << 20).await;
     assert!(
-        matches!(&err, WinrmError::AuthFailed(m) if m == "CredSSP: response head too large"),
+        matches!(&err, WinrmError::Protocol(m) if m == "CredSSP: response head too large"),
         "{err:?}"
     );
 }
@@ -454,7 +520,7 @@ async fn untrusted_outer_cert_is_refused_by_default() {
         .await
         .unwrap_err();
     assert!(
-        matches!(&err, WinrmError::AuthFailed(m) if m.starts_with("CredSSP outer TLS")),
+        matches!(&err, WinrmError::Connection(m) if m.starts_with("CredSSP outer TLS")),
         "{err:?}"
     );
     assert!(log.lock().unwrap().is_empty());
@@ -469,7 +535,7 @@ async fn impostor_outer_cert_is_refused(versions: &[&'static rustls::SupportedPr
         .await
         .unwrap_err();
     assert!(
-        matches!(&err, WinrmError::AuthFailed(m) if m.starts_with("CredSSP outer TLS")),
+        matches!(&err, WinrmError::Connection(m) if m.starts_with("CredSSP outer TLS")),
         "{err:?}"
     );
     assert!(log.lock().unwrap().is_empty());
@@ -505,7 +571,7 @@ fn stalled_inner_tls_hits_the_round_bound() {
     let out = rx
         .recv_timeout(Duration::from_secs(10))
         .expect("handshake loop did not stop: round bound missing");
-    let Err(WinrmError::AuthFailed(message)) = &out else {
+    let Err(WinrmError::Protocol(message)) = &out else {
         panic!("{out:?}");
     };
     assert_eq!(

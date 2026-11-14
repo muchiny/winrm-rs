@@ -84,7 +84,7 @@ async fn post_applies_the_connection_head_cap() {
         ));
     let res = conn.post(None, "<a/>").await;
     assert!(
-        matches!(&res, Err(WinrmError::AuthFailed(m)) if m == "CredSSP: response head too large"),
+        matches!(&res, Err(WinrmError::Protocol(m)) if m == "CredSSP: response head too large"),
         "{res:?}"
     );
 }
@@ -217,7 +217,7 @@ async fn credssp_outer_tls_refuses_an_impostor() {
         match CredSspConnection::connect(&endpoint, &no_verify(), &CredSspDial::Direct, test_opts())
             .await
         {
-            Err(WinrmError::AuthFailed(m)) => {
+            Err(WinrmError::Connection(m)) => {
                 assert!(m.starts_with("CredSSP outer TLS:"), "{label}: {m}");
             }
             Err(e) => panic!("{label}: {e:?}"),

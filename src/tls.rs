@@ -256,7 +256,7 @@ impl CertHandle {
     )]
     pub(crate) fn pin(&self, cert_der: Vec<u8>) -> Result<(), WinrmError> {
         if !self.has_target {
-            return Err(WinrmError::AuthFailed(
+            return Err(WinrmError::Config(
                 "TLS: the endpoint host is not a valid TLS server name, so the server \
                  certificate cannot be pinned; refusing to authenticate"
                     .into(),
@@ -381,7 +381,7 @@ pub(crate) fn parse_sha256_fingerprint(s: &str) -> Result<[u8; 32], WinrmError> 
             .to_digit(16)
             .and_then(|d| u8::try_from(d).ok())
             .ok_or_else(|| {
-                WinrmError::AuthFailed(format!(
+                WinrmError::Config(format!(
                     "pin_server_certificate_sha256: invalid character {c:?}; expected hex \
                      digits, optionally separated by ':'"
                 ))
@@ -394,7 +394,7 @@ pub(crate) fn parse_sha256_fingerprint(s: &str) -> Result<[u8; 32], WinrmError> 
         count = count.saturating_add(1);
     }
     if count != 64 {
-        return Err(WinrmError::AuthFailed(format!(
+        return Err(WinrmError::Config(format!(
             "pin_server_certificate_sha256: expected 64 hex digits (SHA-256), got {count}"
         )));
     }
@@ -574,14 +574,14 @@ const NO_PROCESS_PROVIDER: &str = "no process-wide rustls CryptoProvider is inst
 /// - [`TlsProvider::Ring`]: a `ring` provider private to the client; the
 ///   process-wide default is neither read nor installed.
 /// - [`TlsProvider::ProcessDefault`]: the process-wide default, or
-///   [`WinrmError::AuthFailed`] when none is installed.
+///   [`WinrmError::Config`] when none is installed.
 pub(crate) fn crypto_provider(
     choice: Option<TlsProvider>,
 ) -> Result<Arc<CryptoProvider>, WinrmError> {
     let process_default = || {
         CryptoProvider::get_default()
             .cloned()
-            .ok_or_else(|| WinrmError::AuthFailed(NO_PROCESS_PROVIDER.into()))
+            .ok_or_else(|| WinrmError::Config(NO_PROCESS_PROVIDER.into()))
     };
     match choice {
         None => Ok(CryptoProvider::get_default()
@@ -600,7 +600,7 @@ pub(crate) fn client_config_builder(
     rustls::ClientConfig::builder_with_provider(Arc::clone(provider))
         .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
         .map_err(|e| {
-            WinrmError::AuthFailed(format!(
+            WinrmError::Config(format!(
                 "TLS: the crypto provider supports neither TLS 1.3 nor TLS 1.2: {e}"
             ))
         })
@@ -616,12 +616,12 @@ fn webpki_with_extra(
     for cert in extra {
         roots
             .add(cert.clone())
-            .map_err(|e| WinrmError::AuthFailed(format!("TLS: root certificate rejected: {e}")))?;
+            .map_err(|e| WinrmError::Config(format!("TLS: root certificate rejected: {e}")))?;
     }
     let verifier =
         WebPkiServerVerifier::builder_with_provider(Arc::new(roots), Arc::clone(provider))
             .build()
-            .map_err(|e| WinrmError::AuthFailed(format!("TLS verifier error: {e}")))?;
+            .map_err(|e| WinrmError::Config(format!("TLS verifier error: {e}")))?;
     Ok(verifier)
 }
 
@@ -655,7 +655,7 @@ pub(crate) fn platform_verifier(
 ) -> Result<Arc<dyn ServerCertVerifier>, WinrmError> {
     match result {
         Ok(verifier) => Ok(Arc::new(verifier)),
-        Err(e) => Err(WinrmError::AuthFailed(format!(
+        Err(e) => Err(WinrmError::Config(format!(
             "platform_roots(true): the operating system's certificate store could not be used: {e}"
         ))),
     }
@@ -670,19 +670,19 @@ fn load_root_certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>, W
     let certs = CertificateDer::pem_slice_iter(&pem)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| {
-            WinrmError::AuthFailed(format!(
+            WinrmError::Config(format!(
                 "invalid PEM in root certificates {shown}: {}",
                 describe_pem_error(&e)
             ))
         })?;
     if certs.is_empty() {
-        return Err(WinrmError::AuthFailed(format!(
+        return Err(WinrmError::Config(format!(
             "root certificates {shown} contain no certificate (expected a CERTIFICATE PEM section)"
         )));
     }
     for (index, cert) in certs.iter().enumerate() {
         RootCertStore::empty().add(cert.clone()).map_err(|e| {
-            WinrmError::AuthFailed(format!(
+            WinrmError::Config(format!(
                 "root certificate {} in {shown} is not a usable trust anchor: {e}",
                 index.saturating_add(1)
             ))
@@ -738,14 +738,14 @@ pub(crate) fn server_verifiers(
 ) -> Result<ServerVerifiers, WinrmError> {
     if !opts.pins.is_empty() {
         if accept_invalid_certs {
-            return Err(WinrmError::AuthFailed(
+            return Err(WinrmError::Config(
                 "pin_server_certificate_sha256 replaces accept_invalid_certs: set \
                  accept_invalid_certs = false"
                     .into(),
             ));
         }
         if !use_tls {
-            return Err(WinrmError::AuthFailed(
+            return Err(WinrmError::Config(
                 "pin_server_certificate_sha256 needs use_tls = true: over plain HTTP there is \
                  no server certificate to pin"
                     .into(),
@@ -848,7 +848,7 @@ const MAX_PEM_FILE_BYTES: u64 = 1024 * 1024;
 /// are wiped on drop ([`Zeroizing`]); the decoded DER returned here, and the
 /// copy rustls keeps, are not.
 ///
-/// Every failure is a [`WinrmError::AuthFailed`] naming the file; the message
+/// Every failure is a [`WinrmError::Config`] naming the file; the message
 /// never quotes the file contents, and a path argument that looks like key
 /// material is replaced by a placeholder, so no key material can leak through
 /// it.
@@ -865,19 +865,19 @@ pub(crate) fn load_client_auth_cert(
     let chain = CertificateDer::pem_slice_iter(&cert_pem)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| {
-            WinrmError::AuthFailed(format!(
+            WinrmError::Config(format!(
                 "invalid PEM in client cert {cert_shown}: {}",
                 describe_pem_error(&e)
             ))
         })?;
     if chain.is_empty() {
-        return Err(WinrmError::AuthFailed(format!(
+        return Err(WinrmError::Config(format!(
             "client cert {cert_shown} contains no certificate (expected a CERTIFICATE PEM section)"
         )));
     }
 
     if is_encrypted_key_pem(&key_pem) {
-        return Err(WinrmError::AuthFailed(format!(
+        return Err(WinrmError::Config(format!(
             "client key {key_shown}: encrypted private keys are not supported \
              (decrypt it, e.g. `openssl pkey -in <key> -out <unencrypted key>`)"
         )));
@@ -886,13 +886,13 @@ pub(crate) fn load_client_auth_cert(
     let key = match PrivateKeyDer::from_pem_slice(&key_pem) {
         Ok(key) => key,
         Err(pem::Error::NoItemsFound) => {
-            return Err(WinrmError::AuthFailed(format!(
+            return Err(WinrmError::Config(format!(
                 "client key {key_shown} contains no private key (expected a PRIVATE KEY, \
                  RSA PRIVATE KEY or EC PRIVATE KEY PEM section)"
             )));
         }
         Err(e) => {
-            return Err(WinrmError::AuthFailed(format!(
+            return Err(WinrmError::Config(format!(
                 "invalid PEM in client key {key_shown}: {}",
                 describe_pem_error(&e)
             )));
@@ -912,8 +912,8 @@ fn read_pem_file(path: &Path, what: &str) -> Result<Zeroizing<Vec<u8>>, WinrmErr
     let lossy = path.to_string_lossy();
     let shown = shown_path(&lossy);
     let read_err =
-        |e: std::io::Error| WinrmError::AuthFailed(format!("failed to read {what} {shown}: {e}"));
-    let not_regular = || WinrmError::AuthFailed(format!("{what} {shown} is not a regular file"));
+        |e: std::io::Error| WinrmError::Config(format!("failed to read {what} {shown}: {e}"));
+    let not_regular = || WinrmError::Config(format!("{what} {shown} is not a regular file"));
     // Checked before opening too: opening a FIFO for reading would block.
     if !std::fs::metadata(path).map_err(read_err)?.is_file() {
         return Err(not_regular());
@@ -931,7 +931,7 @@ fn read_pem_file(path: &Path, what: &str) -> Result<Zeroizing<Vec<u8>>, WinrmErr
         .read_to_end(&mut buf)
         .map_err(read_err)?;
     if u64::try_from(buf.len()).map_or(true, |n| n > MAX_PEM_FILE_BYTES) {
-        return Err(WinrmError::AuthFailed(format!(
+        return Err(WinrmError::Config(format!(
             "{what} {shown} is larger than {MAX_PEM_FILE_BYTES} bytes"
         )));
     }

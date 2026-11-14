@@ -157,7 +157,7 @@ mod tests {
     const KERBEROS_PROTOCOL: &str = "application/HTTP-Kerberos-session-encrypted";
 
     fn bad(what: &str) -> WinrmError {
-        WinrmError::AuthFailed(what.to_string())
+        WinrmError::Protocol(what.to_string())
     }
 
     /// A header-length check that accepts every length.

@@ -32,9 +32,11 @@ pub(crate) trait AuthTransport {
 /// WinRM reports SOAP faults as HTTP 500 with the fault envelope in the body,
 /// among them the `w:TimedOut` that ends a silent Receive (an empty poll for
 /// the callers, see `client::empty_poll_on_timeout`). Such an answer becomes
-/// [`WinrmError::Soap`] so callers can act on the fault code. Any other status,
-/// or a 500 whose body holds no fault, becomes [`WinrmError::AuthFailed`] with
-/// the message built by `describe`, so each method keeps its own wording.
+/// [`WinrmError::Soap`] so callers can act on the fault code. A 401 is the
+/// server refusing the credentials, [`WinrmError::AuthRejected`]. Any other
+/// status, or a 500 whose body holds no fault, becomes
+/// [`WinrmError::HttpStatus`]. The message of the last two is built by
+/// `describe`, so each method keeps its own wording.
 pub(crate) fn error_for_status(
     status: u16,
     body: &str,
@@ -45,7 +47,7 @@ pub(crate) fn error_for_status(
     {
         return WinrmError::Soap(fault);
     }
-    WinrmError::AuthFailed(describe())
+    crate::error::status_error(status, describe())
 }
 
 /// An `Authorization` header value marked sensitive, so that `http`/`hyper`
@@ -54,7 +56,7 @@ pub(crate) fn error_for_status(
 /// the credentials or the authentication token.
 pub(crate) fn authorization_value(value: &str) -> Result<reqwest::header::HeaderValue, WinrmError> {
     let mut header = reqwest::header::HeaderValue::from_str(value).map_err(|_| {
-        WinrmError::AuthFailed("Authorization header value is not valid in HTTP".into())
+        WinrmError::Config("Authorization header value is not valid in HTTP".into())
     })?;
     header.set_sensitive(true);
     Ok(header)

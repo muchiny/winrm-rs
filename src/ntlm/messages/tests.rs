@@ -286,7 +286,11 @@ fn decode_challenge_header_bad_base64() {
 #[test]
 fn ntlm_error_display() {
     let err = NtlmError::InvalidMessage("test error".into());
-    assert_eq!(format!("{err}"), "NTLM error: test error");
+    assert_eq!(format!("{err}"), "invalid message: test error");
+    assert_eq!(
+        format!("{}", crate::error::WinrmError::Ntlm(err)),
+        "WinRM NTLM error: invalid message: test error"
+    );
 }
 
 #[test]

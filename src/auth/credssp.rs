@@ -144,7 +144,7 @@ impl AuthTransport for CredSspAuth {
             ..
         } = conn.post(Some(&round5), &body).await?;
         if status == 401 {
-            return Err(WinrmError::AuthFailed(
+            return Err(WinrmError::AuthRejected(
                 "CredSSP: credentials rejected after delegation".into(),
             ));
         }

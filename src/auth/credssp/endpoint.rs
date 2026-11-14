@@ -19,14 +19,14 @@ impl CredSspEndpoint {
     /// Parse `url` (scheme `https` or `http`) the way reqwest does for the
     /// other authentication methods.
     pub(super) fn parse(url: &str) -> Result<Self, WinrmError> {
-        let bad_url = || WinrmError::AuthFailed(format!("CredSSP: bad URL {url}"));
+        let bad_url = || WinrmError::Config(format!("CredSSP: bad URL {url}"));
         let parsed = reqwest::Url::parse(url).map_err(|_| bad_url())?;
         if !matches!(parsed.scheme(), "https" | "http") {
             return Err(bad_url());
         }
         let port = parsed.port_or_known_default().ok_or_else(bad_url)?;
         let invalid_sni = || {
-            WinrmError::AuthFailed(format!(
+            WinrmError::Config(format!(
                 "CredSSP: invalid SNI: {}",
                 parsed.host_str().unwrap_or_default()
             ))
@@ -153,7 +153,7 @@ mod tests {
         // A label of 64 bytes is one too many for a DNS name.
         let url = format!("https://{}.example/wsman", "a".repeat(64));
         match CredSspEndpoint::parse(&url) {
-            Err(WinrmError::AuthFailed(m)) => {
+            Err(WinrmError::Config(m)) => {
                 assert!(m.starts_with("CredSSP: invalid SNI: "), "{m}");
             }
             Err(e) => panic!("{e:?}"),

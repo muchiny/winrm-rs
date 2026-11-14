@@ -432,7 +432,7 @@ fn pss_hash(params: &[u8]) -> Option<CbtHash> {
 ///
 /// # Errors
 ///
-/// [`NtlmError::InvalidMessage`](crate::error::NtlmError::InvalidMessage)
+/// [`NtlmError::ChannelBinding`](crate::error::NtlmError::ChannelBinding)
 /// when the certificate cannot be read or its signature algorithm defines
 /// no channel binding (no single hash, as Ed25519, or unknown): a caller
 /// must then not authenticate without channel binding.
@@ -448,7 +448,7 @@ pub(crate) fn compute_channel_bindings(
 /// [`cbt_hash`], or the error for a certificate without channel binding.
 fn required_cbt_hash(cert_der: &[u8]) -> Result<CbtHash, crate::error::NtlmError> {
     cbt_hash(cert_der).ok_or_else(|| {
-        crate::error::NtlmError::InvalidMessage(
+        crate::error::NtlmError::ChannelBinding(
             "server certificate: unreadable, or its signature algorithm defines no channel \
              binding hash (RFC 5929)"
                 .into(),
@@ -603,7 +603,7 @@ pub(crate) fn random_session_key() -> Result<Zeroizing<[u8; 16]>, crate::error::
     rand::rngs::SysRng
         .try_fill_bytes(key.as_mut_slice())
         .map_err(|e| {
-            crate::error::NtlmError::InvalidMessage(format!(
+            crate::error::NtlmError::Session(format!(
                 "the operating system's random source failed, no session key: {e}"
             ))
         })?;

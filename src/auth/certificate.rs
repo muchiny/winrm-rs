@@ -161,11 +161,14 @@ mod tests {
             .await
             .unwrap_err();
         match err {
-            WinrmError::AuthFailed(msg) => assert_eq!(
-                msg,
+            WinrmError::HttpStatus {
+                status: 500,
+                message,
+            } => assert_eq!(
+                message,
                 "Certificate auth HTTP 500 Internal Server Error: plain failure"
             ),
-            other => panic!("expected AuthFailed, got: {other:?}"),
+            other => panic!("expected HttpStatus, got: {other:?}"),
         }
     }
 

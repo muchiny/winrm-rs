@@ -210,7 +210,7 @@ fn validate_host_refuses_ipv6_literals_that_stand_for_an_ipv4_address() {
     ] {
         let err = validate_host(host).unwrap_err();
         assert!(
-            matches!(&err, WinrmError::AuthFailed(m)
+            matches!(&err, WinrmError::Config(m)
                 if m.contains("invalid host") && m.contains(&format!("pass \"{v4}\""))),
             "{host:?}: {err:?}"
         );
@@ -287,7 +287,7 @@ fn validate_host_rejects_what_would_mis_route_the_endpoint() {
     ] {
         let err = validate_host(host).unwrap_err();
         assert!(
-            matches!(&err, WinrmError::AuthFailed(m) if m.contains("invalid host")),
+            matches!(&err, WinrmError::Config(m) if m.contains("invalid host")),
             "{host:?}: {err:?}"
         );
     }
@@ -317,7 +317,7 @@ async fn a_host_that_is_not_a_host_name_is_refused_before_anything_is_sent() {
             .await
             .unwrap_err();
         assert!(
-            matches!(&err, WinrmError::AuthFailed(m) if m.contains("invalid host")),
+            matches!(&err, WinrmError::Config(m) if m.contains("invalid host")),
             "{host:?}: {err:?}"
         );
     }
@@ -331,7 +331,7 @@ async fn a_host_that_is_not_a_host_name_is_refused_before_anything_is_sent() {
         .await
         .unwrap_err();
     assert!(
-        matches!(&err, WinrmError::AuthFailed(m) if m.contains("WinrmConfig::port")),
+        matches!(&err, WinrmError::Config(m) if m.contains("WinrmConfig::port")),
         "{err:?}"
     );
     let requests = server.received_requests().await.unwrap_or_default();
@@ -370,8 +370,8 @@ fn credssp_without_tls_returns_error() {
     };
     let creds = WinrmCredentials::new("admin", "pass", "");
     match HttpTransport::new(config, creds) {
-        Err(WinrmError::AuthFailed(_)) => {} // expected
-        Err(e) => panic!("expected AuthFailed, got: {e}"),
+        Err(WinrmError::Config(_)) => {} // expected
+        Err(e) => panic!("expected Config, got: {e}"),
         Ok(_) => panic!("expected error, got Ok"),
     }
 }
@@ -386,8 +386,8 @@ fn certificate_auth_without_cert_path_returns_error() {
     };
     let creds = WinrmCredentials::new("admin", "pass", "");
     match HttpTransport::new(config, creds) {
-        Err(WinrmError::AuthFailed(_)) => {}
-        Err(e) => panic!("expected AuthFailed, got: {e}"),
+        Err(WinrmError::Config(_)) => {}
+        Err(e) => panic!("expected Config, got: {e}"),
         Ok(_) => panic!("expected error, got Ok"),
     }
 }
@@ -403,8 +403,8 @@ fn certificate_auth_without_key_path_returns_error() {
     };
     let creds = WinrmCredentials::new("admin", "pass", "");
     match HttpTransport::new(config, creds) {
-        Err(WinrmError::AuthFailed(_)) => {}
-        Err(e) => panic!("expected AuthFailed, got: {e}"),
+        Err(WinrmError::Config(_)) => {}
+        Err(e) => panic!("expected Config, got: {e}"),
         Ok(_) => panic!("expected error, got Ok"),
     }
 }
@@ -455,8 +455,8 @@ fn certificate_auth_nonexistent_cert_file_returns_error() {
     };
     let creds = WinrmCredentials::new("admin", "pass", "");
     match HttpTransport::new(config, creds) {
-        Err(WinrmError::AuthFailed(_)) => {}
-        Err(e) => panic!("expected AuthFailed, got: {e}"),
+        Err(WinrmError::Config(_)) => {}
+        Err(e) => panic!("expected Config, got: {e}"),
         Ok(_) => panic!("expected error, got Ok"),
     }
 }
@@ -522,12 +522,12 @@ fn cert_tls_config(files: &PemFiles) -> WinrmConfig {
     }
 }
 
-/// Build the transport and return the `AuthFailed` message, or panic.
+/// Build the transport and return the `Config` message, or panic.
 fn cert_auth_failed(config: WinrmConfig) -> String {
     match HttpTransport::new(config, WinrmCredentials::new("u", "p", "")) {
-        Err(WinrmError::AuthFailed(msg)) => msg,
-        Err(e) => panic!("expected AuthFailed, got: {e:?}"),
-        Ok(_) => panic!("expected AuthFailed, got Ok"),
+        Err(WinrmError::Config(msg)) => msg,
+        Err(e) => panic!("expected Config, got: {e:?}"),
+        Ok(_) => panic!("expected Config, got Ok"),
     }
 }
 
@@ -1113,8 +1113,8 @@ async fn send_basic_auth_failed_returns_error() {
         .await
         .unwrap_err();
     assert!(
-        matches!(err, WinrmError::AuthFailed(_)),
-        "expected AuthFailed, got: {err}"
+        matches!(err, WinrmError::HttpStatus { status: 403, .. }),
+        "expected HttpStatus, got: {err}"
     );
 }
 
@@ -1421,7 +1421,7 @@ fn proxy_named_after_its_scheme_is_refused_at_construction() {
             .err()
             .expect("refused");
         assert!(
-            matches!(&err, WinrmError::AuthFailed(m) if m.contains("invalid proxy URL")),
+            matches!(&err, WinrmError::Config(m) if m.contains("invalid proxy URL")),
             "{proxy}: {err:?}"
         );
     }
@@ -1457,7 +1457,7 @@ fn basic_over_http_is_refused_unless_encryption_is_never() {
     for mode in [EncryptionMode::Auto, EncryptionMode::Always] {
         let err = basic(false, mode.clone()).err().expect("refused");
         assert!(
-            matches!(&err, WinrmError::AuthFailed(m) if m.contains("EncryptionMode::Never") && m.contains("use_tls")),
+            matches!(&err, WinrmError::Config(m) if m.contains("EncryptionMode::Never") && m.contains("use_tls")),
             "{mode:?}: {err:?}"
         );
     }
@@ -1485,7 +1485,7 @@ fn always_with_a_method_that_never_seals_is_refused() {
         };
         let err = HttpTransport::new(config, creds()).err().expect("refused");
         assert!(
-            matches!(&err, WinrmError::AuthFailed(m) if m.contains("EncryptionMode::Always") && m.contains(&format!("does not seal {name}"))),
+            matches!(&err, WinrmError::Config(m) if m.contains("EncryptionMode::Always") && m.contains(&format!("does not seal {name}"))),
             "{err:?}"
         );
     }
@@ -1582,7 +1582,7 @@ async fn logs_of_a_host_with_userinfo_do_not_carry_the_password() {
         .send_soap(host, "<s:Envelope/>".into(), None)
         .await;
     assert!(
-        matches!(&sent, Err(WinrmError::AuthFailed(m)) if m.contains("invalid host")),
+        matches!(&sent, Err(WinrmError::Config(m)) if m.contains("invalid host")),
         "{sent:?}"
     );
     assert!(logs_contain("<redacted>@127.0.0.1"));
@@ -1764,6 +1764,29 @@ async fn connect_hint_only_for_a_connect_failure_on_the_default_https_port() {
     assert!(connect_hint(&WinrmConfig::default(), false, &WinrmError::Timeout(1)).is_none());
 }
 
+/// `reqwest` says which step failed and for which URL, and leaves the
+/// reason to the causes of its error: the message gives them.
+#[tokio::test]
+async fn a_refused_connection_says_so_in_its_message() {
+    let (_socket, closed) = refused_port();
+    let err = basic_transport(closed)
+        .send_soap_with_retry("127.0.0.1", "<s:Envelope/>".into())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, WinrmError::Http(e) if e.is_connect()),
+        "{err:?}"
+    );
+    let shown = err.to_string();
+    assert!(
+        shown.starts_with("WinRM HTTP error: error sending request for url ("),
+        "{shown}"
+    );
+    assert!(shown.contains("refused"), "{shown}");
+    // In the message, so not behind `source()` as well.
+    assert!(std::error::Error::source(&err).is_none());
+}
+
 /// With a proxy set, a connect failure is the proxy's (unreachable, or
 /// a DNS failure through it): `WinrmConfig::http()` would not fix it.
 #[tokio::test]
@@ -1907,7 +1930,7 @@ async fn host_log_fields_escape_control_characters() {
         .await
         .unwrap_err();
     assert!(
-        matches!(&err, WinrmError::AuthFailed(m) if m.contains("invalid host")),
+        matches!(&err, WinrmError::Config(m) if m.contains("invalid host")),
         "{err:?}"
     );
     let text = logs.text();
@@ -1932,7 +1955,7 @@ async fn bidi_characters_in_a_host_are_refused_and_logged_escaped() {
         .await
         .unwrap_err();
     assert!(
-        matches!(&err, WinrmError::AuthFailed(m) if m.contains("invalid host")),
+        matches!(&err, WinrmError::Config(m) if m.contains("invalid host")),
         "{err:?}"
     );
     let text = logs.text();
@@ -2084,7 +2107,7 @@ async fn before_send_with_is_not_called_for_a_decorated_host() {
         .await
         .unwrap_err();
     assert!(
-        matches!(&err, WinrmError::AuthFailed(m) if m.contains("invalid host")),
+        matches!(&err, WinrmError::Config(m) if m.contains("invalid host")),
         "{err:?}"
     );
     assert!(
@@ -2190,7 +2213,7 @@ async fn unauthorized_on_a_reused_connection_is_not_resent() {
         .await
         .unwrap_err();
     assert!(
-        matches!(&err, WinrmError::Ntlm(e) if e.to_string().contains("NOT resent")),
+        matches!(&err, WinrmError::Connection(m) if m.contains("NOT resent")),
         "got: {err:?}"
     );
     assert_eq!(
@@ -2220,8 +2243,9 @@ async fn unauthorized_on_a_fresh_session_is_not_retried() {
         .send_soap_with_retry(&host, "<a/>".into())
         .await
         .unwrap_err();
-    // Not a credentials problem (bad credentials fail the handshake).
-    assert!(matches!(err, WinrmError::Ntlm(_)), "got: {err:?}");
+    // Not a credentials problem (bad credentials fail the handshake): the
+    // connection lost its session.
+    assert!(matches!(err, WinrmError::Connection(_)), "got: {err:?}");
     assert_eq!(fake.sealed().len(), 1, "log: {:?}", fake.log());
     assert_eq!(fake.plaintext_bodies(), 0, "log: {:?}", fake.log());
 }
@@ -2265,10 +2289,15 @@ async fn failed_sealed_request_is_never_resent() {
             .send_soap_with_retry(&host, "<b/>".into())
             .await
             .unwrap_err();
-        assert!(
-            !matches!(err, WinrmError::Soap(_) | WinrmError::Http(_)),
-            "case {i}: got {err:?}"
-        );
+        // A sealed answer is trusted and keeps its status; one that is not
+        // sealed, or does not unseal, is not what the protocol allows.
+        let expected = match i {
+            0 => matches!(err, WinrmError::HttpStatus { status: 500, .. }),
+            1 => matches!(err, WinrmError::HttpStatus { status: 400, .. }),
+            2 => matches!(&err, WinrmError::Protocol(m) if m.contains("without sealing")),
+            _ => matches!(&err, WinrmError::Protocol(m) if m.starts_with("NTLM sealed response: ")),
+        };
+        assert!(expected, "case {i}: got {err:?}");
         assert_eq!(
             fake.sealed().iter().filter(|p| p.contains("<b/>")).count(),
             1,
@@ -2310,7 +2339,10 @@ async fn sealed_label_on_a_plaintext_fault_is_an_error() {
         .send_soap_with_retry(&host, "<b/>".into())
         .await
         .unwrap_err();
-    assert!(matches!(err, WinrmError::Ntlm(_)), "got: {err:?}");
+    assert!(
+        matches!(&err, WinrmError::Protocol(m) if m.starts_with("NTLM sealed response: ")),
+        "got: {err:?}"
+    );
 }
 
 /// Windows seals the HTTP 500 fault of a sealed request: it surfaces as
@@ -2510,7 +2542,7 @@ async fn requests_are_retried_only_on_connection_errors() {
 
     assert!(HttpTransport::is_retryable(&WinrmError::Http(refused)));
     assert!(!HttpTransport::is_retryable(&WinrmError::Http(timed_out)));
-    assert!(!HttpTransport::is_retryable(&WinrmError::AuthFailed(
+    assert!(!HttpTransport::is_retryable(&WinrmError::Config(
         "x".into()
     )));
 }
@@ -2823,7 +2855,7 @@ fn credssp_with_accept_invalid_certs_is_refused() {
         .err()
         .expect("must refuse");
     assert!(
-        matches!(&err, WinrmError::AuthFailed(m) if m == CREDSSP_UNAUTHENTICATED_TLS),
+        matches!(&err, WinrmError::Config(m) if m == CREDSSP_UNAUTHENTICATED_TLS),
         "{err}"
     );
 }
@@ -2865,7 +2897,7 @@ fn basic_with_accept_invalid_certs_is_refused() {
         .err()
         .expect("must refuse");
     assert!(
-        matches!(&err, WinrmError::AuthFailed(m) if m == BASIC_UNVERIFIED_TLS),
+        matches!(&err, WinrmError::Config(m) if m == BASIC_UNVERIFIED_TLS),
         "{err}"
     );
 }
@@ -2905,7 +2937,7 @@ fn a_refused_credssp_build_logs_no_verification_warn() {
         .err()
         .expect("must refuse");
     assert!(
-        matches!(&err, WinrmError::AuthFailed(m) if m == CREDSSP_UNAUTHENTICATED_TLS),
+        matches!(&err, WinrmError::Config(m) if m == CREDSSP_UNAUTHENTICATED_TLS),
         "{err}"
     );
     assert!(!logs_contain(UNVERIFIED_SERVER_WARN));
@@ -3035,6 +3067,8 @@ async fn credssp_pin_refuses_a_listener_with_another_certificate() {
     let relay = test_server::spawn_tls_relay(port, RSA_CERT_PEM, RSA_KEY_PKCS1_PEM);
     let t = credssp_test_transport(relay);
     let err = send_bounded(&t).await.unwrap_err();
+    // The pin's refusal is the variant the other methods give it
+    // (`kerberos_probe_reports_a_wrong_pin_as_such`), not a network failure.
     assert!(
         matches!(&err, WinrmError::AuthFailed(m) if m.starts_with("CredSSP outer TLS")),
         "{err}"
@@ -3216,7 +3250,7 @@ async fn credssp_request_refuses_an_https_env_proxy_when_opted_in() {
     let t = credssp_env_proxy_transport(5986, true, "https://proxy.test:3128".into());
     let err = send_bounded(&t).await.unwrap_err();
     assert!(
-        matches!(&err, WinrmError::AuthFailed(m)
+        matches!(&err, WinrmError::Config(m)
             if m.starts_with("CredSSP: an https:// proxy is not supported")),
         "{err}"
     );
@@ -3253,7 +3287,7 @@ fn credssp_refuses_an_https_proxy_at_construction() {
     assert!(
         matches!(
             &err,
-            WinrmError::AuthFailed(m) if m == "CredSSP: an https:// proxy is not supported; \
+            WinrmError::Config(m) if m == "CredSSP: an https:// proxy is not supported; \
                 use an http:// or socks5:// proxy, or connect directly"
         ),
         "{err}"
@@ -3282,7 +3316,7 @@ async fn credssp_default_verifier_refuses_untrusted_listener() {
     let t = HttpTransport::new(credssp_test_config(port), creds()).unwrap();
     let err = send_bounded(&t).await.unwrap_err();
     assert!(
-        matches!(&err, WinrmError::AuthFailed(m) if m.starts_with("CredSSP outer TLS")),
+        matches!(&err, WinrmError::Connection(m) if m.starts_with("CredSSP outer TLS")),
         "{err}"
     );
     assert!(log.lock().unwrap().is_empty(), "the server saw a request");
@@ -4371,7 +4405,7 @@ async fn the_hook_is_not_called_for_an_invalid_host() {
         .await
         .unwrap_err();
     assert!(
-        matches!(&err, WinrmError::AuthFailed(m) if m.contains("invalid host")),
+        matches!(&err, WinrmError::Config(m) if m.contains("invalid host")),
         "{err:?}"
     );
     assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -4658,7 +4692,7 @@ async fn explicit_provider_is_used_for_every_handshake() {
                 assert_eq!(result.unwrap(), "<ok/>");
             }
             assert!(
-                matches!(&shared, Err(WinrmError::AuthFailed(m)) if m.starts_with("HTTP 400")),
+                matches!(&shared, Err(WinrmError::HttpStatus { status: 400, .. })),
                 "shared client: {shared:?}"
             );
         } else {
@@ -5015,13 +5049,13 @@ fn credssp_follows_env_proxies_when_opted_in() {
     // it applies to, not when the client is built.
     let t = build(true, "https://10.0.0.1:3128");
     match t.credssp_dial_for(h) {
-        Err(WinrmError::AuthFailed(m)) => {
+        Err(WinrmError::Config(m)) => {
             assert!(
                 m.starts_with("CredSSP: an https:// proxy is not supported"),
                 "{m}"
             );
         }
-        other => panic!("expected AuthFailed, got {other:?}"),
+        other => panic!("expected Config, got {other:?}"),
     }
     assert!(matches!(
         *t.credssp_dial_for(excluded).unwrap(),
@@ -5225,7 +5259,7 @@ async fn never_through_a_proxy_without_session_auth_is_refused_before_type3() {
         .await
         .unwrap_err();
     assert!(
-        matches!(&err, WinrmError::AuthFailed(m) if m.contains("Session-Based-Authentication") && m.contains("proxy_session_auth")),
+        matches!(&err, WinrmError::Connection(m) if m.contains("Session-Based-Authentication") && m.contains("proxy_session_auth")),
         "{err:?}"
     );
     assert_eq!(fake.log(), vec![Event::Negotiate], "no Type 3 may follow");
@@ -5510,7 +5544,7 @@ async fn kerberos_probe_answered_407_is_refused_and_not_kept() {
         let err = t.send_soap_raw(&host, "<a/>".into()).await.unwrap_err();
         assert!(
             is_proxy_refusal(&err)
-                && err.to_string().contains("407")
+                && matches!(err, WinrmError::HttpStatus { status: 407, .. })
                 && !err.to_string().contains("with the server's 401"),
             "{err}"
         );
@@ -5707,12 +5741,12 @@ async fn accepting_invalid_proxy_certs_refuses_a_host_named_like_the_proxy() {
     };
     let t = transport_with(config, &opts).unwrap();
     match send_basic(&t, "localhost").await {
-        Err(WinrmError::AuthFailed(m)) => assert_eq!(
+        Err(WinrmError::Config(m)) => assert_eq!(
             m,
             "danger_accept_invalid_proxy_certs: host localhost has the name of an https:// \
              proxy; it would not be verified, refusing"
         ),
-        other => panic!("expected AuthFailed, got {other:?}"),
+        other => panic!("expected Config, got {other:?}"),
     }
     assert_eq!(read.load(Ordering::SeqCst), 0);
 }
@@ -5837,7 +5871,7 @@ async fn sealing_handshake_always_closed_is_an_error() {
         .await
         .unwrap_err();
     assert!(
-        matches!(&err, WinrmError::Ntlm(e) if e.to_string().contains("closes the connection")),
+        matches!(&err, WinrmError::Connection(m) if m.contains("closes the connection")),
         "{err:?}"
     );
     assert!(fake.sealed().is_empty(), "log: {:?}", fake.log());
@@ -6370,10 +6404,10 @@ async fn credssp_tls_outer_uses_the_extra_root() {
     )
     .unwrap();
     match send_basic(&t, "localhost").await {
-        Err(WinrmError::AuthFailed(m)) => {
+        Err(WinrmError::Connection(m)) => {
             assert!(m.starts_with("CredSSP outer TLS:"), "{m}");
         }
-        other => panic!("expected AuthFailed, got {other:?}"),
+        other => panic!("expected Connection, got {other:?}"),
     }
     assert_eq!(read.load(Ordering::SeqCst), 0);
 }
@@ -6383,21 +6417,21 @@ fn root_file_without_a_certificate_is_a_clear_error() {
     use crate::test_pki::EC_KEY_PKCS8_PEM;
     let keys = root_file("no-cert", EC_KEY_PKCS8_PEM);
     match transport_with(tls_config(AuthMethod::Basic, 5986), &roots(&[&keys])) {
-        Err(WinrmError::AuthFailed(m)) => {
+        Err(WinrmError::Config(m)) => {
             assert!(m.contains(&keys.cert), "{m}");
             assert!(m.contains("no certificate"), "{m}");
             assert!(!m.contains("IvSE2eFVFQPSvWUFhXFxIaP6"), "{m}");
         }
-        other => panic!("expected AuthFailed, got {:?}", other.map(|_| ())),
+        other => panic!("expected Config, got {:?}", other.map(|_| ())),
     }
 }
 
-/// The `AuthFailed` message of building a transport that trusts `pem`.
+/// The `Config` message of building a transport that trusts `pem`.
 fn root_file_error(tag: &str, pem: &str) -> (PemFiles, String) {
     let file = root_file(tag, pem);
     match transport_with(tls_config(AuthMethod::Basic, 5986), &roots(&[&file])) {
-        Err(WinrmError::AuthFailed(m)) => (file, m),
-        other => panic!("expected AuthFailed, got {:?}", other.map(|_| ())),
+        Err(WinrmError::Config(m)) => (file, m),
+        other => panic!("expected Config, got {:?}", other.map(|_| ())),
     }
 }
 
@@ -6435,10 +6469,10 @@ fn missing_root_file_is_a_clear_error() {
         ..Default::default()
     };
     match transport_with(tls_config(AuthMethod::Basic, 5986), &opts) {
-        Err(WinrmError::AuthFailed(m)) => {
+        Err(WinrmError::Config(m)) => {
             assert!(m.contains("/nonexistent/winrm-rs/ca.pem"), "{m}");
         }
-        other => panic!("expected AuthFailed, got {:?}", other.map(|_| ())),
+        other => panic!("expected Config, got {:?}", other.map(|_| ())),
     }
 }
 
@@ -6654,7 +6688,7 @@ async fn pin_refuses_a_host_named_like_the_https_proxy() {
         };
         let err = transport_with(config, &opts).err().expect("must refuse");
         assert!(
-            matches!(&err, WinrmError::AuthFailed(m) if m.starts_with("CredSSP: an https:// proxy is not supported")),
+            matches!(&err, WinrmError::Config(m) if m.starts_with("CredSSP: an https:// proxy is not supported")),
             "{err}"
         );
 
@@ -6679,12 +6713,12 @@ async fn pin_refuses_a_host_named_like_the_https_proxy() {
         )
         .unwrap();
         match send_basic(&t, "localhost").await {
-            Err(WinrmError::AuthFailed(m)) => assert_eq!(
+            Err(WinrmError::Config(m)) => assert_eq!(
                 m,
                 "pin_server_certificate_sha256: host localhost has the name of an https:// \
                  proxy; the pin cannot be applied to it, refusing"
             ),
-            other => panic!("CredSsp (environment proxy): expected AuthFailed, got {other:?}"),
+            other => panic!("CredSsp (environment proxy): expected Config, got {other:?}"),
         }
         assert_eq!(
             read.load(Ordering::SeqCst),
@@ -6709,13 +6743,13 @@ async fn pin_refuses_a_host_named_like_the_https_proxy() {
         };
         let t = transport_with(config, &opts).unwrap();
         match send_basic(&t, "localhost").await {
-            Err(WinrmError::AuthFailed(m)) => assert_eq!(
+            Err(WinrmError::Config(m)) => assert_eq!(
                 m,
                 "pin_server_certificate_sha256: host localhost has the name of an https:// \
                  proxy; the pin cannot be applied to it, refusing",
                 "{label}"
             ),
-            other => panic!("{label}: expected AuthFailed, got {other:?}"),
+            other => panic!("{label}: expected Config, got {other:?}"),
         }
         assert_eq!(read.load(Ordering::SeqCst), 0, "{label}");
     }
@@ -6748,11 +6782,11 @@ async fn pin_accepts_a_host_not_named_like_the_https_proxy() {
     );
 }
 
-/// The build-time refusal of a pin, as `WinrmError::AuthFailed(m)`.
+/// The build-time refusal of a pin, as `WinrmError::Config(m)`.
 fn build_refusal(config: WinrmConfig, opts: &TlsOptions) -> String {
     match transport_with(config, opts) {
-        Err(WinrmError::AuthFailed(m)) => m,
-        other => panic!("expected AuthFailed, got {:?}", other.map(|_| ())),
+        Err(WinrmError::Config(m)) => m,
+        other => panic!("expected Config, got {:?}", other.map(|_| ())),
     }
 }
 

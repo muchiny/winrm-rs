@@ -7,6 +7,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+`WinrmError` says what failed by its variant. That breaks the programs that
+match on it, so the next release is 3.0.0: read *Upgrading from 2.x* first.
+
+### Upgrading from 2.x
+
+Each entry below is a change that can break a program written for 2.x.
+
+#### `WinrmError` says the cause by its variant
+
+Before (2.x): `WinrmError::AuthFailed(String)` was the error of nearly
+everything that was neither a SOAP fault nor an error of `reqwest`: refused
+credentials, an option that contradicts another, a PEM file that does not
+parse, a proxy the method cannot go through, an HTTP 404 or 503, a
+malformed answer, a state the crate should never reach. Telling them apart
+meant reading the message. `WinrmError::Transfer(String)` was both a failed
+file transfer and an output larger than `max_output_bytes`.
+
+After (3.0):
+
+| Variant | What failed | In 2.x |
+|---|---|---|
+| `Config(String)` | What was asked cannot be done as configured: options that contradict each other, a certificate or key file, a `host` that is not a host name, a proxy the method cannot use, a cargo feature that is off. Nothing was sent. | `AuthFailed` |
+| `Http(reqwest::Error)` | The network path, where `reqwest` drives it. | `Http` |
+| `Connection(String)` | The network path, where the crate drives it: the CredSSP connection (TCP, proxy tunnel, TLS), a proxy that does not keep an authenticated connection, an authenticated NTLM or Kerberos connection the server closed. | `AuthFailed`; `Ntlm(NtlmError::InvalidMessage)` for the NTLM connection |
+| `AuthRejected(String)` | The server refused the credentials or the method: HTTP 401, or with CredSSP the NTSTATUS of a refused logon. | `AuthFailed`; `CredSsp(CredSspError::ServerError)` for the NTSTATUS |
+| `AuthFailed(String)` | The authentication failed for another reason: a Kerberos ticket, mutual authentication, a pinned certificate that does not match, the TLS session inside CredSSP. | `AuthFailed` |
+| `HttpStatus { status, message }` | An HTTP status that ends the exchange and is neither a SOAP fault nor a 401. | `AuthFailed` |
+| `Protocol(String)` | An answer that does not follow the protocol or cannot be trusted: a malformed token, an answer to a sealed request that is not sealed or has the wrong framing. | `AuthFailed`; `Ntlm(NtlmError::InvalidMessage)` for the NTLM framing |
+| `OutputLimit { what, limit }` | The output of a command or a WQL enumeration larger than `max_output_bytes`. | `Transfer` |
+| `Transfer(TransferError)` | A file transfer: `RemotePath`, `LocalRead { path, error }`, `LocalWrite { path, error }`, `Host`, `Decode`. | `Transfer(String)` |
+| `Internal(String)` | A state the crate should never reach: a bug to report. | `AuthFailed("internal: …")` |
+
+With CredSSP, Windows reports refused credentials as an NTSTATUS inside the
+handshake (`STATUS_LOGON_FAILURE` for an unknown account, measured on
+Server 2016, 2019, 2022 and 2025). The twelve codes of a refused logon are
+`AuthRejected`, with the name of the code in the message;
+`CredSspError::ServerError` keeps the others. A 401 that does not go on
+with a handshake is `AuthRejected` too where it stands for a refusal: the
+answer to the first round of CredSSP (a server on which CredSSP is not
+enabled), the answer to its NTLM authenticate, and the answer to the NTLM
+negotiate message (a server that does not accept NTLM).
+
+`Ntlm`, `CredSsp`, `Soap`, `Timeout` and `Cancelled` keep their meaning.
+`NtlmError` has four variants where it had one: `InvalidMessage` (a message
+of the handshake that does not parse), `BadSignature` (a signature or a
+`mechListMIC` that does not verify), `ChannelBinding` (the channel binding
+cannot be computed) and `Session` (the random source failed, the sequence
+numbers are spent, or the session is unusable after an earlier error).
+
+`WinrmError`, `NtlmError`, `CredSspError`, `SoapError`, the new
+`TransferError`, `AuthMethod` and `EncryptionMode` are `#[non_exhaustive]`.
+
+The messages follow. The text before the first colon names the variant
+(`WinRM configuration error: …`, `WinRM connection error: …`,
+`WinRM authentication rejected: …`, `WinRM request failed: …`,
+`WinRM protocol error: …`, `winrm-rs internal error: …`). An output over the
+limit no longer starts with `file transfer error: `. The messages of
+`NtlmError` start with `invalid message: `, `signature check failed: `,
+`channel binding: ` or `session: ` where they started with `NTLM error: `.
+The wording of a message is not part of the API.
+
+Migration:
+
+- A `match` on one of these enums needs a wildcard arm.
+- To tell refused credentials from the rest, match `AuthRejected`; in 2.x
+  that meant reading the message of an `AuthFailed`.
+- `Transfer(message)` becomes `Transfer(error)`: `error.to_string()` is the
+  message without its `file transfer error: ` prefix, and the variant of
+  `TransferError` says whether the remote path, a local file or the host
+  refused. The output limit is `OutputLimit`.
+- A request whose authenticated NTLM or Kerberos connection the server had
+  closed (`NOT resent` in the message) was an `Ntlm` or an `AuthFailed`
+  error: it is a `Connection` error.
+- A program that reads the text of a message should match the variant.
+
 ### Security
 
 - **The NTLM session key comes straight from the operating system.** It was
@@ -17,7 +92,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the key and decrypt a recorded sealed exchange. The key is now read with
   `SysRng`, which keeps no state. This covers NTLM over HTTP and HTTPS and
   the NTLM exchange inside CredSSP. If the operating system's random source
-  fails, the handshake fails with `NtlmError::InvalidMessage`.
+  fails, the handshake fails with `NtlmError::Session`.
 - **`run_wql` applies `max_output_bytes` to the first answer too.** The cap
   was only checked after each Pull. The Enumerate request asks for optimized
   enumeration, so a server can return every item in the Enumerate answer and
@@ -45,7 +120,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   resolve the path as .NET does (`[IO.Path]::GetFullPath`) and open it
   only if it is still a path on a drive letter and resolves to itself.
   Otherwise nothing is opened and the call fails with
-  `WinrmError::Transfer`, which quotes the host:
+  `WinrmError::Transfer` (`TransferError::Host`), which quotes the host:
   `RemotePathPolicy::LocalDrive refuses 'T:\f.bin' (drive type 'Network')`.
   The order matters. Resolving a name that holds a `~` looks it up on the
   drive, to expand a short name; reading the type of a drive opened no
@@ -133,6 +208,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **The errors are typed by cause** (breaking): `WinrmError` gains
+  `Config`, `Connection`, `AuthRejected`, `HttpStatus`, `Protocol`,
+  `OutputLimit` and `Internal`, `Transfer` holds a `TransferError`,
+  `NtlmError` gains `BadSignature`, `ChannelBinding` and `Session`, and the
+  error enums, `AuthMethod` and `EncryptionMode` are `#[non_exhaustive]`.
+  See *Upgrading from 2.x*.
+- **The message of `WinrmError::Http` gives the reason.** `reqwest` says
+  which step failed and for which URL, and leaves the reason to the causes
+  of its error, which the message did not show:
+  `WinRM HTTP error: error sending request for url (https://srv:5986/wsman)`
+  for a refused connection as for a certificate that does not verify. The
+  causes now follow, each after `": "`, as in `… (https://srv:5986/wsman):
+  client error (Connect): tcp connect error: Connection refused (os error
+  111)`. At most eight causes are given, 256 characters of each, with
+  control characters neutralised as in a server's text. The error still
+  has no `source()`: its causes are in its message, and the `reqwest`
+  error is in the variant.
 - **A server's SOAP answers are read with an XML parser (`quick-xml`).**
   They were searched for tag-shaped substrings. An answer is now read in one
   forward pass, and an element counts by its name and its place in the
@@ -331,10 +423,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     `unused_must_use` warning.
   - The library holds no `unwrap`, `expect`, `panic!` or `unreachable!`
     any more. Two were left, on branches nothing can reach: an `expect`
-    in `WinrmClientBuilder::build`, now a refusal (`AuthFailed`), and an
-    `unreachable!()` after the retry loop of the transport, which now
-    ends by its `return`s. `clippy::unreachable` joins the lints that
-    keep it so.
+    in `WinrmClientBuilder::build`, now a refusal
+    (`WinrmError::Internal`), and an `unreachable!()` after the retry
+    loop of the transport, which now ends by its `return`s.
+    `clippy::unreachable` joins the lints that keep it so.
   - The proxy route written to the DEBUG log ends with `..`: its `Debug`
     always left the matcher out, and now says so.
 

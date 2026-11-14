@@ -47,23 +47,35 @@ impl Round {
     }
 
     /// Error for a `401` that carries no CredSSP token.
+    ///
+    /// It is the server's refusal where it stands for one: on the first
+    /// round, a server that does not accept CredSSP (it offers its other
+    /// methods, or none); after the NTLM authenticate, a server that
+    /// refuses what it carried. In between the server gave up an exchange
+    /// it had begun, which the protocol does not allow.
     fn no_token(self) -> WinrmError {
-        WinrmError::AuthFailed(match self {
-            Self::Tls(n) => {
-                format!("CredSSP: TLS handshake round {n}: no CredSSP token in response")
-            }
-            Self::Negotiate => "CredSSP: NTLM nego: no CredSSP token".into(),
-            Self::Authenticate => {
-                "CredSSP: server dropped the context after NTLM AUTHENTICATE + pubKeyAuth \
-                 (401 without a CredSSP token is how Windows reports a rejected pubKeyAuth)"
-                    .into()
-            }
-        })
+        match self {
+            Self::Tls(1) => WinrmError::AuthRejected(
+                "CredSSP: the server's 401 to the first round carries no CredSSP token: it \
+                 does not accept CredSSP (on the server: Enable-WSManCredSSP -Role Server)"
+                    .into(),
+            ),
+            Self::Tls(n) => WinrmError::Protocol(format!(
+                "CredSSP: TLS handshake round {n}: no CredSSP token in response"
+            )),
+            Self::Negotiate => WinrmError::Protocol("CredSSP: NTLM nego: no CredSSP token".into()),
+            Self::Authenticate => WinrmError::AuthRejected(
+                "CredSSP: the server answered the NTLM authenticate and the pubKeyAuth with a \
+                 401 without a CredSSP token: it refused the credentials or the binding to \
+                 its public key"
+                    .into(),
+            ),
+        }
     }
 
     /// Error for a CredSSP token that is not base64.
     fn bad_base64(self, e: &base64::DecodeError) -> WinrmError {
-        WinrmError::AuthFailed(match self {
+        WinrmError::Protocol(match self {
             Self::Tls(_) => format!("CredSSP: bad base64 in handshake: {e}"),
             Self::Negotiate => format!("CredSSP: bad b64 NTLM nego: {e}"),
             Self::Authenticate => format!("CredSSP: bad b64 auth: {e}"),
@@ -86,11 +98,14 @@ async fn exchange(
 ) -> Result<Vec<u8>, WinrmError> {
     let resp = conn.post(Some(&authorization(token)), body).await?;
     if resp.status != 401 {
-        return Err(WinrmError::AuthFailed(format!(
-            "CredSSP: {}: expected 401, got {}",
-            round.name(),
-            resp.status
-        )));
+        return Err(WinrmError::HttpStatus {
+            status: resp.status,
+            message: format!(
+                "CredSSP: {}: expected 401, got {}",
+                round.name(),
+                resp.status
+            ),
+        });
     }
     #[cfg(all(debug_assertions, feature = "__internal"))]
     if matches!(round, Round::Authenticate) && std::env::var("CREDSSP_DUMP").is_ok() {
@@ -135,12 +150,12 @@ pub(crate) fn extract_credssp_token_str(www_auth: &str) -> Option<String> {
 /// Call after a handshake round's status and token checks, only when another round follows.
 fn handshake_round_ok(resp: &HttpResponse, round: &str) -> Result<(), WinrmError> {
     if resp.closing {
-        return Err(WinrmError::AuthFailed(format!(
+        return Err(WinrmError::Connection(format!(
             "CredSSP: server closed the connection during {round}"
         )));
     }
     if resp.leftover {
-        return Err(WinrmError::AuthFailed(format!(
+        return Err(WinrmError::Protocol(format!(
             "CredSSP: unexpected bytes after the response during {round}"
         )));
     }
@@ -170,7 +185,7 @@ async fn inner_tls_handshake(
             return Ok(());
         }
     }
-    Err(WinrmError::AuthFailed(format!(
+    Err(WinrmError::Protocol(format!(
         "CredSSP: TLS handshake did not complete in {MAX_TLS_ROUNDS} rounds"
     )))
 }
@@ -190,13 +205,46 @@ async fn ts_round(
     asn1::decode_ts_request(&inner.read_plaintext()?).map_err(WinrmError::CredSsp)
 }
 
+/// The name of `code` when it is an NTSTATUS with which Windows refuses a
+/// logon: the credentials (an unknown account, a wrong password) or what the
+/// account may do (disabled, expired, locked out, not allowed to log on
+/// here or now).
+///
+/// Windows Server 2016, 2019, 2022 and 2025 answer `STATUS_LOGON_FAILURE` to
+/// an unknown account (measured); the other values are the ones `ntstatus.h`
+/// gives the refusals of a network logon.
+fn logon_refusal(code: u32) -> Option<&'static str> {
+    Some(match code {
+        0xC000_0064 => "STATUS_NO_SUCH_USER",
+        0xC000_006A => "STATUS_WRONG_PASSWORD",
+        0xC000_006D => "STATUS_LOGON_FAILURE",
+        0xC000_006E => "STATUS_ACCOUNT_RESTRICTION",
+        0xC000_006F => "STATUS_INVALID_LOGON_HOURS",
+        0xC000_0070 => "STATUS_INVALID_WORKSTATION",
+        0xC000_0071 => "STATUS_PASSWORD_EXPIRED",
+        0xC000_0072 => "STATUS_ACCOUNT_DISABLED",
+        0xC000_015B => "STATUS_LOGON_TYPE_NOT_GRANTED",
+        0xC000_0193 => "STATUS_ACCOUNT_EXPIRED",
+        0xC000_0224 => "STATUS_PASSWORD_MUST_CHANGE",
+        0xC000_0234 => "STATUS_ACCOUNT_LOCKED_OUT",
+        _ => return None,
+    })
+}
+
 /// Refuse a `TSRequest` in which the server reports an error (an NTSTATUS in
-/// `errorCode`).
+/// `errorCode`): [`WinrmError::AuthRejected`] when the code is the refusal
+/// of a logon ([`logon_refusal`]), as for the 401 the other methods get, and
+/// [`CredSspError::ServerError`] with the code otherwise.
 fn refuse_error_code(answer: &asn1::TsRequest) -> Result<(), WinrmError> {
-    match answer.error_code {
-        Some(code) => Err(WinrmError::CredSsp(CredSspError::ServerError(code))),
-        None => Ok(()),
-    }
+    let Some(code) = answer.error_code else {
+        return Ok(());
+    };
+    Err(match logon_refusal(code) {
+        Some(name) => WinrmError::AuthRejected(format!(
+            "CredSSP: the server refused the logon: {name} ({code:#010x})"
+        )),
+        None => WinrmError::CredSsp(CredSspError::ServerError(code)),
+    })
 }
 
 /// The NTLM challenge in the server's answer to the negotiate round: the raw
@@ -212,7 +260,7 @@ fn server_challenge(
     refuse_error_code(&answer)?;
     let spnego = answer
         .nego_token
-        .ok_or_else(|| WinrmError::AuthFailed("CredSSP: no negoToken from server".into()))?;
+        .ok_or_else(|| WinrmError::Protocol("CredSSP: no negoToken from server".into()))?;
     let type2 = asn1::decode_spnego_token(&spnego).map_err(WinrmError::CredSsp)?;
     let challenge = ntlm::parse_challenge(&type2).map_err(WinrmError::Ntlm)?;
     ntlm::log_challenge(&challenge);
@@ -226,7 +274,7 @@ fn server_challenge(
 fn subject_public_key(cert_der: &[u8]) -> Result<Vec<u8>, WinrmError> {
     use x509_cert::der::Decode;
     let cert = x509_cert::Certificate::from_der(cert_der)
-        .map_err(|e| WinrmError::AuthFailed(format!("CredSSP cert parse: {e}")))?;
+        .map_err(|e| WinrmError::Protocol(format!("CredSSP cert parse: {e}")))?;
     Ok(cert
         .tbs_certificate()
         .subject_public_key_info()
@@ -369,26 +417,27 @@ fn verify_server_proof(
     // Verifying the MIC (GSS_VerifyMIC at server seq 0) also re-initialises
     // the server RC4 handle, so the pubKeyAuth below unseals at seq 1,
     // keystream offset 0 — the same reset Windows applies on its side.
-    let nego = answer.nego_token.as_deref().ok_or_else(|| {
-        WinrmError::AuthFailed("CredSSP: server sent no final SPNEGO token".into())
-    })?;
+    let nego = answer
+        .nego_token
+        .as_deref()
+        .ok_or_else(|| WinrmError::Protocol("CredSSP: server sent no final SPNEGO token".into()))?;
     let (state, mic) = asn1::decode_spnego_final(nego).map_err(WinrmError::CredSsp)?;
     if let Some(s) = state
         && s != asn1::NEG_STATE_ACCEPT_COMPLETED
     {
-        return Err(WinrmError::AuthFailed(format!(
+        return Err(WinrmError::Protocol(format!(
             "CredSSP: server final SPNEGO state {s} is not accept-completed"
         )));
     }
     let mic = mic.ok_or_else(|| {
-        WinrmError::AuthFailed("CredSSP: server omitted mechListMIC (RFC 4178 §5)".into())
+        WinrmError::Protocol("CredSSP: server omitted mechListMIC (RFC 4178 §5)".into())
     })?;
     session
         .verify_mech_list_mic(asn1::MECH_TYPE_LIST_NTLM, &mic)
         .map_err(WinrmError::Ntlm)?;
     let sealed = answer
         .pub_key_auth
-        .ok_or_else(|| WinrmError::AuthFailed("CredSSP: no pubKeyAuth from server".into()))?;
+        .ok_or_else(|| WinrmError::Protocol("CredSSP: no pubKeyAuth from server".into()))?;
     let server_hash = session.unseal(&sealed).map_err(WinrmError::Ntlm)?;
     if server_hash != binding.hash(SERVER_TO_CLIENT) {
         return Err(WinrmError::CredSsp(CredSspError::PublicKeyMismatch));
@@ -538,7 +587,7 @@ mod tests {
 
         assert!(handshake_round_ok(&kept, "NTLM negotiate").is_ok());
         let refused = |resp: &HttpResponse| match handshake_round_ok(resp, "NTLM negotiate") {
-            Err(WinrmError::AuthFailed(message)) => message,
+            Err(WinrmError::Protocol(message) | WinrmError::Connection(message)) => message,
             other => panic!("{other:?}"),
         };
         assert_eq!(

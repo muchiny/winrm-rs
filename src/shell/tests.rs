@@ -1143,8 +1143,8 @@ async fn shell_run_command_terminates_the_command_past_max_output_bytes() {
     let err = shell.run_command("x", &[]).await.unwrap_err();
 
     match err {
-        WinrmError::Transfer(msg) => {
-            assert_eq!(msg, "command output exceeded max_output_bytes (4)");
+        WinrmError::OutputLimit { what, limit } => {
+            assert_eq!((what, limit), ("command output", 4));
         }
         other => panic!("got {other:?}"),
     }
@@ -1250,7 +1250,7 @@ async fn shell_run_command_keeps_its_error_when_a_hook_refuses_the_terminate() {
     let err = shell.run_command("x", &[]).await.unwrap_err();
 
     assert!(
-        matches!(&err, WinrmError::Transfer(msg) if msg.contains("max_output_bytes (4)")),
+        matches!(&err, WinrmError::OutputLimit { limit: 4, .. }),
         "got {err:?}"
     );
     assert_eq!(terminate_count(&server).await, 0);

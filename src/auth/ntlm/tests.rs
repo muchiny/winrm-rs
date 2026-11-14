@@ -160,12 +160,21 @@ fn server_sealed_reply() -> Vec<u8> {
         .unwrap()
 }
 
+/// The message of the error `unseal_body` gives for `data`: a frame that is
+/// not the one of MS-WSMV is [`WinrmError::Protocol`], a signature that does
+/// not verify is [`NtlmError::BadSignature`] (marked as such here).
 fn unseal_err(data: &[u8]) -> String {
     let mut client = SealingSession::boxed_from_auth(&KEY);
     match unseal_body(&mut client, data) {
         Ok(text) => panic!("accepted a malformed frame: {text:?}"),
-        Err(WinrmError::Ntlm(e)) => e.to_string(),
-        Err(other) => panic!("expected an NTLM error, got: {other:?}"),
+        Err(WinrmError::Protocol(message)) => {
+            assert!(message.starts_with("NTLM sealed response: "), "{message}");
+            message
+        }
+        Err(WinrmError::Ntlm(NtlmError::BadSignature(message))) => {
+            format!("bad signature: {message}")
+        }
+        Err(other) => panic!("expected a framing or a signature error, got: {other:?}"),
     }
 }
 
@@ -309,7 +318,7 @@ fn unseal_body_rejects_tampered_ciphertext() {
     let last = sealed.len() - 1;
     sealed[last] ^= 0x01;
     let data = framed(&len, 16, &sealed, b"--Encrypted Boundary--\r\n");
-    assert!(unseal_err(&data).contains("checksum mismatch"));
+    assert_eq!(unseal_err(&data), "bad signature: checksum mismatch");
 }
 
 /// A replayed (or reordered) sealed message fails the sequence check.

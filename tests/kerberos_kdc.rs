@@ -359,7 +359,7 @@ async fn kdc_establish_refuses_an_ap_rep_from_another_context() {
             .await;
         acceptor.assert_no_problem();
         match result {
-            Err(WinrmError::AuthFailed(m)) => assert!(
+            Err(WinrmError::Authentication(m)) => assert!(
                 m.contains("Kerberos mutual authentication failed"),
                 "{encryption:?}: {m}"
             ),

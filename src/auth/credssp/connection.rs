@@ -111,7 +111,22 @@ impl CredSspConnection {
         let stream = connector
             .connect(endpoint.server_name.clone(), tcp)
             .await
-            .map_err(|e| WinrmError::AuthFailed(format!("CredSSP outer TLS: {e}")))?;
+            .map_err(|e| {
+                // The text of a TLS error can quote what the server sent
+                // (the names of its certificate): neutralised and bounded.
+                let message = format!(
+                    "CredSSP outer TLS: {}",
+                    crate::error::quote_server_text(&e.to_string(), 512)
+                );
+                // A pinned certificate that does not match is the server
+                // failing to prove who it is, as for the other methods
+                // (`crate::auth::send_error`), not a network failure.
+                if crate::tls::is_pin_mismatch(&e) {
+                    WinrmError::Authentication(message)
+                } else {
+                    WinrmError::Connection(message)
+                }
+            })?;
 
         Ok(Self::from_stream(
             stream,
@@ -194,11 +209,11 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> CredSspConn
         self.stream
             .write_all(&wire)
             .await
-            .map_err(|e| WinrmError::AuthFailed(format!("CredSSP write: {e}")))?;
+            .map_err(|e| WinrmError::Connection(format!("CredSSP write: {e}")))?;
         self.stream
             .flush()
             .await
-            .map_err(|e| WinrmError::AuthFailed(format!("CredSSP flush: {e}")))?;
+            .map_err(|e| WinrmError::Connection(format!("CredSSP flush: {e}")))?;
 
         // ---- Read the response ----
         let mut reader = ResponseReader::new(self.max_head_bytes, self.opts.max_response_bytes);
@@ -208,7 +223,7 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> CredSspConn
                 .stream
                 .read(&mut chunk)
                 .await
-                .map_err(|e| WinrmError::AuthFailed(format!("CredSSP read: {e}")))?;
+                .map_err(|e| WinrmError::Connection(format!("CredSSP read: {e}")))?;
             if n == 0 {
                 return Err(reader.eof_error());
             }

@@ -55,7 +55,7 @@ impl AuthTransport for BasicAuth {
             .body(body)
             .send()
             .await
-            .map_err(WinrmError::Http)?;
+            .map_err(crate::auth::send_error)?;
 
         let status = resp.status();
         let body = crate::auth::read_text_capped(resp, self.max_response_bytes).await?;
@@ -103,7 +103,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_403_returns_auth_failed() {
+    async fn send_403_keeps_its_status() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(403).set_body_string("Forbidden"))
@@ -117,8 +117,28 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, WinrmError::AuthFailed(_)),
-            "expected AuthFailed, got: {err}"
+            matches!(err, WinrmError::HttpStatus { status: 403, .. }),
+            "expected HttpStatus, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_401_is_the_refusal_of_the_credentials() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("Unauthorized"))
+            .mount(&server)
+            .await;
+
+        let http = crate::transport::test_http_client();
+        let auth = BasicAuth::new("user", "wrong", 1 << 20);
+        let err = auth
+            .send_authenticated(&http, &server.uri(), "<soap/>".into())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, WinrmError::AuthRejected(m) if m.starts_with("HTTP 401")),
+            "expected AuthRejected, got: {err}"
         );
     }
 
@@ -146,7 +166,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_500_without_soap_fault_returns_auth_failed() {
+    async fn send_500_without_soap_fault_keeps_its_status() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(500).set_body_string("Internal Error"))
@@ -160,8 +180,8 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, WinrmError::AuthFailed(_)),
-            "expected AuthFailed, got: {err}"
+            matches!(err, WinrmError::HttpStatus { status: 500, .. }),
+            "expected HttpStatus, got: {err}"
         );
     }
 

@@ -32,9 +32,11 @@ pub(crate) trait AuthTransport {
 /// WinRM reports SOAP faults as HTTP 500 with the fault envelope in the body,
 /// among them the `w:TimedOut` that ends a silent Receive (an empty poll for
 /// the callers, see `client::empty_poll_on_timeout`). Such an answer becomes
-/// [`WinrmError::Soap`] so callers can act on the fault code. Any other status,
-/// or a 500 whose body holds no fault, becomes [`WinrmError::AuthFailed`] with
-/// the message built by `describe`, so each method keeps its own wording.
+/// [`WinrmError::Soap`] so callers can act on the fault code. A 401 is the
+/// server refusing the credentials, [`WinrmError::AuthRejected`]. Any other
+/// status, or a 500 whose body holds no fault, becomes
+/// [`WinrmError::HttpStatus`]. The message of the last two is built by
+/// `describe`, so each method keeps its own wording.
 pub(crate) fn error_for_status(
     status: u16,
     body: &str,
@@ -45,16 +47,20 @@ pub(crate) fn error_for_status(
     {
         return WinrmError::Soap(fault);
     }
-    WinrmError::AuthFailed(describe())
+    crate::error::status_error(status, describe())
 }
 
 /// An `Authorization` header value marked sensitive, so that `http`/`hyper`
 /// never index it in an HTTP/2 header table and its `Debug` form (in a
 /// request logged by a dependency, for instance) shows `Sensitive` instead of
 /// the credentials or the authentication token.
+///
+/// Every caller gives a scheme name and base64, which are always valid in a
+/// header: the error is a bug of this crate, and it may come in the middle
+/// of a handshake.
 pub(crate) fn authorization_value(value: &str) -> Result<reqwest::header::HeaderValue, WinrmError> {
     let mut header = reqwest::header::HeaderValue::from_str(value).map_err(|_| {
-        WinrmError::AuthFailed("Authorization header value is not valid in HTTP".into())
+        WinrmError::Internal("Authorization header value is not valid in HTTP".into())
     })?;
     header.set_sensitive(true);
     Ok(header)
@@ -119,8 +125,10 @@ pub(crate) fn peer_certificate(
 /// [`WinrmError::Http`] for a request that failed to go out, unless the
 /// failure is a pinned verifier refusing the connection's certificate (see
 /// [`crate::tls::CertHandle::pin`] and [`crate::tls::PinnedVerifier`]): that
-/// one is reported as such, as
-/// an authentication failure, nothing having been sent.
+/// one is [`WinrmError::Authentication`], nothing having been sent. Every
+/// method sends through here, so that such a refusal is the same error
+/// with each of them and is never retried as a connection that could not
+/// be opened.
 pub(crate) fn send_error(e: reqwest::Error) -> WinrmError {
     if crate::tls::is_pin_mismatch(&e) {
         let mut detail = String::new();
@@ -129,7 +137,7 @@ pub(crate) fn send_error(e: reqwest::Error) -> WinrmError {
             detail = cause.to_string();
             source = cause.source();
         }
-        return WinrmError::AuthFailed(format!(
+        return WinrmError::Authentication(format!(
             "TLS handshake refused by the pinned certificate check: {detail}; nothing was sent \
              on that connection"
         ));

@@ -37,14 +37,14 @@ pub(super) async fn dial_tunnel(
         let proxy = proxy.to_string();
         async move {
             TcpStream::connect(proxy.as_str()).await.map_err(|e| {
-                WinrmError::AuthFailed(format!("CredSSP: TCP connect to the proxy {proxy}: {e}"))
+                WinrmError::Connection(format!("CredSSP: TCP connect to the proxy {proxy}: {e}"))
             })
         }
     };
     match dial {
         CredSspDial::Direct => TcpStream::connect((host, port))
             .await
-            .map_err(|e| WinrmError::AuthFailed(format!("CredSSP TCP connect: {e}"))),
+            .map_err(|e| WinrmError::Connection(format!("CredSSP TCP connect: {e}"))),
         CredSspDial::HttpConnect {
             proxy,
             authorization,
@@ -76,9 +76,9 @@ pub(super) async fn dial_tunnel(
 /// An I/O error of the proxy handshake.
 fn proxy_io(e: &std::io::Error) -> WinrmError {
     if e.kind() == std::io::ErrorKind::UnexpectedEof {
-        WinrmError::AuthFailed("CredSSP: the proxy closed the connection".into())
+        WinrmError::Connection("CredSSP: the proxy closed the connection".into())
     } else {
-        WinrmError::AuthFailed(format!("CredSSP: proxy handshake: {e}"))
+        WinrmError::Connection(format!("CredSSP: proxy handshake: {e}"))
     }
 }
 
@@ -135,34 +135,43 @@ async fn http_connect(
             break end;
         }
         if buf.len() >= MAX_PROXY_HEAD_BYTES {
-            return Err(WinrmError::AuthFailed(
+            return Err(WinrmError::Connection(
                 "CredSSP: proxy response head too large".into(),
             ));
         }
         scanned = buf.len();
         let n = tcp.read(&mut chunk).await.map_err(|e| proxy_io(&e))?;
         if n == 0 {
-            return Err(WinrmError::AuthFailed(
+            return Err(WinrmError::Connection(
                 "CredSSP: the proxy closed the connection".into(),
             ));
         }
         buf.extend_from_slice(chunk.get(..n).unwrap_or_default());
     };
     if head_end > MAX_PROXY_HEAD_BYTES {
-        return Err(WinrmError::AuthFailed(
+        return Err(WinrmError::Connection(
             "CredSSP: proxy response head too large".into(),
         ));
     }
-    let head = parse_response_head(buf.get(..head_end).unwrap_or_default())?;
+    // What the proxy answered is not an HTTP response: the tunnel did not
+    // open, which is a failure of the connection like the others here.
+    let head =
+        parse_response_head(buf.get(..head_end).unwrap_or_default()).map_err(|e| match e {
+            WinrmError::Protocol(what) => WinrmError::Connection(format!(
+                "CredSSP: the proxy did not answer CONNECT with an HTTP response: {}",
+                what.strip_prefix("CredSSP: ").unwrap_or(&what)
+            )),
+            other => other,
+        })?;
     match head.status {
-        200..=299 if buf.len() > head_end => Err(WinrmError::AuthFailed(
+        200..=299 if buf.len() > head_end => Err(WinrmError::Connection(
             "CredSSP: the proxy sent data before the tunnel opened".into(),
         )),
         200..=299 => Ok(()),
-        407 => Err(WinrmError::AuthFailed(
+        407 => Err(WinrmError::Connection(
             "CredSSP: the proxy refused the credentials (407)".into(),
         )),
-        status => Err(WinrmError::AuthFailed(format!(
+        status => Err(WinrmError::Connection(format!(
             "CredSSP: proxy CONNECT failed with status {status}"
         ))),
     }
@@ -209,8 +218,11 @@ async fn socks5_negotiate(
     match (choice, user_pass) {
         ([5, 0], _) => Ok(()),
         ([5, 2], Some((user, pass))) => {
+            // The route refuses such credentials before any dial
+            // (`ProxyRoute::credssp_dial`): here it is a bug, found after
+            // the greeting was sent.
             let too_long = || {
-                WinrmError::AuthFailed(crate::transport::proxy::SOCKS5_CREDENTIALS_TOO_LONG.into())
+                WinrmError::Internal(crate::transport::proxy::SOCKS5_CREDENTIALS_TOO_LONG.into())
             };
             let ulen = u8::try_from(user.len()).map_err(|_| too_long())?;
             let plen = u8::try_from(pass.len()).map_err(|_| too_long())?;
@@ -228,12 +240,12 @@ async fn socks5_negotiate(
             if status == [1, 0] {
                 Ok(())
             } else {
-                Err(WinrmError::AuthFailed(
+                Err(WinrmError::Connection(
                     "CredSSP: the SOCKS5 proxy refused the credentials".into(),
                 ))
             }
         }
-        _ => Err(WinrmError::AuthFailed(
+        _ => Err(WinrmError::Connection(
             "CredSSP: the SOCKS5 proxy accepted no offered authentication method".into(),
         )),
     }
@@ -256,7 +268,7 @@ async fn socks5_request(host: &str, port: u16, remote_dns: bool) -> Result<Vec<u
                 .and_then(|mut addrs| addrs.next())
                 .map(|addr| addr.ip())
                 .ok_or_else(|| {
-                    WinrmError::AuthFailed(format!(
+                    WinrmError::Connection(format!(
                         "CredSSP: cannot resolve {host} for the SOCKS5 proxy"
                     ))
                 })?,
@@ -272,8 +284,11 @@ async fn socks5_request(host: &str, port: u16, remote_dns: bool) -> Result<Vec<u
             request.extend_from_slice(&ip.octets());
         }
         None => {
+            // The endpoint's host is a TLS server name, at most 253 bytes
+            // (`CredSspEndpoint`): here it is a bug, found after the
+            // greeting was sent.
             let len = u8::try_from(host.len()).map_err(|_| {
-                WinrmError::AuthFailed("CredSSP: host name too long for SOCKS5".into())
+                WinrmError::Internal("CredSSP: host name too long for SOCKS5".into())
             })?;
             request.extend_from_slice(&[3, len]);
             request.extend_from_slice(host.as_bytes());
@@ -290,7 +305,7 @@ async fn socks5_read_reply(tcp: &mut tokio::net::TcpStream) -> Result<(), WinrmE
     use tokio::io::AsyncReadExt;
 
     let invalid =
-        || WinrmError::AuthFailed("CredSSP: the SOCKS5 proxy sent an invalid reply".into());
+        || WinrmError::Connection("CredSSP: the SOCKS5 proxy sent an invalid reply".into());
 
     let mut reply = [0u8; 4];
     tcp.read_exact(&mut reply).await.map_err(|e| proxy_io(&e))?;
@@ -299,7 +314,7 @@ async fn socks5_read_reply(tcp: &mut tokio::net::TcpStream) -> Result<(), WinrmE
         return Err(invalid());
     }
     if rep != 0 {
-        return Err(WinrmError::AuthFailed(format!(
+        return Err(WinrmError::Connection(format!(
             "CredSSP: SOCKS5 connect failed (reply {rep})"
         )));
     }

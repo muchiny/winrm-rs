@@ -1,4 +1,5 @@
 use super::*;
+use crate::error::NtlmError;
 use crate::ntlm::SealingSession;
 
 const ENCRYPTED_BOUNDARY: &str = "--Encrypted Boundary";
@@ -160,12 +161,21 @@ fn server_sealed_reply() -> Vec<u8> {
         .unwrap()
 }
 
+/// The message of the error `unseal_body` gives for `data`: a frame that is
+/// not the one of MS-WSMV is [`WinrmError::Protocol`], a signature that does
+/// not verify is [`NtlmError::BadSignature`] (marked as such here).
 fn unseal_err(data: &[u8]) -> String {
     let mut client = SealingSession::boxed_from_auth(&KEY);
     match unseal_body(&mut client, data) {
         Ok(text) => panic!("accepted a malformed frame: {text:?}"),
-        Err(WinrmError::Ntlm(e)) => e.to_string(),
-        Err(other) => panic!("expected an NTLM error, got: {other:?}"),
+        Err(WinrmError::Protocol(message)) => {
+            assert!(message.starts_with("NTLM sealed response: "), "{message}");
+            message
+        }
+        Err(WinrmError::Ntlm(NtlmError::BadSignature(message))) => {
+            format!("bad signature: {message}")
+        }
+        Err(other) => panic!("expected a framing or a signature error, got: {other:?}"),
     }
 }
 
@@ -309,7 +319,7 @@ fn unseal_body_rejects_tampered_ciphertext() {
     let last = sealed.len() - 1;
     sealed[last] ^= 0x01;
     let data = framed(&len, 16, &sealed, b"--Encrypted Boundary--\r\n");
-    assert!(unseal_err(&data).contains("checksum mismatch"));
+    assert_eq!(unseal_err(&data), "bad signature: checksum mismatch");
 }
 
 /// A replayed (or reordered) sealed message fails the sequence check.
@@ -407,4 +417,54 @@ async fn several_seen_certificates_do_not_stop_ntlm_over_plain_http() {
         .await
         .unwrap();
     assert_eq!(fake.handshakes(), 1);
+}
+
+/// Over TLS the Type 3 is bound to the server certificate. A certificate
+/// whose signature algorithm defines no binding hash (Ed25519), or no
+/// certificate at all, stops the handshake before a Type 3 is built: the
+/// authentication could not be completed, which is not the server's
+/// refusal. Over plain HTTP there is no channel to bind.
+#[test]
+fn a_certificate_without_a_binding_hash_stops_the_handshake_over_tls() {
+    use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::pem::PemObject;
+
+    let auth = NtlmAuth {
+        username: crate::test_ntlm_server::USER.into(),
+        password: Zeroizing::new(crate::test_ntlm_server::PASS.into()),
+        domain: String::new(),
+        max_response_bytes: 1 << 20,
+        proxy_gate: None,
+        workstation: None,
+    };
+    let ed25519 = CertificateDer::from_pem_slice(crate::test_pki::CBT_ED25519_PEM.as_bytes())
+        .unwrap()
+        .to_vec();
+    let challenge = crate::test_ntlm_server::challenge_header();
+    let negotiated = |peer_certificate: Option<Vec<u8>>| Negotiated {
+        type1: ntlm::create_negotiate_message(),
+        token: challenge.strip_prefix("Negotiate ").unwrap().to_string(),
+        peer_certificate,
+    };
+    let refused = |negotiated: &Negotiated| match auth.answer_challenge(
+        "https://srv:5986/wsman",
+        negotiated,
+        false,
+    ) {
+        Err(WinrmError::Authentication(message)) => message,
+        Err(e) => panic!("{e:?}"),
+        Ok(_) => panic!("a Type 3 was built"),
+    };
+    assert_eq!(
+        refused(&negotiated(Some(ed25519.clone()))),
+        format!(
+            "NTLM channel binding: {}",
+            crate::ntlm::crypto::NO_BINDING_HASH
+        )
+    );
+    assert!(refused(&negotiated(None)).contains("reported no server certificate"));
+    assert!(
+        auth.answer_challenge("http://srv:5985/wsman", &negotiated(Some(ed25519)), false)
+            .is_ok()
+    );
 }

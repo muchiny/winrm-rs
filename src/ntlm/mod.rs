@@ -10,16 +10,12 @@ pub(crate) mod messages;
 // Re-export crate-internal API
 pub(crate) use messages::{
     check_challenge, create_authenticate_message_http, create_negotiate_message,
-    decode_challenge_header, encode_authorization, log_challenge, sanitize_workstation,
-    workstation,
+    encode_authorization, log_challenge, parse_challenge, sanitize_workstation, workstation,
 };
-// Only the CredSSP path reaches these three from outside `ntlm::messages`, so
-// the reexport is feature-gated. `crate::__fuzz` calls `parse_challenge`
-// through its full path, and the tests of the module through `super::`.
+// Only the CredSSP path reaches these two from outside `ntlm::messages`, so
+// the reexport is feature-gated.
 #[cfg(feature = "credssp")]
-pub(crate) use messages::{
-    create_authenticate_message_credssp, create_negotiate_message_credssp, parse_challenge,
-};
+pub(crate) use messages::{create_authenticate_message_credssp, create_negotiate_message_credssp};
 
 // The sealing session uses crypto internals
 use crate::error::NtlmError;
@@ -34,13 +30,19 @@ const SIGNATURE_LEN: usize = 16;
 const SIGNATURE_VERSION: u32 = 1;
 
 /// Error text once a sequence counter has used `u32::MAX`.
-const SEQ_EXHAUSTED: &str = "NTLM sequence number exhausted";
+const SEQ_EXHAUSTED: &str = "sequence number exhausted";
 
 /// Error text of every call on a session that failed earlier.
-const SESSION_DEAD: &str = "NTLM sealing session is unusable after an earlier error";
+const SESSION_DEAD: &str = "unusable after an earlier error";
 
-fn invalid(what: &str) -> NtlmError {
-    NtlmError::InvalidMessage(what.into())
+/// The error of a session that cannot seal or sign any more.
+fn session_error(what: &str) -> NtlmError {
+    NtlmError::Session(what.into())
+}
+
+/// The error of a signature that does not verify.
+fn bad_signature(what: &str) -> NtlmError {
+    NtlmError::BadSignature(what.into())
 }
 
 /// The first 8 bytes of an HMAC-MD5 digest: the NTLM signature checksum.
@@ -89,7 +91,7 @@ fn parse_signature(sig: &[u8]) -> Option<(u32, [u8; 8], u32)> {
 /// - [`Self::sign_mech_list_mic`] resets the client RC4 handle only when it
 ///   is the first client operation; later it signs without a reset.
 /// - Any error poisons the session: every later call returns
-///   [`NtlmError::InvalidMessage`]. That covers a failed
+///   [`NtlmError::Session`]. That covers a failed
 ///   [`Self::unseal`] or [`Self::verify_mech_list_mic`] and an exhausted
 ///   sequence counter.
 /// - Sequence numbers never wrap: the message that carries `u32::MAX` goes
@@ -226,7 +228,7 @@ impl SealingSession {
         op: impl FnOnce(&mut Self) -> Result<T, NtlmError>,
     ) -> Result<T, NtlmError> {
         if self.poisoned {
-            return Err(invalid(SESSION_DEAD));
+            return Err(session_error(SESSION_DEAD));
         }
         let result = op(self);
         if result.is_err() {
@@ -244,11 +246,13 @@ impl SealingSession {
     ///
     /// # Errors
     ///
-    /// [`NtlmError::InvalidMessage`] when the session is poisoned or the
+    /// [`NtlmError::Session`] when the session is poisoned or the
     /// client sequence number is exhausted.
     pub(crate) fn seal(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, NtlmError> {
         self.guarded(|s| {
-            let seq = s.client_seq_num.ok_or_else(|| invalid(SEQ_EXHAUSTED))?;
+            let seq = s
+                .client_seq_num
+                .ok_or_else(|| session_error(SEQ_EXHAUSTED))?;
             // 1. Compute signature: HMAC_MD5(sign_key, seq_num + plaintext)[0..8]
             let mac = hmac_md5_parts(&s.client_sign_key, &[&seq.to_le_bytes(), plaintext]);
             let mut checksum = checksum_head(&mac);
@@ -289,7 +293,9 @@ impl SealingSession {
     /// [`Self::sign`] on a session already checked live.
     #[cfg(any(test, feature = "credssp", feature = "__internal"))]
     fn sign_live(&mut self, data: &[u8]) -> Result<[u8; 16], NtlmError> {
-        let seq = self.client_seq_num.ok_or_else(|| invalid(SEQ_EXHAUSTED))?;
+        let seq = self
+            .client_seq_num
+            .ok_or_else(|| session_error(SEQ_EXHAUSTED))?;
         let mac = hmac_md5_parts(&self.client_sign_key, &[&seq.to_le_bytes(), data]);
         let mut checksum = checksum_head(&mac);
         // KEY_EXCH path: encrypt the checksum with the client RC4 stream.
@@ -349,10 +355,10 @@ impl SealingSession {
     ///
     /// # Errors
     ///
-    /// Returns [`NtlmError::InvalidMessage`] if the MIC is not 16 bytes, has
+    /// Returns [`NtlmError::BadSignature`] if the MIC is not 16 bytes, has
     /// a version other than 1, carries an unexpected sequence number, or its
-    /// checksum does not match, and on a poisoned session. Any error poisons
-    /// the session.
+    /// checksum does not match, and [`NtlmError::Session`] on a poisoned
+    /// session. Any error poisons the session.
     #[cfg(any(test, feature = "credssp", feature = "__internal"))]
     pub(crate) fn verify_mech_list_mic(
         &mut self,
@@ -360,14 +366,16 @@ impl SealingSession {
         mic: &[u8],
     ) -> Result<(), NtlmError> {
         self.guarded(|s| {
-            let (version, received, sig_seq) =
-                parse_signature(mic).ok_or_else(|| invalid("mechListMIC must be 16 bytes"))?;
+            let (version, received, sig_seq) = parse_signature(mic)
+                .ok_or_else(|| bad_signature("mechListMIC must be 16 bytes"))?;
             if version != SIGNATURE_VERSION {
-                return Err(invalid("mechListMIC bad signature version"));
+                return Err(bad_signature("mechListMIC bad signature version"));
             }
-            let seq = s.server_seq_num.ok_or_else(|| invalid(SEQ_EXHAUSTED))?;
+            let seq = s
+                .server_seq_num
+                .ok_or_else(|| session_error(SEQ_EXHAUSTED))?;
             if sig_seq != seq {
-                return Err(invalid("mechListMIC sequence number mismatch"));
+                return Err(bad_signature("mechListMIC sequence number mismatch"));
             }
 
             // Expected checksum: RC4(server handle, HMAC_MD5(server sign key,
@@ -379,7 +387,7 @@ impl SealingSession {
             s.server_seal_handle.process(&mut expected);
 
             if expected.ct_eq(&received).unwrap_u8() == 0 {
-                return Err(invalid("mechListMIC checksum mismatch"));
+                return Err(bad_signature("mechListMIC checksum mismatch"));
             }
 
             s.server_seq_num = seq.checked_add(1);
@@ -396,31 +404,34 @@ impl SealingSession {
     ///
     /// # Errors
     ///
-    /// Returns [`NtlmError::InvalidMessage`] if:
+    /// Returns [`NtlmError::BadSignature`] if:
     /// - The message is shorter than 16 bytes
     /// - The signature version is not 1
     /// - The sequence number does not match the expected value
     /// - The HMAC-MD5 checksum does not match the expected value
-    /// - The session is poisoned
+    ///
+    /// and [`NtlmError::Session`] if the session is poisoned.
     ///
     /// Any error poisons the session.
     pub(crate) fn unseal(&mut self, sealed: &[u8]) -> Result<Vec<u8>, NtlmError> {
         self.guarded(|s| {
             let (sig, ciphertext) = sealed
                 .split_at_checked(SIGNATURE_LEN)
-                .ok_or_else(|| invalid("sealed message too short"))?;
+                .ok_or_else(|| bad_signature("sealed message too short"))?;
             let (version, mut sig_checksum, sig_seq) =
-                parse_signature(sig).ok_or_else(|| invalid("sealed message too short"))?;
+                parse_signature(sig).ok_or_else(|| bad_signature("sealed message too short"))?;
 
             // Verify signature version (unencrypted field)
             if version != SIGNATURE_VERSION {
-                return Err(invalid("bad signature version"));
+                return Err(bad_signature("bad signature version"));
             }
 
             // Verify sequence number (unencrypted field)
-            let seq = s.server_seq_num.ok_or_else(|| invalid(SEQ_EXHAUSTED))?;
+            let seq = s
+                .server_seq_num
+                .ok_or_else(|| session_error(SEQ_EXHAUSTED))?;
             if sig_seq != seq {
-                return Err(invalid("sequence number mismatch"));
+                return Err(bad_signature("sequence number mismatch"));
             }
 
             // Decrypt payload first (matches seal order: rc4(plaintext) then rc4(checksum)).
@@ -437,7 +448,7 @@ impl SealingSession {
             // are correct. Defence-in-depth against timing oracles.
             let mac = hmac_md5_parts(&s.server_sign_key, &[&seq.to_le_bytes(), &plaintext]);
             if sig_checksum.ct_eq(&checksum_head(&mac)).unwrap_u8() == 0 {
-                return Err(invalid("checksum mismatch"));
+                return Err(bad_signature("checksum mismatch"));
             }
 
             s.server_seq_num = seq.checked_add(1);

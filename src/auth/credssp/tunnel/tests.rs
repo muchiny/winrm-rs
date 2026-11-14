@@ -35,9 +35,9 @@ fn http_dial(pport: u16, authorization: Option<&str>) -> CredSspDial {
     }
 }
 
-fn auth_failed(res: Result<tokio::net::TcpStream, WinrmError>) -> String {
+fn connection_error(res: Result<tokio::net::TcpStream, WinrmError>) -> String {
     match res {
-        Err(WinrmError::AuthFailed(m)) => m,
+        Err(WinrmError::Connection(m)) => m,
         Err(e) => panic!("{e:?}"),
         Ok(_) => panic!("the tunnel opened"),
     }
@@ -98,7 +98,7 @@ fn connect_request_never_grows_its_buffer() {
 async fn dial_tunnel_brackets_an_ipv6_target() {
     let (pport, heads) =
         test_proxy::spawn_connect_proxy_answering("HTTP/1.1 403 Forbidden\r\n\r\n").await;
-    let err = auth_failed(bounded(dial_tunnel(&http_dial(pport, None), "::1", 5986)).await);
+    let err = connection_error(bounded(dial_tunnel(&http_dial(pport, None), "::1", 5986)).await);
     assert_eq!(err, "CredSSP: proxy CONNECT failed with status 403");
     assert!(
         heads.lock().unwrap()[0].starts_with("CONNECT [::1]:5986 HTTP/1.1\r\nHost: [::1]:5986\r\n")
@@ -120,10 +120,23 @@ async fn dial_tunnel_reports_407_and_other_statuses() {
             "HTTP/1.1 200 OK\r\n\r\nEARLY",
             "CredSSP: the proxy sent data before the tunnel opened",
         ),
+        // What answers is not an HTTP proxy: the tunnel did not open, which
+        // is a failure of the connection like the three above.
+        (
+            "SSH-2.0-OpenSSH_9.6\r\n\r\n",
+            "CredSSP: the proxy did not answer CONNECT with an HTTP response: bad status \
+             line: SSH-2.0-OpenSSH_9.6",
+        ),
+        (
+            "HTTP/1.1 200 OK\r\nno colon here\r\n\r\n",
+            "CredSSP: the proxy did not answer CONNECT with an HTTP response: bad header \
+             line: no colon here",
+        ),
     ] {
         let (pport, _) = test_proxy::spawn_connect_proxy_answering(answer).await;
         // The target port is never reached: nothing listens on port 9.
-        let err = auth_failed(bounded(dial_tunnel(&http_dial(pport, None), "127.0.0.1", 9)).await);
+        let err =
+            connection_error(bounded(dial_tunnel(&http_dial(pport, None), "127.0.0.1", 9)).await);
         assert_eq!(err, expected, "{answer:?}");
     }
 }
@@ -151,7 +164,7 @@ async fn dial_tunnel_bounds_the_proxy_answer() {
         endless.extend_from_slice(b"X-Pad: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n");
     }
     let port = scripted(endless).await;
-    let err = auth_failed(bounded(dial_tunnel(&http_dial(port, None), "127.0.0.1", 9)).await);
+    let err = connection_error(bounded(dial_tunnel(&http_dial(port, None), "127.0.0.1", 9)).await);
     assert_eq!(err, "CredSSP: proxy response head too large");
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -161,7 +174,7 @@ async fn dial_tunnel_bounds_the_proxy_answer() {
         let mut head = [0u8; 1024];
         let _ = s.read(&mut head).await;
     });
-    let err = auth_failed(bounded(dial_tunnel(&http_dial(port, None), "127.0.0.1", 9)).await);
+    let err = connection_error(bounded(dial_tunnel(&http_dial(port, None), "127.0.0.1", 9)).await);
     assert_eq!(err, "CredSSP: the proxy closed the connection");
 }
 
@@ -221,7 +234,7 @@ async fn dial_tunnel_refuses_a_socks5_without_a_common_method() {
         user_pass: None,
         remote_dns: false,
     };
-    let err = auth_failed(bounded(dial_tunnel(&dial, "127.0.0.1", 9)).await);
+    let err = connection_error(bounded(dial_tunnel(&dial, "127.0.0.1", 9)).await);
     assert_eq!(
         err,
         "CredSSP: the SOCKS5 proxy accepted no offered authentication method"
@@ -253,18 +266,18 @@ async fn dial_tunnel_reports_socks5_refusals() {
     };
     let port = scripted(&[&[5, 2], &[1, 1]]).await;
     assert_eq!(
-        auth_failed(bounded(dial_tunnel(&dial(port, true), "127.0.0.1", 9)).await),
+        connection_error(bounded(dial_tunnel(&dial(port, true), "127.0.0.1", 9)).await),
         "CredSSP: the SOCKS5 proxy refused the credentials"
     );
     // Offered no credentials, so user name and password is no choice.
     let port = scripted(&[&[5, 2]]).await;
     assert_eq!(
-        auth_failed(bounded(dial_tunnel(&dial(port, false), "127.0.0.1", 9)).await),
+        connection_error(bounded(dial_tunnel(&dial(port, false), "127.0.0.1", 9)).await),
         "CredSSP: the SOCKS5 proxy accepted no offered authentication method"
     );
     let port = scripted(&[&[5, 0], &[5, 5, 0, 1, 0, 0, 0, 0, 0, 0]]).await;
     assert_eq!(
-        auth_failed(bounded(dial_tunnel(&dial(port, false), "127.0.0.1", 9)).await),
+        connection_error(bounded(dial_tunnel(&dial(port, false), "127.0.0.1", 9)).await),
         "CredSSP: SOCKS5 connect failed (reply 5)"
     );
 }
@@ -417,7 +430,7 @@ async fn dial_tunnel_refuses_a_malformed_socks5_reply() {
     ] {
         let (pport, _peer) = scripted_proxy(vec![vec![5, 0], reply.clone()]).await;
         assert_eq!(
-            auth_failed(
+            connection_error(
                 bounded(dial_tunnel(
                     &socks5_dial(pport, None, false),
                     "127.0.0.1",
@@ -432,13 +445,22 @@ async fn dial_tunnel_refuses_a_malformed_socks5_reply() {
 }
 
 /// What SOCKS5 cannot carry is refused before any of it is sent: a host
-/// name or a credential of more than 255 bytes.
+/// name or a credential of more than 255 bytes. The route and the endpoint
+/// refuse both as a configuration error before any dial, so here, after
+/// the greeting, it is a state the crate should not reach: `Internal`.
 #[tokio::test]
 async fn dial_tunnel_refuses_what_socks5_cannot_carry() {
+    fn internal_error(res: Result<tokio::net::TcpStream, WinrmError>) -> String {
+        match res {
+            Err(WinrmError::Internal(m)) => m,
+            Err(e) => panic!("{e:?}"),
+            Ok(_) => panic!("the tunnel opened"),
+        }
+    }
     let long = "a".repeat(256);
     let (pport, peer) = scripted_proxy(vec![vec![5, 0], SOCKS5_OPENED.to_vec()]).await;
     assert_eq!(
-        auth_failed(bounded(dial_tunnel(&socks5_dial(pport, None, true), &long, 9)).await),
+        internal_error(bounded(dial_tunnel(&socks5_dial(pport, None, true), &long, 9)).await),
         "CredSSP: host name too long for SOCKS5"
     );
     assert_eq!(bounded(peer).await.unwrap(), vec![vec![5, 1, 0]]);
@@ -447,7 +469,7 @@ async fn dial_tunnel_refuses_what_socks5_cannot_carry() {
         let (pport, peer) = scripted_proxy(vec![vec![5, 2], vec![1, 0]]).await;
         let dial = socks5_dial(pport, Some(user_pass), false);
         assert_eq!(
-            auth_failed(bounded(dial_tunnel(&dial, "127.0.0.1", 9)).await),
+            internal_error(bounded(dial_tunnel(&dial, "127.0.0.1", 9)).await),
             crate::transport::proxy::SOCKS5_CREDENTIALS_TOO_LONG
         );
         assert_eq!(bounded(peer).await.unwrap(), vec![vec![5, 2, 0, 2]]);
@@ -468,7 +490,7 @@ async fn dial_tunnel_reports_a_peer_that_closes_or_is_absent() {
         let _ = s.read_exact(&mut greeting).await;
     });
     assert_eq!(
-        auth_failed(
+        connection_error(
             bounded(dial_tunnel(
                 &socks5_dial(pport, None, false),
                 "127.0.0.1",
@@ -485,7 +507,7 @@ async fn dial_tunnel_reports_a_peer_that_closes_or_is_absent() {
         .local_addr()
         .unwrap()
         .port();
-    let err = auth_failed(
+    let err = connection_error(
         bounded(dial_tunnel(
             &socks5_dial(closed, None, false),
             "127.0.0.1",
@@ -495,7 +517,8 @@ async fn dial_tunnel_reports_a_peer_that_closes_or_is_absent() {
     );
     let start = format!("CredSSP: TCP connect to the proxy 127.0.0.1:{closed}: ");
     assert!(err.starts_with(&start), "{err}");
-    let err = auth_failed(bounded(dial_tunnel(&CredSspDial::Direct, "127.0.0.1", closed)).await);
+    let err =
+        connection_error(bounded(dial_tunnel(&CredSspDial::Direct, "127.0.0.1", closed)).await);
     assert!(err.starts_with("CredSSP TCP connect: "), "{err}");
 }
 
@@ -503,7 +526,7 @@ async fn dial_tunnel_reports_a_peer_that_closes_or_is_absent() {
 fn proxy_io_tells_a_closed_connection_from_another_error() {
     use std::io::{Error, ErrorKind};
     let message = |e: Error| match proxy_io(&e) {
-        WinrmError::AuthFailed(m) => m,
+        WinrmError::Connection(m) => m,
         other => panic!("{other:?}"),
     };
     assert_eq!(
@@ -539,7 +562,7 @@ async fn dial_tunnel_refuses_a_head_that_ends_past_the_cap() {
         let _ = s.read(&mut head).await;
     });
     assert_eq!(
-        auth_failed(bounded(dial_tunnel(&http_dial(port, None), "127.0.0.1", 9)).await),
+        connection_error(bounded(dial_tunnel(&http_dial(port, None), "127.0.0.1", 9)).await),
         "CredSSP: proxy response head too large"
     );
 }

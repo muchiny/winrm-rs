@@ -44,7 +44,7 @@ pub(crate) struct KerberosAuth {
 /// budget cannot be cancelled, so it keeps its slot (and its pool thread) and
 /// the number of such calls is at most the size of `slots`. A call that
 /// exceeds `budget` gives `WinrmError::Timeout` (in whole seconds, at least
-/// 1); one that panics gives `WinrmError::AuthFailed`.
+/// 1); one that panics gives `WinrmError::Internal`.
 #[cfg(any(feature = "kerberos", test))]
 async fn run_blocking_bounded<T: Send + 'static>(
     budget: std::time::Duration,
@@ -52,15 +52,16 @@ async fn run_blocking_bounded<T: Send + 'static>(
     f: impl FnOnce() -> Result<T, WinrmError> + Send + 'static,
 ) -> Result<T, WinrmError> {
     let run = async {
-        let permit = slots.acquire_owned().await.map_err(|_| {
-            WinrmError::AuthFailed("Kerberos: internal: KDC slot semaphore closed".into())
-        })?;
+        let permit = slots
+            .acquire_owned()
+            .await
+            .map_err(|_| WinrmError::Internal("Kerberos: KDC slot semaphore closed".into()))?;
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             f()
         })
         .await
-        .map_err(|e| WinrmError::AuthFailed(format!("Kerberos: library call failed: {e}")))?
+        .map_err(|e| WinrmError::Internal(format!("Kerberos: library call failed: {e}")))?
     };
     tokio::time::timeout(budget, run)
         .await
@@ -103,9 +104,16 @@ mod wire {
     /// encrypted header copy, 12-byte checksum).
     pub(super) const MAX_SEALED_HEADER_LEN: usize = 1024;
 
-    /// Error for a Kerberos message-encryption failure.
+    /// Error for a sealed answer that is not what MS-WSMV and RFC 4121 ask
+    /// for, or that does not unseal: what the server sent.
     pub(super) fn sealing_error(what: impl std::fmt::Display) -> WinrmError {
-        WinrmError::AuthFailed(format!("Kerberos message encryption: {what}"))
+        WinrmError::Protocol(format!("Kerberos message encryption: {what}"))
+    }
+
+    /// Error for a request the Kerberos library of this machine could not
+    /// seal, or sealed in a layout Windows does not read. Nothing was sent.
+    pub(super) fn wrap_error(what: impl std::fmt::Display) -> WinrmError {
+        WinrmError::Authentication(format!("Kerberos message encryption: {what}"))
     }
 
     /// Turn a wrap token produced by `gss_wrap_iov` with separate header, data,
@@ -132,7 +140,7 @@ mod wire {
             // SSPI's header is already rotated. An empty or foreign header means
             // the library emulated the IOV call (whole token in `data`): refuse.
             if header.len() < TOKEN_HEADER_LEN || header.get(..2) != Some(&TOK_ID_WRAP[..]) {
-                return Err(sealing_error(
+                return Err(wrap_error(
                     "the Kerberos library returned no separate wrap token header",
                 ));
             }
@@ -140,22 +148,21 @@ mod wire {
         }
         let (token_header, confounder) = header
             .split_at_checked(TOKEN_HEADER_LEN)
-            .ok_or_else(|| sealing_error("wrap token header too short"))?;
+            .ok_or_else(|| wrap_error("wrap token header too short"))?;
         let flags = token_header.get(2).copied().unwrap_or_default();
         if token_header.get(..2) != Some(&TOK_ID_WRAP[..])
             || flags & FLAG_SEALED == 0
             || flags & FLAG_SENT_BY_ACCEPTOR != 0
         {
-            return Err(sealing_error(
+            return Err(wrap_error(
                 "the session key does not produce RFC 4121 sealed wrap tokens (AES enctypes \
                  are required)",
             ));
         }
         if token_header.get(6..8) != Some(&[0, 0][..]) {
-            return Err(sealing_error("wrap token already rotated"));
+            return Err(wrap_error("wrap token already rotated"));
         }
-        let rrc =
-            u16::try_from(trailer.len()).map_err(|_| sealing_error("wrap trailer too long"))?;
+        let rrc = u16::try_from(trailer.len()).map_err(|_| wrap_error("wrap trailer too long"))?;
         let mut out_header = Vec::with_capacity(header.len().saturating_add(trailer.len()));
         out_header.extend_from_slice(token_header.get(..6).unwrap_or_default());
         out_header.extend_from_slice(&rrc.to_be_bytes());
@@ -265,7 +272,7 @@ mod wire {
         };
         match peer {
             crate::auth::PeerCertificate::Known(der) if der.as_slice() == bound => Ok(()),
-            _ => Err(WinrmError::AuthFailed(
+            _ => Err(WinrmError::Authentication(
                 "Kerberos over TLS: the connection that carried the AP-REQ did not present the \
                  certificate its channel binding was computed for; refusing the context"
                     .into(),
@@ -303,7 +310,7 @@ mod wire {
         server_token: Option<Vec<u8>>,
     ) -> Result<P::Ctx, WinrmError> {
         let server_token = server_token.ok_or_else(|| {
-            WinrmError::AuthFailed(
+            WinrmError::Authentication(
                 "Kerberos: the server sent no mutual authentication token, so no context \
                  for message encryption"
                     .into(),
@@ -314,14 +321,12 @@ mod wire {
                 ctx,
                 extra_token: false,
             }) => Ok(ctx),
-            Ok(StepOutcome::Finished { .. } | StepOutcome::Continue) => {
-                Err(WinrmError::AuthFailed(
-                    "Kerberos: the context needs another round trip, which WinRM does not \
+            Ok(StepOutcome::Finished { .. } | StepOutcome::Continue) => Err(WinrmError::Protocol(
+                "Kerberos: the context needs another round trip, which WinRM does not \
                      support"
-                        .into(),
-                ))
-            }
-            Err(e) => Err(WinrmError::AuthFailed(format!(
+                    .into(),
+            )),
+            Err(e) => Err(WinrmError::Authentication(format!(
                 "Kerberos mutual authentication failed: {e}"
             ))),
         }
@@ -387,7 +392,7 @@ impl KerberosSession {
         let iov = self
             .ctx
             .wrap_iov(true, plaintext.into())
-            .map_err(|e| sealing_error(format!("wrap failed: {e}")))?;
+            .map_err(|e| wire::wrap_error(format!("wrap failed: {e}")))?;
         let (header, rest) = iov.into_inner();
         let (data, rest) = rest.into_inner();
         let (padding, trailer) = rest.into_inner();
@@ -407,7 +412,7 @@ impl KerberosSession {
         let iov = self
             .ctx
             .wrap_iov(true, plaintext.into())
-            .map_err(|e| sealing_error(format!("wrap failed: {e}")))?;
+            .map_err(|e| wire::wrap_error(format!("wrap failed: {e}")))?;
         let (header, rest) = iov.into_inner();
         let (data, padding) = rest.into_inner();
         Ok((header.to_vec(), data.to_vec(), padding.to_vec(), Vec::new()))
@@ -479,7 +484,7 @@ impl KerberosAuth {
                 &service_principal,
                 channel_bindings.as_deref(),
             )
-            .map_err(|e| WinrmError::AuthFailed(format!("Kerberos init: {e}")))?;
+            .map_err(|e| WinrmError::Authentication(format!("Kerberos init: {e}")))?;
             Ok((ctx, format!("Negotiate {}", B64.encode(&*token))))
         })
         .await
@@ -498,7 +503,7 @@ impl KerberosAuth {
             return Ok(None);
         };
         B64.decode(token_b64.trim_ascii()).map(Some).map_err(|e| {
-            WinrmError::AuthFailed(format!("Kerberos: bad b64 in WWW-Authenticate: {e}"))
+            WinrmError::Protocol(format!("Kerberos: bad b64 in WWW-Authenticate: {e}"))
         })
     }
 
@@ -525,7 +530,7 @@ impl KerberosAuth {
         match peer {
             crate::auth::PeerCertificate::Known(der) => Ok(der),
             crate::auth::PeerCertificate::Ambiguous | crate::auth::PeerCertificate::Unknown => {
-                Err(WinrmError::AuthFailed(
+                Err(WinrmError::Authentication(
                     "Kerberos over TLS: the server certificate of the connection is unknown or \
                      ambiguous; refusing to authenticate without a certain channel binding"
                         .into(),
@@ -564,8 +569,8 @@ impl KerberosAuth {
             // must present this very certificate or fail before any byte of
             // the request is written.
             let handle = cert.ok_or_else(|| {
-                WinrmError::AuthFailed(
-                    "Kerberos over TLS: internal: no verifier to pin the bound certificate".into(),
+                WinrmError::Internal(
+                    "Kerberos over TLS: no verifier to pin the bound certificate".into(),
                 )
             })?;
             handle.pin(der.clone())?;
@@ -575,9 +580,15 @@ impl KerberosAuth {
         };
         let bindings = bound
             .as_deref()
-            .map(crate::ntlm::crypto::tls_server_end_point)
-            .transpose()
-            .map_err(|e| WinrmError::AuthFailed(format!("Kerberos channel binding: {e}")))?;
+            .map(|der| {
+                crate::ntlm::crypto::tls_server_end_point(der).ok_or_else(|| {
+                    WinrmError::Authentication(format!(
+                        "Kerberos channel binding: {}",
+                        crate::ntlm::crypto::NO_BINDING_HASH
+                    ))
+                })
+            })
+            .transpose()?;
         let (pending, auth_header) = self.initiate(bindings).await?;
         let resp = http
             .post(url)
@@ -596,7 +607,7 @@ impl KerberosAuth {
         )?;
         let status = resp.status();
         if status.as_u16() == 401 {
-            return Err(WinrmError::AuthFailed(
+            return Err(WinrmError::AuthRejected(
                 "Kerberos authentication rejected (or, over HTTPS, its channel binding)".into(),
             ));
         }
@@ -647,7 +658,7 @@ impl AuthTransport for KerberosAuth {
             .body(body)
             .send()
             .await
-            .map_err(WinrmError::Http)?;
+            .map_err(crate::auth::send_error)?;
 
         // Handle mutual auth (server sends back a token).
         //
@@ -656,12 +667,12 @@ impl AuthTransport for KerberosAuth {
         // step() error would let an unauthenticated server pass.
         if let Some(server_token) = Self::server_token(resp.headers())? {
             ctx.step(&server_token).map_err(|e| {
-                WinrmError::AuthFailed(format!("Kerberos mutual authentication failed: {e}"))
+                WinrmError::Authentication(format!("Kerberos mutual authentication failed: {e}"))
             })?;
         }
 
         if resp.status().as_u16() == 401 {
-            return Err(WinrmError::AuthFailed(
+            return Err(WinrmError::AuthRejected(
                 "Kerberos authentication rejected".into(),
             ));
         }
@@ -684,7 +695,7 @@ impl AuthTransport for KerberosAuth {
         _url: &str,
         _body: String,
     ) -> impl Future<Output = Result<String, WinrmError>> {
-        std::future::ready(Err(WinrmError::AuthFailed(
+        std::future::ready(Err(WinrmError::Config(
             "Kerberos auth requires the 'kerberos' feature: \
              cargo add winrm-rs --features kerberos"
                 .into(),
@@ -701,7 +712,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn stub_returns_auth_failed_error() {
+    async fn stub_returns_a_config_error() {
         let auth = KerberosAuth {
             service_principal: "HTTP/test".into(),
             max_response_bytes: 1024,
@@ -715,13 +726,13 @@ mod tests {
         // Must be Err — kills the Ok(String::new()) and Ok("xyzzy") mutants.
         assert!(result.is_err(), "stub must return Err, got Ok");
         match result.unwrap_err() {
-            WinrmError::AuthFailed(msg) => {
+            WinrmError::Config(msg) => {
                 assert!(
                     msg.contains("kerberos") && msg.contains("feature"),
                     "error should mention kerberos feature, got: {msg}"
                 );
             }
-            other => panic!("expected AuthFailed, got: {other}"),
+            other => panic!("expected Config, got: {other}"),
         }
     }
 }

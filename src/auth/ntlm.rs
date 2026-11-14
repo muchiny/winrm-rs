@@ -8,7 +8,7 @@ use zeroize::Zeroizing;
 
 use crate::auth::AuthTransport;
 use crate::auth::sealed;
-use crate::error::{NtlmError, WinrmError};
+use crate::error::WinrmError;
 use crate::ntlm;
 
 /// NTLM authentication transport.
@@ -43,8 +43,9 @@ pub(crate) type SessionKey = Box<Zeroizing<[u8; 16]>>;
 struct Negotiated {
     /// The Type 1 that was sent: the MIC of the Type 3 covers it.
     type1: Vec<u8>,
-    /// The `WWW-Authenticate` value of the `401`, which carries the Type 2.
-    www_auth: String,
+    /// The token of the `Negotiate` challenge of the `401`: the Type 2, in
+    /// base64 as the server sent it.
+    token: String,
     /// The server certificate of the connection that carried the challenge,
     /// when it is known.
     peer_certificate: Option<Vec<u8>>,
@@ -52,6 +53,13 @@ struct Negotiated {
 
 /// Length of an NTLM message signature (MS-NLMP 2.2.2.9.1).
 const SIGNATURE_LEN: usize = 16;
+
+/// The server's 401 to the Type 1 does not go on with the handshake: it has
+/// no `WWW-Authenticate` header, or one that offers no `Negotiate` token
+/// (its other methods, or `Negotiate` alone). That is its refusal of the
+/// method, not a malformed answer.
+const NO_CHALLENGE: &str = "NTLM: the server's 401 to the negotiate message carries no Negotiate \
+                            challenge: it does not accept NTLM for this request";
 
 /// Wrap a SOAP body in NTLM-sealed multipart/encrypted format (MS-WSMV 2.2.9.1).
 ///
@@ -83,10 +91,10 @@ pub(crate) fn unseal_body(
     data: &[u8],
 ) -> Result<String, WinrmError> {
     let bad = |what: &str| {
-        WinrmError::Ntlm(NtlmError::InvalidMessage(format!(
-            "sealed response: {what} ({} bytes)",
+        WinrmError::Protocol(format!(
+            "NTLM sealed response: {what} ({} bytes)",
             data.len()
-        )))
+        ))
     };
     let frame = sealed::parse(
         data,
@@ -192,10 +200,10 @@ impl NtlmAuth {
             .map_err(crate::auth::send_error)?;
 
         if resp.status().as_u16() != 401 {
-            return Err(WinrmError::AuthFailed(format!(
-                "expected 401 for NTLM negotiate, got {}",
-                resp.status()
-            )));
+            return Err(WinrmError::HttpStatus {
+                status: resp.status().as_u16(),
+                message: format!("expected 401 for NTLM negotiate, got {}", resp.status()),
+            });
         }
         // A forwarding proxy announces here whether it keeps the server
         // connection to this client (RFC 4559 section 6). On a refusal no
@@ -204,11 +212,17 @@ impl NtlmAuth {
             gate.check_answer(resp.status(), resp.headers())?;
         }
 
-        let www_auth = resp
+        // The challenge is the `WWW-Authenticate` value that carries a
+        // `Negotiate` token. A server, or a proxy on the way, may list
+        // another method first, each in a header of its own.
+        let token = resp
             .headers()
-            .get("WWW-Authenticate")
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| WinrmError::AuthFailed("missing WWW-Authenticate header in 401".into()))?
+            .get_all("WWW-Authenticate")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .find_map(|value| value.strip_prefix("Negotiate "))
+            .ok_or_else(|| WinrmError::AuthRejected(NO_CHALLENGE.into()))?
+            .trim_ascii()
             .to_string();
 
         // Over TLS, the channel binding token must come from the certificate
@@ -217,12 +231,12 @@ impl NtlmAuth {
         let peer_certificate = match crate::auth::peer_certificate(&resp, cert) {
             crate::auth::PeerCertificate::Known(der) => Some(der),
             crate::auth::PeerCertificate::Ambiguous if url.starts_with("https://") => {
-                return Err(WinrmError::Ntlm(NtlmError::InvalidMessage(
+                return Err(WinrmError::Authentication(
                     "NTLM over TLS: this client has seen several server certificates and cannot \
                      tell which one its connection uses; refusing to authenticate without a \
                      certain channel binding"
                         .into(),
-                )));
+                ));
             }
             crate::auth::PeerCertificate::Ambiguous | crate::auth::PeerCertificate::Unknown => None,
         };
@@ -232,7 +246,7 @@ impl NtlmAuth {
 
         Ok(Negotiated {
             type1,
-            www_auth,
+            token,
             peer_certificate,
         })
     }
@@ -253,18 +267,19 @@ impl NtlmAuth {
         negotiated: &Negotiated,
         sealing: bool,
     ) -> Result<(Vec<u8>, SessionKey), WinrmError> {
-        // Decode the challenge and keep the raw Type 2 bytes for the MIC.
-        let www_auth = negotiated.www_auth.as_str();
-        let token = www_auth.strip_prefix("Negotiate ").ok_or_else(|| {
-            WinrmError::AuthFailed("missing Negotiate prefix in challenge".into())
-        })?;
+        // Decode the challenge once: the raw Type 2 bytes go into the MIC.
+        let token = negotiated.token.as_str();
         let type2_raw = {
             use base64::Engine;
             base64::engine::general_purpose::STANDARD
-                .decode(token.trim_ascii())
-                .map_err(|e| WinrmError::AuthFailed(format!("base64 decode: {e}")))?
+                .decode(token)
+                .map_err(|e| {
+                    WinrmError::Protocol(format!(
+                        "NTLM: the server's Negotiate token is not base64: {e}"
+                    ))
+                })?
         };
-        let challenge = ntlm::decode_challenge_header(www_auth).map_err(WinrmError::Ntlm)?;
+        let challenge = ntlm::parse_challenge(&type2_raw).map_err(WinrmError::Ntlm)?;
         // A Type 2 holds no secret (server challenge, names, timestamp). It is
         // logged before the check, so a refused challenge is visible too.
         tracing::trace!(target: "winrm_rs::ntlm::challenge", type2 = %token, "NTLM challenge received");
@@ -285,15 +300,19 @@ impl NtlmAuth {
         // the handshake instead of authenticating unbound.
         let channel_bindings = if url.starts_with("https://") {
             let cert_der = negotiated.peer_certificate.as_deref().ok_or_else(|| {
-                WinrmError::Ntlm(NtlmError::InvalidMessage(
+                WinrmError::Authentication(
                     "NTLM over TLS: the connection reported no server certificate to bind \
                      the authentication to (channel binding)"
                         .into(),
-                ))
+                )
             })?;
             Some(
-                crate::ntlm::crypto::compute_channel_bindings(cert_der)
-                    .map_err(WinrmError::Ntlm)?,
+                crate::ntlm::crypto::compute_channel_bindings(cert_der).ok_or_else(|| {
+                    WinrmError::Authentication(format!(
+                        "NTLM channel binding: {}",
+                        crate::ntlm::crypto::NO_BINDING_HASH
+                    ))
+                })?,
             )
         } else {
             None
@@ -343,7 +362,7 @@ impl NtlmAuth {
         let resp = request.send().await.map_err(crate::auth::send_error)?;
 
         if resp.status().as_u16() == 401 {
-            return Err(WinrmError::AuthFailed(
+            return Err(WinrmError::AuthRejected(
                 "NTLM authentication rejected (bad credentials or CBT mismatch)".into(),
             ));
         }

@@ -116,12 +116,12 @@ fn parse_status_line(line: &str) -> Option<(u8, u16)> {
 /// Parse a response head: the bytes up to and including its CRLFCRLF.
 pub(super) fn parse_response_head(head: &[u8]) -> Result<ResponseHead, WinrmError> {
     let text = std::str::from_utf8(head)
-        .map_err(|_| WinrmError::AuthFailed("CredSSP: non-UTF8 response head".into()))?;
+        .map_err(|_| WinrmError::Protocol("CredSSP: non-UTF8 response head".into()))?;
     let text = text.strip_suffix("\r\n\r\n").unwrap_or(text);
     let mut lines = text.split("\r\n");
     let status_line = lines.next().unwrap_or_default();
     let (minor_version, status) = parse_status_line(status_line).ok_or_else(|| {
-        WinrmError::AuthFailed(format!(
+        WinrmError::Protocol(format!(
             "CredSSP: bad status line: {}",
             crate::auth::excerpt(status_line)
         ))
@@ -129,7 +129,7 @@ pub(super) fn parse_response_head(head: &[u8]) -> Result<ResponseHead, WinrmErro
     let mut headers = Vec::new();
     for line in lines {
         if line.starts_with([' ', '\t']) {
-            return Err(WinrmError::AuthFailed("CredSSP: folded header line".into()));
+            return Err(WinrmError::Protocol("CredSSP: folded header line".into()));
         }
         let (name, value) = line
             .split_once(':')
@@ -137,7 +137,7 @@ pub(super) fn parse_response_head(head: &[u8]) -> Result<ResponseHead, WinrmErro
                 !name.is_empty() && name.bytes().all(is_tchar) && !value.contains(['\r', '\n'])
             })
             .ok_or_else(|| {
-                WinrmError::AuthFailed(format!(
+                WinrmError::Protocol(format!(
                     "CredSSP: bad header line: {}",
                     crate::auth::excerpt(line)
                 ))
@@ -155,7 +155,7 @@ pub(super) fn parse_response_head(head: &[u8]) -> Result<ResponseHead, WinrmErro
 /// without chunked or close-delimited bodies).
 fn body_framing(head: &ResponseHead, max_body_bytes: usize) -> Result<BodyFraming, WinrmError> {
     if head.header_values("transfer-encoding").next().is_some() {
-        return Err(WinrmError::AuthFailed(
+        return Err(WinrmError::Protocol(
             "CredSSP: Transfer-Encoding is not supported".into(),
         ));
     }
@@ -163,12 +163,12 @@ fn body_framing(head: &ResponseHead, max_body_bytes: usize) -> Result<BodyFramin
         .header_values("content-encoding")
         .find(|v| !v.eq_ignore_ascii_case("identity"))
     {
-        return Err(WinrmError::AuthFailed(format!(
+        return Err(WinrmError::Protocol(format!(
             "CredSSP: Content-Encoding is not supported: {}",
             crate::auth::excerpt(coding)
         )));
     }
-    let invalid = || WinrmError::AuthFailed("CredSSP: invalid Content-Length".into());
+    let invalid = || WinrmError::Protocol("CredSSP: invalid Content-Length".into());
     let mut length: Option<&str> = None;
     for part in head
         .header_values("content-length")
@@ -195,7 +195,7 @@ fn body_framing(head: &ResponseHead, max_body_bytes: usize) -> Result<BodyFramin
         }
         None => match head.status {
             204 | 304 | 401 => Ok(BodyFraming::Empty),
-            status => Err(WinrmError::AuthFailed(format!(
+            status => Err(WinrmError::Protocol(format!(
                 "CredSSP: response {status} without Content-Length"
             ))),
         },
@@ -278,7 +278,7 @@ impl ResponseReader {
             return Ok(self.fill_pending(bytes));
         }
         self.buf.extend_from_slice(bytes);
-        let too_large = || WinrmError::AuthFailed("CredSSP: response head too large".into());
+        let too_large = || WinrmError::Protocol("CredSSP: response head too large".into());
         loop {
             let from = self.scan_from.max(self.head_start);
             #[cfg(test)]
@@ -302,14 +302,14 @@ impl ResponseReader {
             let head =
                 parse_response_head(self.buf.get(self.head_start..head_end).unwrap_or_default())?;
             if head.status == 101 {
-                return Err(WinrmError::AuthFailed(
+                return Err(WinrmError::Protocol(
                     "CredSSP: unexpected 101 Switching Protocols".into(),
                 ));
             }
             if head.status < 200 {
                 self.interim = self.interim.saturating_add(1);
                 if self.interim > MAX_INTERIM_RESPONSES {
-                    return Err(WinrmError::AuthFailed(
+                    return Err(WinrmError::Protocol(
                         "CredSSP: too many interim responses".into(),
                     ));
                 }
@@ -355,12 +355,12 @@ impl ResponseReader {
     /// The error for an EOF at the current point.
     pub(crate) fn eof_error(&self) -> WinrmError {
         match &self.pending {
-            Some(p) => WinrmError::AuthFailed(format!(
+            Some(p) => WinrmError::Connection(format!(
                 "CredSSP: connection closed after {} of {} body bytes",
                 p.body.len(),
                 p.want
             )),
-            None => WinrmError::AuthFailed("CredSSP: server closed connection mid-response".into()),
+            None => WinrmError::Connection("CredSSP: server closed connection mid-response".into()),
         }
     }
 }

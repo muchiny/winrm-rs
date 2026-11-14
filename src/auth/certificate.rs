@@ -51,7 +51,7 @@ impl AuthTransport for CertificateAuth {
             .body(body)
             .send()
             .await
-            .map_err(WinrmError::Http)?;
+            .map_err(crate::auth::send_error)?;
 
         let status = resp.status();
         let body = crate::auth::read_text_capped(resp, self.max_response_bytes).await?;
@@ -161,11 +161,14 @@ mod tests {
             .await
             .unwrap_err();
         match err {
-            WinrmError::AuthFailed(msg) => assert_eq!(
-                msg,
+            WinrmError::HttpStatus {
+                status: 500,
+                message,
+            } => assert_eq!(
+                message,
                 "Certificate auth HTTP 500 Internal Server Error: plain failure"
             ),
-            other => panic!("expected AuthFailed, got: {other:?}"),
+            other => panic!("expected HttpStatus, got: {other:?}"),
         }
     }
 

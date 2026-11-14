@@ -24,20 +24,36 @@ fn http_500_without_a_fault_keeps_the_method_message() {
         "X HTTP 500: Internal error".into()
     });
     match err {
-        WinrmError::AuthFailed(msg) => assert_eq!(msg, "X HTTP 500: Internal error"),
-        other => panic!("expected AuthFailed, got: {other:?}"),
+        WinrmError::HttpStatus {
+            status: 500,
+            message,
+        } => assert_eq!(message, "X HTTP 500: Internal error"),
+        other => panic!("expected HttpStatus, got: {other:?}"),
     }
 }
 
 #[test]
 fn a_fault_under_another_status_is_not_reinterpreted() {
-    // Only a 500 carries a WinRM fault; a 400 or 401 stays the method's error.
-    for status in [400, 401, 403, 503] {
+    // Only a 500 carries a WinRM fault; any other status stays the method's
+    // error, with its code.
+    for status in [400, 403, 503] {
         let err = error_for_status(status, TIMED_OUT_FAULT, || format!("X HTTP {status}"));
         match err {
-            WinrmError::AuthFailed(msg) => assert_eq!(msg, format!("X HTTP {status}")),
-            other => panic!("status {status}: expected AuthFailed, got: {other:?}"),
+            WinrmError::HttpStatus {
+                status: got,
+                message,
+            } => assert_eq!((got, message), (status, format!("X HTTP {status}"))),
+            other => panic!("status {status}: expected HttpStatus, got: {other:?}"),
         }
+    }
+}
+
+#[test]
+fn a_401_is_the_refusal_of_the_credentials_even_with_a_fault_in_its_body() {
+    let err = error_for_status(401, TIMED_OUT_FAULT, || "X HTTP 401".into());
+    match err {
+        WinrmError::AuthRejected(message) => assert_eq!(message, "X HTTP 401"),
+        other => panic!("expected AuthRejected, got: {other:?}"),
     }
 }
 

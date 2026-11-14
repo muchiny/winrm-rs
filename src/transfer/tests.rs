@@ -74,7 +74,7 @@ fn a_path_beyond_any_budget_is_refused() {
     for policy in POLICIES {
         let err = upload_chunk_len(&"a".repeat(CMD_LINE_BUDGET), policy).unwrap_err();
         assert!(
-            matches!(&err, WinrmError::Transfer(m) if m == "remote path too long for a transfer command line"),
+            matches!(&err, WinrmError::Transfer(TransferError::RemotePath(m)) if m == "remote path too long for a transfer command line"),
             "{err:?}"
         );
     }
@@ -263,7 +263,9 @@ fn local_drive_policy_refuses_dos_device_names() {
         r"C:\x\CONOUT$",
     ] {
         match validate_remote_path_for(p, RemotePathPolicy::LocalDrive) {
-            Err(WinrmError::Transfer(m)) => assert!(m.contains("DOS device"), "{p:?}: {m}"),
+            Err(WinrmError::Transfer(TransferError::RemotePath(m))) => {
+                assert!(m.contains("DOS device"), "{p:?}: {m}");
+            }
             other => panic!("{p:?}: expected Transfer, got {other:?}"),
         }
         assert!(
@@ -288,7 +290,9 @@ fn local_drive_policy_resolves_dot_segments_before_the_device_check() {
         r"C:\x\LPT1\",
     ] {
         match validate_remote_path_for(p, RemotePathPolicy::LocalDrive) {
-            Err(WinrmError::Transfer(m)) => assert!(m.contains("DOS device"), "{p:?}: {m}"),
+            Err(WinrmError::Transfer(TransferError::RemotePath(m))) => {
+                assert!(m.contains("DOS device"), "{p:?}: {m}");
+            }
             other => panic!("{p:?}: expected Transfer, got {other:?}"),
         }
     }
@@ -331,7 +335,7 @@ fn local_drive_policy_refuses_components_of_dots_and_blanks() {
         "C:\\...",
     ] {
         match validate_remote_path_for(p, RemotePathPolicy::LocalDrive) {
-            Err(WinrmError::Transfer(m)) => {
+            Err(WinrmError::Transfer(TransferError::RemotePath(m))) => {
                 assert!(m.contains("only of dots and blanks"), "{p:?}: {m}");
             }
             other => panic!("{p:?}: expected Transfer, got {other:?}"),
@@ -369,7 +373,9 @@ fn local_drive_policy_drops_a_trailing_tab_or_no_break_space_before_the_device_c
         "C:\\x\\COM1 \u{a0}.",
     ] {
         match validate_remote_path_for(p, RemotePathPolicy::LocalDrive) {
-            Err(WinrmError::Transfer(m)) => assert!(m.contains("DOS device"), "{p:?}: {m}"),
+            Err(WinrmError::Transfer(TransferError::RemotePath(m))) => {
+                assert!(m.contains("DOS device"), "{p:?}: {m}");
+            }
             other => panic!("{p:?}: expected Transfer, got {other:?}"),
         }
     }
@@ -416,7 +422,7 @@ fn local_drive_policy_keeps_the_base_checks() {
 #[test]
 fn local_drive_policy_names_itself_in_the_error() {
     match validate_remote_path_for(r"\\h\s\f", RemotePathPolicy::LocalDrive) {
-        Err(WinrmError::Transfer(m)) => {
+        Err(WinrmError::Transfer(TransferError::RemotePath(m))) => {
             assert!(m.contains("RemotePathPolicy::LocalDrive"), "{m}");
             assert!(m.contains(r#""\\\\h\\s\\f""#), "{m}");
         }
@@ -480,7 +486,7 @@ fn transfer_error_quotes_stderr_without_control_characters() {
         exit_code: 1,
     };
     match decode_download(&output) {
-        Err(WinrmError::Transfer(msg)) => {
+        Err(WinrmError::Transfer(TransferError::Host(msg))) => {
             assert_eq!(
                 msg,
                 r"download failed: Cannot find path \u{1b}[31mC:\x\u{1b}[0m"
@@ -499,7 +505,7 @@ fn download_failure_quotes_a_bounded_stderr() {
         exit_code: 1,
     };
     match decode_download(&output) {
-        Err(WinrmError::Transfer(msg)) => {
+        Err(WinrmError::Transfer(TransferError::Host(msg))) => {
             assert!(msg.len() < 1_000, "{} bytes", msg.len());
             assert!(msg.starts_with("download failed: EEE"), "{msg}");
             assert!(msg.ends_with("[100000 bytes in total]"), "{msg}");

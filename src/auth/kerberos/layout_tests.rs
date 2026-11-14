@@ -58,8 +58,11 @@ fn windows_layout_appends_padding_to_the_data() {
 fn windows_layout_refuses_an_emulated_iov_wrap() {
     let err = windows_layout(&[], b"whole-token", &[], &[]).unwrap_err();
     assert!(
-        err.to_string().contains("no separate wrap token header"),
-        "{err}"
+        matches!(
+            &err,
+            WinrmError::Authentication(m) if m.contains("no separate wrap token header")
+        ),
+        "{err:?}"
     );
 }
 
@@ -89,7 +92,7 @@ fn windows_layout_refuses_what_is_not_a_sealed_initiator_wrap_token() {
         mutate(&mut header);
         let err = windows_layout(&header, &data, &padding, &trailer).unwrap_err();
         assert!(
-            matches!(err, WinrmError::AuthFailed(ref m) if m.contains("Kerberos message encryption")),
+            matches!(err, WinrmError::Authentication(ref m) if m.contains("Kerberos message encryption")),
             "{name}: {err:?}"
         );
     }
@@ -143,10 +146,10 @@ fn acceptor_sealed_nonzero_ec_is_refused() {
     assert!(check(&bytes, 32).is_ok());
     bytes[4..6].copy_from_slice(&16u16.to_be_bytes());
     match check(&bytes, 16) {
-        Err(WinrmError::AuthFailed(m)) => {
+        Err(WinrmError::Protocol(m)) => {
             assert!(m.contains("extra count (EC)"), "{m}");
         }
-        other => panic!("expected AuthFailed, got {other:?}"),
+        other => panic!("expected Protocol, got {other:?}"),
     }
 }
 
@@ -155,8 +158,8 @@ fn acceptor_sealed_header_len_must_match_rrc() {
     // RRC 28 needs a 60-byte header; 61 is refused.
     let bytes = sealed_bytes(&acceptor_token(0x07, 0), 11);
     match check(&bytes, 10) {
-        Err(WinrmError::AuthFailed(m)) => assert!(m.contains("rotation count"), "{m}"),
-        other => panic!("expected AuthFailed, got {other:?}"),
+        Err(WinrmError::Protocol(m)) => assert!(m.contains("rotation count"), "{m}"),
+        other => panic!("expected Protocol, got {other:?}"),
     }
     // RRC 40 (an AES-SHA2-shaped token) goes with a 72-byte header.
     let mut token = acceptor_token(0x07, 0);
@@ -238,10 +241,17 @@ impl wire::PendingStep for FakePending {
     }
 }
 
-fn auth_failed(result: Result<u8, WinrmError>) -> String {
+fn authentication_error(result: Result<u8, WinrmError>) -> String {
     match result {
-        Err(WinrmError::AuthFailed(m)) => m,
-        other => panic!("expected AuthFailed, got {other:?}"),
+        Err(WinrmError::Authentication(m)) => m,
+        other => panic!("expected Authentication, got {other:?}"),
+    }
+}
+
+fn protocol_error(result: Result<u8, WinrmError>) -> String {
+    match result {
+        Err(WinrmError::Protocol(m)) => m,
+        other => panic!("expected Protocol, got {other:?}"),
     }
 }
 
@@ -251,14 +261,14 @@ fn establish_refuses_a_missing_ap_rep() {
         ctx: 1,
         extra_token: false,
     }));
-    let m = auth_failed(wire::finish_mutual(pending, None));
+    let m = authentication_error(wire::finish_mutual(pending, None));
     assert!(m.contains("no mutual authentication token"), "{m}");
 }
 
 #[test]
 fn establish_refuses_a_failed_ap_rep_step() {
     let pending = FakePending(Err("boom".into()));
-    let m = auth_failed(wire::finish_mutual(pending, Some(vec![1])));
+    let m = authentication_error(wire::finish_mutual(pending, Some(vec![1])));
     assert!(m.contains("Kerberos mutual authentication failed"), "{m}");
     assert!(m.contains("boom"), "{m}");
 }
@@ -266,7 +276,7 @@ fn establish_refuses_a_failed_ap_rep_step() {
 #[test]
 fn establish_refuses_a_continue_needed_context() {
     let pending = FakePending(Ok(wire::StepOutcome::Continue));
-    let m = auth_failed(wire::finish_mutual(pending, Some(vec![1])));
+    let m = protocol_error(wire::finish_mutual(pending, Some(vec![1])));
     assert!(m.contains("another round trip"), "{m}");
 }
 
@@ -276,7 +286,7 @@ fn establish_refuses_a_finished_context_with_an_extra_token() {
         ctx: 1,
         extra_token: true,
     }));
-    let m = auth_failed(wire::finish_mutual(pending, Some(vec![1])));
+    let m = protocol_error(wire::finish_mutual(pending, Some(vec![1])));
     assert!(m.contains("another round trip"), "{m}");
 }
 
@@ -303,11 +313,11 @@ fn bound_certificate_must_be_the_known_same_certificate() {
         PeerCertificate::Unknown,
     ] {
         match wire::check_bound_certificate(Some(&der), &peer) {
-            Err(WinrmError::AuthFailed(m)) => assert!(
+            Err(WinrmError::Authentication(m)) => assert!(
                 m.contains("did not present the certificate its channel binding was computed for"),
                 "{m}"
             ),
-            other => panic!("expected AuthFailed for {peer:?}, got {other:?}"),
+            other => panic!("expected Authentication for {peer:?}, got {other:?}"),
         }
     }
 }
@@ -362,7 +372,7 @@ mod blocking {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn kerberos_blocking_call_panic_is_auth_failed() {
+    async fn kerberos_blocking_call_panic_is_an_internal_error() {
         let out = run_blocking_bounded(
             Duration::from_secs(5),
             Arc::new(Semaphore::new(4)),
@@ -370,10 +380,10 @@ mod blocking {
         )
         .await;
         match out {
-            Err(WinrmError::AuthFailed(m)) => {
+            Err(WinrmError::Internal(m)) => {
                 assert!(m.contains("library call failed"), "{m}");
             }
-            other => panic!("expected AuthFailed, got {other:?}"),
+            other => panic!("expected Internal, got {other:?}"),
         }
     }
 

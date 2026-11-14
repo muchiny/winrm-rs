@@ -534,7 +534,11 @@ jobs:
           # commit sets the next. The Release workflow runs this check on
           # the tagged commit without this input (`verify`, release.yml):
           # the version chosen for a release is checked there.
-          release-type: minor
+          #
+          # `major` for the 3.0 window, which opens with the typed errors
+          # (#54): until 3.0.0 is released a pull request may break the
+          # API. The release commit of 3.0.0 sets this back to `minor`.
+          release-type: major
       - name: Breaking changes under a 1.x version
         if: steps.semver.outcome == 'failure'
         run: >-

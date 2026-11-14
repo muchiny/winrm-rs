@@ -12,9 +12,9 @@ fn read_all(chunks: &[&[u8]]) -> Result<Option<HttpResponse>, WinrmError> {
 
 fn err_text(input: &[u8]) -> String {
     match read_all(&[input]) {
-        Err(WinrmError::AuthFailed(m)) => m,
+        Err(WinrmError::Protocol(m)) => m,
         other => panic!(
-            "expected AuthFailed for {:?}, got {other:?}",
+            "expected Protocol for {:?}, got {other:?}",
             String::from_utf8_lossy(input)
         ),
     }
@@ -41,7 +41,7 @@ fn head_scan_is_linear_in_the_bytes_fed() {
     );
     let mut small = ResponseReader::new(64, 64);
     assert!(
-        matches!(small.feed(&[b'a'; 65]), Err(WinrmError::AuthFailed(m)) if m == "CredSSP: response head too large")
+        matches!(small.feed(&[b'a'; 65]), Err(WinrmError::Protocol(m)) if m == "CredSSP: response head too large")
     );
 }
 
@@ -149,13 +149,13 @@ fn reader_reports_a_short_body_at_eof() {
     );
     assert_eq!(
         r.eof_error().to_string(),
-        WinrmError::AuthFailed("CredSSP: connection closed after 3 of 10 body bytes".into())
+        WinrmError::Connection("CredSSP: connection closed after 3 of 10 body bytes".into())
             .to_string()
     );
     let mut early = ResponseReader::new(1024, 64);
     assert!(early.feed(b"HTTP/1.1 200").unwrap().is_none());
     assert!(
-        matches!(early.eof_error(), WinrmError::AuthFailed(m) if m == "CredSSP: server closed connection mid-response")
+        matches!(early.eof_error(), WinrmError::Connection(m) if m == "CredSSP: server closed connection mid-response")
     );
 }
 
@@ -249,7 +249,7 @@ fn missing_header_is_absent() {
 }
 
 /// Feed `input` in one read, then byte by byte, to a reader whose head
-/// cap is `max_head`; both must give the same `AuthFailed` text.
+/// cap is `max_head`; both must give the same `Protocol` text.
 fn capped_err_text(input: &[u8], max_head: usize) -> String {
     let mut texts = Vec::new();
     for chunk_len in [input.len(), 1] {
@@ -262,8 +262,8 @@ fn capped_err_text(input: &[u8], max_head: usize) -> String {
             }
         }
         match out {
-            Err(WinrmError::AuthFailed(m)) => texts.push(m),
-            other => panic!("chunk {chunk_len}: expected AuthFailed, got {other:?}"),
+            Err(WinrmError::Protocol(m)) => texts.push(m),
+            other => panic!("chunk {chunk_len}: expected Protocol, got {other:?}"),
         }
     }
     assert_eq!(texts[0], texts[1]);
@@ -276,7 +276,7 @@ fn head_ending_past_the_cap_in_one_read_is_refused() {
     assert!(input.len() > 64);
     let mut r = ResponseReader::new(64, 64);
     assert!(
-        matches!(r.feed(input), Err(WinrmError::AuthFailed(m)) if m == "CredSSP: response head too large")
+        matches!(r.feed(input), Err(WinrmError::Protocol(m)) if m == "CredSSP: response head too large")
     );
     assert_eq!(
         capped_err_text(input, 64),

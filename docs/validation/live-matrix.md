@@ -426,7 +426,8 @@ ne figurent pas dans la matrice.
   plus fiables.
 - **Les clés clientes chiffrées ne sont pas gérées.** `client_key_pem` doit être
   non chiffrée (`PRIVATE KEY`, `RSA PRIVATE KEY` ou `EC PRIVATE KEY`) ; une clé
-  chiffrée est une `AuthFailed` à la construction.
+  chiffrée est une `WinrmError::Config` à la construction (`AuthFailed` jusqu'à
+  2.x).
 - **Le même certificat client est présenté à tous les hôtes d'un client**, comme
   les identifiants appartiennent au client.
 - **Un proxy `https://` partage la configuration d'authentification cliente** du
@@ -455,7 +456,8 @@ ne figurent pas dans la matrice.
   Receive et n'est pas concerné.
 - **`Shell::run_command` termine la commande quand il abandonne (depuis
   2.0.0).** Quand la commande se termine, atteint le plafond
-  `max_output_bytes` (`WinrmError::Transfer`) ou son délai total
+  `max_output_bytes` (`WinrmError::OutputLimit`, `Transfer` jusqu'à 2.x) ou son
+  délai total
   (`WinrmError::Timeout(2 * operation_timeout_secs)`), il envoie une seule
   terminaison, bornée (voie de nettoyage, `min(operation_timeout_secs, 10)` s,
   au moins 1 s), puis rend son résultat ou son erreur ; le shell reste
@@ -491,8 +493,9 @@ ne figurent pas dans la matrice.
   réauthentifiée une fois au lieu de donner un 401 : le portail verrouillé
   refuse la connexion neuve, la requête n'est donc pas partie, et elle est
   scellée avec la nouvelle session puis envoyée une seule fois ; un 401
-  reçu après envoi fait toujours échouer la requête (`WinrmError::Ntlm`,
-  « NOT resent ») au lieu de la renvoyer : `reqwest` n'expose pas l'adresse
+  reçu après envoi fait toujours échouer la requête
+  (`WinrmError::Connection`, « NOT resent » ; `WinrmError::Ntlm` jusqu'à 2.x)
+  au lieu de la renvoyer : `reqwest` n'expose pas l'adresse
   locale de la connexion qui a porté une réponse, donc une connexion perdue
   après l'envoi ne se détecte qu'à ce 401 (une réponse
   `Connection: close` fait déjà abandonner la connexion, et

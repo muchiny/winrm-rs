@@ -19,6 +19,13 @@ pub struct CommandOutput {
     /// Standard error bytes accumulated from all Receive polls.
     pub stderr: Vec<u8>,
     /// Process exit code, or `-1` if the server did not report one.
+    ///
+    /// Windows keeps an exit code as an unsigned 32-bit number, and WinRM
+    /// writes it so. It is given here as the `i32` with the same bits, as
+    /// `std::process::ExitStatus::code` gives it on Windows: a process that
+    /// ends on an access violation (`0xC0000005`) has the exit code
+    /// `-1073741819`, and `exit_code.cast_unsigned()` is the number Windows
+    /// shows. A process that exits with `0xFFFFFFFF` reads as `-1` too.
     pub exit_code: i32,
 }
 

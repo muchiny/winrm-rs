@@ -195,6 +195,26 @@ async fn run_command_nonzero_exit() {
     assert_eq!(output.exit_code, 42, "expected exit code 42");
 }
 
+/// Windows writes an exit code as an unsigned 32-bit number
+/// (`<rsp:ExitCode>3221225477</rsp:ExitCode>`). One above `i32::MAX` is the
+/// `i32` with the same bits, and not the `-1` of a command whose exit code
+/// the server did not give.
+#[tokio::test]
+#[ignore]
+async fn run_command_exit_code_above_i32_max() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    // 0xC0000005, the exit code of a process that ends on an access
+    // violation, then one whose bits are not those of -1.
+    for code in [-1_073_741_819_i32, -2] {
+        let output = client
+            .run_command(&host, "cmd.exe", &["/c", "exit", "/b", &code.to_string()])
+            .await
+            .expect("run exit");
+        assert_eq!(output.exit_code, code);
+        assert!(output.exit_code.cast_unsigned() > 0x7FFF_FFFF);
+    }
+}
+
 // --- PowerShell ---
 
 #[tokio::test]

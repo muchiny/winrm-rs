@@ -107,13 +107,24 @@ pub(crate) fn parse_receive_output_raw(xml: &str) -> Result<ReceiveOutput, SoapE
     })
 }
 
-/// The exit code a server wrote. Text that is not a number is left as `None`
-/// (fail-soft), with a `tracing::warn` so that callers can tell "command
-/// still running" (no `ExitCode` element) from "the server wrote an
-/// `ExitCode` that cannot be read" (a server malfunction, or a response that
-/// was tampered with).
+/// The exit code a server wrote.
+///
+/// Windows keeps the exit code of a process as an unsigned 32-bit number,
+/// and writes it so: `3221225477` for a process that ends on an access
+/// violation (`0xC0000005`), `4294967294` for `exit -2`. A number above
+/// `i32::MAX` is read as the `i32` with the same bits, which is what
+/// `std::process::ExitStatus::code` gives on Windows. A number written with
+/// its sign is read as it is.
+///
+/// Text that is not such a number is left as `None` (fail-soft), with a
+/// `tracing::warn` so that callers can tell "command still running" (no
+/// `ExitCode` element) from "the server wrote an `ExitCode` that cannot be
+/// read" (a server malfunction, or a response that was tampered with).
 fn parse_exit_code(text: &str) -> Option<i32> {
-    match text.parse::<i32>() {
+    let code = text
+        .parse::<i32>()
+        .or_else(|_| text.parse::<u32>().map(u32::cast_signed));
+    match code {
         Ok(code) => Some(code),
         Err(e) => {
             tracing::warn!(

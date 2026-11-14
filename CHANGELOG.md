@@ -245,6 +245,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   message. The faults that read well keep their text (`w:TimedOut`,
   `w:InvalidSelectors`). The parser's tests now read answers captured from
   Windows Server 2012 R2 and 2025 (`src/soap/parser/fixtures/`).
+- **An exit code above 2 147 483 647 is no longer reported as `-1`.**
+  Windows writes the exit code of a command as an unsigned 32-bit number:
+  `3221225477` for a process that ends on an access violation
+  (`0xC0000005`), `4294967294` for `exit -2`. Such a number does not fit the
+  `i32` of `CommandOutput::exit_code`, so it was dropped with a warning and
+  the command reported `-1`, the value of a command whose exit code the
+  server did not give. It is now the `i32` with the same bits
+  (`-1073741819`, `-2`), which is what `std::process::ExitStatus::code`
+  returns on Windows and what `%ERRORLEVEL%` shows.
+  `ReceiveOutput::exit_code` follows. Seen on Windows Server 2025, whose
+  answer is now a fixture of the parser's tests.
 
 ### Documentation
 

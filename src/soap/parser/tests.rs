@@ -42,6 +42,59 @@ fn real_receive_answer_of_server_2025_gives_both_streams() {
     );
 }
 
+const RECEIVE_NTSTATUS_2025: &str = include_str!("fixtures/2025-receive-exit-ntstatus.xml");
+
+/// Windows Server 2025, `cmd.exe /c exit /b -1073741819` (the exit code of a
+/// process that ends on an access violation, `0xC0000005`): the server
+/// writes the exit code as an unsigned number, which does not fit an `i32`.
+#[test]
+fn real_receive_answer_with_an_exit_code_above_i32_max_gives_it() {
+    assert!(RECEIVE_NTSTATUS_2025.contains("<rsp:ExitCode>3221225477</rsp:ExitCode>"));
+    for output in [
+        parse_receive_output(RECEIVE_NTSTATUS_2025).unwrap(),
+        parse_receive_output_raw(RECEIVE_NTSTATUS_2025).unwrap(),
+    ] {
+        assert!(output.done);
+        assert_eq!(output.exit_code, Some(-1_073_741_819));
+        assert_eq!(output.exit_code.map(i32::cast_unsigned), Some(0xC000_0005));
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+    }
+}
+
+/// An exit code is a 32-bit number, written with a sign or without: both
+/// readings of the same bits are the same code. What is neither is no exit
+/// code.
+#[test]
+fn an_exit_code_is_the_i32_with_the_bits_the_server_wrote() {
+    for (text, code) in [
+        ("0", Some(0)),
+        ("1", Some(1)),
+        ("+7", Some(7)),
+        ("-1", Some(-1)),
+        ("2147483647", Some(i32::MAX)),
+        ("-2147483648", Some(i32::MIN)),
+        ("2147483648", Some(i32::MIN)),
+        ("3221225477", Some(-1_073_741_819)),
+        ("4294967294", Some(-2)),
+        ("4294967295", Some(-1)),
+        ("04294967295", Some(-1)),
+        ("4294967296", None),
+        ("-2147483649", None),
+        ("-4294967295", None),
+        ("0xC0000005", None),
+        ("1.0", None),
+        ("1 2", None),
+    ] {
+        let xml = format!("<r><rsp:ExitCode>{text}</rsp:ExitCode></r>");
+        assert_eq!(
+            parse_receive_output_raw(&xml).unwrap().exit_code,
+            code,
+            "{text}"
+        );
+    }
+}
+
 const CREATE: &str = include_str!("fixtures/2012r2-create.xml");
 const COMMAND: &str = include_str!("fixtures/2012r2-command.xml");
 const RECEIVE: &str = include_str!("fixtures/2012r2-receive.xml");

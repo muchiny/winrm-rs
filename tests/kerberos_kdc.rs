@@ -32,6 +32,7 @@
     clippy::indexing_slicing,
     clippy::arithmetic_side_effects,
     clippy::as_conversions,
+    clippy::too_many_lines,
     reason = "test code"
 )]
 

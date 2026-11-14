@@ -31,6 +31,7 @@
     clippy::indexing_slicing,
     clippy::arithmetic_side_effects,
     clippy::as_conversions,
+    clippy::too_many_lines,
     reason = "test code"
 )]
 
@@ -113,6 +114,11 @@ fn clixml_fragment() -> impl Strategy<Value = Vec<u8>> {
         Just(b"<S S=\"verbose\">".to_vec()),
         Just(b"<Obj S=\"progress\"><S N=\"x\">p</S></Obj>".to_vec()),
         Just(b"</S>".to_vec()),
+        Just(b"<Obj S=\"x\">".to_vec()),
+        Just(b"</Obj>".to_vec()),
+        Just(b"<S S=\"Error\" ".to_vec()),
+        Just(b"<S x>".to_vec()),
+        Just(b"<Objs ".to_vec()),
         Just(b"_x000D__x000A_".to_vec()),
         Just(b"_xD83D__xDE00_".to_vec()),
         Just(b"&lt;&amp;&#x41;".to_vec()),

@@ -901,7 +901,10 @@ impl WinrmClient {
         let (mut items, mut context) =
             soap::parse_enumerate_response(&response).map_err(WinrmError::Soap)?;
 
+        // With `OptimizeEnumeration` the Enumerate answer itself can carry
+        // every item, so the cap applies to it as well as to each Pull.
         let max_output = config.max_output_bytes;
+        check_wql_cap(&items, max_output)?;
 
         // Phase 2: Pull remaining items if enumeration is not complete
         let mut pacer = PollPacer::default();
@@ -923,13 +926,7 @@ impl WinrmClient {
             items.push_str(&more_items);
             context = next_ctx;
 
-            if let Some(cap) = max_output
-                && items.len() > cap
-            {
-                return Err(WinrmError::Transfer(format!(
-                    "WQL enumeration exceeded max_output_bytes ({cap})"
-                )));
-            }
+            check_wql_cap(&items, max_output)?;
 
             if context.is_some()
                 && let Some(d) = pacer.delay_after(polled_at.elapsed(), progressed)
@@ -1136,6 +1133,17 @@ impl WinrmClient {
             resource_uri.to_string(),
             ShellKind::from_resource_uri(resource_uri),
         ))
+    }
+}
+
+/// Refuse the WQL items collected so far once they exceed
+/// `max_output_bytes` (`cap`); `None` means no cap.
+fn check_wql_cap(items: &str, cap: Option<usize>) -> Result<(), WinrmError> {
+    match cap {
+        Some(cap) if items.len() > cap => Err(WinrmError::Transfer(format!(
+            "WQL enumeration exceeded max_output_bytes ({cap})"
+        ))),
+        _ => Ok(()),
     }
 }
 

@@ -50,8 +50,8 @@ drives; "invariant" is what it asserts beyond *must not panic*.
 
 | Target | Source | Invariant |
 |---|---|---|
-| `fuzz_soap_parse` | `soap/parser.rs` response parsers, and the reader they share (`soap/xml.rs`, over `quick-xml`) | decoded streams fit in the response; an id is text of the response; a response that is a fault gives that fault from every parser of an answer |
-| `fuzz_soap_enumerate` | `parse_enumerate_response` | a response that is a fault is never a page; an `EndOfSequence` element after a response that is read, in an element that holds both, clears the context and keeps the items; escaped item text never does and is never a fault; the context cannot add XML elements to the next `Pull` |
+| `fuzz_soap_parse` | `soap/parser.rs` response parsers, and the reader they share (`soap/xml.rs`, over `quick-xml`) | decoded streams fit in the response; an id is text of the response; a response is a fault for a parser of an answer when it is one for `check_soap_fault`, and it is the same fault; the check of the transport (`check_answer`) misses no fault and refuses nothing a parser reads |
+| `fuzz_soap_enumerate` | `parse_enumerate_response` | a response that is a fault is never a page, and a page is never read from a response the transport refuses; an `EndOfSequence` element after a response that is read, in an element that holds both, clears the context and keeps the items; escaped item text never does and is never a fault; the context cannot add XML elements to the next `Pull` |
 | `fuzz_soap_envelope` | all envelope builders, the five PSRP ones included (shell creation with `creationXml`, command, receive, send, signal) | **no input can add XML markup** — tag counts match an empty-input baseline |
 | `fuzz_xml_escape` | `envelope::xml_escape` | complete (no raw markup survives) and reversible |
 | `fuzz_clixml_stderr` | `soap/clixml.rs::ClixmlDecoder` | output does not depend on how stderr is sliced; plain stderr passes through, and so does raw text between the records of an open document, even when it looks like the start of a record; a document inside another one is decoded; output ≤ 3× input |

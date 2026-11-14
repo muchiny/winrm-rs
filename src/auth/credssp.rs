@@ -1073,6 +1073,36 @@ fn proxy_io(e: &std::io::Error) -> WinrmError {
     }
 }
 
+/// The CONNECT request head for `authority`, with the proxy credentials
+/// (`authorization`, the `Proxy-Authorization` value) when there are any.
+///
+/// The buffer gets its final size before anything is written to it, so it
+/// never grows: growing frees the old buffer, which could already hold the
+/// credentials, without wiping it.
+fn connect_request(authority: &str, authorization: Option<&str>) -> Zeroizing<String> {
+    let [name, value, end] = match authorization {
+        Some(value) => ["Proxy-Authorization: ", value, "\r\n"],
+        None => [""; 3],
+    };
+    let parts = [
+        "CONNECT ",
+        authority,
+        " HTTP/1.1\r\nHost: ",
+        authority,
+        "\r\n",
+        name,
+        value,
+        end,
+        "\r\n",
+    ];
+    let len = parts.iter().map(|part| part.len()).sum();
+    let mut request = Zeroizing::new(String::with_capacity(len));
+    for part in parts {
+        request.push_str(part);
+    }
+    request
+}
+
 /// Ask the HTTP proxy on `tcp` to open a tunnel to `authority`. Only a 2xx
 /// answer with nothing after its head opens it.
 async fn http_connect(
@@ -1082,22 +1112,7 @@ async fn http_connect(
 ) -> Result<(), WinrmError> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let mut request = Zeroizing::new(String::with_capacity(256));
-    for part in [
-        "CONNECT ",
-        authority,
-        " HTTP/1.1\r\nHost: ",
-        authority,
-        "\r\n",
-    ] {
-        request.push_str(part);
-    }
-    if let Some(value) = authorization {
-        for part in ["Proxy-Authorization: ", value, "\r\n"] {
-            request.push_str(part);
-        }
-    }
-    request.push_str("\r\n");
+    let request = connect_request(authority, authorization);
     tcp.write_all(request.as_bytes())
         .await
         .map_err(|e| proxy_io(&e))?;
@@ -2825,6 +2840,29 @@ mod tests {
                 "{:?}",
                 heads[0]
             );
+        }
+    }
+
+    /// The CONNECT head is allocated once at its final size, however long
+    /// the credentials and the authority are: a buffer that grew would have
+    /// left its old copy, credentials included, unwiped on the heap.
+    #[test]
+    fn connect_request_never_grows_its_buffer() {
+        let long_host = format!("{}.example:5986", "h".repeat(300));
+        let long_value = format!("Basic {}", "QUJD".repeat(200));
+        for authority in ["127.0.0.1:5986", long_host.as_str()] {
+            for authorization in [None, Some("Basic dXNlcjpwdw=="), Some(long_value.as_str())] {
+                let request = connect_request(authority, authorization);
+                let credentials = authorization
+                    .map_or_default(|value| format!("Proxy-Authorization: {value}\r\n"));
+                assert_eq!(
+                    request.as_str(),
+                    format!(
+                        "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n{credentials}\r\n"
+                    )
+                );
+                assert_eq!(request.capacity(), request.len());
+            }
         }
     }
 

@@ -35,6 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   One real name is refused with the others: a directory named with
   no-break spaces alone, which `RemotePathPolicy::Any` still reaches.
   `RemotePathPolicy::Any` is unchanged.
+- **The CredSSP proxy `CONNECT` request is built in a buffer of its final
+  size.** With a long proxy password or host name the buffer grew while it
+  was written, which freed its first copy, `Proxy-Authorization` value
+  included, without wiping it.
 
 ### Changed
 

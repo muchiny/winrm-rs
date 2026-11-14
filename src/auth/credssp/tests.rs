@@ -1708,26 +1708,6 @@ async fn a_round_without_a_usable_token_is_refused() {
     }
 }
 
-/// A server that never ends its flight does not hold the client: the inner
-/// TLS handshake stops after its ten rounds. The flight here is the start
-/// of a record header, so the client has nothing to answer and sends no
-/// other request.
-#[tokio::test]
-async fn an_inner_tls_handshake_that_never_ends_is_refused() {
-    // `FgMD` is 16 03 03: a handshake record of TLS 1.2, cut before its length.
-    const CUT_RECORD: &[u8] =
-        b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: CredSSP FgMD\r\nContent-Length: 0\r\n\r\n";
-    let (err, log) = refused(Fault::RawAnswer(1, CUT_RECORD), 1 << 20).await;
-    let WinrmError::AuthFailed(message) = &err else {
-        panic!("{err:?}");
-    };
-    assert_eq!(
-        message,
-        "CredSSP: TLS handshake did not complete in 10 rounds"
-    );
-    assert_eq!(rounds(&log).len(), 1);
-}
-
 /// The answer to the delegation round is the answer to the request: a `401`
 /// means the server refused the credentials, another status than 2xx is an
 /// error that quotes the body.
@@ -2066,6 +2046,10 @@ async fn impostor_outer_cert_is_refused_tls12() {
     impostor_outer_cert_is_refused(&[&rustls::version::TLS12]).await;
 }
 
+/// A server whose flight never ends does not hold the client: the inner TLS
+/// handshake stops after its ten rounds, and the client, which has nothing
+/// to answer, sends no other request.
+///
 /// The inner-TLS loop never awaits, so a tokio timeout cannot stop it:
 /// the exchange runs on its own thread, watched from this one.
 #[test]
@@ -2082,6 +2066,12 @@ fn stalled_inner_tls_hits_the_round_bound() {
     let out = rx
         .recv_timeout(Duration::from_secs(10))
         .expect("handshake loop did not stop: round bound missing");
-    assert!(matches!(out, Err(WinrmError::AuthFailed(_))), "{out:?}");
+    let Err(WinrmError::AuthFailed(message)) = &out else {
+        panic!("{out:?}");
+    };
+    assert_eq!(
+        message,
+        "CredSSP: TLS handshake did not complete in 10 rounds"
+    );
     assert_eq!(rounds(&log.lock().unwrap()).len(), 1);
 }

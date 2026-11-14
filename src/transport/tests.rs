@@ -2338,6 +2338,53 @@ async fn sealed_fault_is_a_soap_error_and_keeps_the_session() {
     assert_eq!(fake.handshakes(), 1, "log: {:?}", fake.log());
 }
 
+/// A sealed answer with a success status that is no answer is refused on
+/// this route as on the others, once it is unsealed. The request is not
+/// sent again, and the session stays usable (no new handshake).
+#[tokio::test]
+async fn sealed_body_that_is_no_answer_is_an_error_and_keeps_the_session() {
+    let (_server, fake, transport, host) = sealed_setup().await;
+    let fault = "<s:Envelope><s:Body><s:Fault><s:Code><s:Value>s:Receiver</s:Value></s:Code>\
+                 </s:Fault></s:Body></s:Envelope>";
+    fake.push(Reply::ok("<first/>"));
+    fake.push(Reply::ok("OK"));
+    fake.push(Reply::ok(""));
+    fake.push(Reply::ok(fault));
+    fake.push(Reply::ok("<after/>"));
+    transport
+        .send_soap_with_retry(&host, "<a/>".into())
+        .await
+        .unwrap();
+    for request in ["<b/>", "<c/>"] {
+        let err = transport
+            .send_soap_with_retry(&host, request.into())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                WinrmError::Soap(crate::error::SoapError::ParseError(_))
+            ),
+            "{request}: {err:?}"
+        );
+    }
+    let err = transport
+        .send_soap_with_retry(&host, "<d/>".into())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, WinrmError::Soap(crate::error::SoapError::Fault { code, .. }) if code == "s:Receiver"),
+        "{err:?}"
+    );
+    let reply = transport
+        .send_soap_with_retry(&host, "<e/>".into())
+        .await
+        .unwrap();
+    assert_eq!(reply, "<after/>");
+    assert_eq!(fake.handshakes(), 1, "log: {:?}", fake.log());
+    assert_eq!(fake.sealed().len(), 5, "log: {:?}", fake.log());
+}
+
 /// An answer larger than the response cap is refused before unsealing.
 #[tokio::test]
 async fn oversized_sealed_answer_is_an_error() {

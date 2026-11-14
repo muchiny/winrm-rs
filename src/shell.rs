@@ -586,6 +586,8 @@ impl<'a> Shell<'a> {
     /// If the Disconnect fails, a refusal by the client's `before_send` hook
     /// included, the shell is deleted instead (that Delete goes through the
     /// hook too) and the Disconnect's error is returned: the runspace is gone.
+    /// A Disconnect whose answer is not one (a body that is not XML, behind
+    /// a success status) has failed in that sense, whatever the server did.
     /// A hook that refuses [`RequestKind::Disconnect`](crate::RequestKind::Disconnect)
     /// but lets [`RequestKind::Delete`](crate::RequestKind::Delete) through
     /// therefore deletes the shell.

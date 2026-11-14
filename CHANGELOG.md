@@ -106,9 +106,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - this holds for every operation. The transport refuses a response that
     comes with a success status and is not an XML document, or is a fault,
     whatever was asked. Delete, Signal, Send, Disconnect and Reconnect have
-    nothing to read in their answer and took any body for a success. One
-    case stays as it was: the body of an HTTP error that is not XML is not
-    an error of its own;
+    nothing to read in their answer and took for a success any body in
+    which no fault was found. Such an
+    error says nothing of the request, which the server may have carried
+    out; a `Shell::disconnect` that ends on it deletes the shell, as it does
+    for any Disconnect that fails. One case stays as it was: the body of an
+    HTTP error that is not XML is not an error of its own;
   - a fault comes first. A response whose fault is read gives that fault
     from every parser, whatever else it holds: a Create or a Command
     response that is a fault and has a `ShellId` in it no longer gives an
@@ -117,7 +120,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - the `RelatesTo` that binds a sealed answer to its request is the first
     one of the header, and it is text alone: one that is blank, or that
     holds an element, binds nothing, where the next one that had text was
-    taken;
+    taken. The `MessageID` of the request is read by the same rule, which
+    every request the crate builds meets;
   - text is decoded: character references, the five predefined entities and
     CDATA sections are resolved, and comments are skipped, in an id, an
     enumeration context, an exit code, a fault code and a fault reason. A
@@ -141,16 +145,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - what a fault holds is the fault's: a `Stream` in its detail is not
     output.
 
-  What is still not checked: the characters of a name and of a text (a
-  control character a server writes in an id goes into the next request as
-  it is), where the XML declaration stands, and the attributes of the
-  elements whose attributes are not read. Byte order marks at the start of
+  What is still not checked: that the root element is a SOAP `Envelope` (an
+  XML document of another kind, behind a success status, is an answer with
+  nothing in it), the characters of a name and of a text (a control
+  character a server writes in an id goes into the next request as it is),
+  where the XML declaration stands, and the attributes of the elements
+  whose attributes are not read. Byte order marks at the start of
   a response are skipped, however many there are.
 
   New dependency: `quick-xml` 0.42 without its default features
-  (`#![forbid(unsafe_code)]`; its one dependency, `memchr`, was in the tree
-  already). In `cargo vet` it is an exemption, not an audit. The CLIXML
-  decoder of stderr does not use it and is unchanged.
+  (`#![forbid(unsafe_code)]`). It brings `memchr`, its one dependency, into
+  the build of the library: only the tests depended on it until now, and it
+  has `unsafe` code. In `cargo vet` both are exemptions, not audits. The
+  CLIXML decoder of stderr does not use `quick-xml` and is unchanged.
 - **MSRV raised to 1.100.0** (from 1.99.0). `clippy.toml` and the MSRV job
   follow. CI and the release workflow pin 1.100.0 as well: 1.100 has no
   point release so far. Twelve `map(..).unwrap_or_default()` chains become

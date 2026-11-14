@@ -82,6 +82,19 @@ proptest! {
     }
 }
 
+// P-SOAP-2 — What the transport asks of a success response never panics on
+// arbitrary string input, and it finds the fault `check_soap_fault` finds.
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+    #[test]
+    fn check_answer_never_panics(s in "\\PC{0,4096}") {
+        let answer = winrm_rs::__fuzz::check_answer(&s);
+        if let Err(fault) = winrm_rs::__fuzz::check_soap_fault(&s) {
+            prop_assert_eq!(answer.map_err(|e| e.to_string()), Err(fault.to_string()));
+        }
+    }
+}
+
 // P-NTLM-3 — `parse_challenge` rejects buffers that don't start with the
 // `NTLMSSP\0` signature.
 proptest! {

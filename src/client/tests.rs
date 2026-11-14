@@ -295,6 +295,32 @@ async fn signal_terminate_success() {
     assert!(result.is_ok());
 }
 
+/// A Delete and a Signal read nothing from their answer: a success status
+/// is not enough for them to succeed, the body has to be an answer.
+#[tokio::test]
+async fn a_delete_or_a_signal_answered_by_what_is_no_answer_fails() {
+    for body in ["", "OK", "<html><body>Welcome</body>", "x<s:Envelope/>"] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        for result in [
+            client.delete_shell("127.0.0.1", "SHELL-1").await,
+            client.signal_terminate("127.0.0.1", "S1", "C1").await,
+        ] {
+            assert!(
+                matches!(
+                    result,
+                    Err(WinrmError::Soap(crate::error::SoapError::ParseError(_)))
+                ),
+                "{body:?}: {result:?}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn ntlm_handshake_success() {
     let server = MockServer::start().await;

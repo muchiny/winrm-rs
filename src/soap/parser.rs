@@ -197,8 +197,13 @@ pub(crate) fn check_soap_fault(xml: &str) -> Result<(), SoapError> {
 /// The transport asks this of every response a server gives with a success
 /// status, whatever the operation: the answer of a Delete, of a Signal or of
 /// a Send holds nothing to read, so no parser would refuse a fault there, or
-/// a body that is not a response at all. What an `Items` element holds is
-/// not read, as in [`parse_enumerate_response`].
+/// a body that is not XML. What an `Items` element holds is not read, as in
+/// [`parse_enumerate_response`].
+///
+/// This is all it asks. The root element is not required to be a SOAP
+/// `Envelope`, like in the parsers, which read the elements of an answer in
+/// any root: an XML document of another kind is an answer with nothing in
+/// it.
 pub(crate) fn check_answer(xml: &str) -> Result<(), SoapError> {
     read_answer(xml, AnyAnswer)?;
     Ok(())

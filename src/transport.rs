@@ -1266,8 +1266,14 @@ impl HttpTransport {
     /// Dispatches by [`Route`]. A dedicated route runs under `slot`, which
     /// the caller took ([`Self::send_soap_with_retry`]); a plain route drops
     /// a slot it is given. With Kerberos through a forwarding proxy, the
-    /// proxy probe (`kerberos_proxy_probe`) runs first. The response is
-    /// checked for SOAP faults before returning.
+    /// proxy probe (`kerberos_proxy_probe`) runs first.
+    ///
+    /// The body of a success status is returned once it is an answer
+    /// (`soap::check_answer`): an XML document that is not a fault. One that
+    /// is empty or is not XML is a [`SoapError::ParseError`], and that error
+    /// says nothing of the request, which the server may have carried out.
+    ///
+    /// [`SoapError::ParseError`]: crate::error::SoapError::ParseError
     #[tracing::instrument(
         level = "debug",
         skip(self, host, body, slot),

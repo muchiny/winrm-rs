@@ -74,7 +74,8 @@ x509-cert = { version = "0.3", optional = true }
 openssl = { version = "0.10", optional = true }
 idna = "1.1"
 # The reader of the server's SOAP answers (src/soap/parser.rs). No default
-# feature; its one dependency, memchr, was in the tree already.
+# feature. Its one dependency, memchr, was a dependency of the tests only:
+# it is now built with the library too.
 quick-xml = { version = "0.42", default-features = false }
 
 

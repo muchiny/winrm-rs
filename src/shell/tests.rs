@@ -1586,3 +1586,49 @@ async fn a_refused_disconnect_deletes_the_shell_and_returns_its_error() {
         drop(server);
     }
 }
+
+/// A Disconnect whose answer is refused has failed like one the server
+/// refuses, whatever the server did: the shell is deleted, once, and the
+/// error is the one of the Disconnect. Returning without the Delete would
+/// leave a shell nobody holds the id of.
+#[tokio::test]
+async fn a_disconnect_answered_by_what_is_no_answer_deletes_the_shell() {
+    use crate::soap::namespaces::{ACTION_DELETE, ACTION_DISCONNECT};
+
+    for answer in ["", "OK", "<s:Envelope><s:Body>"] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains(ACTION_DISCONNECT))
+            .respond_with(ResponseTemplate::new(200).set_body_string(answer))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains(ACTION_DELETE))
+            .and(body_string_contains("SH-KEPT"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("<s:Envelope><s:Body/></s:Envelope>"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_ok(
+            &server,
+            r"<s:Envelope><s:Body><rsp:Shell><rsp:ShellId>SH-KEPT</rsp:ShellId></rsp:Shell></s:Body></s:Envelope>",
+            1,
+        )
+        .await;
+
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        let shell = client.open_shell("127.0.0.1").await.unwrap();
+        let err = shell.disconnect().await.unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                WinrmError::Soap(crate::error::SoapError::ParseError(_))
+            ),
+            "{answer:?}: {err:?}"
+        );
+        drop(server);
+    }
+}

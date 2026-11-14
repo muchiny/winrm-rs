@@ -325,6 +325,14 @@ fn the_first_relates_to_of_the_header_decides() {
         );
     }
 
+    // One that stands in the body, before the header, is not the first of
+    // the header.
+    let response = format!(
+        "<s:Envelope><s:Body><a:RelatesTo>uuid:other</a:RelatesTo></s:Body>\
+         <s:Header><a:RelatesTo>{id}</a:RelatesTo></s:Header></s:Envelope>"
+    );
+    assert_eq!(relates_to(&response).as_deref(), Some(id));
+
     // The request is read the same way.
     let request = header("<wsa:MessageID>uuid:1<y/></wsa:MessageID>");
     assert_eq!(message_id(&request), None);
@@ -1531,11 +1539,18 @@ fn an_xml_declaration_is_skipped_wherever_it_stands() {
 /// text alone like the first.
 #[test]
 fn an_exit_code_after_a_blank_one_is_read_like_the_first() {
-    let xml = "<r><rsp:ExitCode> </rsp:ExitCode><rsp:ExitCode>2<x/></rsp:ExitCode></r>";
-    assert_eq!(
-        parse_error(parse_receive_output_raw(xml).map(|output| output.done)),
-        ELEMENT_IN_TEXT
-    );
+    for blank in ["<rsp:ExitCode> </rsp:ExitCode>", "<rsp:ExitCode/>"] {
+        let xml = format!("<r>{blank}<rsp:ExitCode>2</rsp:ExitCode></r>");
+        let output = parse_receive_output_raw(&xml).unwrap();
+        assert_eq!(output.exit_code, Some(2), "{blank}");
+
+        let xml = format!("<r>{blank}<rsp:ExitCode>2<x/></rsp:ExitCode></r>");
+        assert_eq!(
+            parse_error(parse_receive_output_raw(&xml).map(|output| output.done)),
+            ELEMENT_IN_TEXT,
+            "{blank}"
+        );
+    }
 }
 
 /// SOAP forbids a DTD, and without one a document cannot declare an entity.

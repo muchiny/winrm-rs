@@ -7,8 +7,157 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+
+- **The NTLM session key comes straight from the operating system.** It was
+  drawn from `rand`'s thread-local generator, whose state is never wiped and
+  can produce its past output again until it reseeds (every 64 KiB). A copy
+  of the key therefore outlived the sealing session, which is wiped when it
+  ends: someone able to read the process memory afterwards could recompute
+  the key and decrypt a recorded sealed exchange. The key is now read with
+  `SysRng`, which keeps no state. This covers NTLM over HTTP and HTTPS and
+  the NTLM exchange inside CredSSP. If the operating system's random source
+  fails, the handshake fails with `NtlmError::InvalidMessage`.
+- **`run_wql` applies `max_output_bytes` to the first answer too.** The cap
+  was only checked after each Pull. The Enumerate request asks for optimized
+  enumeration, so a server can return every item in the Enumerate answer and
+  end the sequence there: those items were returned whatever the cap, up to
+  the size limit of one response (4 × max(`max_envelope_size`, 512 KiB)).
+- **`RemotePathPolicy::LocalDrive` refuses a path with a component made only
+  of dots and blanks**, other than `.` and `..` (`C:\x\LPT1\. `,
+  `C:\x\LPT1\a\...`, a component that is a lone space). Windows reads such a
+  component as nothing, as `.` or as `..` depending on the code that opens
+  the path, so these paths could name a DOS device the policy refuses in its
+  plain form. A TAB or a no-break space at the end of the last component is
+  now dropped before the device check, like a trailing dot or space
+  (`C:\x\LPT1<TAB>`). The rules come from the .NET Framework reference
+  source; they were not exercised against a live Windows PowerShell 5.1.
+  One real name is refused with the others: a directory named with
+  no-break spaces alone, which `RemotePathPolicy::Any` still reaches.
+  `RemotePathPolicy::Any` is unchanged.
+- **The CredSSP proxy `CONNECT` request is built in a buffer of its final
+  size.** With a long proxy password or host name the buffer grew while it
+  was written, which freed its first copy, `Proxy-Authorization` value
+  included, without wiping it.
+- **The proxy URL is parsed once for routing, not at every decision.** To
+  tell whether a request goes through the proxy, the client built a
+  `hyper-util` matcher from the proxy URL each time: for a CredSSP request
+  of a client that follows the environment's proxies, for an NTLM or
+  Kerberos authentication to an `http://` endpoint under a
+  `ProxySessionAuth` other than `Allow`, and after a connection error. Each
+  build parsed the URL, proxy password included, into copies that were
+  freed without being wiped. Each dedicated connection also parsed it
+  again for the TLS name of an `https://` proxy. The matcher and that name
+  are now read once, with the client. Unchanged: `reqwest` parses the proxy
+  URL for each client it builds, one per dedicated connection, and keeps
+  what it parsed as long as that client, and `hyper-util` still copies a
+  SOCKS user name and password at each routing decision.
+- **Raw stderr written while a CLIXML document is open is no longer lost.**
+  `powershell.exe` keeps its `<Objs>` document open until it exits, and a
+  native command can write to stderr in the meantime. The decoder behind
+  `CommandOutput::stderr`, `Shell::receive_next` and `StderrDecoder` skipped
+  any text between two records, and read any `<` as the start of a record,
+  which it then dropped: after `a < b`, `<stdin>:1: error` or the
+  `#< CLIXML` line of a nested `powershell.exe`, the rest of stderr was held
+  back and dropped when the command ended (past 16 MiB it was released raw).
+  Text reaching stderr could thus hide the errors that followed it.
+  Inside a document, CLIXML is now recognised by the bytes `powershell.exe`
+  writes: `<S S="` starts a string record, `<Obj S="` an object record,
+  `<Objs` the root tag of a document inside this one, and `</Objs>` closes
+  the innermost open document. A record must also be well-formed: a `<`
+  inside a tag, or a tag other than `</S>` inside a string record, makes its
+  bytes text. Everything else passes through. The documents
+  `powershell.exe` writes decode as before. What changes for other input:
+  - a tag that is none of those (another name, an `<S>` or `<Obj>` that
+    names no stream, a lone end tag, a comment) comes out as text instead of
+    being dropped, and so does a `<` left unfinished at the end of the
+    stream;
+  - a record that is not well-formed comes out as text, instead of being
+    decoded up to its first `<` or of taking in the records after it;
+  - a document inside an open one (nested `powershell.exe`) has its records
+    decoded instead of being dropped whole, and its `#< CLIXML` line comes
+    out as text;
+  - the blank bytes between a record or a root tag and the raw text after
+    it are dropped, as they are between two records.
+
+  Raw text that holds a whole well-formed record is still read as that
+  record, and an `<Obj S="` that nothing closes still holds what follows
+  it.
+
 ### Changed
 
+- **A server's SOAP answers are read with an XML parser (`quick-xml`).**
+  They were searched for tag-shaped substrings. An answer is now read in one
+  forward pass, and an element counts by its name and its place in the
+  document: a fault is the first child of the `Body`, with its code and its
+  reason at their places inside it; `MessageID` and `RelatesTo` are children
+  of the `Header`; the elements of an answer (`ShellId`, `CommandId`,
+  `Stream`, `CommandState`, `ExitCode`, `Items`, `EnumerationContext`,
+  `EndOfSequence`) are read outside a fault and outside the `Items` of an
+  enumeration. Prefixes stay free: namespaces are not resolved. What changes:
+  - an answer is read to its end before any of it is returned, and one that
+    is not an XML document is refused with `SoapError::ParseError`, where it
+    was read as far as the search went: unbalanced or mismatched tags, an
+    answer cut short, an empty body, text around the root element, a second
+    root element, an entity XML does not define, a DTD. This holds for
+    `ShellId` and `CommandId` too: an id that stands before a malformed
+    part is no longer returned, so a Create response refused this way
+    leaves its shell on the host until the server ends it for being idle;
+  - this holds for every operation. The transport refuses a response that
+    comes with a success status and is not an XML document, or is a fault,
+    whatever was asked. Delete, Signal, Send, Disconnect and Reconnect have
+    nothing to read in their answer and took for a success any body in
+    which no fault was found. Such an
+    error says nothing of the request, which the server may have carried
+    out; a `Shell::disconnect` that ends on it deletes the shell, as it does
+    for any Disconnect that fails. One case stays as it was: the body of an
+    HTTP error that is not XML is not an error of its own;
+  - a fault comes first. A response whose fault is read gives that fault
+    from every parser, whatever else it holds: a Create or a Command
+    response that is a fault and has a `ShellId` in it no longer gives an
+    id. A fault that stands after the place where a response stops being a
+    document is not read: the response is refused for not being one;
+  - the `RelatesTo` that binds a sealed answer to its request is the first
+    one of the header, and it is text alone: one that is blank, or that
+    holds an element, binds nothing, where the next one that had text was
+    taken. The `MessageID` of the request is read by the same rule, which
+    every request the crate builds meets;
+  - text is decoded: character references, the five predefined entities and
+    CDATA sections are resolved, and comments are skipped, in an id, an
+    enumeration context, an exit code, a fault code and a fault reason. A
+    character reference that names no character reads as U+FFFD. An id or a
+    context goes into the next request as the text it decodes to, escaped
+    as before: a context the server wrote with `&amp;` goes back with
+    `&amp;`, where it went back as `&amp;amp;`. The items of `run_wql` are
+    still returned as the server wrote them, and a DTD or an entity in them
+    is left there;
+  - an id, an enumeration context, a stream and an exit code are text
+    alone. An answer where one of them holds an element is refused, where
+    the text up to that element was taken;
+  - attributes are read as attributes. A `Stream` is named by its `Name`
+    wherever it stands among the others and whichever quote it uses, and a
+    command is done when a `CommandState` element says so in its `State`,
+    where the URI of the `Done` state anywhere in the answer was enough. A
+    `Stream` or a `CommandState` whose attributes are not well-formed is
+    refused;
+  - an element with attributes is read like one without (`ShellId`,
+    `ExitCode`, `EnumerationContext`);
+  - what a fault holds is the fault's: a `Stream` in its detail is not
+    output.
+
+  What is still not checked: that the root element is a SOAP `Envelope` (an
+  XML document of another kind, behind a success status, is an answer with
+  nothing in it), the characters of a name and of a text (a control
+  character a server writes in an id goes into the next request as it is),
+  where the XML declaration stands, and the attributes of the elements
+  whose attributes are not read. Byte order marks at the start of
+  a response are skipped, however many there are.
+
+  New dependency: `quick-xml` 0.42 without its default features
+  (`#![forbid(unsafe_code)]`). It brings `memchr`, its one dependency, into
+  the build of the library: only the tests depended on it until now, and it
+  has `unsafe` code. In `cargo vet` both are exemptions, not audits. The
+  CLIXML decoder of stderr does not use `quick-xml` and is unchanged.
 - **MSRV raised to 1.100.0** (from 1.99.0). `clippy.toml` and the MSRV job
   follow. CI and the release workflow pin 1.100.0 as well: 1.100 has no
   point release so far. Twelve `map(..).unwrap_or_default()` chains become
@@ -26,14 +175,134 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `toml_edit` 0.25.19 and `winnow` 1.0.5 in the lockfile, with their
   `cargo vet` exemptions; `fuzz/Cargo.lock` follows for the three it has.
   This lockfile only builds this repository.
+- `cargo vet` imports the audits that Mozilla, Google, the Bytecode
+  Alliance, Embark Studios, ISRG and Zcash publish (`[imports]` in
+  `supply-chain/config.toml`). An audit now covers 62 of the 269 crate
+  versions of the dependency tree, where each one was an exemption; 207
+  exemptions remain (`quick-xml` is one of them). CI still reads no network: `cargo vet --locked` checks
+  against `supply-chain/imports.lock`.
 - `release.toml` (`cargo-release`) and `cliff.toml` (`git-cliff`) are
   removed: the release procedure uses neither tool (CONTRIBUTING.md,
   "Releasing"), and `release.toml` asked for a publish and a push from the
   maintainer's machine, which that procedure forbids. Neither file was in
   the published crate.
+- The unit tests of eighteen more modules move to a file of their own, as
+  those of `src/transport.rs` and `src/client.rs` did in 2.1.0
+  (`src/soap/parser.rs` to `src/soap/parser/tests.rs`, `src/ntlm/mod.rs` to
+  `src/ntlm/tests.rs`, the `layout_tests` of `src/auth/kerberos.rs` to
+  `src/auth/kerberos/layout_tests.rs`, and so on): every test module of
+  more than 150 lines. Same tests, same names, no API change.
+  `sonar-project.properties` leaves these files, and
+  `src/auth/credssp/test_server.rs`, out of main-code analysis.
+- The coverage gate of CI (95 % of lines) counts less test code. The test
+  modules written in a source file counted in that figure, and they are
+  covered at nearly 100 %: once the long ones were moved out, the gate read
+  94.48 %. The `#[cfg(test)]` helper modules (`src/test_*.rs`,
+  `src/auth/credssp/test_server.rs`) now leave the report as well; the
+  short test modules that stay in their source file still count.
+  Eighteen tests cover library code that no test ran, which brings the
+  figure to 96.23 %: the SOCKS5 and `CONNECT` tunnel of CredSSP (each form
+  of target and of reply, what SOCKS5 cannot carry, a proxy that closes or
+  is absent, an answer that ends past its size cap), a CredSSP round
+  answered without a usable token, the answer to the delegation round, the
+  query and the server name of the CredSSP endpoint, a Receive on a PSRP
+  shell, a refused Disconnect, and malformed `TSRequest`, SPNEGO and
+  certificate fields.
+- **No `#[allow]` is left in the library but the test exemption at the top
+  of `src/lib.rs`, and Clippy now refuses one** (`allow_attributes`,
+  `allow_attributes_without_reason`). The two
+  module-wide `#![allow(dead_code)]` of `src/asn1.rs` and
+  `src/ntlm/crypto.rs` are gone, with what they hid sorted out item by
+  item: seven functions that were `pub` in a private module are
+  `pub(crate)`; two ASN.1 readers that only the test server and the fuzz
+  targets call (`decode_spnego_mech_list_mic`, `extract_subject_public_key`)
+  are built for tests and with `__internal` only; two NTLM constants are
+  built with `credssp` only; a constant and a helper used by tests alone
+  move to the tests. Each exception that remains is an
+  `#[expect(..., reason = "...")]`
+  under the feature condition where the lint fires, so it warns as soon as
+  it is no longer needed. CI lints every combination of the three features
+  (`cargo hack clippy --feature-powerset`, 8 runs) instead of two. No API
+  change; a build with `credssp` and without `__internal` no longer
+  compiles those two readers.
+- No function of the library is longer than 100 lines any more, and
+  `clippy::too_many_lines` is now a lint of the crate (test code is
+  exempt). Six were longer, the longest being the CredSSP handshake (258
+  lines). That handshake is now a sequence of named steps: the round that
+  posts a token and reads the one that answers, the inner TLS handshake,
+  the client proof, the check of the server's, the delegation. The NTLM
+  handshake is its negotiate round, the Type 3 that answers the challenge
+  and the final request; the Type 3 builder takes a structure instead of
+  eleven positional arguments; the CLIXML decoder has one method per mode;
+  the transport constructor and the SOCKS5 dial are split the same way.
+  The steps that hold the exported session key or the cleartext
+  TSCredentials are plain functions, not `async`: the compiler, where a
+  comment used to, keeps them out of the state of a future. No behaviour
+  change: same requests in the same order, same error messages. The
+  debug-only `CREDSSP_DUMP` lines keep their names; `inner_cert_der` now
+  comes first.
+- `src/auth/credssp.rs` (1 818 lines) is now a module of six files, one per
+  part: `endpoint.rs` (the endpoint URL), `tunnel.rs` (the TCP stream,
+  direct or through a `CONNECT` or SOCKS5 proxy), `tls.rs` (the TLS
+  contexts of a client and the in-memory inner session), `connection.rs`
+  (the one HTTPS connection of an exchange), `response.rs` (its HTTP/1.1
+  responses) and `handshake.rs` (the handshake, up to the delegation).
+  `credssp.rs` keeps `CredSspAuth`. The tests of each part are next to it;
+  the exchanges against the in-process acceptor stay in
+  `src/auth/credssp/tests.rs`. The code is moved, not rewritten: same
+  requests, same error messages, same tests under new paths. Two things
+  go: the `#[cfg(feature = "credssp")]` attributes on single items, which
+  repeated the gate `src/auth/mod.rs` puts on the module, and the
+  `AuthTransport` implementation for a build without the feature, which
+  that gate kept from ever being compiled. No API change.
+- The NTLM Type 3 builder always exchanges a session key and sets
+  `NEGOTIATE_KEY_EXCH` itself. Its branch without a key exchange, where
+  the exported key is the session base key, could not be reached (both
+  callers set the flag) and is removed. The messages are unchanged.
+
+### Fixed
+
+- **The reason of a fault is the server's message in two cases where it was
+  not.** Windows writes the reason of a fault as
+  `<s:Text xml:lang="en-US">`, which the search never matched (it looked for
+  a tag without attributes), so the reason came from the `Message` of the
+  fault's detail, cut at the first closing tag. A fault whose detail is a
+  WMI error (`run_wql` on a class that does not exist) had the reason
+  `SOAP fault`: it now has the WMI message. A fault whose message wraps a
+  provider fault (`run_wql` with an invalid query) had a reason that began
+  with the markup of that provider fault
+  (`<f:ProviderFault provider="WMI Provider" ...`): it now has the
+  provider's message. The reason is the first message of the fault's detail
+  that has text, else the fault's `Reason`, else a SOAP 1.1 `faultstring`.
+  The order changes for a server that writes `<s:Text>` without attribute
+  and a message in the detail: its reason was the `Text`, it is now the
+  message. The faults that read well keep their text (`w:TimedOut`,
+  `w:InvalidSelectors`). The parser's tests now read answers captured from
+  Windows Server 2012 R2 and 2025 (`src/soap/parser/fixtures/`).
+- **An exit code above 2 147 483 647 is no longer reported as `-1`.**
+  Windows writes the exit code of a command as an unsigned 32-bit number:
+  `3221225477` for a process that ends on an access violation
+  (`0xC0000005`), `4294967294` for `exit -2`. Such a number does not fit the
+  `i32` of `CommandOutput::exit_code`, so it was dropped with a warning and
+  the command reported `-1`, the value of a command whose exit code the
+  server did not give. It is now the `i32` with the same bits
+  (`-1073741819`, `-2`), which is what `std::process::ExitStatus::code`
+  returns on Windows and what `%ERRORLEVEL%` shows.
+  `ReceiveOutput::exit_code` follows. Windows Server 2012 R2 and 2025 both
+  write it so; the answer of the latter is now a fixture of the parser's
+  tests.
 
 ### Documentation
 
+- CredSSP is validated on four generations of Windows Server, not one: the
+  live tests named `credssp` (the handshake and a command, a large
+  response, the `CONNECT` and SOCKS5 tunnels, a request a `before_send`
+  hook refuses, a command that prints nothing) pass against Server 2016,
+  2019, 2022 and 2025. The README, the crate documentation,
+  `AuthMethod::CredSsp` and `Cargo.toml` said "Server 2025; not yet
+  exercised on other host generations". Server 2012 R2 stays out: its
+  HTTPS listener shares no cipher suite with `rustls`, and those tests skip
+  there. The feature keeps its "experimental" label.
 - README: the `credssp` section names `openssl-sys` 0.9.118, the version in
   the lockfile since 2.1.0, which builds against LibreSSL up to 4.4. The
   `WinrmConfig` table gains the five fields it left out (`codepage`,

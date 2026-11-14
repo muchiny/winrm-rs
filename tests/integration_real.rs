@@ -56,6 +56,7 @@
     clippy::indexing_slicing,
     clippy::arithmetic_side_effects,
     clippy::as_conversions,
+    clippy::too_many_lines,
     reason = "test code"
 )]
 
@@ -192,6 +193,40 @@ async fn run_command_nonzero_exit() {
         .await
         .expect("run exit 42");
     assert_eq!(output.exit_code, 42, "expected exit code 42");
+}
+
+/// Windows writes an exit code as an unsigned 32-bit number
+/// (`<rsp:ExitCode>3221225477</rsp:ExitCode>`). One above `i32::MAX` is the
+/// `i32` with the same bits, and not the `-1` of a command whose exit code
+/// the server did not give.
+#[tokio::test]
+#[ignore]
+async fn run_command_exit_code_above_i32_max() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    // 0xC0000005, the exit code of a process that ends on an access
+    // violation, then one whose bits are not those of -1.
+    for code in [-1_073_741_819_i32, -2] {
+        let output = client
+            .run_command(&host, "cmd.exe", &["/c", "exit", "/b", &code.to_string()])
+            .await
+            .expect("run exit");
+        assert_eq!(output.exit_code, code);
+        assert!(output.exit_code.cast_unsigned() > 0x7FFF_FFFF);
+    }
+}
+
+/// The same through PowerShell, whose `exit` takes the signed number.
+#[tokio::test]
+#[ignore]
+async fn run_powershell_exit_code_above_i32_max() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    for code in [-1_073_741_819_i32, -2] {
+        let output = client
+            .run_powershell(&host, &format!("exit {code}"))
+            .await
+            .expect("run exit");
+        assert_eq!(output.exit_code, code);
+    }
 }
 
 // --- PowerShell ---
@@ -3275,6 +3310,100 @@ async fn shell_disconnect_returns_error_on_cmd_shell() {
         result.is_err(),
         "disconnect on CMD shell should return an error"
     );
+}
+
+/// The opening messages of a PowerShell remoting session, as the
+/// `creationXml` of its shell: `SESSION_CAPABILITY` then `INIT_RUNSPACEPOOL`
+/// (MS-PSRP 2.2.2.1 and 2.2.2.2), each in one fragment (2.2.4). The crate
+/// does not speak that protocol: this is the least a server asks to open a
+/// shell of the kind it lets disconnect.
+fn psrp_creation_xml() -> String {
+    use base64::Engine as _;
+
+    const SESSION_CAPABILITY: &str = concat!(
+        r#"<Obj RefId="0"><MS>"#,
+        r#"<Version N="protocolversion">2.3</Version>"#,
+        r#"<Version N="PSVersion">2.0</Version>"#,
+        r#"<Version N="SerializationVersion">1.1.0.1</Version>"#,
+        "</MS></Obj>",
+    );
+    const INIT_RUNSPACEPOOL: &str = concat!(
+        r#"<Obj RefId="0"><MS>"#,
+        r#"<I32 N="MinRunspaces">1</I32><I32 N="MaxRunspaces">1</I32>"#,
+        r#"<Obj N="PSThreadOptions" RefId="1"><TN RefId="0">"#,
+        "<T>System.Management.Automation.Runspaces.PSThreadOptions</T>",
+        "<T>System.Enum</T><T>System.ValueType</T><T>System.Object</T></TN>",
+        "<ToString>Default</ToString><I32>0</I32></Obj>",
+        r#"<Obj N="ApartmentState" RefId="2"><TN RefId="1">"#,
+        "<T>System.Threading.ApartmentState</T>",
+        "<T>System.Enum</T><T>System.ValueType</T><T>System.Object</T></TN>",
+        "<ToString>Unknown</ToString><I32>2</I32></Obj>",
+        r#"<Obj N="ApplicationArguments" RefId="3"><TN RefId="2">"#,
+        "<T>System.Management.Automation.PSPrimitiveDictionary</T>",
+        "<T>System.Collections.Hashtable</T><T>System.Object</T></TN><DCT /></Obj>",
+        r#"<Obj N="HostInfo" RefId="4"><MS>"#,
+        r#"<B N="_isHostNull">true</B><B N="_isHostUINull">true</B>"#,
+        r#"<B N="_isHostRawUINull">true</B><B N="_useRunspaceHost">true</B>"#,
+        "</MS></Obj></MS></Obj>",
+    );
+
+    let runspace_pool = uuid::Uuid::new_v4();
+    let mut fragments = Vec::new();
+    for (object_id, message_type, data) in [
+        (1_u64, 0x0001_0002_u32, SESSION_CAPABILITY),
+        (2, 0x0001_0004, INIT_RUNSPACEPOOL),
+    ] {
+        let mut message = Vec::new();
+        message.extend_from_slice(&2_u32.to_le_bytes()); // to the server
+        message.extend_from_slice(&message_type.to_le_bytes());
+        message.extend_from_slice(&runspace_pool.to_bytes_le());
+        message.extend_from_slice(&[0; 16]); // of no pipeline
+        message.extend_from_slice(data.as_bytes());
+
+        fragments.extend_from_slice(&object_id.to_be_bytes());
+        fragments.extend_from_slice(&0_u64.to_be_bytes()); // its first fragment
+        fragments.push(0b11); // which is also its last
+        fragments.extend_from_slice(&u32::try_from(message.len()).unwrap().to_be_bytes());
+        fragments.extend_from_slice(&message);
+    }
+    base64::engine::general_purpose::STANDARD.encode(fragments)
+}
+
+/// A PowerShell remoting shell is the kind Windows lets disconnect. The
+/// answers of a Disconnect and of a Reconnect hold nothing the client reads:
+/// a real server shows here that they are answers all the same, which no
+/// other test of this suite does (a cmd shell refuses the Disconnect).
+#[tokio::test]
+#[ignore]
+async fn psrp_shell_disconnects_and_reconnects() {
+    use winrm_rs::RESOURCE_URI_PSRP;
+
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let shell = client
+        .open_psrp_shell(&host, &psrp_creation_xml(), RESOURCE_URI_PSRP)
+        .await
+        .expect("open a PowerShell remoting shell");
+
+    // The server answers the opening messages on the shell itself.
+    let shell_id = shell.shell_id().to_owned();
+    let opening = shell
+        .receive_next(&shell_id)
+        .await
+        .expect("receive the server's opening messages");
+    assert!(
+        !opening.stdout.is_empty(),
+        "no opening message from the server"
+    );
+
+    let disconnected = shell.disconnect().await.expect("disconnect");
+    assert_eq!(disconnected, shell_id);
+
+    let shell = client
+        .reconnect_shell(&host, &disconnected, RESOURCE_URI_PSRP)
+        .await
+        .expect("reconnect");
+    // The shell is the one that was left: the server still knows it.
+    shell.close().await.expect("close the reconnected shell");
 }
 
 // === Signal Ctrl+C ===

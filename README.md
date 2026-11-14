@@ -340,7 +340,10 @@ device paths, `\\?\` long paths and relative paths before anything is sent
 (`RemotePathPolicy::LocalDrive`, the default). It also refuses a path whose
 last component, after resolving `.` and `..`, is a DOS device name (`CON`,
 `NUL`, `COM1`, `LPT1`, ...): Windows opens the device instead of a file, and
-a printer port may be redirected to a network printer. With the `Any`
+a printer port may be redirected to a network printer. A path with a
+component made only of dots and blanks, other than `.` and `..`, is refused
+as well (`C:\x\LPT1\. `): Windows does not read such a component the same
+way everywhere. With the `Any`
 policy, a path may name a UNC share or a device path, and under CredSSP or
 Basic a UNC path is reached with your credentials: never pass an untrusted
 path. On the host, blocking outbound SMB (445) and WebDAV, the "Network
@@ -517,7 +520,7 @@ cargo test --test integration_real -- --ignored
 |---|---|---|
 | *(default)* | stable | NTLMv2, Basic, Certificate auth; no optional deps |
 | `kerberos` | stable | Pulls `cross-krb5`; requires a working `kinit` |
-| `credssp` | **experimental** | Double-hop delegation. Needs `use_tls = true` with a verified certificate: it refuses `accept_invalid_certs = true`, so pin the listener certificate with `pin_server_certificate_sha256` or trust its CA with `add_root_certificates_pem`. Reaches the host through no proxy, or an `http://` or `socks5://` one set in `WinrmConfig::proxy` or, with `use_env_proxy(true)`, taken from the environment per request (an `https://` or `socks4://` proxy is refused). It does not apply `max_retries` (see `AuthMethod::CredSsp`). Each request holds one of the connection slots shared with the other connection-bound methods for its whole exchange (32 per host, 128 per client). Validated end-to-end against Windows Server 2025; not yet exercised on other host generations. Delegates your cleartext password to the target: use it only toward hosts you trust as much as the account. Transfers refuse UNC paths by default since 2.0, so a double-hop to a share needs `.remote_path_policy(RemotePathPolicy::Any)` on the builder. Links the host OpenSSL; see below. |
+| `credssp` | **experimental** | Double-hop delegation. Needs `use_tls = true` with a verified certificate: it refuses `accept_invalid_certs = true`, so pin the listener certificate with `pin_server_certificate_sha256` or trust its CA with `add_root_certificates_pem`. Reaches the host through no proxy, or an `http://` or `socks5://` one set in `WinrmConfig::proxy` or, with `use_env_proxy(true)`, taken from the environment per request (an `https://` or `socks4://` proxy is refused). It does not apply `max_retries` (see `AuthMethod::CredSsp`). Each request holds one of the connection slots shared with the other connection-bound methods for its whole exchange (32 per host, 128 per client). Validated end-to-end against Windows Server 2016, 2019, 2022 and 2025; not against Server 2012 R2, whose HTTPS listener shares no cipher suite with `rustls`. Delegates your cleartext password to the target: use it only toward hosts you trust as much as the account. Transfers refuse UNC paths by default since 2.0, so a double-hop to a share needs `.remote_path_policy(RemotePathPolicy::Any)` on the builder. Links the host OpenSSL; see below. |
 
 ### `credssp` and the host OpenSSL
 

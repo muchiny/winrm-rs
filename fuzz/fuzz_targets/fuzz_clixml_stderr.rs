@@ -5,8 +5,10 @@
 //! re-slicing it nor make the client amplify it.
 //!
 //! The same bytes also drive a well-formed multi-document stream (nested
-//! PowerShell: a doubled marker, several `<Objs>` documents after it), whose
-//! decoded text must be exactly the records written, however it is sliced.
+//! PowerShell: a doubled marker, several `<Objs>` documents after it or
+//! inside an open one, raw stderr text written between the records of an
+//! open document), whose decoded text must be exactly the records and the
+//! raw text written, however it is sliced.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
@@ -73,9 +75,12 @@ fn slice<'a>(stream: &'a [u8], seeds: &[u8]) -> Vec<&'a [u8]> {
 }
 
 /// Build a well-formed CLIXML stream from `data` and the text it decodes to.
-/// Each byte picks a record kind and a character; `0x00` closes the current
-/// document and opens another, `0x01` doubles the leading marker, a leading
-/// `0x02` puts a raw stderr line between the marker and the first document.
+/// Each byte picks a record kind (or raw text inside the document, which
+/// must come out unchanged even when it looks like CLIXML, or a whole
+/// document inside the open one) and a
+/// character; `0x00` closes the current document and opens another, `0x01`
+/// doubles the leading marker, a leading `0x02` puts a raw stderr line
+/// between the marker and the first document.
 fn multi_document(data: &[u8]) -> (Vec<u8>, String) {
     const OPEN: &str = "<Objs Version=\"1.1.0.1\">";
     let mut stream = String::from("#< CLIXML\r\n");
@@ -103,11 +108,45 @@ fn multi_document(data: &[u8]) -> (Vec<u8>, String) {
             4 => ("é", "é"),
             _ => ("x", "x"),
         };
-        let (kind, prefix) = match b / 8 % 5 {
+        let (kind, prefix) = match b / 8 % 8 {
             0 => ("Error", ""),
             1 => ("warning", "WARNING: "),
             2 => ("verbose", "VERBOSE: "),
             3 => ("debug", "DEBUG: "),
+            4 => {
+                // Raw stderr inside the open document: not a record, so it
+                // passes through. It starts with a byte that is neither
+                // blank nor `<`, so it is text from its first byte on.
+                stream.push('#');
+                stream.push_str(text);
+                expected.push('#');
+                expected.push_str(text);
+                continue;
+            }
+            5 => {
+                // Nested PowerShell writing while the document is open: its
+                // marker line is text, its record decodes, and its end tag
+                // closes it alone (the records after it still decode).
+                stream.push_str("#< CLIXML\r\n");
+                stream.push_str(OPEN);
+                stream.push_str("<S S=\"Error\">");
+                stream.push_str(escaped);
+                stream.push_str("</S></Objs>");
+                expected.push_str("#< CLIXML\r\n");
+                expected.push_str(text);
+                continue;
+            }
+            6 => {
+                // Raw stderr that looks like CLIXML without being it: tags
+                // that name no stream, and a root tag that never ends. None
+                // of it is a record, and none of it takes in what follows.
+                const LOOKALIKE: &str = "#<S x> <Obj RefId=\"0\"> </Objs > <Objs here ";
+                stream.push_str(LOOKALIKE);
+                stream.push_str(text);
+                expected.push_str(LOOKALIKE);
+                expected.push_str(text);
+                continue;
+            }
             _ => {
                 stream.push_str("<Obj S=\"progress\" RefId=\"0\"><TN RefId=\"0\"><T>p</T></TN><Obj N=\"in\"><S N=\"m\">");
                 stream.push_str(escaped);

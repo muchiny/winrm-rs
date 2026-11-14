@@ -1,6 +1,6 @@
 //! Choosing the authentication method and how the listener's certificate is trusted.
 //!
-//! Usage: WINRM_HOST=win-server WINRM_AUTH=<method> [...] cargo run --example auth_methods
+//! Usage: `WINRM_HOST=win-server WINRM_AUTH=<method> [...] cargo run --example auth_methods`
 //!
 //! | `WINRM_AUTH`     | Also set                                            | Notes                                                        |
 //! |------------------|-----------------------------------------------------|--------------------------------------------------------------|

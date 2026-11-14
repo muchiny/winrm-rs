@@ -10,7 +10,7 @@ use secrecy::SecretString;
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-/// Helper to build an HttpTransport with Basic auth pointing at a wiremock server.
+/// Helper to build an `HttpTransport` with Basic auth pointing at a wiremock server.
 fn basic_transport(port: u16) -> HttpTransport {
     let config = WinrmConfig {
         auth_method: AuthMethod::Basic,
@@ -1042,9 +1042,60 @@ async fn send_basic_soap_fault_returns_soap_error() {
         .await
         .unwrap_err();
     assert!(
-        matches!(err, WinrmError::Soap(_)),
-        "expected Soap error, got: {err}"
+        matches!(&err, WinrmError::Soap(crate::error::SoapError::Fault { code, .. }) if code == "s:Receiver"),
+        "expected the fault, got: {err}"
     );
+}
+
+/// A body that comes with a success status is an answer, or the exchange
+/// fails: the operations that read nothing from their answer (Delete,
+/// Signal, Send) have this check alone between a server and a success.
+#[tokio::test]
+async fn a_success_status_with_a_body_that_is_no_answer_is_an_error() {
+    let fault = "<s:Envelope><s:Body><s:Fault><s:Code><s:Value>s:Receiver</s:Value></s:Code>\
+                 </s:Fault></s:Body></s:Envelope>";
+    for (body, is_fault) in [
+        (String::new(), false),
+        ("OK".to_owned(), false),
+        ("<s:Envelope><s:Body>".to_owned(), false),
+        ("<s:Envelope/><s:Envelope/>".to_owned(), false),
+        ("<!DOCTYPE x><s:Envelope/>".to_owned(), false),
+        // Read as far as it is XML, this one holds no fault.
+        (format!("x{fault}"), false),
+        (fault.to_owned(), true),
+        (format!("{fault}<!-- end -->\n"), true),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body.clone()))
+            .mount(&server)
+            .await;
+        let addr = server.address();
+        let err = basic_transport(addr.port())
+            .send_soap_with_retry(&addr.ip().to_string(), "<soap/>".into())
+            .await
+            .unwrap_err();
+        let expected = match &err {
+            WinrmError::Soap(crate::error::SoapError::Fault { .. }) => is_fault,
+            WinrmError::Soap(crate::error::SoapError::ParseError(_)) => !is_fault,
+            _ => false,
+        };
+        assert!(expected, "{body:?}: {err:?}");
+    }
+
+    // An answer with nothing in it, as a Delete has.
+    let server = MockServer::start().await;
+    let answer = "<?xml version=\"1.0\"?>\n<s:Envelope><s:Header/><s:Body/></s:Envelope>\n";
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(answer))
+        .mount(&server)
+        .await;
+    let addr = server.address();
+    let reply = basic_transport(addr.port())
+        .send_soap_with_retry(&addr.ip().to_string(), "<soap/>".into())
+        .await
+        .unwrap();
+    assert_eq!(reply, answer);
 }
 
 #[tokio::test]
@@ -1327,7 +1378,7 @@ fn every_tls_config_uses_the_chosen_provider() {
             },
             WinrmCredentials::new(USER, PASS, ""),
             TransportOptions::default(),
-            Arc::clone(&p),
+            &p,
             proxy::env_var,
         )
         .unwrap();
@@ -1348,7 +1399,7 @@ fn every_tls_config_uses_the_chosen_provider() {
             },
             WinrmCredentials::new(USER, PASS, ""),
             TransportOptions::default(),
-            Arc::clone(&p),
+            &p,
             proxy::env_var,
         )
         .unwrap();
@@ -2285,6 +2336,53 @@ async fn sealed_fault_is_a_soap_error_and_keeps_the_session() {
         .unwrap();
     assert_eq!(reply, "<after/>");
     assert_eq!(fake.handshakes(), 1, "log: {:?}", fake.log());
+}
+
+/// A sealed answer with a success status that is no answer is refused on
+/// this route as on the others, once it is unsealed. The request is not
+/// sent again, and the session stays usable (no new handshake).
+#[tokio::test]
+async fn sealed_body_that_is_no_answer_is_an_error_and_keeps_the_session() {
+    let (_server, fake, transport, host) = sealed_setup().await;
+    let fault = "<s:Envelope><s:Body><s:Fault><s:Code><s:Value>s:Receiver</s:Value></s:Code>\
+                 </s:Fault></s:Body></s:Envelope>";
+    fake.push(Reply::ok("<first/>"));
+    fake.push(Reply::ok("OK"));
+    fake.push(Reply::ok(""));
+    fake.push(Reply::ok(fault));
+    fake.push(Reply::ok("<after/>"));
+    transport
+        .send_soap_with_retry(&host, "<a/>".into())
+        .await
+        .unwrap();
+    for request in ["<b/>", "<c/>"] {
+        let err = transport
+            .send_soap_with_retry(&host, request.into())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                WinrmError::Soap(crate::error::SoapError::ParseError(_))
+            ),
+            "{request}: {err:?}"
+        );
+    }
+    let err = transport
+        .send_soap_with_retry(&host, "<d/>".into())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, WinrmError::Soap(crate::error::SoapError::Fault { code, .. }) if code == "s:Receiver"),
+        "{err:?}"
+    );
+    let reply = transport
+        .send_soap_with_retry(&host, "<e/>".into())
+        .await
+        .unwrap();
+    assert_eq!(reply, "<after/>");
+    assert_eq!(fake.handshakes(), 1, "log: {:?}", fake.log());
+    assert_eq!(fake.sealed().len(), 5, "log: {:?}", fake.log());
 }
 
 /// An answer larger than the response cap is refused before unsealing.
@@ -3316,7 +3414,7 @@ fn from_utf16le(bytes: &[u8]) -> String {
     .unwrap()
 }
 
-/// Over TLS the Type 3 now carries a MIC, MsvAvFlags 0x2, the target name,
+/// Over TLS the Type 3 now carries a MIC, `MsvAvFlags` 0x2, the target name,
 /// a zero LM response and the channel binding — as the plain-HTTP path does.
 #[tokio::test]
 async fn ntlm_over_tls_type3_carries_mic_flags_target_name_and_zero_lm() {
@@ -3602,7 +3700,7 @@ async fn kerberos_without_the_feature_sends_nothing_in_any_mode() {
             WinrmCredentials::new("u", "p", ""),
         )
         .unwrap();
-        assert!(transport.seals() == (encryption != EncryptionMode::Never));
+        assert_eq!(transport.seals(), encryption != EncryptionMode::Never);
         let err = transport
             .send_soap_raw("127.0.0.1", "<s:Envelope/>".into())
             .await
@@ -3738,9 +3836,9 @@ fn seals_follows_mode_and_scheme_for_ntlm_and_kerberos() {
     let seals = |auth_method: AuthMethod, encryption: EncryptionMode, use_tls: bool| {
         HttpTransport::new(
             WinrmConfig {
+                use_tls,
                 auth_method,
                 encryption,
-                use_tls,
                 ..Default::default()
             },
             WinrmCredentials::new("u", "p", ""),
@@ -3788,10 +3886,10 @@ fn seals_follows_mode_and_scheme_for_ntlm_and_kerberos() {
 #[test]
 fn auto_seals_over_https_when_the_certificate_is_not_verified() {
     let config = |auth_method, encryption, use_tls, accept_invalid_certs| WinrmConfig {
-        auth_method,
-        encryption,
         use_tls,
         accept_invalid_certs,
+        auth_method,
+        encryption,
         ..Default::default()
     };
     let seals = |auth_method, encryption, use_tls, accept_invalid_certs| {
@@ -3978,7 +4076,9 @@ async fn waiters_for_a_full_host_take_no_client_slot() {
         128,
         "queued waiters hold client slots"
     );
-    waiters.iter().for_each(|w| w.abort());
+    for waiter in &waiters {
+        waiter.abort();
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -4283,9 +4383,9 @@ fn route_follows_method_mode_and_scheme() {
     use EncryptionMode::{Always, Auto, Never};
     let route = |auth_method, encryption, use_tls| {
         Route::for_config(&WinrmConfig {
+            use_tls,
             auth_method,
             encryption,
-            use_tls,
             ..Default::default()
         })
     };
@@ -4517,7 +4617,7 @@ async fn explicit_provider_is_used_for_every_handshake() {
                 },
                 ..Default::default()
             },
-            only(suite),
+            &only(suite),
             proxy::env_var,
         )
         .unwrap()
@@ -4717,7 +4817,7 @@ async fn ntlm_cbt_through_an_https_proxy_binds_the_target_certificate() {
     assert_eq!(type3_channel_bindings(&seen[0]), Some(cbt_of(EC_CERT_PEM)));
 }
 
-/// An https endpoint reached through an HTTPS_PROXY from the environment:
+/// An https endpoint reached through an `HTTPS_PROXY` from the environment:
 /// reqwest's real proxy selection tunnels it, and the Type 3 still binds
 /// the endpoint's certificate.
 #[tokio::test]
@@ -5892,7 +5992,7 @@ async fn dedicated_client_never_opens_a_second_connection() {
     let fake = FakeNtlmServer::mount(&server).await;
     let (relay, accepts) = spawn_counting_relay(server.address().port());
     let transport = relayed_transport(relay);
-    let big = "x".repeat(200_000);
+    let big = format!("<r>{}</r>", "x".repeat(200_000));
     for _ in 0..20 {
         fake.push(Reply::ok(&big));
     }
@@ -5901,7 +6001,7 @@ async fn dedicated_client_never_opens_a_second_connection() {
             .send_soap_with_retry("127.0.0.1", format!("<r{i}/>"))
             .await
             .unwrap();
-        assert_eq!(reply.len(), 200_000, "exchange {i}");
+        assert_eq!(reply.len(), big.len(), "exchange {i}");
     }
     assert_eq!(accepts.load(Ordering::SeqCst), 1, "log: {:?}", fake.log());
     assert_eq!(fake.handshakes(), 1);

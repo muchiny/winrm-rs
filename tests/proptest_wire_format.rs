@@ -31,8 +31,14 @@
     clippy::indexing_slicing,
     clippy::arithmetic_side_effects,
     clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::too_many_lines,
+    clippy::similar_names,
+    clippy::assert_is_empty,
     reason = "test code"
 )]
+
+use std::fmt::Write as _;
 
 use proptest::prelude::*;
 
@@ -81,6 +87,19 @@ proptest! {
     }
 }
 
+// P-SOAP-2 — What the transport asks of a success response never panics on
+// arbitrary string input, and it finds the fault `check_soap_fault` finds.
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+    #[test]
+    fn check_answer_never_panics(s in "\\PC{0,4096}") {
+        let answer = winrm_rs::__fuzz::check_answer(&s);
+        if let Err(fault) = winrm_rs::__fuzz::check_soap_fault(&s) {
+            prop_assert_eq!(answer.map_err(|e| e.to_string()), Err(fault.to_string()));
+        }
+    }
+}
+
 // P-NTLM-3 — `parse_challenge` rejects buffers that don't start with the
 // `NTLMSSP\0` signature.
 proptest! {
@@ -113,6 +132,11 @@ fn clixml_fragment() -> impl Strategy<Value = Vec<u8>> {
         Just(b"<S S=\"verbose\">".to_vec()),
         Just(b"<Obj S=\"progress\"><S N=\"x\">p</S></Obj>".to_vec()),
         Just(b"</S>".to_vec()),
+        Just(b"<Obj S=\"x\">".to_vec()),
+        Just(b"</Obj>".to_vec()),
+        Just(b"<S S=\"Error\" ".to_vec()),
+        Just(b"<S x>".to_vec()),
+        Just(b"<Objs ".to_vec()),
         Just(b"_x000D__x000A_".to_vec()),
         Just(b"_xD83D__xDE00_".to_vec()),
         Just(b"&lt;&amp;&#x41;".to_vec()),
@@ -183,7 +207,7 @@ fn clixml_escape(text: &str) -> String {
             '"' => out.push_str("&quot;"),
             c if c.is_control() => {
                 for unit in c.encode_utf16(&mut [0; 2]) {
-                    out.push_str(&format!("_x{unit:04X}_"));
+                    write!(out, "_x{unit:04X}_").unwrap();
                 }
             }
             c => out.push(c),
@@ -228,7 +252,7 @@ proptest! {
                         continue;
                     }
                 };
-                stream.push_str(&format!("<S S=\"{tag}\">{}</S>", clixml_escape(text)));
+                write!(stream, "<S S=\"{tag}\">{}</S>", clixml_escape(text)).unwrap();
                 expected.push_str(prefix);
                 expected.push_str(text);
                 if !prefix.is_empty() {

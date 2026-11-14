@@ -521,6 +521,10 @@ pub(crate) struct HttpTransport {
     /// [`crate::tls::ProxyRoutingVerifier`]), so a host with one of these
     /// names is refused (see [`Self::checked_endpoint`]). Empty otherwise.
     shared_proxy_names: Vec<rustls::pki_types::ServerName<'static>>,
+    /// The server names of the `https://` proxy of [`Self::route`], read
+    /// from it once: the verifier of each dedicated connection takes them
+    /// from here, and the proxy URL is not parsed again for it.
+    proxy_names: Vec<rustls::pki_types::ServerName<'static>>,
     /// The proxy route of every client of this transport, resolved once at
     /// construction.
     route: proxy::ProxyRoute,
@@ -857,6 +861,107 @@ fn build_http_client(
     builder.build().map_err(WinrmError::Http)
 }
 
+/// Refuses a configuration whose encryption mode the auth method cannot
+/// honour, before anything else is read or built.
+fn check_encryption_policy(config: &WinrmConfig) -> Result<(), WinrmError> {
+    // Basic over plain HTTP puts the password and every body on the wire in
+    // cleartext, so `Never` is the caller's explicit consent to that.
+    if matches!(config.auth_method, AuthMethod::Basic)
+        && !config.use_tls
+        && config.encryption != EncryptionMode::Never
+    {
+        return Err(WinrmError::AuthFailed(
+            "Basic auth over HTTP sends the password and every SOAP body in cleartext: use \
+             HTTPS (use_tls = true), or set encryption = EncryptionMode::Never to accept \
+             plaintext"
+                .into(),
+        ));
+    }
+    if config.encryption == EncryptionMode::Always
+        && !matches!(config.auth_method, AuthMethod::Ntlm | AuthMethod::Kerberos)
+    {
+        return Err(WinrmError::AuthFailed(format!(
+            "EncryptionMode::Always: winrm-rs seals SOAP bodies only with NTLM and \
+             Kerberos and does not seal {}; use EncryptionMode::Auto, where HTTPS protects \
+             the bodies",
+            method_name(&config.auth_method)
+        )));
+    }
+    Ok(())
+}
+
+/// The client certificate and key of Certificate auth; `None` for the other
+/// methods.
+///
+/// Loaded when the transport is built, so a bad path or PEM fails at
+/// construction. It is presented through the rustls config of the shared
+/// client (`reqwest::Identity` would be discarded by
+/// `tls_backend_preconfigured`).
+fn load_client_auth(config: &WinrmConfig) -> Result<Option<ClientAuthCert>, WinrmError> {
+    if !matches!(config.auth_method, AuthMethod::Certificate) {
+        return Ok(None);
+    }
+    // Checked before any file is read: over plain HTTP there is no handshake
+    // to present the certificate in.
+    if !config.use_tls {
+        return Err(WinrmError::AuthFailed(
+            "Certificate auth requires HTTPS (set use_tls = true)".into(),
+        ));
+    }
+    let cert_path = config.client_cert_pem.as_deref().ok_or_else(|| {
+        WinrmError::AuthFailed("Certificate auth requires client_cert_pem".into())
+    })?;
+    let key_path = config
+        .client_key_pem
+        .as_deref()
+        .ok_or_else(|| WinrmError::AuthFailed("Certificate auth requires client_key_pem".into()))?;
+    crate::tls::load_client_auth_cert(cert_path, key_path).map(Some)
+}
+
+/// Warns about what Basic and NTLM leave unprotected over plain HTTP.
+fn warn_plain_http(config: &WinrmConfig) {
+    if config.use_tls {
+        return;
+    }
+    if matches!(config.auth_method, AuthMethod::Basic) {
+        tracing::warn!(
+            "Basic auth over HTTP transmits credentials in cleartext (EncryptionMode::Never) — \
+             use HTTPS in production"
+        );
+    }
+    if matches!(config.auth_method, AuthMethod::Ntlm) {
+        tracing::warn!(
+            target: "winrm_rs::ntlm_over_http",
+            sealed = config.encryption != EncryptionMode::Never,
+            "NTLM over plain HTTP: the handshake does not authenticate the server and is \
+             not bound to the connection, so a party on the network path can relay it, \
+             or record it to guess the password offline; sealing protects only the SOAP \
+             bodies. Use HTTPS (the default, WinrmConfig::https()) or Kerberos"
+        );
+    }
+}
+
+/// The rustls configuration of the shared client over HTTPS: `verifier`
+/// authenticates the server, and `client_auth` is presented when there is
+/// one (Certificate auth).
+fn origin_client_tls(
+    provider: &Arc<CryptoProvider>,
+    verifier: Arc<dyn ServerCertVerifier>,
+    client_auth: Option<ClientAuthCert>,
+) -> Result<rustls::ClientConfig, WinrmError> {
+    let builder = crate::tls::client_config_builder(provider)?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier);
+    match client_auth {
+        Some(ClientAuthCert { chain, key }) => {
+            builder.with_client_auth_cert(chain, key).map_err(|e| {
+                WinrmError::AuthFailed(format!("client certificate and key rejected: {e}"))
+            })
+        }
+        None => Ok(builder.with_no_client_auth()),
+    }
+}
+
 /// The construction WARNs for a certificate that is not verified: the
 /// server's (`accept_invalid_certs`), and an `https://` proxy's
 /// (`danger_accept_invalid_proxy_certs`) when the route has such a proxy for
@@ -914,7 +1019,7 @@ impl HttpTransport {
         var: impl Fn(&str) -> Option<String>,
     ) -> Result<Self, WinrmError> {
         let provider = crate::tls::crypto_provider(opts.tls.provider)?;
-        Self::with_provider(config, credentials, opts, provider, var)
+        Self::with_provider(config, credentials, opts, &provider, var)
     }
 
     /// Create a new HTTP transport whose every TLS configuration (the shared
@@ -937,76 +1042,14 @@ impl HttpTransport {
         config: WinrmConfig,
         credentials: WinrmCredentials,
         opts: TransportOptions,
-        provider: Arc<CryptoProvider>,
+        provider: &Arc<CryptoProvider>,
         var: impl Fn(&str) -> Option<String>,
     ) -> Result<Self, WinrmError> {
         debug!(tls_provider = ?opts.tls.provider, "TLS crypto provider choice");
 
-        // Refused before anything else is read or built. Basic over plain
-        // HTTP puts the password and every body on the wire in cleartext, so
-        // `Never` is the caller's explicit consent to that.
-        if matches!(config.auth_method, AuthMethod::Basic)
-            && !config.use_tls
-            && config.encryption != EncryptionMode::Never
-        {
-            return Err(WinrmError::AuthFailed(
-                "Basic auth over HTTP sends the password and every SOAP body in cleartext: use \
-                 HTTPS (use_tls = true), or set encryption = EncryptionMode::Never to accept \
-                 plaintext"
-                    .into(),
-            ));
-        }
-        if config.encryption == EncryptionMode::Always
-            && !matches!(config.auth_method, AuthMethod::Ntlm | AuthMethod::Kerberos)
-        {
-            return Err(WinrmError::AuthFailed(format!(
-                "EncryptionMode::Always: winrm-rs seals SOAP bodies only with NTLM and \
-                 Kerberos and does not seal {}; use EncryptionMode::Auto, where HTTPS protects \
-                 the bodies",
-                method_name(&config.auth_method)
-            )));
-        }
-
-        // Load the client certificate for Certificate auth here, so a bad path
-        // or PEM fails at construction. It is presented through the rustls
-        // config built below (`reqwest::Identity` would be discarded by
-        // `tls_backend_preconfigured`).
-        let client_auth = if matches!(config.auth_method, AuthMethod::Certificate) {
-            // Checked before any file is read: over plain HTTP there is no
-            // handshake to present the certificate in.
-            if !config.use_tls {
-                return Err(WinrmError::AuthFailed(
-                    "Certificate auth requires HTTPS (set use_tls = true)".into(),
-                ));
-            }
-            let cert_path = config.client_cert_pem.as_deref().ok_or_else(|| {
-                WinrmError::AuthFailed("Certificate auth requires client_cert_pem".into())
-            })?;
-            let key_path = config.client_key_pem.as_deref().ok_or_else(|| {
-                WinrmError::AuthFailed("Certificate auth requires client_key_pem".into())
-            })?;
-            Some(crate::tls::load_client_auth_cert(cert_path, key_path)?)
-        } else {
-            None
-        };
-
-        if matches!(config.auth_method, AuthMethod::Basic) && !config.use_tls {
-            tracing::warn!(
-                "Basic auth over HTTP transmits credentials in cleartext (EncryptionMode::Never) — \
-                 use HTTPS in production"
-            );
-        }
-
-        if matches!(config.auth_method, AuthMethod::Ntlm) && !config.use_tls {
-            tracing::warn!(
-                target: "winrm_rs::ntlm_over_http",
-                sealed = config.encryption != EncryptionMode::Never,
-                "NTLM over plain HTTP: the handshake does not authenticate the server and is \
-                 not bound to the connection, so a party on the network path can relay it, \
-                 or record it to guess the password offline; sealing protects only the SOAP \
-                 bodies. Use HTTPS (the default, WinrmConfig::https()) or Kerberos"
-            );
-        }
+        check_encryption_policy(&config)?;
+        let client_auth = load_client_auth(&config)?;
+        warn_plain_http(&config);
 
         if matches!(config.auth_method, AuthMethod::CredSsp) && !config.use_tls {
             return Err(WinrmError::AuthFailed(
@@ -1038,7 +1081,7 @@ impl HttpTransport {
             config.use_tls,
             config.accept_invalid_certs,
             &proxy_names,
-            &provider,
+            provider,
         )?;
         // CredSSP has no channel binding on the outer TLS (MS-CSSP), so it
         // runs only behind a verifier that authenticates the server.
@@ -1061,26 +1104,18 @@ impl HttpTransport {
         let pinned = !opts.tls.pins.is_empty();
         let shared_proxy_names =
             if config.use_tls && (pinned || opts.tls.accept_invalid_proxy_certs) {
-                proxy_names
+                proxy_names.clone()
             } else {
                 Vec::new()
             };
         let (client_tls, server_verifier) = if config.use_tls {
-            let tls_builder = crate::tls::client_config_builder(&provider)?
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::clone(&origin));
-            let client_tls = match client_auth {
-                Some(ClientAuthCert { chain, key }) => {
-                    tls_builder.with_client_auth_cert(chain, key).map_err(|e| {
-                        WinrmError::AuthFailed(format!("client certificate and key rejected: {e}"))
-                    })?
-                }
-                None => tls_builder.with_no_client_auth(),
-            };
-            (client_tls, Some(origin))
+            (
+                origin_client_tls(provider, Arc::clone(&origin), client_auth)?,
+                Some(origin),
+            )
         } else {
             // Plain HTTP: TLS only on the leg to an `https://` proxy.
-            (crate::tls::plain_http_config(proxy, &provider)?, None)
+            (crate::tls::plain_http_config(proxy, provider)?, None)
         };
 
         #[cfg(feature = "credssp")]
@@ -1130,6 +1165,7 @@ impl HttpTransport {
             before_send: None,
             log_soap_bodies: false,
             shared_proxy_names,
+            proxy_names,
             route,
             options: opts,
             proxy_warned: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -1230,8 +1266,14 @@ impl HttpTransport {
     /// Dispatches by [`Route`]. A dedicated route runs under `slot`, which
     /// the caller took ([`Self::send_soap_with_retry`]); a plain route drops
     /// a slot it is given. With Kerberos through a forwarding proxy, the
-    /// proxy probe (`kerberos_proxy_probe`) runs first. The response is
-    /// checked for SOAP faults before returning.
+    /// proxy probe (`kerberos_proxy_probe`) runs first.
+    ///
+    /// The body of a success status is returned once it is an answer
+    /// (`soap::check_answer`): an XML document that is not a fault. One that
+    /// is empty or is not XML is a [`SoapError::ParseError`], and that error
+    /// says nothing of the request, which the server may have carried out.
+    ///
+    /// [`SoapError::ParseError`]: crate::error::SoapError::ParseError
     #[tracing::instrument(
         level = "debug",
         skip(self, host, body, slot),
@@ -1263,42 +1305,74 @@ impl HttpTransport {
             self.kerberos_proxy_probe(&url).await?;
         }
 
-        let response_text: String = match route {
+        // The exchange is on the heap, one allocation per request. Left in
+        // place, it is part of the future of every caller, whatever the
+        // method in use: the largest route (CredSSP, several kilobytes) sets
+        // its size, and each wrapper above (deadline, cleanup) holds it once
+        // more, up to 30 kB for the future of `run_powershell`.
+        let response_text = Box::pin(self.exchange(route, host, &url, body, slot)).await?;
+
+        if self.log_soap_bodies {
+            trace!(target: "winrm_rs::wire", response = %response_text, "SOAP response body");
+        } else {
+            trace!(response_len = response_text.len(), "SOAP response body");
+        }
+        // Every route gives the body of a success status here. Such a body
+        // is an answer or it is refused, whatever the operation: several of
+        // them (Delete, Signal, Send) read nothing else from it.
+        soap::check_answer(&response_text).map_err(WinrmError::Soap)?;
+        Ok(response_text)
+    }
+
+    /// One request on `route`, authentication included: the body of the
+    /// response to a success status. [`Self::send_soap`] is the only caller.
+    ///
+    /// No span of its own: the one of `send_soap` covers this call, and
+    /// skips `body`, which may hold a script and the secrets written in it.
+    async fn exchange(
+        &self,
+        route: Route,
+        host: &str,
+        url: &str,
+        body: String,
+        slot: Option<SlotGuard>,
+    ) -> Result<String, WinrmError> {
+        match route {
             Route::Basic => {
                 let auth = BasicAuth::new(
                     &self.credentials.username,
                     self.credentials.password.expose_secret(),
                     self.max_response_bytes(),
                 );
-                auth.send_authenticated(&self.http, &url, body).await?
+                auth.send_authenticated(&self.http, url, body).await
             }
             Route::Sealed => {
-                self.send_sealed(host, &url, &body, dedicated_slot(slot)?)
-                    .await?
+                self.send_sealed(host, url, &body, dedicated_slot(slot)?)
+                    .await
             }
             Route::NtlmOverTls => {
-                self.send_ntlm_over_tls(host, &url, &body, dedicated_slot(slot)?)
-                    .await?
+                self.send_ntlm_over_tls(host, url, &body, dedicated_slot(slot)?)
+                    .await
             }
             Route::KerberosOverTls => {
-                self.send_kerberos_over_tls(host, &url, &body, dedicated_slot(slot)?)
-                    .await?
+                self.send_kerberos_over_tls(host, url, &body, dedicated_slot(slot)?)
+                    .await
             }
             Route::NtlmPlain => {
-                self.ntlm_auth_for(&url)
-                    .send_authenticated(&self.http, &url, body)
-                    .await?
+                self.ntlm_auth_for(url)
+                    .send_authenticated(&self.http, url, body)
+                    .await
             }
             Route::KerberosPlain => {
-                self.kerberos_auth(&url)?
-                    .send_authenticated(&self.http, &url, body)
-                    .await?
+                self.kerberos_auth(url)?
+                    .send_authenticated(&self.http, url, body)
+                    .await
             }
             Route::Certificate => {
                 let auth = CertificateAuth {
                     max_response_bytes: self.max_response_bytes(),
                 };
-                auth.send_authenticated(&self.http, &url, body).await?
+                auth.send_authenticated(&self.http, url, body).await
             }
             #[cfg(feature = "credssp")]
             Route::CredSsp => {
@@ -1312,25 +1386,15 @@ impl HttpTransport {
                         WinrmError::AuthFailed("CredSSP requires HTTPS (set use_tls = true)".into())
                     })?),
                     opts: CredSspConnOptions::from_config(&self.config),
-                    dial: self.credssp_dial_for(&url)?,
+                    dial: self.credssp_dial_for(url)?,
                 };
-                auth.send_authenticated(&self.http, &url, body).await?
+                auth.send_authenticated(&self.http, url, body).await
             }
             #[cfg(not(feature = "credssp"))]
-            Route::CredSsp => {
-                return Err(WinrmError::AuthFailed(
-                    "CredSSP authentication requires the `credssp` cargo feature".into(),
-                ));
-            }
-        };
-
-        if self.log_soap_bodies {
-            trace!(target: "winrm_rs::wire", response = %response_text, "SOAP response body");
-        } else {
-            trace!(response_len = response_text.len(), "SOAP response body");
+            Route::CredSsp => Err(WinrmError::AuthFailed(
+                "CredSSP authentication requires the `credssp` cargo feature".into(),
+            )),
         }
-        soap::check_soap_fault(&response_text).map_err(WinrmError::Soap)?;
-        Ok(response_text)
     }
 
     /// The [`Route`] of every request of this transport.
@@ -1476,8 +1540,7 @@ impl HttpTransport {
     #[cfg(feature = "kerberos")]
     async fn kerberos_proxy_probe(&self, url: &str) -> Result<(), WinrmError> {
         // Only a gated URL is ever kept, so a kept answer is read before the
-        // route's matcher is built: a proxy that announced it needs nothing
-        // more.
+        // route is asked: a proxy that announced it needs nothing more.
         let known = self
             .proxy_probes
             .lock()
@@ -1658,7 +1721,7 @@ impl HttpTransport {
                     Arc::clone(verifier),
                     url_server_name(&self.endpoint(host)),
                 )
-                .with_proxies(self.route.https_proxy_server_names());
+                .with_proxies(self.proxy_names.clone());
                 let handle = capturing.cert_handle();
                 tls.dangerous()
                     .set_certificate_verifier(Arc::new(capturing));
@@ -2029,17 +2092,18 @@ impl HttpTransport {
         }
     }
 
-    /// Without the `kerberos` feature there is no unsealed dedicated path.
+    /// Without the `kerberos` feature there is no unsealed dedicated path:
+    /// the refusal is ready at once, there is nothing to wait for.
     #[cfg(not(feature = "kerberos"))]
-    async fn send_plain_body(
+    fn send_plain_body(
         _conn: &mut AuthConn,
         _url: &str,
         _body: &str,
         _max_response_bytes: usize,
-    ) -> Result<String, SealedFailure> {
-        Err(SealedFailure::Error(WinrmError::AuthFailed(
+    ) -> std::future::Ready<Result<String, SealedFailure>> {
+        std::future::ready(Err(SealedFailure::Error(WinrmError::AuthFailed(
             "internal: unsealed exchange on a dedicated connection".into(),
-        )))
+        ))))
     }
 
     /// Send a request with NTLM over HTTPS, unsealed (TLS protects it): a
@@ -2129,7 +2193,10 @@ impl HttpTransport {
         let action = crate::soap::envelope::request_action(&body).unwrap_or("");
         let kind = RequestKind::from_action(action);
         let max = self.config.max_retries;
-        for attempt in 0..=max {
+        // Attempts 0 to `max`. The loop ends by a `return`: only the retry
+        // arm goes round again, and it is not taken at attempt `max`.
+        let mut attempt: u32 = 0;
+        loop {
             // Take the slot first, so that an approval does not go stale
             // during the slot wait. On a retryable error the slot was moved
             // into `send_soap`, so it is released before the backoff sleep.
@@ -2156,17 +2223,23 @@ impl HttpTransport {
                         "retrying after transient HTTP error"
                     );
                     tokio::time::sleep(delay).await;
+                    attempt = attempt.saturating_add(1);
                 }
                 Err(e) => {
-                    let proxied = self.route.proxy_for(&self.endpoint(host)).is_some();
-                    if let Some(hint) = connect_hint(&self.config, proxied, &e) {
-                        tracing::warn!(host = %log_host(host), "{hint}");
+                    // Only a connect error can get the hint. Every other
+                    // error comes through here too (the timeout of each
+                    // silent Receive poll, for one): the proxy route is not
+                    // looked up for those.
+                    if matches!(&e, WinrmError::Http(err) if err.is_connect()) {
+                        let proxied = self.route.proxy_for(&self.endpoint(host)).is_some();
+                        if let Some(hint) = connect_hint(&self.config, proxied, &e) {
+                            tracing::warn!(host = %log_host(host), "{hint}");
+                        }
                     }
                     return Err(e);
                 }
             }
         }
-        unreachable!()
     }
 
     /// The `wsmv:SessionId` value this transport stamps on every request.

@@ -1,4 +1,4 @@
-//! Forward-only substring search shared by the parsers.
+//! Forward-only substring search of the CLIXML decoder.
 
 /// Forward-only search for one needle in one haystack. It remembers the last
 /// hit, or that there is none, so a caller whose start offset only moves

@@ -19,7 +19,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use sha2::{Digest, Sha256};
 
-use super::{MemBio, OpenSslMemTls};
+use super::tls::OpenSslMemTls;
 use crate::asn1;
 use crate::ntlm::SealingSession;
 use crate::test_ntlm_server::exported_session_key;
@@ -61,15 +61,21 @@ pub(crate) enum Fault {
     OversizedContentLength(usize),
     /// Answer the first round with a response head that never ends.
     OversizedHead,
+    /// Answer the request of this rank (the first is 1) with these bytes,
+    /// without decoding what it carries, and close. It is logged as a round
+    /// without `authInfo`, whatever it carried. The requests before it are
+    /// answered honestly: 1 and 2 are the inner TLS handshake, 3 the NTLM
+    /// negotiate, 4 the NTLM authenticate, 5 the delegation.
+    RawAnswer(usize, &'static [u8]),
 }
 
 /// What the server saw and did, in order.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Event {
     /// One HTTP request: its `Content-Length`, and whether its decrypted
-    /// TSRequest carried `[2] authInfo`.
+    /// `TSRequest` carried `[2] authInfo`.
     Round { body_len: usize, auth_info: bool },
-    /// TSCredentials decrypted: the password of `user` reached the server.
+    /// `TSCredentials` decrypted: the password of `user` reached the server.
     Delegated { user: String },
     /// The SOAP body of the delegation round, answered `200`.
     Executed { body: String },
@@ -297,7 +303,7 @@ const DROPPED: &[u8] =
 /// The inner TLS 1.2 acceptor, on `RSA_CERT_PEM`, in memory mode.
 fn inner_acceptor() -> Result<OpenSslMemTls, String> {
     use openssl::pkey::PKey;
-    use openssl::ssl::{Ssl, SslAcceptor, SslMethod, SslStream, SslVersion};
+    use openssl::ssl::{Ssl, SslAcceptor, SslMethod, SslVersion};
     // OpenSSL's owned certificate.
     type Certificate = <openssl::x509::X509Ref as ToOwned>::Owned;
 
@@ -314,17 +320,11 @@ fn inner_acceptor() -> Result<OpenSslMemTls, String> {
     let key = PKey::private_key_from_pem(RSA_KEY_PKCS1_PEM.as_bytes()).map_err(e)?;
     builder.set_private_key(&key).map_err(e)?;
     let acceptor = builder.build();
-    let mut ssl = Ssl::new(acceptor.context()).map_err(e)?;
-    ssl.set_accept_state();
-    let bio = MemBio {
-        incoming: std::collections::VecDeque::new(),
-        outgoing: Vec::new(),
-    };
-    let ssl = SslStream::new(ssl, bio).map_err(e)?;
-    Ok(OpenSslMemTls { ssl })
+    let ssl = Ssl::new(acceptor.context()).map_err(e)?;
+    OpenSslMemTls::server(ssl).map_err(e)
 }
 
-/// The SubjectPublicKey of the inner certificate, read with the crate's own
+/// The `SubjectPublicKey` of the inner certificate, read with the crate's own
 /// DER walker (not the client's `x509_cert` path).
 fn inner_subject_public_key() -> Vec<u8> {
     use rustls::pki_types::CertificateDer;
@@ -346,7 +346,7 @@ fn binding_hash(magic: &[u8], nonce: &[u8], spk: &[u8]) -> Vec<u8> {
 const CLIENT_MAGIC: &[u8] = b"CredSSP Client-To-Server Binding Hash\0";
 const SERVER_MAGIC: &[u8] = b"CredSSP Server-To-Client Binding Hash\0";
 
-/// The NTLM Type 2 challenge, with target info and the flags (KEY_EXCH,
+/// The NTLM Type 2 challenge, with target info and the flags (`KEY_EXCH`,
 /// SEAL, SIGN) the CredSSP path needs.
 fn type2() -> Vec<u8> {
     fn av(out: &mut Vec<u8>, id: u16, value: &[u8]) {
@@ -397,6 +397,7 @@ fn serve(
     let mut handshaking = true;
     let mut session: Option<Box<SealingSession>> = None;
     let mut first = true;
+    let mut rank = 0usize;
 
     while let Some((head, body)) = read_request(&mut tls)? {
         let body_len = body.len();
@@ -404,6 +405,14 @@ fn serve(
             body_len,
             auth_info,
         };
+
+        rank += 1;
+        if let Fault::RawAnswer(at, answer) = fault
+            && rank == at
+        {
+            record(round(false));
+            return send(&mut tls, answer);
+        }
 
         if std::mem::take(&mut first) {
             match fault {

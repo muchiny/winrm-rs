@@ -1,6 +1,6 @@
 //! Basic WinRM command execution example.
 //!
-//! Usage: WINRM_HOST=win-server WINRM_USER=admin WINRM_PASS=password [WINRM_CA=ca.pem] [WINRM_HTTP=1] cargo run --example basic
+//! Usage: `WINRM_HOST=win-server WINRM_USER=admin WINRM_PASS=password [WINRM_CA=ca.pem] [WINRM_HTTP=1] cargo run --example basic`
 //!
 //! By default the example connects over HTTPS on 5986 and validates the
 //! listener certificate. `WINRM_CA` names a PEM file with the CA to trust (a

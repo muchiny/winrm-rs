@@ -56,13 +56,17 @@
     clippy::indexing_slicing,
     clippy::arithmetic_side_effects,
     clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::too_many_lines,
+    clippy::similar_names,
+    clippy::assert_is_empty,
     reason = "test code"
 )]
 
 use std::time::{Duration, Instant};
 use winrm_rs::{
-    AuthMethod, CancellationToken, EncryptionMode, SecretString, WinrmClient, WinrmConfig,
-    WinrmCredentials, WinrmError,
+    AuthMethod, CancellationToken, EncryptionMode, RemotePathPolicy, SecretString, WinrmClient,
+    WinrmConfig, WinrmCredentials, WinrmError,
 };
 
 fn test_client() -> Option<(WinrmClient, String)> {
@@ -71,6 +75,14 @@ fn test_client() -> Option<(WinrmClient, String)> {
 
 /// Same as [`test_client`], with a last-minute tweak applied to the config.
 fn test_client_with(tweak: impl FnOnce(&mut WinrmConfig)) -> Option<(WinrmClient, String)> {
+    let (host, mut config, credentials) = test_settings()?;
+    tweak(&mut config);
+    let client = WinrmClient::new(config, credentials).ok()?;
+    Some((client, host))
+}
+
+/// The bench host, with the config and the credentials of [`test_client`].
+fn test_settings() -> Option<(String, WinrmConfig, WinrmCredentials)> {
     let host = std::env::var("WINRM_TEST_HOST").ok()?;
     let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
     let pass = std::env::var("WINRM_TEST_PASS").ok()?;
@@ -78,16 +90,13 @@ fn test_client_with(tweak: impl FnOnce(&mut WinrmConfig)) -> Option<(WinrmClient
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(5985);
-
-    let mut config = WinrmConfig {
+    let config = WinrmConfig {
         auth_method: AuthMethod::Basic,
         encryption: EncryptionMode::Never,
         port: Some(port),
         ..WinrmConfig::http()
     };
-    tweak(&mut config);
-    let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).ok()?;
-    Some((client, host))
+    Some((host, config, WinrmCredentials::new(user, pass, "")))
 }
 
 /// Number of open shells created with the given `IdleTimeOut`, as seen by
@@ -141,7 +150,7 @@ async fn is_server_2012_r2() -> bool {
 // --- Shell lifecycle ---
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn create_and_delete_shell() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let shell_id = client.create_shell(&host).await.expect("create shell");
@@ -155,7 +164,7 @@ async fn create_and_delete_shell() {
 // --- Command execution ---
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn run_command_whoami() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let output = client
@@ -168,7 +177,7 @@ async fn run_command_whoami() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn run_command_with_args() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let output = client
@@ -184,7 +193,7 @@ async fn run_command_with_args() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn run_command_nonzero_exit() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let output = client
@@ -194,10 +203,44 @@ async fn run_command_nonzero_exit() {
     assert_eq!(output.exit_code, 42, "expected exit code 42");
 }
 
+/// Windows writes an exit code as an unsigned 32-bit number
+/// (`<rsp:ExitCode>3221225477</rsp:ExitCode>`). One above `i32::MAX` is the
+/// `i32` with the same bits, and not the `-1` of a command whose exit code
+/// the server did not give.
+#[tokio::test]
+#[ignore = "needs the Windows bench: see the head of this file"]
+async fn run_command_exit_code_above_i32_max() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    // 0xC0000005, the exit code of a process that ends on an access
+    // violation, then one whose bits are not those of -1.
+    for code in [-1_073_741_819_i32, -2] {
+        let output = client
+            .run_command(&host, "cmd.exe", &["/c", "exit", "/b", &code.to_string()])
+            .await
+            .expect("run exit");
+        assert_eq!(output.exit_code, code);
+        assert!(output.exit_code.cast_unsigned() > 0x7FFF_FFFF);
+    }
+}
+
+/// The same through PowerShell, whose `exit` takes the signed number.
+#[tokio::test]
+#[ignore = "needs the Windows bench: see the head of this file"]
+async fn run_powershell_exit_code_above_i32_max() {
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    for code in [-1_073_741_819_i32, -2] {
+        let output = client
+            .run_powershell(&host, &format!("exit {code}"))
+            .await
+            .expect("run exit");
+        assert_eq!(output.exit_code, code);
+    }
+}
+
 // --- PowerShell ---
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn run_powershell_version() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let output = client
@@ -213,7 +256,7 @@ async fn run_powershell_version() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn run_powershell_json_output() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let output = client
@@ -231,7 +274,7 @@ async fn run_powershell_json_output() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn run_powershell_unicode() {
     if is_server_2012_r2().await {
         eprintln!(
@@ -263,7 +306,7 @@ async fn run_powershell_unicode() {
 // --- Shell reuse ---
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn shell_reuse_multiple_commands() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let shell = client.open_shell(&host).await.expect("open shell");
@@ -295,7 +338,7 @@ async fn shell_reuse_multiple_commands() {
 // --- Streaming ---
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn shell_start_command_and_receive() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let shell = client.open_shell(&host).await.expect("open shell");
@@ -326,7 +369,7 @@ async fn shell_start_command_and_receive() {
 // --- Facts gathering (ferrum-style) ---
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn gather_host_facts_json() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let script = r"
@@ -356,7 +399,7 @@ $facts | ConvertTo-Json -Compress
 // === WQL/WMI queries ===
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn wql_query_win32_operatingsystem() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let result = client
@@ -374,7 +417,7 @@ async fn wql_query_win32_operatingsystem() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn wql_query_win32_service() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let result = client
@@ -393,7 +436,7 @@ async fn wql_query_win32_service() {
 
 /// Many small pages: the enumeration is followed to its end.
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn run_wql_pages_to_the_end_with_a_small_envelope() {
     let (client, host) = test_client_with(|c| c.max_envelope_size = 8192)
         .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
@@ -439,7 +482,7 @@ fn test_client_ntlm() -> Option<(WinrmClient, String)> {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn ntlm_run_command_whoami() {
     let (client, host) = test_client_ntlm().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let output = client
@@ -452,7 +495,7 @@ async fn ntlm_run_command_whoami() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn ntlm_run_powershell() {
     let (client, host) = test_client_ntlm().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let output = client
@@ -465,7 +508,7 @@ async fn ntlm_run_powershell() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn ntlm_shell_reuse() {
     let (client, host) = test_client_ntlm().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let shell = client.open_shell(&host).await.expect("ntlm open shell");
@@ -523,7 +566,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogLines {
 /// announce `Proxy-Support: Session-Based-Authentication`. Skipped without
 /// `WINRM_TEST_PROXY`.
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn ntlm_through_a_forward_proxy() {
     use tracing_subscriber::util::SubscriberInitExt;
     use winrm_rs::ProxySessionAuth;
@@ -586,7 +629,7 @@ async fn ntlm_through_a_forward_proxy() {
 // === File transfer ===
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn upload_and_download_file() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
 
@@ -626,7 +669,7 @@ async fn upload_and_download_file() {
 /// An empty local file truncates an existing remote file, and creates the
 /// remote file when it is missing.
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn upload_empty_file_truncates_the_remote_file() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
 
@@ -691,7 +734,7 @@ async fn upload_empty_file_truncates_the_remote_file() {
 /// a 10 000-byte file goes to a 200-character path holding four U+2019 and
 /// comes back identical.
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn upload_to_a_long_quoted_path() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
 
@@ -745,6 +788,176 @@ async fn upload_to_a_long_quoted_path() {
     let _ = std::fs::remove_file(&local_download);
 }
 
+/// [`test_client`] with `RemotePathPolicy::Any`, which only the builder sets.
+fn test_client_any_remote_path() -> Option<(WinrmClient, String)> {
+    let (host, config, credentials) = test_settings()?;
+    let client = WinrmClient::builder(config)
+        .credentials(credentials)
+        .remote_path_policy(RemotePathPolicy::Any)
+        .build()
+        .ok()?;
+    Some((client, host))
+}
+
+/// Gives drive `T:` to every logon session of the host, as a `subst` drive
+/// on the share `\\localhost\C$\Windows\Temp`. Prints the type of the drive,
+/// then the short name of a file it puts in that directory.
+///
+/// A host that already has a drive `T:` is left as it is: the script prints
+/// `InUse` and stops. What an earlier run may have left is removed first.
+///
+/// A `subst` run by the test's own command is seen by that command's logon
+/// session alone; run by SYSTEM, here through a scheduled task, it goes to
+/// the namespace all sessions share.
+const NETWORK_DRIVE_UP: &str = r"if (([Environment]::GetLogicalDrives() -contains 'T:\') -or (([IO.DriveInfo]'T').DriveType -ne 'NoRootDirectory')) { 'InUse'; return }
+Remove-Item -LiteralPath 'C:\Windows\Temp\winrm-rs-t.bin' -ErrorAction SilentlyContinue
+'short names' | Set-Content -LiteralPath 'C:\Windows\Temp\winrm-rs-t-long-name.bin'
+& schtasks.exe /create /tn winrm-rs-netdrive /tr 'subst.exe T: \\localhost\C$\Windows\Temp' /sc once /st 00:00 /ru SYSTEM /f 2>&1 | Out-Null
+& schtasks.exe /run /tn winrm-rs-netdrive 2>&1 | Out-Null
+foreach ($i in 1..40) { if (([IO.DriveInfo]'T').DriveType -ne 'NoRootDirectory') { break }; Start-Sleep -Milliseconds 250 }
+([IO.DriveInfo]'T').DriveType
+(New-Object -ComObject Scripting.FileSystemObject).GetFile('C:\Windows\Temp\winrm-rs-t-long-name.bin').ShortName";
+
+/// Removes drive `T:`, the scheduled task and the files of the test, and
+/// prints the type of the drive, which is `NoRootDirectory` once it is gone.
+const NETWORK_DRIVE_DOWN: &str = r"& schtasks.exe /create /tn winrm-rs-netdrive /tr 'subst.exe T: /D' /sc once /st 00:00 /ru SYSTEM /f 2>&1 | Out-Null
+& schtasks.exe /run /tn winrm-rs-netdrive 2>&1 | Out-Null
+foreach ($i in 1..40) { if (([IO.DriveInfo]'T').DriveType -eq 'NoRootDirectory') { break }; Start-Sleep -Milliseconds 250 }
+& schtasks.exe /delete /tn winrm-rs-netdrive /f 2>&1 | Out-Null
+Remove-Item -LiteralPath 'C:\Windows\Temp\winrm-rs-t.bin', 'C:\Windows\Temp\winrm-rs-t-long-name.bin' -ErrorAction SilentlyContinue
+([IO.DriveInfo]'T').DriveType";
+
+/// A drive letter of the host that leads to a share is refused by the host
+/// under `RemotePathPolicy::LocalDrive`, and opened under `Any`.
+///
+/// `T:\winrm-rs-t.bin` reads as a path on a local drive: only the host
+/// knows that the letter leads to `\\localhost\C$\Windows\Temp`.
+///
+/// The refusal comes before the host asks anything of the drive: a path
+/// given by the short name of a file of the share is refused under that
+/// name, where resolving it first would put the long name in the answer.
+///
+/// The transfers are made first and judged after the drive is removed, so
+/// that a failed assertion does not leave the drive behind. A set-up call
+/// that fails on the way can: `NETWORK_DRIVE_DOWN` is the script that
+/// removes what it made.
+#[tokio::test]
+#[ignore = "BENCH ONLY: gives the host a drive letter and a scheduled task for the time of the test"]
+async fn network_drive_is_refused_by_the_host_under_local_drive() {
+    const ON_DRIVE: &str = r"T:\winrm-rs-t.bin";
+    const ON_DISK: &str = r"C:\Windows\Temp\winrm-rs-t.bin";
+    const LONG_NAME: &str = "winrm-rs-t-long-name.bin";
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let (any, _) = test_client_any_remote_path().expect("a client with RemotePathPolicy::Any");
+    let content = b"through a drive letter that leads to a share\n";
+    let local = std::env::temp_dir().join("winrm_rs_test_netdrive_up.bin");
+    let back = std::env::temp_dir().join("winrm_rs_test_netdrive_down.bin");
+    std::fs::write(&local, content).expect("write local file");
+    let _ = std::fs::remove_file(&back);
+
+    let up = client
+        .run_powershell(&host, NETWORK_DRIVE_UP)
+        .await
+        .expect("give the host drive T:");
+    let up_stdout = String::from_utf8_lossy(&up.stdout).into_owned();
+    let mut up_lines = up_stdout.lines().map(str::trim);
+    let drive_type = up_lines.next().unwrap_or_default();
+    let short_name = up_lines.next().unwrap_or_default();
+    assert_ne!(
+        drive_type, "InUse",
+        "the host already has a drive T:, nothing was changed"
+    );
+    let by_short_name = format!(r"T:\{short_name}");
+
+    let refused_upload = client.upload_file(&host, &local, ON_DRIVE).await;
+    let created = client
+        .run_powershell(&host, &format!("Test-Path -LiteralPath '{ON_DISK}'"))
+        .await;
+    let refused_download = client.download_file(&host, ON_DRIVE, &back).await;
+    let refused_timed = client
+        .download_file_with_timeout(&host, ON_DRIVE, &back, Duration::from_secs(60))
+        .await;
+    let refused_short = client.download_file(&host, &by_short_name, &back).await;
+    let written_before = back.exists();
+
+    let any_upload = any.upload_file(&host, &local, ON_DRIVE).await;
+    let any_download = any.download_file(&host, ON_DRIVE, &back).await;
+    let through_drive = std::fs::read(&back);
+    let _ = std::fs::remove_file(&back);
+    let disk_download = client.download_file(&host, ON_DISK, &back).await;
+    let on_disk = std::fs::read(&back);
+
+    let down = client
+        .run_powershell(&host, NETWORK_DRIVE_DOWN)
+        .await
+        .expect("remove drive T:");
+    let _ = std::fs::remove_file(&local);
+    let _ = std::fs::remove_file(&back);
+
+    assert_eq!(
+        drive_type,
+        "Network",
+        "drive T: is not a network drive: {}",
+        String::from_utf8_lossy(&up.stderr)
+    );
+    if short_name.contains('~') {
+        println!("by short name: {refused_short:?}");
+        match refused_short {
+            Err(WinrmError::Transfer(m)) => {
+                let refusal = format!(
+                    "RemotePathPolicy::LocalDrive refuses '{by_short_name}' (drive type 'Network')"
+                );
+                assert!(m.contains(&refusal), "{m}");
+                assert!(
+                    !m.contains(LONG_NAME),
+                    "the refusal names a file of the share: {m}"
+                );
+            }
+            other => panic!("short name: expected the host's refusal, got {other:?}"),
+        }
+    } else {
+        println!("the host's C: gives no short names ({short_name:?}): that part is skipped");
+    }
+    for (what, result) in [
+        ("upload_file", refused_upload),
+        ("download_file", refused_download),
+        ("download_file_with_timeout", refused_timed),
+    ] {
+        println!("{what}: {result:?}");
+        match result {
+            Err(WinrmError::Transfer(m)) => assert!(
+                m.contains(
+                    r"RemotePathPolicy::LocalDrive refuses 'T:\winrm-rs-t.bin' (drive type 'Network')"
+                ),
+                "{what}: {m}"
+            ),
+            other => panic!("{what}: expected the host's refusal, got {other:?}"),
+        }
+    }
+    let created = created.expect("look for the file a refused upload must not create");
+    assert_eq!(
+        String::from_utf8_lossy(&created.stdout).trim(),
+        "False",
+        "a refused upload created the file"
+    );
+    assert!(!written_before, "a refused download wrote the local file");
+
+    assert_eq!(any_upload.expect("upload under Any"), content.len() as u64);
+    assert_eq!(
+        any_download.expect("download under Any"),
+        content.len() as u64
+    );
+    assert_eq!(through_drive.expect("read what came through T:"), content);
+    disk_download.expect("download the same file by its path on C:");
+    assert_eq!(on_disk.expect("read what came from C:"), content);
+    assert_eq!(
+        String::from_utf8_lossy(&down.stdout).trim(),
+        "NoRootDirectory",
+        "drive T: is still there: {}",
+        String::from_utf8_lossy(&down.stderr)
+    );
+}
+
 /// A failed upload leaves no shell behind.
 ///
 /// A 4001-byte upload sends three chunks. A `before_send` hook refuses a
@@ -760,7 +973,7 @@ async fn upload_to_a_long_quoted_path() {
 /// (the shell Delete does not end a running command on every host). Run the
 /// test alone (`-- --ignored --test-threads=1`) to read them.
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn upload_failure_leaves_no_shell_behind() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -844,7 +1057,7 @@ async fn upload_failure_leaves_no_shell_behind() {
 // === CLIXML stderr parsing ===
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn powershell_stderr_clixml_parsed() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let output = client
@@ -871,7 +1084,7 @@ async fn powershell_stderr_clixml_parsed() {
 /// 2012 R2) has no information stream, so the raw-stderr half, which proves
 /// the copy exists, only runs on newer hosts.
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn write_host_reaches_stdout_once() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let script = "Write-Host 'host-marker'";
@@ -958,7 +1171,7 @@ fn assert_large_clixml_decoded(stderr: &[u8]) {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn powershell_large_clixml_stderr_reassembled() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let output = client
@@ -969,7 +1182,7 @@ async fn powershell_large_clixml_stderr_reassembled() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn streaming_large_clixml_stderr_reassembled() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let shell = client.open_shell(&host).await.expect("open shell");
@@ -998,7 +1211,7 @@ async fn streaming_large_clixml_stderr_reassembled() {
 /// the burst is written ~10 s before the last error, so its first record must
 /// arrive on a poll that is neither `done` nor already holding the last one.
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn streaming_clixml_stderr_yields_records_before_exit() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let shell = client.open_shell(&host).await.expect("open shell");
@@ -1055,7 +1268,7 @@ async fn streaming_clixml_stderr_yields_records_before_exit() {
 /// strict `after == before == 0` check holds even while other live tests open
 /// and close shells in the same process or the server reaps old ones.
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn max_output_bytes_aborts_and_releases_shell() {
     // Unique per process, below the server's 7200 s default ceiling.
     let marker = 4000 + u64::from(std::process::id() % 3000);
@@ -1097,7 +1310,7 @@ async fn max_output_bytes_aborts_and_releases_shell() {
 /// deleted the remote shell (counted through the marker `IdleTimeOut`, with a
 /// positive control so a failed enumeration cannot read as 0).
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn run_powershell_with_timeout_expires_and_releases_shell() {
     // Unique per process, below the server's 7200 s default ceiling and
     // outside the range `max_output_bytes_aborts_and_releases_shell` uses.
@@ -1163,7 +1376,7 @@ async fn wait_until_no_process_matches(
 /// its deadline (`2 * operation_timeout_secs`) and on `max_output_bytes`, and
 /// the shell stays usable.
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn shell_run_command_terminates_on_cap_and_deadline() {
     let (observer, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
 
@@ -1216,7 +1429,7 @@ async fn shell_run_command_terminates_on_cap_and_deadline() {
 /// A command that finishes inside the limit returns its output as
 /// `run_powershell` would, and leaves no shell.
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn run_powershell_with_timeout_returns_output_of_a_fast_command() {
     let marker = 7150 + u64::from(std::process::id() % 40);
     let (client, host) = test_client_with(|c| c.idle_timeout_secs = Some(marker))
@@ -1248,7 +1461,7 @@ async fn run_powershell_with_timeout_returns_output_of_a_fast_command() {
 /// must leave no shell behind (before this was fixed the shell survived until
 /// its idle timeout).
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn run_powershell_with_cancel_releases_shell() {
     // Unique per process, below the server's 7200 s default ceiling and
     // outside the (disjoint) ranges of the other shell-count tests.
@@ -1297,7 +1510,7 @@ async fn run_powershell_with_cancel_releases_shell() {
 /// stderr, under the 64 KiB cap, while the raw CLIXML is ~160 KB, far over it.
 /// Only a cap applied to the raw bytes can trip.
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn max_output_bytes_counts_raw_clixml_stderr() {
     const CAP: usize = 64 * 1024;
     const SCRIPT: &str = "1..40 | % { Write-Error ([string][char]9 * 500) }";
@@ -1339,7 +1552,7 @@ async fn max_output_bytes_counts_raw_clixml_stderr() {
 /// Drive the whole shell/command state machine by hand, one primitive per
 /// step, instead of going through `run_command`.
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn low_level_command_lifecycle() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
 
@@ -1393,7 +1606,7 @@ async fn low_level_command_lifecycle() {
 /// shell is created and the command started with a default-timeout client, so
 /// slow setup requests on a busy bench stay out of the short window.
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn signal_terminate_stops_running_command() {
     let (setup, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let (client, _) = test_client_with(|c| c.operation_timeout_secs = 15)
@@ -1449,7 +1662,7 @@ async fn signal_terminate_stops_running_command() {
 // === Working directory ===
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn shell_with_working_directory() {
     let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
     let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
@@ -1482,7 +1695,7 @@ async fn shell_with_working_directory() {
 // === Environment variables ===
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn shell_with_env_vars() {
     let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
     let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
@@ -1515,7 +1728,7 @@ async fn shell_with_env_vars() {
 // === Stdin piping ===
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn shell_send_input_stdin() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let shell = client.open_shell(&host).await.expect("open shell");
@@ -1554,7 +1767,7 @@ async fn shell_send_input_stdin() {
 // === Retry on transient errors ===
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn retry_config_works_with_real_server() {
     let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
     let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
@@ -1583,7 +1796,7 @@ async fn retry_config_works_with_real_server() {
 // === CancellationToken ===
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn cancel_long_running_command() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let cancel = CancellationToken::new();
@@ -1617,7 +1830,7 @@ async fn cancel_long_running_command() {
 /// network. If the local network answers with an immediate ICMP unreachable,
 /// the call fails fast and the assertion still holds.
 #[tokio::test]
-#[ignore]
+#[ignore = "touches the network: a connect to a non-routable address"]
 async fn connect_timeout_is_honoured() {
     let config = WinrmConfig {
         auth_method: AuthMethod::Basic,
@@ -1663,7 +1876,7 @@ async fn connect_timeout_is_honoured() {
 /// regression that surfaces the Receive `TimedOut` fault again fails every
 /// attempt, so it still turns the test red.
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn shell_run_command_times_out() {
     const OP: u64 = 15;
     const SETUP_TRIES: usize = 6;
@@ -1784,7 +1997,7 @@ async fn assert_silent_command_completes(client: &WinrmClient, host: &str) {
 /// the server's `TimedOut` fault on Receive is an empty poll and the call goes
 /// on until the command completes (Basic over HTTP).
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn silent_command_longer_than_operation_timeout_completes() {
     let (client, host) = test_client_with(|c| c.operation_timeout_secs = SILENT_OP_SECS)
         .expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
@@ -1948,13 +2161,13 @@ impl RecordingForwarder {
     /// Occurrences of `needle` (ASCII, case-insensitive) in the bytes sent
     /// towards the server.
     fn count_to_server(&self, needle: &str) -> usize {
-        Self::count(self.streams(true), needle)
+        Self::count(&self.streams(true), needle)
     }
 
     /// Occurrences of `needle` (ASCII, case-insensitive) in the bytes sent
     /// back to the client.
     fn count_to_client(&self, needle: &str) -> usize {
-        Self::count(self.streams(false), needle)
+        Self::count(&self.streams(false), needle)
     }
 
     /// Size of the largest HTTP answer body sent back to the client, from
@@ -1974,7 +2187,7 @@ impl RecordingForwarder {
             .unwrap_or(0)
     }
 
-    fn count(streams: Vec<Vec<u8>>, needle: &str) -> usize {
+    fn count(streams: &[Vec<u8>], needle: &str) -> usize {
         let needle = needle.to_ascii_lowercase().into_bytes();
         streams
             .iter()
@@ -2061,7 +2274,7 @@ fn sealed_traffic(forwarder: &RecordingForwarder) -> (usize, usize) {
 /// fault happened (a `500` status line) and that the NTLM handshake ran once
 /// (two `Authorization: Negotiate` requests, Type 1 and Type 3).
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn silent_command_completes_over_ntlm_sealed_http() {
     let (client, forwarder) =
         sealed_ntlm_client(|c| c.operation_timeout_secs = SILENT_OP_SECS).await;
@@ -2096,7 +2309,7 @@ async fn silent_command_completes_over_ntlm_sealed_http() {
 /// upload chunks (several sealed requests each) and a download whose base64
 /// response runs to some 270 KB across several sealed Receive answers.
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn ntlm_sealed_upload_and_download_large_file() {
     let (client, forwarder) = sealed_ntlm_client(|_| {}).await;
 
@@ -2150,7 +2363,7 @@ async fn ntlm_sealed_upload_and_download_large_file() {
 /// `cancel_long_running_command`. Cancelling drops a sealed exchange in
 /// flight, so the same client must still work afterwards.
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn ntlm_sealed_cancel_long_running_command() {
     let (client, forwarder) = sealed_ntlm_client(|_| {}).await;
     let forwarder = std::sync::Arc::new(forwarder);
@@ -2209,7 +2422,7 @@ async fn ntlm_sealed_cancel_long_running_command() {
 
 /// Ctrl+C over sealed NTLM: same outcome as `shell_signal_ctrl_c`.
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn ntlm_sealed_shell_signal_ctrl_c() {
     let (client, forwarder) = sealed_ntlm_client(|_| {}).await;
     let shell = client.open_shell(SEALED_HOST).await.expect("open shell");
@@ -2296,7 +2509,7 @@ async fn concurrent_shells_timings(client: &WinrmClient, host: &str) -> (Duratio
 /// Concurrent shells over Basic: the reference timings for
 /// `ntlm_sealed_concurrent_shells`.
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn concurrent_shells_timings_basic() {
     // Default operation timeout: the 10 s command ends its Receive anyway, and
     // shell creation must not race a short window on a busy bench.
@@ -2310,7 +2523,7 @@ async fn concurrent_shells_timings_basic() {
 /// per connection); compare the timings with
 /// `concurrent_shells_timings_basic`.
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn ntlm_sealed_concurrent_shells() {
     // Default operation timeout, as in `concurrent_shells_timings_basic`.
     let (client, forwarder) = sealed_ntlm_client(|_| {}).await;
@@ -2353,7 +2566,7 @@ async fn sealed_large_output(max_envelope_size: u32) -> usize {
 /// `MaxEnvelopeSize`: it arrives over several sealed Receive answers, each
 /// under the response cap (`4 * max(MaxEnvelopeSize, 512 KiB)`).
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn ntlm_sealed_large_output_default_envelope() {
     let largest = sealed_large_output(153_600).await;
     assert!(
@@ -2366,7 +2579,7 @@ async fn ntlm_sealed_large_output_default_envelope() {
 /// 2025 still answers a Receive with about 150 KB at most (measured 155 KB),
 /// well under the cap.
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn ntlm_sealed_large_output_500k_envelope() {
     let largest = sealed_large_output(512_000).await;
     assert!(
@@ -2379,7 +2592,7 @@ async fn ntlm_sealed_large_output_500k_envelope() {
 /// cannot be checked here; the server accepting the sealed requests is the
 /// evidence).
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn ntlm_encryption_always_over_https() {
     if is_server_2012_r2().await {
         eprintln!(
@@ -2405,7 +2618,7 @@ async fn ntlm_encryption_always_over_https() {
 
 /// Same over Certificate authentication (HTTPS).
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn silent_command_completes_over_certificate_auth() {
     if is_server_2012_r2().await {
         eprintln!(
@@ -2415,7 +2628,7 @@ async fn silent_command_completes_over_certificate_auth() {
     }
     let (client, host) =
         cert_client_from_env("WINRM_TEST_CLIENT_CERT", "WINRM_TEST_CLIENT_KEY", |c| {
-            c.operation_timeout_secs = SILENT_OP_SECS
+            c.operation_timeout_secs = SILENT_OP_SECS;
         })
         .expect("set WINRM_TEST_HOST, WINRM_TEST_PASS and eval tests/scripts/make-client-cert.sh");
     assert_silent_command_completes(&client, &host).await;
@@ -2424,7 +2637,7 @@ async fn silent_command_completes_over_certificate_auth() {
 /// Same over CredSSP (HTTPS).
 #[cfg(feature = "credssp")]
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn silent_command_completes_over_credssp() {
     if is_server_2012_r2().await {
         eprintln!(
@@ -2455,7 +2668,7 @@ async fn silent_command_completes_over_credssp() {
 // === Idle timeout ===
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn shell_with_idle_timeout_works() {
     let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
     let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
@@ -2483,7 +2696,7 @@ async fn shell_with_idle_timeout_works() {
 // === Custom User-Agent ===
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn custom_user_agent_does_not_break() {
     let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
     let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
@@ -2511,7 +2724,7 @@ async fn custom_user_agent_does_not_break() {
 // === Proxy error test ===
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn invalid_proxy_returns_http_error() {
     let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
     let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
@@ -2735,7 +2948,7 @@ fn https_test_port() -> u16 {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn http_proxy_carries_ntlm_over_http() {
     let proxy = TestProxy::http().await;
     let proxy_url = format!("http://{}", proxy.addr);
@@ -2761,7 +2974,7 @@ async fn http_proxy_carries_ntlm_over_http() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn http_proxy_connect_carries_https() {
     if is_server_2012_r2().await {
         eprintln!(
@@ -2804,7 +3017,7 @@ async fn http_proxy_connect_carries_https() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn socks5_proxy_carries_ntlm() {
     let proxy = TestProxy::socks5().await;
     let proxy_url = format!("socks5://{}", proxy.addr);
@@ -2827,7 +3040,7 @@ async fn socks5_proxy_carries_ntlm() {
 // === HTTPS setup helper (run once to enable HTTPS tests) ===
 
 #[tokio::test]
-#[ignore]
+#[ignore = "BENCH ONLY: changes the host's configuration and does not undo it"]
 async fn setup_https_listener() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let script = r#"
@@ -2859,7 +3072,7 @@ async fn setup_https_listener() {
 // === HTTPS tests (require setup_https_listener to have run first) ===
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn check_https_listener_status() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
 
@@ -2913,7 +3126,7 @@ fn test_client_https_ntlm() -> Option<(WinrmClient, String)> {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "BENCH ONLY: changes the host's configuration and does not undo it"]
 async fn enable_credssp_server() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let script = r"
@@ -2931,7 +3144,7 @@ async fn enable_credssp_server() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "BENCH ONLY: changes the host's configuration and does not undo it"]
 async fn enable_cbt_hardening_strict() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let script = r"
@@ -2949,7 +3162,7 @@ async fn enable_cbt_hardening_strict() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn compute_server_cbt_hash() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let script = r#"
@@ -2975,7 +3188,7 @@ async fn compute_server_cbt_hash() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn dump_https_cert_info() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let script = r"
@@ -3000,7 +3213,7 @@ async fn dump_https_cert_info() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn dump_winrm_service_config() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let script = r"
@@ -3021,7 +3234,7 @@ async fn dump_winrm_service_config() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn basic_over_https_works() {
     if is_server_2012_r2().await {
         eprintln!(
@@ -3063,7 +3276,7 @@ async fn basic_over_https_works() {
 
 #[cfg(feature = "credssp")]
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn credssp_run_command_whoami() {
     // Full MS-CSSP handshake against a live host. 2012 R2 is skipped below:
     // it has no cipher suite rustls will take, so the HTTPS leg never gets
@@ -3147,7 +3360,7 @@ async fn credssp_whoami_through(test: &str, proxy_url: String) -> Option<()> {
 /// tunnel.
 #[cfg(feature = "credssp")]
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn credssp_through_http_proxy() {
     let proxy = TestProxy::http().await;
     let url = format!("http://{}", proxy.addr);
@@ -3171,7 +3384,7 @@ async fn credssp_through_http_proxy() {
 /// CredSSP through a SOCKS5 proxy.
 #[cfg(feature = "credssp")]
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn credssp_through_socks5_proxy() {
     let proxy = TestProxy::socks5().await;
     let url = format!("socks5://{}", proxy.addr);
@@ -3191,7 +3404,7 @@ async fn credssp_through_socks5_proxy() {
 /// by its `Content-Length` (identity coding, no chunked framing).
 #[cfg(feature = "credssp")]
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn credssp_reads_a_large_framed_response() {
     if is_server_2012_r2().await {
         eprintln!(
@@ -3227,7 +3440,7 @@ async fn credssp_reads_a_large_framed_response() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn ntlm_over_https_with_cbt() {
     if is_server_2012_r2().await {
         eprintln!(
@@ -3258,7 +3471,7 @@ async fn ntlm_over_https_with_cbt() {
 // is surfaced correctly when attempting disconnect on a cmd shell.
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn shell_disconnect_returns_error_on_cmd_shell() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let shell = client.open_shell(&host).await.expect("open shell");
@@ -3277,10 +3490,104 @@ async fn shell_disconnect_returns_error_on_cmd_shell() {
     );
 }
 
+/// The opening messages of a PowerShell remoting session, as the
+/// `creationXml` of its shell: `SESSION_CAPABILITY` then `INIT_RUNSPACEPOOL`
+/// (MS-PSRP 2.2.2.1 and 2.2.2.2), each in one fragment (2.2.4). The crate
+/// does not speak that protocol: this is the least a server asks to open a
+/// shell of the kind it lets disconnect.
+fn psrp_creation_xml() -> String {
+    use base64::Engine as _;
+
+    const SESSION_CAPABILITY: &str = concat!(
+        r#"<Obj RefId="0"><MS>"#,
+        r#"<Version N="protocolversion">2.3</Version>"#,
+        r#"<Version N="PSVersion">2.0</Version>"#,
+        r#"<Version N="SerializationVersion">1.1.0.1</Version>"#,
+        "</MS></Obj>",
+    );
+    const INIT_RUNSPACEPOOL: &str = concat!(
+        r#"<Obj RefId="0"><MS>"#,
+        r#"<I32 N="MinRunspaces">1</I32><I32 N="MaxRunspaces">1</I32>"#,
+        r#"<Obj N="PSThreadOptions" RefId="1"><TN RefId="0">"#,
+        "<T>System.Management.Automation.Runspaces.PSThreadOptions</T>",
+        "<T>System.Enum</T><T>System.ValueType</T><T>System.Object</T></TN>",
+        "<ToString>Default</ToString><I32>0</I32></Obj>",
+        r#"<Obj N="ApartmentState" RefId="2"><TN RefId="1">"#,
+        "<T>System.Threading.ApartmentState</T>",
+        "<T>System.Enum</T><T>System.ValueType</T><T>System.Object</T></TN>",
+        "<ToString>Unknown</ToString><I32>2</I32></Obj>",
+        r#"<Obj N="ApplicationArguments" RefId="3"><TN RefId="2">"#,
+        "<T>System.Management.Automation.PSPrimitiveDictionary</T>",
+        "<T>System.Collections.Hashtable</T><T>System.Object</T></TN><DCT /></Obj>",
+        r#"<Obj N="HostInfo" RefId="4"><MS>"#,
+        r#"<B N="_isHostNull">true</B><B N="_isHostUINull">true</B>"#,
+        r#"<B N="_isHostRawUINull">true</B><B N="_useRunspaceHost">true</B>"#,
+        "</MS></Obj></MS></Obj>",
+    );
+
+    let runspace_pool = uuid::Uuid::new_v4();
+    let mut fragments = Vec::new();
+    for (object_id, message_type, data) in [
+        (1_u64, 0x0001_0002_u32, SESSION_CAPABILITY),
+        (2, 0x0001_0004, INIT_RUNSPACEPOOL),
+    ] {
+        let mut message = Vec::new();
+        message.extend_from_slice(&2_u32.to_le_bytes()); // to the server
+        message.extend_from_slice(&message_type.to_le_bytes());
+        message.extend_from_slice(&runspace_pool.to_bytes_le());
+        message.extend_from_slice(&[0; 16]); // of no pipeline
+        message.extend_from_slice(data.as_bytes());
+
+        fragments.extend_from_slice(&object_id.to_be_bytes());
+        fragments.extend_from_slice(&0_u64.to_be_bytes()); // its first fragment
+        fragments.push(0b11); // which is also its last
+        fragments.extend_from_slice(&u32::try_from(message.len()).unwrap().to_be_bytes());
+        fragments.extend_from_slice(&message);
+    }
+    base64::engine::general_purpose::STANDARD.encode(fragments)
+}
+
+/// A PowerShell remoting shell is the kind Windows lets disconnect. The
+/// answers of a Disconnect and of a Reconnect hold nothing the client reads:
+/// a real server shows here that they are answers all the same, which no
+/// other test of this suite does (a cmd shell refuses the Disconnect).
+#[tokio::test]
+#[ignore = "needs the Windows bench: see the head of this file"]
+async fn psrp_shell_disconnects_and_reconnects() {
+    use winrm_rs::RESOURCE_URI_PSRP;
+
+    let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
+    let shell = client
+        .open_psrp_shell(&host, &psrp_creation_xml(), RESOURCE_URI_PSRP)
+        .await
+        .expect("open a PowerShell remoting shell");
+
+    // The server answers the opening messages on the shell itself.
+    let shell_id = shell.shell_id().to_owned();
+    let opening = shell
+        .receive_next(&shell_id)
+        .await
+        .expect("receive the server's opening messages");
+    assert!(
+        !opening.stdout.is_empty(),
+        "no opening message from the server"
+    );
+
+    let disconnected = shell.disconnect().await.expect("disconnect");
+    assert_eq!(disconnected, shell_id);
+
+    let shell = client
+        .reconnect_shell(&host, &disconnected, RESOURCE_URI_PSRP)
+        .await
+        .expect("reconnect");
+    // The shell is the one that was left: the server still knows it.
+    shell.close().await.expect("close the reconnected shell");
+}
+
 // === Signal Ctrl+C ===
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn shell_signal_ctrl_c() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let shell = client.open_shell(&host).await.expect("open shell");
@@ -3321,7 +3628,7 @@ async fn shell_signal_ctrl_c() {
 // === Multi-chunk file transfer ===
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn upload_and_download_large_file() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
 
@@ -3362,7 +3669,7 @@ async fn upload_and_download_large_file() {
 // === Binary file transfer (all byte values) ===
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn upload_and_download_binary_file() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
 
@@ -3401,7 +3708,7 @@ async fn upload_and_download_binary_file() {
 // === Concurrent shells ===
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn concurrent_shells() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
 
@@ -3434,7 +3741,7 @@ async fn concurrent_shells() {
 // === PowerShell with cancellation (Shell-level) ===
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn shell_run_powershell_with_cancel() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let shell = client.open_shell(&host).await.expect("open shell");
@@ -3468,7 +3775,7 @@ async fn shell_run_powershell_with_cancel() {
 // === WQL with custom namespace ===
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn wql_query_custom_namespace() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let result = client
@@ -3488,7 +3795,7 @@ async fn wql_query_custom_namespace() {
 // === WQL with invalid namespace ===
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn wql_query_invalid_namespace() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let result = client
@@ -3507,7 +3814,7 @@ async fn wql_query_invalid_namespace() {
 // === Small max envelope size ===
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn small_max_envelope_size() {
     let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
     let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
@@ -3539,7 +3846,7 @@ async fn small_max_envelope_size() {
 // EncryptionMode::Always forces NTLM message sealing (multipart/encrypted).
 // The first request authenticates with plaintext, subsequent requests are sealed.
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn ntlm_encryption_always() {
     let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
     let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
@@ -3565,7 +3872,7 @@ async fn ntlm_encryption_always() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn ntlm_encryption_never() {
     let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
     let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
@@ -3591,7 +3898,7 @@ async fn ntlm_encryption_never() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn ntlm_encryption_auto_over_http() {
     let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
     let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
@@ -3619,7 +3926,7 @@ async fn ntlm_encryption_auto_over_http() {
 // === Builder pattern ===
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn builder_pattern_works() {
     let host = std::env::var("WINRM_TEST_HOST").expect("WINRM_TEST_HOST");
     let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
@@ -3650,7 +3957,7 @@ async fn builder_pattern_works() {
 // === Error cases on real server ===
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn invalid_shell_id_returns_error() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let result = client
@@ -3663,7 +3970,7 @@ async fn invalid_shell_id_returns_error() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn double_delete_shell_returns_error() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let shell_id = client.create_shell(&host).await.expect("create shell");
@@ -3681,7 +3988,7 @@ async fn double_delete_shell_returns_error() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn command_on_deleted_shell_returns_error() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let shell_id = client.create_shell(&host).await.expect("create shell");
@@ -3754,7 +4061,7 @@ fn probe_text(bytes: &[u8]) -> String {
 
 /// The full path with `%SystemRoot%` runs the 64-bit System32 PowerShell.
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn probe_full_powershell_path_runs_system32() {
     let Some((client, host)) = test_client() else {
         eprintln!(
@@ -3794,7 +4101,7 @@ async fn probe_full_powershell_path_runs_system32() {
 /// A bare command name resolves from the shell's working directory before the
 /// search path, whereas the full path runs the real PowerShell.
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn probe_bare_name_resolves_from_the_working_directory() {
     let Some((client, host)) = test_client() else {
         eprintln!(
@@ -3898,7 +4205,7 @@ async fn probe_bare_name_resolves_from_the_working_directory() {
 /// It mutates a per-user profile file, so it must not run in parallel with
 /// other live tests (`--test-threads=1`).
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn probe_noprofile_skips_profile_output() {
     let Some((client, host)) = test_client() else {
         eprintln!(
@@ -4015,7 +4322,7 @@ async fn probe_noprofile_skips_profile_output() {
 /// of the list whose row has `exit_code == 0` and no "too long" in stderr, that
 /// is, the character count of the longest probe line that ran.
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn probe_command_line_limit() {
     let Some((client, host)) = test_client() else {
         eprintln!("SKIP probe_command_line_limit: set WINRM_TEST_HOST and WINRM_TEST_PASS");
@@ -4060,7 +4367,7 @@ async fn probe_command_line_limit() {
 /// The arguments reach `cmd.exe` as one command line, so an `&` inside one
 /// argument is an operator.
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn probe_arguments_are_one_cmd_line() {
     let Some((client, host)) = test_client() else {
         eprintln!("SKIP probe_arguments_are_one_cmd_line: set WINRM_TEST_HOST and WINRM_TEST_PASS");
@@ -4080,7 +4387,7 @@ async fn probe_arguments_are_one_cmd_line() {
 /// A `PATH` set through `env_vars` steers the bare `powershell.exe`, while the
 /// full path is unaffected.
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn probe_path_env_steers_bare_powershell() {
     let Some((client, host)) = test_client_with(|c| {
         c.env_vars = vec![(
@@ -4179,10 +4486,10 @@ fn test_client_rogue_cert() -> Option<(WinrmClient, String)> {
 /// client certificate during the initial handshake (rustls cannot renegotiate).
 ///
 /// BENCH ONLY: installs a root CA, maps it to an admin account and enables
-/// client-cert negotiation, with no teardown — never point WINRM_TEST_HOST at a
+/// client-cert negotiation, with no teardown — never point `WINRM_TEST_HOST` at a
 /// real machine.
 #[tokio::test]
-#[ignore]
+#[ignore = "BENCH ONLY: changes the host's configuration and does not undo it"]
 async fn setup_certificate_auth() {
     use base64::Engine as _;
     if is_server_2012_r2().await {
@@ -4316,7 +4623,7 @@ if ($Matches[1] -ne 'Enabled') { exit 3 }
 /// http://schemas.dmtf.org/wbem/wsman/1/wsman/secprofile/https/mutual` header
 /// that makes WinRM map it to an account (without either, HTTP 401).
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn certificate_auth_whoami() {
     if is_server_2012_r2().await {
         eprintln!(
@@ -4350,16 +4657,16 @@ async fn certificate_auth_whoami() {
 /// the same code path to the same host, authenticates. Without it, a client
 /// that never presents any certificate would pass the rejection check too.
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn certificate_auth_unmapped_cert_is_rejected() {
+    const BENCH: &str =
+        "set WINRM_TEST_HOST, WINRM_TEST_PASS and eval tests/scripts/make-client-cert.sh";
     if is_server_2012_r2().await {
         eprintln!(
             "SKIP certificate_auth_unmapped_cert_is_rejected: no TLS cipher suite shared with Server 2012 R2 (see basic_over_https_works)"
         );
         return;
     }
-    const BENCH: &str =
-        "set WINRM_TEST_HOST, WINRM_TEST_PASS and eval tests/scripts/make-client-cert.sh";
     let (mapped, host) = test_client_cert().expect(BENCH);
     let out = mapped
         .run_command(&host, "whoami", &[])
@@ -4451,7 +4758,7 @@ fn krb_bench_ntlm_credentials() -> WinrmCredentials {
 /// command runs as the domain user whose TGT is in the cache.
 #[cfg(feature = "kerberos")]
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the domain controller bench: see the Kerberos section of this file"]
 async fn kerberos_run_command_whoami() {
     let (client, host) = kerberos_client_from_env(|_| {});
     let output = client
@@ -4470,7 +4777,7 @@ async fn kerberos_run_command_whoami() {
 /// fault on a silent Receive is an empty poll, as over the other methods.
 #[cfg(feature = "kerberos")]
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the domain controller bench: see the Kerberos section of this file"]
 async fn silent_command_completes_over_kerberos() {
     let (client, host) = kerberos_client_from_env(|c| c.operation_timeout_secs = SILENT_OP_SECS);
     assert_silent_command_completes(&client, &host).await;
@@ -4484,7 +4791,7 @@ async fn silent_command_completes_over_kerberos() {
 /// fail.
 #[cfg(feature = "kerberos")]
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the domain controller bench: see the Kerberos section of this file"]
 async fn kerberos_two_commands_on_one_client() {
     let (client, host) = kerberos_client_from_env(|_| {});
     for round in 1..=2 {
@@ -4516,7 +4823,7 @@ async fn kerberos_two_commands_on_one_client() {
 /// `check_acceptor_sealed` has to go (the EC check stays).
 #[cfg(feature = "kerberos")]
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the domain controller bench: see the Kerberos section of this file"]
 async fn kerberos_sealed_answer_sizes() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("winrm_rs::kerberos::sealed=trace")
@@ -4545,7 +4852,7 @@ async fn kerberos_sealed_answer_sizes() {
 /// existing HTTPS listener is left as it is. Not undone.
 #[cfg(feature = "kerberos")]
 #[tokio::test]
-#[ignore]
+#[ignore = "BENCH ONLY: changes the domain controller's configuration and does not undo it"]
 async fn setup_dc_https_listener() {
     let (client, host) = kerberos_client_from_env(|_| {});
     let script = r#"
@@ -4598,7 +4905,7 @@ fn kerberos_https_client_from_env(tweak: impl FnOnce(&mut WinrmConfig)) -> (Winr
 /// the messages inside TLS.
 #[cfg(feature = "kerberos")]
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the domain controller bench: see the Kerberos section of this file"]
 async fn kerberos_over_https_whoami() {
     let (client, host) = kerberos_https_client_from_env(|_| {});
     let output = client
@@ -4719,7 +5026,7 @@ where
 /// it with a hint at the cause instead of an opaque `HTTP 500`.
 #[cfg(feature = "kerberos")]
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the domain controller bench: see the Kerberos section of this file"]
 async fn kerberos_unsealed_with_allow_unencrypted_false_is_a_clear_error() {
     with_dc_requiring_encryption(|| async {
         let (client, host) = kerberos_client_from_env(|c| c.encryption = EncryptionMode::Never);
@@ -4796,7 +5103,7 @@ fn kerberos_sealed_traffic(forwarder: &RecordingForwarder) -> usize {
 /// sealed. Every SOAP body crosses sealed, each connection authenticates once.
 #[cfg(feature = "kerberos")]
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the domain controller bench: see the Kerberos section of this file"]
 async fn kerberos_sealed_with_allow_unencrypted_false() {
     with_dc_requiring_encryption(|| async {
         let (client, forwarder, host) = sealed_kerberos_client(|_| {}).await;
@@ -4861,7 +5168,7 @@ async fn kerberos_sealed_with_allow_unencrypted_false() {
 /// server accepting the sealed requests is the evidence; the wire is TLS).
 #[cfg(feature = "kerberos")]
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the domain controller bench: see the Kerberos section of this file"]
 async fn kerberos_encryption_always_over_https() {
     let (client, host) = kerberos_https_client_from_env(|c| c.encryption = EncryptionMode::Always);
     let output = client
@@ -5256,7 +5563,7 @@ fn kerberos_client_through_relay(
 /// the sealed one.
 #[cfg(feature = "kerberos")]
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the domain controller bench and the `openssl` command: see the Kerberos section"]
 async fn kerberos_channel_binding_through_a_tls_relay_is_refused() {
     let https_port: u16 = std::env::var("WINRM_TEST_KRB_HTTPS_PORT")
         .expect("WINRM_TEST_KRB_HTTPS_PORT")
@@ -5327,7 +5634,7 @@ async fn assert_split_relay_fails_at_the_handshake() {
 /// The split case under the DC's default `CbtHardeningLevel = Relaxed`.
 #[cfg(feature = "kerberos")]
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the domain controller bench and the `openssl` command: see the Kerberos section"]
 async fn kerberos_channel_binding_split_relay_fails_at_the_handshake() {
     assert_split_relay_fails_at_the_handshake().await;
 }
@@ -5339,7 +5646,7 @@ async fn kerberos_channel_binding_split_relay_fails_at_the_handshake() {
 /// them as is (TLS only), which shows the relay would see plaintext.
 #[cfg(feature = "kerberos")]
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the domain controller bench and the `openssl` command: see the Kerberos section"]
 async fn always_seals_inside_tls_seen_by_a_relay_with_dc_cbt_none() {
     with_dc_cbt_hardening("None", || async {
         let https_port: u16 = std::env::var("WINRM_TEST_KRB_HTTPS_PORT")
@@ -5411,7 +5718,7 @@ async fn always_seals_inside_tls_seen_by_a_relay_with_dc_cbt_none() {
 /// handshake as under `Relaxed`.
 #[cfg(feature = "kerberos")]
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the domain controller bench and the `openssl` command: see the Kerberos section"]
 async fn kerberos_over_https_with_dc_cbt_strict() {
     with_dc_cbt_hardening("Strict", || async {
         for mode in [
@@ -5457,7 +5764,7 @@ async fn kerberos_over_https_with_dc_cbt_strict() {
 /// must now pass on one connection each.
 #[cfg(feature = "kerberos")]
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the domain controller bench: see the Kerberos section of this file"]
 async fn sealed_download_after_upload_stays_on_its_connection_allow_unencrypted_false() {
     with_dc_requiring_encryption(|| async {
         let dc_port = std::env::var("WINRM_TEST_KRB_PORT").expect("WINRM_TEST_KRB_PORT");
@@ -5645,7 +5952,7 @@ async fn assert_refusal_leaves_session_usable(
 /// The hook sees every request a `run_command` issues (Create, Execute, at
 /// least one Receive, Signal, Delete).
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn before_send_sees_every_request_of_a_run_command() {
     let gate = Gate::open();
     let (client, host) = gated_client(&gate, |_| {});
@@ -5659,7 +5966,7 @@ async fn before_send_sees_every_request_of_a_run_command() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn before_send_refusal_leaves_a_basic_session_usable() {
     let gate = Gate::open();
     let (client, host) = gated_client(&gate, |_| {});
@@ -5671,7 +5978,7 @@ async fn before_send_refusal_leaves_a_basic_session_usable() {
 /// refusal after the sealing would show as a sequence-number gap that the
 /// server rejects.
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn before_send_refusal_leaves_a_sealed_ntlm_session_usable() {
     let gate = Gate::open();
     let (_, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
@@ -5726,7 +6033,7 @@ async fn assert_ntlm_https_refusal_leaves_session_usable(test: &str, mode: Encry
 
 /// Sealed NTLM over HTTPS (`Auto` without certificate verification).
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn before_send_refusal_leaves_an_ntlm_https_session_usable() {
     assert_ntlm_https_refusal_leaves_session_usable(
         "before_send_refusal_leaves_an_ntlm_https_session_usable",
@@ -5738,7 +6045,7 @@ async fn before_send_refusal_leaves_an_ntlm_https_session_usable() {
 /// Unsealed NTLM over HTTPS (`Never`): TLS alone, each message carried by
 /// its own Negotiate and Authenticate.
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn before_send_refusal_leaves_an_unsealed_ntlm_https_session_usable() {
     assert_ntlm_https_refusal_leaves_session_usable(
         "before_send_refusal_leaves_an_unsealed_ntlm_https_session_usable",
@@ -5749,7 +6056,7 @@ async fn before_send_refusal_leaves_an_unsealed_ntlm_https_session_usable() {
 
 #[cfg(feature = "credssp")]
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn before_send_refusal_leaves_a_credssp_session_usable() {
     if is_server_2012_r2().await {
         eprintln!(
@@ -5783,7 +6090,7 @@ async fn before_send_refusal_leaves_a_credssp_session_usable() {
 /// Kerberos tests.
 #[cfg(feature = "kerberos")]
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the domain controller bench: see the Kerberos section of this file"]
 async fn before_send_refusal_leaves_a_kerberos_session_usable() {
     const HINT: &str = "eval \"$(tests/scripts/vm-connect-dc.sh)\" and kinit vagrant@WINRM.TEST";
     let host = std::env::var("WINRM_TEST_KRB_HOST").expect(HINT);
@@ -5821,7 +6128,7 @@ fn init_debug_log() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn poll_pacing_bench_cmd_ping() {
     init_debug_log();
     let Some((client, host)) = test_client_with(|c| c.operation_timeout_secs = 60) else {
@@ -5836,7 +6143,7 @@ async fn poll_pacing_bench_cmd_ping() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn poll_pacing_bench_powershell_times_out_once() {
     init_debug_log();
     let Some((client, host)) = test_client_with(|c| c.operation_timeout_secs = 60) else {
@@ -5855,7 +6162,7 @@ async fn poll_pacing_bench_powershell_times_out_once() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn poll_pacing_bench_stderr_trickle() {
     init_debug_log();
     let Some((client, host)) = test_client_with(|c| c.operation_timeout_secs = 60) else {
@@ -5879,7 +6186,7 @@ async fn poll_pacing_bench_stderr_trickle() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn poll_pacing_bench_wql_pages() {
     init_debug_log();
     let Some((client, host)) = test_client_with(|c| {
@@ -5901,7 +6208,7 @@ async fn poll_pacing_bench_wql_pages() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn poll_pacing_bench_zero_operation_timeout() {
     init_debug_log();
     let Some((client, host)) = test_client_with(|c| c.operation_timeout_secs = 0) else {
@@ -5934,7 +6241,7 @@ async fn poll_pacing_bench_zero_operation_timeout() {
 /// When `WINRM_TEST_HOST` is an IP address, the same client must refuse it:
 /// the host name is still checked.
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn custom_ca_https_listener_authenticates() {
     let (Ok(ca_pem), Ok(ca_host)) = (
         std::env::var("WINRM_TEST_CA_PEM"),
@@ -6027,7 +6334,7 @@ async fn assert_whoami(client: &WinrmClient, host: &str, label: &str) {
 /// feature) and Kerberos on the DC (`kerberos` feature, when
 /// `WINRM_TEST_KRB_HOST` and `WINRM_TEST_KRB_HTTPS_CERT_SHA256` are set).
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn pinned_https_listener_authenticates() {
     let Some(pin) = bench_https_pin() else {
         eprintln!("SKIP pinned_https_listener_authenticates: set WINRM_TEST_HTTPS_CERT_SHA256");
@@ -6112,7 +6419,7 @@ async fn pinned_https_listener_authenticates() {
 /// A pin that matches no certificate refuses the bench listener, for Basic
 /// and NTLM.
 #[tokio::test]
-#[ignore]
+#[ignore = "needs the Windows bench: see the head of this file"]
 async fn pinned_https_listener_refuses_a_wrong_pin() {
     if bench_https_pin().is_none() {
         eprintln!(

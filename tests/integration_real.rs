@@ -75,6 +75,14 @@ fn test_client() -> Option<(WinrmClient, String)> {
 
 /// Same as [`test_client`], with a last-minute tweak applied to the config.
 fn test_client_with(tweak: impl FnOnce(&mut WinrmConfig)) -> Option<(WinrmClient, String)> {
+    let (host, mut config, credentials) = test_settings()?;
+    tweak(&mut config);
+    let client = WinrmClient::new(config, credentials).ok()?;
+    Some((client, host))
+}
+
+/// The bench host, with the config and the credentials of [`test_client`].
+fn test_settings() -> Option<(String, WinrmConfig, WinrmCredentials)> {
     let host = std::env::var("WINRM_TEST_HOST").ok()?;
     let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
     let pass = std::env::var("WINRM_TEST_PASS").ok()?;
@@ -82,16 +90,13 @@ fn test_client_with(tweak: impl FnOnce(&mut WinrmConfig)) -> Option<(WinrmClient
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(5985);
-
-    let mut config = WinrmConfig {
+    let config = WinrmConfig {
         auth_method: AuthMethod::Basic,
         encryption: EncryptionMode::Never,
         port: Some(port),
         ..WinrmConfig::http()
     };
-    tweak(&mut config);
-    let client = WinrmClient::new(config, WinrmCredentials::new(user, pass, "")).ok()?;
-    Some((client, host))
+    Some((host, config, WinrmCredentials::new(user, pass, "")))
 }
 
 /// Number of open shells created with the given `IdleTimeOut`, as seen by
@@ -785,69 +790,84 @@ async fn upload_to_a_long_quoted_path() {
 
 /// [`test_client`] with `RemotePathPolicy::Any`, which only the builder sets.
 fn test_client_any_remote_path() -> Option<(WinrmClient, String)> {
-    let host = std::env::var("WINRM_TEST_HOST").ok()?;
-    let user = std::env::var("WINRM_TEST_USER").unwrap_or_else(|_| "vagrant".into());
-    let pass = std::env::var("WINRM_TEST_PASS").ok()?;
-    let port: u16 = std::env::var("WINRM_TEST_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(5985);
-    let client = WinrmClient::builder(WinrmConfig {
-        auth_method: AuthMethod::Basic,
-        encryption: EncryptionMode::Never,
-        port: Some(port),
-        ..WinrmConfig::http()
-    })
-    .credentials(WinrmCredentials::new(user, pass, ""))
-    .remote_path_policy(RemotePathPolicy::Any)
-    .build()
-    .ok()?;
+    let (host, config, credentials) = test_settings()?;
+    let client = WinrmClient::builder(config)
+        .credentials(credentials)
+        .remote_path_policy(RemotePathPolicy::Any)
+        .build()
+        .ok()?;
     Some((client, host))
 }
 
 /// Gives drive `T:` to every logon session of the host, as a `subst` drive
-/// on the share `\\localhost\C$\Windows\Temp`, and prints its type.
+/// on the share `\\localhost\C$\Windows\Temp`. Prints the type of the drive,
+/// then the short name of a file it puts in that directory.
+///
+/// A host that already has a drive `T:` is left as it is: the script prints
+/// `InUse` and stops. What an earlier run may have left is removed first.
 ///
 /// A `subst` run by the test's own command is seen by that command's logon
 /// session alone; run by SYSTEM, here through a scheduled task, it goes to
 /// the namespace all sessions share.
-const NETWORK_DRIVE_UP: &str = r"& schtasks.exe /create /tn winrm-rs-netdrive /tr 'subst.exe T: \\localhost\C$\Windows\Temp' /sc once /st 00:00 /ru SYSTEM /f 2>&1 | Out-Null
+const NETWORK_DRIVE_UP: &str = r"if (([IO.DriveInfo]'T').DriveType -ne 'NoRootDirectory') { 'InUse'; return }
+Remove-Item -LiteralPath 'C:\Windows\Temp\winrm-rs-t.bin' -ErrorAction SilentlyContinue
+'short names' | Set-Content -LiteralPath 'C:\Windows\Temp\winrm-rs-t-long-name.bin'
+& schtasks.exe /create /tn winrm-rs-netdrive /tr 'subst.exe T: \\localhost\C$\Windows\Temp' /sc once /st 00:00 /ru SYSTEM /f 2>&1 | Out-Null
 & schtasks.exe /run /tn winrm-rs-netdrive 2>&1 | Out-Null
-foreach ($i in 1..40) { if (Test-Path 'T:\') { break }; Start-Sleep -Milliseconds 250 }
-([IO.DriveInfo]'T:\').DriveType";
+foreach ($i in 1..40) { if (([IO.DriveInfo]'T').DriveType -ne 'NoRootDirectory') { break }; Start-Sleep -Milliseconds 250 }
+([IO.DriveInfo]'T').DriveType
+(New-Object -ComObject Scripting.FileSystemObject).GetFile('C:\Windows\Temp\winrm-rs-t-long-name.bin').ShortName";
 
-/// Removes drive `T:`, the scheduled task and the file of the test, and
-/// prints whether the drive is still there.
+/// Removes drive `T:`, the scheduled task and the files of the test, and
+/// prints the type of the drive, which is `NoRootDirectory` once it is gone.
 const NETWORK_DRIVE_DOWN: &str = r"& schtasks.exe /create /tn winrm-rs-netdrive /tr 'subst.exe T: /D' /sc once /st 00:00 /ru SYSTEM /f 2>&1 | Out-Null
 & schtasks.exe /run /tn winrm-rs-netdrive 2>&1 | Out-Null
-foreach ($i in 1..40) { if (-not (Test-Path 'T:\')) { break }; Start-Sleep -Milliseconds 250 }
+foreach ($i in 1..40) { if (([IO.DriveInfo]'T').DriveType -eq 'NoRootDirectory') { break }; Start-Sleep -Milliseconds 250 }
 & schtasks.exe /delete /tn winrm-rs-netdrive /f 2>&1 | Out-Null
-Remove-Item -LiteralPath 'C:\Windows\Temp\winrm-rs-t.bin' -ErrorAction SilentlyContinue
-Test-Path 'T:\'";
+Remove-Item -LiteralPath 'C:\Windows\Temp\winrm-rs-t.bin', 'C:\Windows\Temp\winrm-rs-t-long-name.bin' -ErrorAction SilentlyContinue
+([IO.DriveInfo]'T').DriveType";
 
 /// A drive letter of the host that leads to a share is refused by the host
 /// under `RemotePathPolicy::LocalDrive`, and opened under `Any`.
 ///
 /// `T:\winrm-rs-t.bin` reads as a path on a local drive: only the host
-/// knows that the letter leads to `\\localhost\C$\Windows\Temp`. The
-/// transfers are made first and judged after the drive is removed, so that
-/// a failed assertion does not leave the drive behind.
+/// knows that the letter leads to `\\localhost\C$\Windows\Temp`.
+///
+/// The refusal comes before the host asks anything of the drive: a path
+/// given by the short name of a file of the share is refused under that
+/// name, where resolving it first would put the long name in the answer.
+///
+/// The transfers are made first and judged after the drive is removed, so
+/// that a failed assertion does not leave the drive behind. A set-up call
+/// that fails on the way can: `NETWORK_DRIVE_DOWN` is the script that
+/// removes what it made.
 #[tokio::test]
 #[ignore = "BENCH ONLY: gives the host a drive letter and a scheduled task for the time of the test"]
 async fn network_drive_is_refused_by_the_host_under_local_drive() {
     const ON_DRIVE: &str = r"T:\winrm-rs-t.bin";
     const ON_DISK: &str = r"C:\Windows\Temp\winrm-rs-t.bin";
+    const LONG_NAME: &str = "winrm-rs-t-long-name.bin";
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let (any, _) = test_client_any_remote_path().expect("a client with RemotePathPolicy::Any");
     let content = b"through a drive letter that leads to a share\n";
     let local = std::env::temp_dir().join("winrm_rs_test_netdrive_up.bin");
     let back = std::env::temp_dir().join("winrm_rs_test_netdrive_down.bin");
     std::fs::write(&local, content).expect("write local file");
+    let _ = std::fs::remove_file(&back);
 
     let up = client
         .run_powershell(&host, NETWORK_DRIVE_UP)
         .await
         .expect("give the host drive T:");
+    let up_stdout = String::from_utf8_lossy(&up.stdout).into_owned();
+    let mut up_lines = up_stdout.lines().map(str::trim);
+    let drive_type = up_lines.next().unwrap_or_default();
+    let short_name = up_lines.next().unwrap_or_default();
+    assert_ne!(
+        drive_type, "InUse",
+        "the host already has a drive T:, nothing was changed"
+    );
+    let by_short_name = format!(r"T:\{short_name}");
 
     let refused_upload = client.upload_file(&host, &local, ON_DRIVE).await;
     let created = client
@@ -857,6 +877,7 @@ async fn network_drive_is_refused_by_the_host_under_local_drive() {
     let refused_timed = client
         .download_file_with_timeout(&host, ON_DRIVE, &back, Duration::from_secs(60))
         .await;
+    let refused_short = client.download_file(&host, &by_short_name, &back).await;
     let written_before = back.exists();
 
     let any_upload = any.upload_file(&host, &local, ON_DRIVE).await;
@@ -874,11 +895,29 @@ async fn network_drive_is_refused_by_the_host_under_local_drive() {
     let _ = std::fs::remove_file(&back);
 
     assert_eq!(
-        String::from_utf8_lossy(&up.stdout).trim(),
+        drive_type,
         "Network",
         "drive T: is not a network drive: {}",
         String::from_utf8_lossy(&up.stderr)
     );
+    if short_name.contains('~') {
+        println!("by short name: {refused_short:?}");
+        match refused_short {
+            Err(WinrmError::Transfer(m)) => {
+                let refusal = format!(
+                    "RemotePathPolicy::LocalDrive refuses '{by_short_name}' (drive type 'Network')"
+                );
+                assert!(m.contains(&refusal), "{m}");
+                assert!(
+                    !m.contains(LONG_NAME),
+                    "the refusal names a file of the share: {m}"
+                );
+            }
+            other => panic!("short name: expected the host's refusal, got {other:?}"),
+        }
+    } else {
+        println!("the host's C: gives no short names ({short_name:?}): that part is skipped");
+    }
     for (what, result) in [
         ("upload_file", refused_upload),
         ("download_file", refused_download),
@@ -913,7 +952,7 @@ async fn network_drive_is_refused_by_the_host_under_local_drive() {
     assert_eq!(on_disk.expect("read what came from C:"), content);
     assert_eq!(
         String::from_utf8_lossy(&down.stdout).trim(),
-        "False",
+        "NoRootDirectory",
         "drive T: is still there: {}",
         String::from_utf8_lossy(&down.stderr)
     );

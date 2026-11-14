@@ -22,8 +22,10 @@ use crate::shell::Shell;
 /// This triple encoding yields ~3.5× expansion. WinRS enforces an ~8191-char
 /// command-line limit, so the raw chunk must stay under ~2 KB.
 ///
-/// This is the cap: [`upload_chunk_len`] lowers it for a long remote path,
-/// whose escaped form takes room in every chunk's command line.
+/// This is the cap: [`upload_chunk_len`] lowers it by what else every
+/// chunk's command line carries, which is the host's check of the path
+/// under [`RemotePathPolicy::LocalDrive`] and the escaped form of a long
+/// remote path.
 const CHUNK_SIZE: usize = 2000;
 
 /// The command-line length a transfer command may reach: cmd.exe's
@@ -90,19 +92,29 @@ pub(crate) fn validate_remote_path(path: &str) -> Result<(), WinrmError> {
 /// device check.
 ///
 /// These checks read the text of the path, before anything is sent. The
-/// host then checks what the text cannot show: the transfer script resolves
-/// the path as .NET does and refuses it, without opening it, unless it is
-/// still a path on a drive letter and that drive is local (fixed,
-/// removable, CD-ROM or RAM disk). A mapped network drive and a `subst`
-/// drive that leads to a share are refused there, and so is a device name
-/// the host knows that the list above would miss. The error is a
-/// [`WinrmError::Transfer`] that quotes the host's answer:
+/// host then checks what the text cannot show. The transfer script reads
+/// the type of the drive the path starts with and refuses the path, without
+/// resolving or opening it, unless that drive is local (fixed, removable,
+/// CD-ROM or RAM disk): a mapped network drive and a `subst` drive made on
+/// a share are refused there. On a local drive the script resolves the path
+/// as .NET does and refuses it unless it is still a path on a drive letter.
+/// That is a second check of device names, after the list above: Windows
+/// Server 2012 R2 to 2022 resolve every DOS device name to a device, Server
+/// 2025 `NUL` alone. The error is a [`WinrmError::Transfer`] that quotes
+/// the host's answer:
 /// `RemotePathPolicy::LocalDrive refuses 'T:\f.bin' (drive type 'Network')`.
 /// A drive letter the host does not have is refused the same way (drive
 /// type `NoRootDirectory`).
 ///
-/// A symbolic link or a junction on the host can still lead a
-/// drive-absolute path to a share: neither check sees it.
+/// What the policy does not cover:
+///
+/// - A symbolic link or a junction on the host can still lead a
+///   drive-absolute path to a share: neither check sees it.
+/// - Windows PowerShell, which runs the transfer scripts, contacts the
+///   network drives the session sees when it starts, whatever the script
+///   and the path, as it does for
+///   [`run_powershell`](crate::WinrmClient::run_powershell). The policy
+///   keeps a transfer from reading or writing a file on such a drive.
 ///
 /// Only the builder chooses the policy, with
 /// [`WinrmClientBuilder::remote_path_policy`](crate::WinrmClientBuilder::remote_path_policy);
@@ -116,8 +128,9 @@ pub enum RemotePathPolicy {
     /// Accept only drive-absolute remote paths: a letter, `:`, then `\` or
     /// `/`, whose last component, after resolving `.` and `..`, is not a DOS
     /// device name, and with no component made only of dots and blanks
-    /// other than `.` and `..`; and, on the host, only a path it resolves
-    /// to one of its local drives. The default since 2.0.
+    /// other than `.` and `..`; and, on the host, only a path on one of its
+    /// local drives that it resolves to a path on a drive letter. The
+    /// default since 2.0.
     #[default]
     LocalDrive,
 }
@@ -251,12 +264,15 @@ fn names_dos_device(path: &str) -> bool {
 impl WinrmClient {
     /// Upload a local file to a remote Windows host.
     ///
-    /// The file is chunked into pieces of up to ~2 KB, base64-encoded, and
-    /// written via PowerShell `[IO.File]::WriteAllBytes` /
+    /// The file is chunked into pieces of up to 2000 bytes, base64-encoded,
+    /// and written via PowerShell `[IO.File]::WriteAllBytes` /
     /// `[IO.File]::Open('Append')`. The small chunk size is dictated by the
     /// WinRS command-line limit (~8191 chars) after triple encoding (base64
-    /// → UTF-16LE → base64); a long remote path shrinks it so that every
-    /// command line stays inside that limit.
+    /// → UTF-16LE → base64). What else the command line carries shrinks it,
+    /// so that every command line stays inside that limit: the host's check
+    /// of the path under
+    /// [`RemotePathPolicy::LocalDrive`](crate::RemotePathPolicy::LocalDrive)
+    /// (1830 bytes a chunk for a short path), and a long remote path.
     ///
     /// The transfer scripts run
     /// `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -NonInteractive`:
@@ -298,13 +314,14 @@ impl WinrmClient {
     ///   since 2.0) UNC, WebDAV and device paths, a last component that
     ///   is a DOS device name (`NUL`, `COM1`, `LPT1`, ...) and a component
     ///   made only of dots and blanks (other than `.` and `..`) are refused
-    ///   before anything is sent, and the host refuses, before it opens it,
-    ///   a path on a drive that is not one of its local drives (a mapped
-    ///   or `subst` drive that leads to a share). The policy does not limit
-    ///   which local files a path names, and a symbolic link or a junction
-    ///   on the host is followed.
-    ///   A client built with `.remote_path_policy(RemotePathPolicy::Any)`
-    ///   lets them through.
+    ///   before anything is sent, and the host refuses, without resolving
+    ///   or opening it, a path on a drive that is not one of its local
+    ///   drives (a mapped drive, a `subst` drive made on a share). A client
+    ///   built with `.remote_path_policy(RemotePathPolicy::Any)` lets all
+    ///   of these through. The policy does not limit which local files a
+    ///   path names, a symbolic link or a junction on the host is followed,
+    ///   and Windows PowerShell contacts the network drives the session
+    ///   sees when it starts, whatever the path.
     /// - Each chunk of the file, up to 2000 bytes, travels as base64 inside the
     ///   `powershell.exe -EncodedCommand` command line. A host that audits
     ///   process command lines (Security event 4688, Sysmon event 1) or logs
@@ -437,13 +454,14 @@ impl WinrmClient {
     ///   since 2.0) UNC, WebDAV and device paths, a last component that
     ///   is a DOS device name (`NUL`, `COM1`, `LPT1`, ...) and a component
     ///   made only of dots and blanks (other than `.` and `..`) are refused
-    ///   before anything is sent, and the host refuses, before it opens it,
-    ///   a path on a drive that is not one of its local drives (a mapped
-    ///   or `subst` drive that leads to a share). The policy does not limit
-    ///   which local files a path names, and a symbolic link or a junction
-    ///   on the host is followed.
-    ///   A client built with `.remote_path_policy(RemotePathPolicy::Any)`
-    ///   lets them through.
+    ///   before anything is sent, and the host refuses, without resolving
+    ///   or opening it, a path on a drive that is not one of its local
+    ///   drives (a mapped drive, a `subst` drive made on a share). A client
+    ///   built with `.remote_path_policy(RemotePathPolicy::Any)` lets all
+    ///   of these through. The policy does not limit which local files a
+    ///   path names, a symbolic link or a junction on the host is followed,
+    ///   and Windows PowerShell contacts the network drives the session
+    ///   sees when it starts, whatever the path.
     /// - The file comes back as base64 on the command's stdout. PowerShell
     ///   transcription on the host, if enabled, records it.
     /// - `local_path` is written with this process's privileges. A symbolic
@@ -576,7 +594,9 @@ fn byte_count(len: usize) -> u64 {
 }
 
 /// The largest chunk length, up to [`CHUNK_SIZE`], whose upload command line
-/// fits [`CMD_LINE_BUDGET`] for this (already escaped) remote path.
+/// fits [`CMD_LINE_BUDGET`] for this (already escaped) remote path under
+/// this policy: the host's check of [`RemotePathPolicy::LocalDrive`] is
+/// part of the script.
 ///
 /// The append form of the script is the longer one, so it sets the limit.
 fn upload_chunk_len(escaped_path: &str, policy: RemotePathPolicy) -> Result<usize, WinrmError> {
@@ -616,7 +636,7 @@ fn chunks_to_send(data: &[u8], chunk_len: usize) -> Vec<&[u8]> {
 
 /// The drive types [`RemotePathPolicy::LocalDrive`] lets a transfer script
 /// open, under the names of .NET's `System.IO.DriveType`. The types left out
-/// are `Network` (a mapped drive, a `subst` drive that leads to a share),
+/// are `Network` (a mapped drive, a `subst` drive made on a share),
 /// `NoRootDirectory` (no such drive) and `Unknown`.
 const LOCAL_DRIVE_TYPES: &str = "'Fixed', 'Removable', 'CDRom', 'Ram'";
 
@@ -629,32 +649,48 @@ const LOCAL_DRIVE_TYPES: &str = "'Fixed', 'Removable', 'CDRom', 'Ram'";
 ///
 /// Under [`RemotePathPolicy::LocalDrive`] the host checks the path before
 /// `action` runs, which is the part of the policy the text of a path cannot
-/// show to the client. `$p` is the path as .NET resolves it
-/// (`[IO.Path]::GetFullPath`, which `[IO.File]` applies to what it opens):
-/// it must still start with a drive letter, and that drive must be of one
-/// of the [`LOCAL_DRIVE_TYPES`]. A mapped network drive and a `subst` drive
-/// that leads to a share are of type `Network`, and a device name the host
-/// knows resolves to `\\.\name` (every DOS device name on Windows Server
-/// 2012 R2 to 2022, `NUL` alone on Server 2025). `action` then opens the
-/// resolved path, the one that was checked, and it sits in the branch the
-/// check allows: a check that fails for a reason of its own runs nothing.
-/// The refusal is one line on stderr, written as it is and not thrown, so
-/// that the error the caller gets quotes that line and not the way
-/// PowerShell prints an error record.
+/// show to the client. In this order:
+///
+/// 1. The type of the drive (`$t`) is read from the letter the text starts
+///    with, and only if the text starts with a letter, `:` and a separator.
+///    Reading it asks nothing of a share. A mapped network drive and a
+///    `subst` drive made on a share are of type `Network`.
+/// 2. The path is resolved as .NET does it (`[IO.Path]::GetFullPath`, which
+///    `[IO.File]` applies to what it opens) only on a drive of one of the
+///    [`LOCAL_DRIVE_TYPES`] (`$l`). Resolving a name that holds a `~` looks
+///    it up on the drive, to expand a short name: done before the type is
+///    known, it queries the share the policy is about to refuse, and the
+///    refusal then quotes the long names found there.
+/// 3. `action` runs only if the resolved path still starts with a drive
+///    letter and resolves to itself. A device name the host knows resolves
+///    to `\\.\name` (every DOS device name on Windows Server 2012 R2 to
+///    2022, `NUL` alone on Server 2025); the short name of a file whose long
+///    name is a device name does so the second time it is resolved. What
+///    `action` opens is therefore the path that was checked.
+///
+/// `action` sits in the branch the check allows: a check that fails for a
+/// reason of its own runs nothing. The refusal is one line on stderr,
+/// written as it is and not thrown, so that the error the caller gets quotes
+/// that line and not the way PowerShell prints an error record. It names the
+/// path as the caller gave it when the drive is refused, as resolved when
+/// the drive is local.
 ///
 /// The check cannot see a symbolic link or a junction on the way: the
 /// resolved path and the type of its drive are the same with or without
-/// one.
+/// one. It also comes after Windows PowerShell has started, and Windows
+/// PowerShell contacts the network drives of the session when it starts,
+/// whatever the script is.
 fn transfer_script(escaped_path: &str, policy: RemotePathPolicy, action: &str) -> String {
     match policy {
         RemotePathPolicy::Any => {
             format!("$ErrorActionPreference = 'Stop'; $p = '{escaped_path}'; {action}")
         }
         RemotePathPolicy::LocalDrive => format!(
-            "$ErrorActionPreference = 'Stop'; \
-             $p = [IO.Path]::GetFullPath('{escaped_path}'); \
-             $t = if ($p -cmatch '^[A-Za-z]:\\\\') {{ ([IO.DriveInfo]$p.Substring(0, 3)).DriveType }}; \
-             if ({LOCAL_DRIVE_TYPES} -ccontains $t) {{ {action} }} \
+            "$ErrorActionPreference = 'Stop'; $p = '{escaped_path}'; \
+             $t = if ($p -cmatch '^[A-Za-z]:[\\\\/]') {{ ([IO.DriveInfo]$p.Substring(0, 1)).DriveType }}; \
+             $l = {LOCAL_DRIVE_TYPES} -ccontains $t; \
+             if ($l) {{ $p = [IO.Path]::GetFullPath($p) }}; \
+             if ($l -and $p -cmatch '^[A-Za-z]:\\\\' -and [IO.Path]::GetFullPath($p) -ceq $p) {{ {action} }} \
              else {{ [Console]::Error.WriteLine(\"RemotePathPolicy::LocalDrive refuses '$p' (drive type '$t')\"); exit 1 }}"
         ),
     }

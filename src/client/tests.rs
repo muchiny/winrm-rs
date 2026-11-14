@@ -2451,7 +2451,8 @@ async fn upload_file_multi_chunk_with_append() {
     let dir = unique_temp_path("winrm-rs-test-upload-multi-chunk");
     std::fs::create_dir_all(&dir).unwrap();
     let local_file = dir.join("multi.bin");
-    // 4001 bytes = 3 chunks with CHUNK_SIZE=2000 (2000 + 2000 + 1)
+    // 4001 bytes = 3 chunks: a chunk holds at most 2000 bytes, and a little
+    // less under the default policy, whose check takes room in the script.
     let data = vec![0xABu8; 4001];
     std::fs::write(&local_file, &data).unwrap();
 
@@ -3712,7 +3713,7 @@ async fn upload_file_of_an_empty_file_truncates_the_remote_file() {
     let scripts = powershell_scripts(&bodies);
     assert_eq!(scripts.len(), 1, "{scripts:?}");
     assert!(
-        scripts[0].contains("GetFullPath('C:\\dest.txt')"),
+        scripts[0].contains("$p = 'C:\\dest.txt'; $t = "),
         "{}",
         scripts[0]
     );
@@ -3770,12 +3771,12 @@ async fn the_remote_path_policy_decides_what_the_transfer_scripts_check() {
         }
         assert_eq!(scripts.len(), 3, "{policy:?}: {scripts:?}");
         for script in &scripts {
-            let resolves = script.contains("$p = [IO.Path]::GetFullPath('C:\\dest.txt')");
-            assert_eq!(resolves, checked, "{policy:?}: {script}");
+            let names_the_path = script.contains("$p = 'C:\\dest.txt'; ");
+            assert!(names_the_path, "{policy:?}: {script}");
             let reads_the_drive = script.contains("-ccontains $t");
             assert_eq!(reads_the_drive, checked, "{policy:?}: {script}");
-            let opens_as_given = script.contains("$p = 'C:\\dest.txt'");
-            assert_eq!(opens_as_given, !checked, "{policy:?}: {script}");
+            let resolves = script.contains("$p = [IO.Path]::GetFullPath($p)");
+            assert_eq!(resolves, checked, "{policy:?}: {script}");
         }
     }
     std::fs::remove_file(&local).ok();

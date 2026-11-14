@@ -19,7 +19,8 @@ fn transfer_launch_is_the_full_path_without_profile_or_prompts() {
 const POLICIES: [RemotePathPolicy; 2] = [RemotePathPolicy::Any, RemotePathPolicy::LocalDrive];
 
 /// Without the host's check a short path leaves room for the 2000-byte cap.
-/// The check takes 92 bytes of each chunk.
+/// The check takes room in every command line. The figure is the one the
+/// CHANGELOG and the rustdoc of `upload_file` quote: it changes with them.
 #[test]
 fn chunk_len_of_a_short_path_under_each_policy() {
     assert_eq!(
@@ -28,7 +29,7 @@ fn chunk_len_of_a_short_path_under_each_policy() {
     );
     assert_eq!(
         upload_chunk_len("C:\\dest.bin", RemotePathPolicy::LocalDrive).unwrap(),
-        1908
+        1830
     );
 }
 
@@ -91,8 +92,10 @@ fn chunks_to_send_of_an_empty_file_is_one_empty_chunk() {
 const UNCHECKED_HEAD: &str = r"$ErrorActionPreference = 'Stop'; $p = 'C:\a''b'; ";
 
 /// What stands before the action of a script under `LocalDrive`, for the
-/// same path: the host resolves it and reads the type of its drive.
-const CHECK_HEAD: &str = r"$ErrorActionPreference = 'Stop'; $p = [IO.Path]::GetFullPath('C:\a''b'); $t = if ($p -cmatch '^[A-Za-z]:\\') { ([IO.DriveInfo]$p.Substring(0, 3)).DriveType }; if ('Fixed', 'Removable', 'CDRom', 'Ram' -ccontains $t) { ";
+/// same path: the host reads the type of the drive from the text, resolves
+/// the path only on a local drive, and runs the action only on a path that
+/// is still on a drive letter and resolves to itself.
+const CHECK_HEAD: &str = r"$ErrorActionPreference = 'Stop'; $p = 'C:\a''b'; $t = if ($p -cmatch '^[A-Za-z]:[\\/]') { ([IO.DriveInfo]$p.Substring(0, 1)).DriveType }; $l = 'Fixed', 'Removable', 'CDRom', 'Ram' -ccontains $t; if ($l) { $p = [IO.Path]::GetFullPath($p) }; if ($l -and $p -cmatch '^[A-Za-z]:\\' -and [IO.Path]::GetFullPath($p) -ceq $p) { ";
 
 /// What stands after it: the refusal, in the other branch.
 const CHECK_TAIL: &str = r#" } else { [Console]::Error.WriteLine("RemotePathPolicy::LocalDrive refuses '$p' (drive type '$t')"); exit 1 }"#;
@@ -115,9 +118,30 @@ fn upload_script_keeps_both_chunk_forms() {
     );
 }
 
+/// The order the host's check depends on: nothing is asked of the drive
+/// before its type is known. Resolving a name that holds a `~` looks it up
+/// on the drive, which on a share is a request to the file server.
+#[test]
+fn the_host_reads_the_drive_type_before_it_resolves_the_path() {
+    let script = download_script("C:\\a", RemotePathPolicy::LocalDrive);
+    let at = |part: &str| {
+        script
+            .find(part)
+            .unwrap_or_else(|| panic!("{part}: {script}"))
+    };
+    let type_read = at("[IO.DriveInfo]");
+    let local_only = at("if ($l) {");
+    let resolved = at("[IO.Path]::GetFullPath");
+    let action = at("[IO.File]::");
+    assert!(type_read < local_only, "{script}");
+    assert!(local_only < resolved, "{script}");
+    assert!(resolved < action, "{script}");
+}
+
 /// Under `LocalDrive` a script is the one of `Any` with the host's check
-/// around its action. The path is written once, as what the host resolves:
-/// the action opens `$p`, inside the branch the check allows.
+/// around its action. The path is written once: the check and the action
+/// read it from `$p`, and the action sits inside the branch the check
+/// allows.
 #[test]
 fn local_drive_scripts_run_their_action_inside_the_host_check() {
     let (any, local) = (RemotePathPolicy::Any, RemotePathPolicy::LocalDrive);
@@ -441,8 +465,9 @@ fn download_script_keeps_a_unicode_quote_inside_the_literal() {
          [Convert]::ToBase64String([IO.File]::ReadAllBytes($p))"
     );
     assert!(
-        download_script(path, RemotePathPolicy::LocalDrive)
-            .contains("GetFullPath('C:\\temp\\a\u{2019}\u{2019})); x #'); "),
+        download_script(path, RemotePathPolicy::LocalDrive).starts_with(
+            "$ErrorActionPreference = 'Stop'; $p = 'C:\\temp\\a\u{2019}\u{2019})); x #'; $t = "
+        ),
     );
 }
 
@@ -1097,8 +1122,94 @@ mod on_windows {
         let ran = run(&download_script(path, RemotePathPolicy::LocalDrive));
         assert_eq!(ran.code, Some(1), "{}", ran.stderr);
         assert!(ran.stdout.is_empty(), "{}", ran.stdout);
-        let refusal = r"RemotePathPolicy::LocalDrive refuses '\\.\nul' (drive type '')";
+        let refusal = r"RemotePathPolicy::LocalDrive refuses '\\.\nul' (drive type '";
         assert!(ran.stderr.contains(refusal), "{}", ran.stderr);
+    }
+
+    /// The script does not lean on the client's check of the text: what does
+    /// not start with a letter, `:` and a separator has no drive type, and is
+    /// refused without being resolved.
+    #[test]
+    fn the_host_refuses_what_does_not_start_with_a_drive_under_local_drive() {
+        for path in [
+            "winrm-rs-relative.bin",
+            "C:winrm-rs-relative.bin",
+            r"\\localhost\C$\Windows\win.ini",
+            r"\\.\C:\Windows\win.ini",
+            r"\\?\C:\Windows\win.ini",
+        ] {
+            let ran = run(&download_script(path, RemotePathPolicy::LocalDrive));
+            assert_eq!(ran.code, Some(1), "{path}: {}", ran.stderr);
+            assert!(ran.stdout.is_empty(), "{path}: {}", ran.stdout);
+            let refusal = format!("RemotePathPolicy::LocalDrive refuses '{path}' (drive type '')");
+            assert!(ran.stderr.contains(&refusal), "{path}: {}", ran.stderr);
+        }
+    }
+
+    /// A file whose long name is a device name with a blank after it, named
+    /// by its short name: the path resolves to that long name, which in turn
+    /// resolves to the device. The script refuses a path that does not
+    /// resolve to itself. Skipped where the volume gives no short names.
+    #[test]
+    fn the_host_refuses_a_short_name_that_stands_for_a_device() {
+        let dir = test_dir("short-name-on-windows");
+        // Only a verbatim path can name `nul ` as a file.
+        let verbatim = format!(r"\\?\{}", dir.display());
+        std::fs::write(format!(r"{verbatim}\nul "), b"planted").expect("a file named `nul `");
+        let alias = dir.join("NUL~1");
+        if alias.exists() {
+            let path = alias.to_str().expect("a UTF-8 temporary path");
+            let ran = run(&download_script(path, RemotePathPolicy::LocalDrive));
+            assert_eq!(ran.code, Some(1), "{}", ran.stderr);
+            assert!(ran.stdout.is_empty(), "{}", ran.stdout);
+            let refusal = "RemotePathPolicy::LocalDrive refuses '";
+            assert!(ran.stderr.contains(refusal), "{}", ran.stderr);
+            assert!(
+                ran.stderr.contains(r"\nul ' (drive type '"),
+                "{}",
+                ran.stderr
+            );
+        } else {
+            eprintln!("no short name on this volume: test skipped");
+        }
+        std::fs::remove_dir_all(&verbatim).ok();
+    }
+
+    /// A quote, a typographic quote, a dollar and a subexpression in a file
+    /// name: the scripts write and read that very file.
+    #[test]
+    fn the_scripts_take_a_name_with_quotes_and_dollars_as_text() {
+        let dir = test_dir("quotes-on-windows");
+        for policy in POLICIES {
+            let file = dir.join(format!("{policy:?} it's \u{2019} $(Get-Date) $HOME.bin"));
+            let path = file.to_str().expect("a UTF-8 temporary path");
+            let escaped = escape_ps_single_quoted(path);
+
+            let written = run(&upload_script(&escaped, policy, &B64.encode(b"abc"), true));
+            assert_eq!(written.code, Some(0), "{policy:?}: {}", written.stderr);
+            assert_eq!(std::fs::read(&file).unwrap(), b"abc", "{policy:?}");
+
+            let read = run(&download_script(path, policy));
+            assert_eq!(read.code, Some(0), "{policy:?}: {}", read.stderr);
+            assert_eq!(read.stdout.trim_ascii(), B64.encode(b"abc"), "{policy:?}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The refusal quotes the path as text too, and as the caller gave it:
+    /// on a drive that is not local nothing is resolved.
+    #[test]
+    fn the_refusal_quotes_a_path_with_quotes_and_dollars_as_text() {
+        let Some(letter) = unused_drive() else {
+            eprintln!("every drive letter is in use: test skipped");
+            return;
+        };
+        let path = format!(r"{letter}:\it's $(Get-Date) $HOME~1.bin");
+        let refused = run(&download_script(&path, RemotePathPolicy::LocalDrive));
+        assert_eq!(refused.code, Some(1), "{}", refused.stderr);
+        let refusal =
+            format!("RemotePathPolicy::LocalDrive refuses '{path}' (drive type 'NoRootDirectory')");
+        assert!(refused.stderr.contains(&refusal), "{}", refused.stderr);
     }
 
     /// A drive that does not exist is not a local drive. Under `Any` the

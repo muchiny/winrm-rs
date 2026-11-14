@@ -96,9 +96,17 @@ We will credit reporters in the release notes and CHANGELOG (unless you prefer t
 - What `accept_invalid_certs = true` gives up, as its documentation states:
   the server is not authenticated. CredSSP, and Basic over HTTPS, refuse the
   flag.
-- What `RemotePathPolicy::Any` lets through, and a symbolic link or a
-  junction on the host that leads a drive-absolute path to a share: neither
-  the client's check nor the host's sees it.
+- What `RemotePathPolicy::Any` lets through, and what the host's check under
+  `LocalDrive` takes from the host as it finds it:
+  - a symbolic link or a junction that leads a drive-absolute path to a
+    share: neither the client's check nor the host's sees it;
+  - the type Windows gives a drive: a volume that a file-system driver
+    presents as a fixed disk, and a virtual disk or an ISO image attached
+    from a share, are local drives to the check;
+  - a drive letter that a process of the same session, or an administrator
+    of the host, redefines between the check and the opening of the file;
+  - the contact Windows PowerShell makes with the network drives the session
+    sees when it starts, before any script and whatever the path.
 - What `danger_accept_invalid_proxy_certs(true)` gives up: the `https://`
   proxy is not authenticated. The WinRM server stays verified.
 - Windows server settings: `AllowUnencrypted = true`,

@@ -343,10 +343,13 @@ last component, after resolving `.` and `..`, is a DOS device name (`CON`,
 a printer port may be redirected to a network printer. A path with a
 component made only of dots and blanks, other than `.` and `..`, is refused
 as well (`C:\x\LPT1\. `): Windows does not read such a component the same
-way everywhere. The host checks too, before it opens the path: a drive
-letter that is a mapped network drive, or a `subst` drive on a share, is
-refused there, and the error quotes the host
+way everywhere. The host checks too, before it resolves or opens the path:
+a drive letter that is a mapped network drive, or a `subst` drive on a
+share, is refused there, and the error quotes the host
 (`RemotePathPolicy::LocalDrive refuses 'T:\f.bin' (drive type 'Network')`).
+That keeps a transfer from reading or writing a file on such a drive; it
+does not keep Windows PowerShell from contacting the network drives the
+session sees when it starts, which it does whatever the path.
 With the `Any`
 policy, a path may name a UNC share or a device path, and under CredSSP or
 Basic a UNC path is reached with your credentials: never pass an untrusted

@@ -40,33 +40,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   letter leads: `T:\f.bin` went to the host, and if `T:` was a mapped
   network drive or a `subst` drive on a share there, the host opened the
   share, with the credentials of the session under CredSSP or Basic. The
-  transfer scripts now resolve the path on the host as .NET does
-  (`[IO.Path]::GetFullPath`) and open it only if it is still a path on a
-  drive letter and that drive is fixed, removable, a CD-ROM or a RAM disk.
+  transfer scripts now read the type of the drive the path starts with and
+  go on only if it is fixed, removable, a CD-ROM or a RAM disk. They then
+  resolve the path as .NET does (`[IO.Path]::GetFullPath`) and open it
+  only if it is still a path on a drive letter and resolves to itself.
   Otherwise nothing is opened and the call fails with
   `WinrmError::Transfer`, which quotes the host:
   `RemotePathPolicy::LocalDrive refuses 'T:\f.bin' (drive type 'Network')`.
-  The host is also the judge of device names: it resolves the ones it knows
-  to `\\.\name`, which the same test refuses, whatever the client's own
-  list holds. Measured on Windows Server 2012 R2, 2016, 2019, 2022 and
-  2025: a `subst` drive on a share and a `net use` drive both have the type
-  `Network`; the device names tried (`NUL`, `CON`, `AUX`, `COM1`, `LPT1`,
-  `CONIN$`, with or without an extension) all resolve to a device path on
-  2012 R2 to 2022, a bare `NUL` alone on 2025. What changes for a caller:
+  The order matters. Resolving a name that holds a `~` looks it up on the
+  drive, to expand a short name; reading the type of a drive asks nothing
+  of a share. The type is therefore read first, and a path on a network
+  drive is refused as the caller wrote it, without being resolved.
+  Resolving is also a second check of device names, after the client's
+  list: a name the host resolves to `\\.\name` is refused there. Measured
+  on Windows Server 2012 R2, 2016, 2019, 2022 and 2025: a `subst` drive on
+  a share and a `net use` drive both have the type `Network`; the device
+  names tried (`nul`, `nul.txt`, `con`, `aux:`, `COM1`, `LPT1.x`,
+  `CONIN$`) all resolve to a device path on 2012 R2 to 2022, and `nul`
+  alone on 2025, where the client's list stays the only check of the
+  others. What changes for a caller:
   - a path on a network drive letter needs `RemotePathPolicy::Any`, like a
     UNC path;
   - a drive letter the host does not have fails with the policy's message
     (drive type `NoRootDirectory`), not with .NET's
     `DirectoryNotFoundException`;
-  - an upload chunk carries at most 1908 bytes under `LocalDrive`, not
+  - an upload chunk carries at most 1830 bytes under `LocalDrive`, not
     2000, since the check takes room on each command line: an upload makes
-    about 5 % more requests. `RemotePathPolicy::Any` keeps 2000.
+    about 9 % more requests. `RemotePathPolicy::Any` keeps 2000.
 
-  A symbolic link or a junction on the host is still followed: neither
-  check sees it. Under both policies the transfer scripts now stop at
-  their first error (`$ErrorActionPreference = 'Stop'`), so the exit code
-  no longer depends on which statement failed; no failure is known that
-  the previous scripts reported as a success.
+  What the check does not cover. A symbolic link or a junction on the host
+  is still followed: neither check sees it. And Windows PowerShell
+  contacts the network drives the session sees when it starts, before any
+  script and whatever the path, as it does for `run_powershell` (measured
+  on Server 2012 R2, 2016 and 2025): the policy keeps a transfer from
+  reading or writing a file on such a drive, not the host from reaching
+  it. Under both policies the transfer scripts now stop at their first
+  error (`$ErrorActionPreference = 'Stop'`), so the exit code no longer
+  depends on which statement failed; no failure is known that the previous
+  scripts reported as a success.
 - **The CredSSP proxy `CONNECT` request is built in a buffer of its final
   size.** With a long proxy password or host name the buffer grew while it
   was written, which freed its first copy, `Proxy-Authorization` value

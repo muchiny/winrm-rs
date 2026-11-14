@@ -8,8 +8,6 @@
 //! Wrappers (rather than `pub use`) keep the visibility of the wrapped items
 //! unchanged, so enabling the feature cannot widen the real API surface.
 
-#![allow(missing_docs)]
-
 use crate::error::{NtlmError, SoapError, WinrmError};
 
 // ---------------------------------------------------------------------------
@@ -54,7 +52,7 @@ pub fn create_authenticate_message(
 /// Build the Type 3 of the HTTP and HTTPS handshakes (MIC, `MsvAvFlags`,
 /// target name, zero LM; the channel binding when given); also returns the
 /// session key.
-#[allow(clippy::too_many_arguments, reason = "mirrors the wrapped builder")]
+#[expect(clippy::too_many_arguments, reason = "mirrors the wrapped builder")]
 pub fn create_authenticate_message_http(
     challenge: &ChallengeMessage,
     username: &str,
@@ -334,6 +332,12 @@ pub fn check_soap_fault(xml: &str) -> Result<(), SoapError> {
     crate::soap::parser::check_soap_fault(xml)
 }
 
+/// What the transport asks of a response that comes with a success status
+/// (`soap::parser::check_answer`): a document that is not a fault.
+pub fn check_answer(xml: &str) -> Result<(), SoapError> {
+    crate::soap::parser::check_answer(xml)
+}
+
 /// Parse a WS-Enumeration `Enumerate`/`Pull` response.
 pub fn parse_enumerate_response(xml: &str) -> Result<(String, Option<String>), SoapError> {
     crate::soap::parser::parse_enumerate_response(xml)
@@ -436,7 +440,7 @@ pub fn create_psrp_shell_request(
     )
 }
 
-#[allow(clippy::too_many_arguments, reason = "mirrors the wrapped builder")]
+#[expect(clippy::too_many_arguments, reason = "mirrors the wrapped builder")]
 pub fn execute_command_with_id_request(
     endpoint: &str,
     shell_id: &str,

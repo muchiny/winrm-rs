@@ -1332,6 +1332,233 @@ async fn dial_tunnel_reports_socks5_refusals() {
     );
 }
 
+fn socks5_dial(pport: u16, user_pass: Option<(&str, &str)>, remote_dns: bool) -> CredSspDial {
+    CredSspDial::Socks5 {
+        proxy: format!("127.0.0.1:{pport}"),
+        user_pass: user_pass.map(|(user, pass)| {
+            (
+                Zeroizing::new(user.to_string()),
+                Zeroizing::new(pass.to_string()),
+            )
+        }),
+        remote_dns,
+    }
+}
+
+/// The SOCKS5 reply that opens the tunnel, bound to `0.0.0.0:0`.
+const SOCKS5_OPENED: [u8; 10] = [5, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+
+/// A loopback peer serving one connection: at each step it waits for a
+/// message, keeps it and writes the step's reply. It then holds the
+/// connection until the client closes it, and returns the messages.
+async fn scripted_proxy(replies: Vec<Vec<u8>>) -> (u16, tokio::task::JoinHandle<Vec<Vec<u8>>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let peer = tokio::spawn(async move {
+        let (mut s, _) = listener.accept().await.unwrap();
+        let mut seen = Vec::new();
+        let mut msg = [0u8; 600];
+        for reply in replies {
+            match s.read(&mut msg).await {
+                Ok(n) if n > 0 => seen.push(msg[..n].to_vec()),
+                _ => return seen,
+            }
+            if s.write_all(&reply).await.is_err() {
+                return seen;
+            }
+        }
+        while matches!(s.read(&mut msg).await, Ok(n) if n > 0) {}
+        seen
+    });
+    (port, peer)
+}
+
+/// Without `remote_dns` the client resolves the name and sends the address:
+/// the name does not reach the proxy.
+#[tokio::test]
+async fn dial_tunnel_socks5_resolves_the_name_itself() {
+    let opened = [&SOCKS5_OPENED[..], b"hi"].concat();
+    let (pport, peer) = scripted_proxy(vec![vec![5, 0], opened]).await;
+    let mut stream = dial_tunnel(&socks5_dial(pport, None, false), "localhost", 5986)
+        .await
+        .unwrap();
+    assert_eq!(&read_two(&mut stream).await, b"hi");
+    drop(stream);
+
+    let port = 5986u16.to_be_bytes();
+    let v4 = [&[5, 1, 0, 1, 127, 0, 0, 1][..], &port].concat();
+    let v6 = [
+        &[5, 1, 0, 4][..],
+        &std::net::Ipv6Addr::LOCALHOST.octets(),
+        &port,
+    ]
+    .concat();
+    let seen = peer.await.unwrap();
+    assert_eq!(seen.len(), 2);
+    assert!(seen[1] == v4 || seen[1] == v6, "{:?}", seen[1]);
+}
+
+/// An IPv6 target goes out as an address (`ATYP` 4), with `remote_dns` or
+/// without, and a name of 255 bytes, the longest SOCKS5 carries, as a name.
+#[tokio::test]
+async fn dial_tunnel_socks5_encodes_each_kind_of_target() {
+    let port = 5986u16.to_be_bytes();
+    for remote_dns in [false, true] {
+        let (pport, peer) = scripted_proxy(vec![vec![5, 0], SOCKS5_OPENED.to_vec()]).await;
+        let stream = dial_tunnel(&socks5_dial(pport, None, remote_dns), "::1", 5986)
+            .await
+            .unwrap();
+        drop(stream);
+        let want = [
+            &[5, 1, 0, 4][..],
+            &std::net::Ipv6Addr::LOCALHOST.octets(),
+            &port,
+        ]
+        .concat();
+        assert_eq!(peer.await.unwrap()[1], want, "remote_dns {remote_dns}");
+    }
+
+    let name = "a".repeat(255);
+    let (pport, peer) = scripted_proxy(vec![vec![5, 0], SOCKS5_OPENED.to_vec()]).await;
+    let stream = dial_tunnel(&socks5_dial(pport, None, true), &name, 5986)
+        .await
+        .unwrap();
+    drop(stream);
+    let want = [&[5, 1, 0, 3, 255][..], name.as_bytes(), &port].concat();
+    assert_eq!(peer.await.unwrap()[1], want);
+}
+
+/// The reply is read to its last byte whatever the form of the bound
+/// address: the next byte the caller reads is the first one of the tunnel.
+#[tokio::test]
+async fn dial_tunnel_socks5_reads_the_whole_reply() {
+    let name = [&[5, 0, 0, 3, 4][..], b"host", &[0x1f, 0x90]].concat();
+    let v6 = [&[5, 0, 0, 4][..], &[0xfe; 16], &[0x1f, 0x90]].concat();
+    for reply in [SOCKS5_OPENED.to_vec(), name, v6] {
+        let answer = [&reply[..], b"hi"].concat();
+        let (pport, _peer) = scripted_proxy(vec![vec![5, 0], answer]).await;
+        let mut stream = dial_tunnel(&socks5_dial(pport, None, false), "127.0.0.1", 9)
+            .await
+            .unwrap();
+        assert_eq!(&read_two(&mut stream).await, b"hi", "{reply:?}");
+    }
+}
+
+/// A reply of another protocol version, or with an address type SOCKS5
+/// does not define, is refused.
+#[tokio::test]
+async fn dial_tunnel_refuses_a_malformed_socks5_reply() {
+    for reply in [
+        vec![4, 0, 0, 1, 0, 0, 0, 0, 0, 0],
+        vec![5, 0, 0, 9, 0, 0, 0, 0, 0, 0],
+    ] {
+        let (pport, _peer) = scripted_proxy(vec![vec![5, 0], reply.clone()]).await;
+        assert_eq!(
+            auth_failed(dial_tunnel(&socks5_dial(pport, None, false), "127.0.0.1", 9).await),
+            "CredSSP: the SOCKS5 proxy sent an invalid reply",
+            "{reply:?}"
+        );
+    }
+}
+
+/// What SOCKS5 cannot carry is refused before any of it is sent: a host
+/// name or a credential of more than 255 bytes.
+#[tokio::test]
+async fn dial_tunnel_refuses_what_socks5_cannot_carry() {
+    let long = "a".repeat(256);
+    let (pport, peer) = scripted_proxy(vec![vec![5, 0], SOCKS5_OPENED.to_vec()]).await;
+    assert_eq!(
+        auth_failed(dial_tunnel(&socks5_dial(pport, None, true), &long, 9).await),
+        "CredSSP: host name too long for SOCKS5"
+    );
+    assert_eq!(peer.await.unwrap(), vec![vec![5, 1, 0]]);
+
+    for user_pass in [(long.as_str(), "p"), ("u", long.as_str())] {
+        let (pport, peer) = scripted_proxy(vec![vec![5, 2], vec![1, 0]]).await;
+        let dial = socks5_dial(pport, Some(user_pass), false);
+        assert_eq!(
+            auth_failed(dial_tunnel(&dial, "127.0.0.1", 9).await),
+            crate::transport::proxy::SOCKS5_CREDENTIALS_TOO_LONG
+        );
+        assert_eq!(peer.await.unwrap(), vec![vec![5, 2, 0, 2]]);
+    }
+}
+
+/// A proxy that closes during the handshake, and one that cannot be
+/// reached, are reported as such; so is a host that cannot be reached
+/// directly.
+#[tokio::test]
+async fn dial_tunnel_reports_a_peer_that_closes_or_is_absent() {
+    use tokio::io::AsyncReadExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let pport = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut s, _) = listener.accept().await.unwrap();
+        let mut greeting = [0u8; 3];
+        let _ = s.read_exact(&mut greeting).await;
+    });
+    assert_eq!(
+        auth_failed(dial_tunnel(&socks5_dial(pport, None, false), "127.0.0.1", 9).await),
+        "CredSSP: the proxy closed the connection"
+    );
+
+    // A port nothing listens on: bound, then released.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let err = auth_failed(dial_tunnel(&socks5_dial(closed, None, false), "127.0.0.1", 9).await);
+    let start = format!("CredSSP: TCP connect to the proxy 127.0.0.1:{closed}: ");
+    assert!(err.starts_with(&start), "{err}");
+    let err = auth_failed(dial_tunnel(&CredSspDial::Direct, "127.0.0.1", closed).await);
+    assert!(err.starts_with("CredSSP TCP connect: "), "{err}");
+}
+
+#[test]
+fn proxy_io_tells_a_closed_connection_from_another_error() {
+    use std::io::{Error, ErrorKind};
+    let message = |e: Error| match proxy_io(&e) {
+        WinrmError::AuthFailed(m) => m,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        message(Error::from(ErrorKind::UnexpectedEof)),
+        "CredSSP: the proxy closed the connection"
+    );
+    assert_eq!(
+        message(Error::new(ErrorKind::ConnectionReset, "reset by peer")),
+        "CredSSP: proxy handshake: reset by peer"
+    );
+}
+
+/// A `CONNECT` answer whose head ends past the 64 KiB cap is refused, also
+/// when its end comes in the read that crosses the cap.
+#[tokio::test]
+async fn dial_tunnel_refuses_a_head_that_ends_past_the_cap() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut s, _) = listener.accept().await.unwrap();
+        let mut head = [0u8; 1024];
+        let _ = s.read(&mut head).await;
+        let mut answer = b"HTTP/1.1 200 OK\r\nX-Pad: ".to_vec();
+        answer.resize(MAX_PROXY_HEAD_BYTES - 1, b'a');
+        let _ = s.write_all(&answer).await;
+        // Once the client has read all of that, one byte under the cap, the
+        // end of the head comes in a read of its own.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let _ = s.write_all(b"\r\n\r\n").await;
+        let _ = s.read(&mut head).await;
+    });
+    assert_eq!(
+        auth_failed(dial_tunnel(&http_dial(port, None), "127.0.0.1", 9).await),
+        "CredSSP: proxy response head too large"
+    );
+}
+
 /// One CredSSP exchange posting `body` to the acceptor on `port`.
 async fn run(auth: &CredSspAuth, port: u16, body: &str) -> Result<String, WinrmError> {
     crate::test_pki::install_test_provider();
@@ -1372,6 +1599,85 @@ async fn mock_happy_path_delegates_once() {
         1
     );
     assert!(log.contains(&Event::Executed { body: BODY.into() }));
+}
+
+/// A round the server does not answer with a `401` carrying a CredSSP token
+/// fails with the name of that round, and no password is delegated.
+#[tokio::test]
+async fn a_round_without_a_usable_token_is_refused() {
+    const OK: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    const NO_TOKEN: &[u8] =
+        b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: CredSSP\r\nContent-Length: 0\r\n\r\n";
+    const NOT_BASE64: &[u8] =
+        b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: CredSSP !!!!\r\nContent-Length: 0\r\n\r\n";
+    for (rank, answer, expected) in [
+        (
+            1,
+            OK,
+            "CredSSP: TLS handshake round 1: expected 401, got 200",
+        ),
+        (
+            1,
+            NO_TOKEN,
+            "CredSSP: TLS handshake round 1: no CredSSP token in response",
+        ),
+        (1, NOT_BASE64, "CredSSP: bad base64 in handshake: "),
+        (3, OK, "CredSSP: NTLM negotiate: expected 401, got 200"),
+        (3, NO_TOKEN, "CredSSP: NTLM nego: no CredSSP token"),
+        (3, NOT_BASE64, "CredSSP: bad b64 NTLM nego: "),
+        (4, OK, "CredSSP: NTLM authenticate: expected 401, got 200"),
+        (
+            4,
+            NO_TOKEN,
+            "CredSSP: server dropped the context after NTLM AUTHENTICATE + pubKeyAuth",
+        ),
+        (4, NOT_BASE64, "CredSSP: bad b64 auth: "),
+    ] {
+        let (err, log) = refused(Fault::RawAnswer(rank, answer), 1 << 20).await;
+        let WinrmError::AuthFailed(message) = &err else {
+            panic!("request {rank}: {err:?}");
+        };
+        assert!(message.starts_with(expected), "request {rank}: {message}");
+        assert_eq!(rounds(&log).len(), rank, "{message}");
+    }
+}
+
+/// The answer to the delegation round is the answer to the request: a `401`
+/// means the server refused the credentials, another status than 2xx is an
+/// error that quotes the body.
+#[tokio::test]
+async fn the_answer_to_the_delegation_round_is_checked() {
+    const REFUSED: &[u8] = b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n";
+    const BUSY: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 4\r\n\r\nbusy";
+    for (answer, expected) in [
+        (REFUSED, "CredSSP: credentials rejected after delegation"),
+        (BUSY, "CredSSP HTTP 503: busy"),
+    ] {
+        let (port, log) =
+            test_server::spawn(Fault::RawAnswer(5, answer), EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let err = run(&mock_auth(no_verify(), 1 << 20), port, BODY)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, WinrmError::AuthFailed(message) if message == expected),
+            "{err:?}"
+        );
+        assert_eq!(rounds(&log.lock().unwrap()).len(), 5);
+    }
+}
+
+#[test]
+fn credssp_endpoint_keeps_the_query_and_refuses_a_bad_server_name() {
+    let e = CredSspEndpoint::parse("https://host:5986/wsman?PSVersion=5.1").unwrap();
+    assert_eq!(e.path, "/wsman?PSVersion=5.1");
+
+    // A label of 64 bytes is one too many for a DNS name.
+    let url = format!("https://{}.example/wsman", "a".repeat(64));
+    match CredSspEndpoint::parse(&url) {
+        Err(WinrmError::AuthFailed(m)) => assert!(m.starts_with("CredSSP: invalid SNI: "), "{m}"),
+        Err(e) => panic!("{e:?}"),
+        Ok(_) => panic!("accepted"),
+    }
 }
 
 /// Each request runs its own session on its own connection: the inner TLS

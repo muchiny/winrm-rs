@@ -103,6 +103,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   more than 150 lines. Same tests, same names, no API change.
   `sonar-project.properties` leaves these files, and
   `src/auth/credssp/test_server.rs`, out of main-code analysis.
+- The coverage gate of CI (95 % of lines) measures the library code alone.
+  The test modules written in a source file counted in that figure, and
+  they are covered at nearly 100 %: once they were moved out, the gate read
+  94.48 %. The `#[cfg(test)]` helper modules (`src/test_*.rs`,
+  `src/auth/credssp/test_server.rs`) now leave the report as well, and
+  eighteen tests cover code that no test ran: the SOCKS5 and `CONNECT`
+  tunnel of CredSSP (each form of target and of reply, what SOCKS5 cannot
+  carry, a proxy that closes or is absent), a CredSSP round answered
+  without a usable token, the answer to the delegation round, a Receive on
+  a PSRP shell, a refused Disconnect, and malformed `TSRequest` and SPNEGO
+  fields.
 
 ### Documentation
 

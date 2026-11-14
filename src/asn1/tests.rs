@@ -625,3 +625,95 @@ fn ts_credentials_roundtrip() {
     );
     assert!(decode_ts_credentials(&[0x04, 0x00]).is_err());
 }
+
+/// `authInfo`, `pubKeyAuth` and `clientNonce` are OCTET STRINGs: another type
+/// in their place is an error, not an absent field.
+#[test]
+fn decode_ts_request_rejects_a_field_of_the_wrong_type() {
+    for field in [2, 3, 5] {
+        let mut contents = encode_context_tag(0, &encode_integer_value(6));
+        contents.extend_from_slice(&encode_context_tag(field, &encode_integer_value(1)));
+        assert!(
+            decode_ts_request(&encode_sequence(&contents)).is_err(),
+            "field [{field}]"
+        );
+    }
+}
+
+/// `negoTokens` is checked at each level: SEQUENCE OF, SEQUENCE, `[0]`,
+/// OCTET STRING.
+#[test]
+fn decode_ts_request_checks_every_level_of_nego_data() {
+    let ts = |nego: &[u8]| {
+        let mut contents = encode_context_tag(0, &encode_integer_value(6));
+        contents.extend_from_slice(&encode_context_tag(1, nego));
+        decode_ts_request(&encode_sequence(&contents))
+    };
+    let malformed = |nego: &[u8]| matches!(ts(nego), Err(CredSspError::Asn1Decode(m)) if m == "TSRequest: malformed negoTokens");
+    let token = encode_octet_string(b"token");
+
+    let good = encode_sequence(&encode_sequence(&encode_context_tag(0, &token)));
+    assert!(matches!(ts(&good), Ok(t) if t.nego_token.as_deref() == Some(&b"token"[..])));
+
+    // An OCTET STRING where the SEQUENCE OF, then the SEQUENCE, is expected.
+    assert!(malformed(&encode_octet_string(&encode_sequence(
+        &encode_context_tag(0, &token)
+    ))));
+    assert!(malformed(&encode_sequence(&encode_octet_string(
+        &encode_context_tag(0, &token)
+    ))));
+    // `[1]` where `[0]` is expected.
+    assert!(malformed(&encode_sequence(&encode_sequence(
+        &encode_context_tag(1, &token)
+    ))));
+    // An INTEGER where the OCTET STRING is expected.
+    assert!(malformed(&encode_sequence(&encode_sequence(
+        &encode_context_tag(0, &encode_integer_value(1))
+    ))));
+}
+
+/// A `NegTokenResp` whose `[1]` does not hold a SEQUENCE is refused.
+#[test]
+fn decode_spnego_final_rejects_a_neg_token_resp_that_is_no_sequence() {
+    let err = decode_spnego_final(&[0xa1, 0x02, 0x04, 0x00]).unwrap_err();
+    assert!(
+        matches!(&err, CredSspError::Asn1Decode(m)
+            if m == "expected NegTokenResp SEQUENCE (0x30), got tag 0x04"),
+        "{err:?}"
+    );
+}
+
+/// A GSS-API `NegTokenInit` with mechanism types and no `mechToken` holds
+/// no NTLM message.
+#[test]
+fn decode_spnego_token_rejects_a_neg_token_init_without_mech_token() {
+    let mech_types = encode_context_tag(0, &encode_sequence(&[]));
+    let init = encode_context_tag(0, &encode_sequence(&mech_types));
+    let spnego_oid = encode_tlv(0x06, &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x02]);
+    let token = encode_tlv(0x60, &[spnego_oid, init].concat());
+    let err = decode_spnego_token(&token).unwrap_err();
+    assert!(
+        matches!(&err, CredSspError::Asn1Decode(m) if m == "no mechToken in NegTokenInit"),
+        "{err:?}"
+    );
+}
+
+/// A certificate whose seventh field holds no BIT STRING, or an empty one,
+/// has no public key to return.
+#[test]
+fn extract_subject_public_key_reports_a_certificate_without_a_key() {
+    let filler = encode_integer_value(1).repeat(6);
+    for spki in [
+        encode_sequence(&encode_sequence(&[])),
+        // A BIT STRING with its unused-bits byte and nothing else.
+        encode_sequence(&encode_tlv(0x03, &[0x00])),
+    ] {
+        let tbs = encode_sequence(&[filler.clone(), spki].concat());
+        let err = extract_subject_public_key(&encode_sequence(&tbs)).unwrap_err();
+        assert!(
+            matches!(&err, CredSspError::Asn1Decode(m)
+                if m == "SubjectPublicKey not found in certificate"),
+            "{err:?}"
+        );
+    }
+}

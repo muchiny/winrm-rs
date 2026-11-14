@@ -25,3 +25,68 @@ additional_cargo_args = [
     "--config",
     "target.'cfg(target_os = \"linux\")'.runner = ['prlimit', '--as=8589934592']",
 ]
+
+# Mutants no test of the mutation run can catch, each with its reason. The
+# run is `cargo test --lib` on Linux with the features `credssp` and
+# `kerberos` (.github/workflows/mutants.yml). A regex is matched against the
+# name `cargo mutants --list` prints. One written with a line number stops
+# matching when the code above it moves: the mutant then comes back as
+# missed, and the entry is to be updated or dropped.
+exclude_re = [
+    # --- The mutant behaves as the code does. ---
+
+    # A constant that is the `|` of flags with no bit in common: `^` gives
+    # the same value. (`&` gives another one, and is caught.) A mutant in a
+    # function has a name that ends with ` in <function>`, and is kept.
+    # Checked for the four constants there are: `TYPE3_NEVER_ECHO`,
+    # `TYPE1_FLAGS`, `TYPE1_FLAGS_CREDSSP` and `AV_FLAGS_KEPT_WITH_MIC`. The
+    # name of such a mutant holds no more than its line, so this entry would
+    # also hide a new constant whose flags overlap: check one when adding it.
+    '^src/ntlm/(crypto|messages)\.rs:\d+:\d+: replace \| with \^$',
+    # `echoed | SEAL | SIGN | VERSION`: `^` binds tighter than `|`, so a `^`
+    # in front of SIGN or VERSION joins two of the three flags, which have
+    # no bit in common, before the `|`. (In front of SEAL it applies to the
+    # echoed flags, and is caught.)
+    '^src/ntlm/messages\.rs:(757|758):13: replace \| with \^ in create_authenticate_message_credssp$',
+    # `use_tls` is already `true` in `WinrmConfig::default()`.
+    '^src/config\.rs:\d+:\d+: delete field use_tls from struct Self expression in WinrmConfig::https$',
+    # Differs for a connection idle for 60 s to the nanosecond.
+    '^src/transport\.rs:\d+:\d+: replace < with <= in HttpTransport::take_conn$',
+
+    # --- Code the mutation run does not compile, or never reaches. ---
+
+    # The stub of a build without `kerberos`.
+    '^src/transport\.rs:\d+:\d+: replace HttpTransport::send_plain_body -> std::future::Ready<',
+    # `!cfg!(feature = "kerberos")` is `false` with the feature.
+    '^src/transport\.rs:\d+:\d+: replace match guard !cfg!\(feature = "kerberos"\) with false in Route::for_config$',
+    # Lab tooling of debug builds with `__internal` (SSLKEYLOGFILE,
+    # CREDSSP_DUMP): no release has it.
+    '^src/auth/credssp/tls\.rs:\d+:\d+: replace apply_debug_key_log with \(\)$',
+    '^src/auth/credssp/handshake\.rs:111:\d+: replace && with \|\| in exchange$',
+    # The `#[cfg(windows)]` branch (COMPUTERNAME).
+    '^src/ntlm/messages\.rs:842:16: delete ! in workstation$',
+    # `env_var` answers `None` in a unit-test build, so that the tests do not
+    # depend on the proxy variables of the machine: there, a body that is
+    # `None` changes nothing, and the comparison after the early return is
+    # never reached. `tests/proxy_env.rs` reads the real variables, in child
+    # processes.
+    '^src/transport/proxy\.rs:\d+:\d+: replace env_var -> Option<String> with None$',
+    '^src/transport/proxy\.rs:\d+:\d+: replace == with != in env_var$',
+
+    # --- Kerberos code that needs a ticket. ---
+
+    # A `cross_krb5::ClientCtx` only exists once a KDC has issued a ticket.
+    # `tests/kerberos_kdc.rs` runs these functions against a throwaway MIT
+    # KDC (CI job `kerberos-kdc`); the unit tests cannot. What they can reach
+    # without a ticket is tested and stays in the run: the token layout
+    # (`wire::`), `server_token`, the probe, `send_plain_body`,
+    # `check_pinned_certificate`.
+    '^src/auth/kerberos\.rs:\d+:\d+: .*\bKerberosSession::(seal_body|wrap_parts|unseal_body)\b',
+    # `establish` reads the answer to the AP-REQ on these two lines; what it
+    # does before it asks for a ticket stays in the run.
+    '^src/auth/kerberos\.rs:(609|617):\d+: .* in KerberosAuth::establish$',
+    # Its first statement asks for a ticket.
+    '^src/auth/kerberos\.rs:\d+:\d+: .*<impl AuthTransport for KerberosAuth>::send_authenticated\b',
+    # Only a Kerberos session answers `true`.
+    '^src/transport\.rs:\d+:\d+: replace Sealer::binds_answers_by_relates_to -> bool with false$',
+]

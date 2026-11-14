@@ -1771,24 +1771,36 @@ async fn connect_hint_only_for_a_connect_failure_on_the_default_https_port() {
 }
 
 /// `reqwest` says which step failed and for which URL, and leaves the
-/// reason to the causes of its error: the message gives them.
+/// reason to the causes of its error: the message gives them, down to the
+/// last one. What that reason is depends on the system: Linux and Windows
+/// refuse the connection to a port that is bound and does not listen, and
+/// the macOS runner of CI lets it run into the connect timeout.
 #[tokio::test]
-async fn a_refused_connection_says_so_in_its_message() {
+async fn a_failed_connection_gives_its_reason_in_the_message() {
     let (_socket, closed) = refused_port();
     let err = basic_transport(closed)
         .send_soap_with_retry("127.0.0.1", "<s:Envelope/>".into())
         .await
         .unwrap_err();
-    assert!(
-        matches!(&err, WinrmError::Http(e) if e.is_connect()),
-        "{err:?}"
-    );
+    let WinrmError::Http(inner) = &err else {
+        panic!("{err:?}");
+    };
+    assert!(inner.is_connect(), "{err:?}");
+    let reason = std::iter::successors(std::error::Error::source(inner), |cause| cause.source())
+        .last()
+        .expect("reqwest gives the reason as a cause")
+        .to_string();
     let shown = err.to_string();
     assert!(
         shown.starts_with("WinRM HTTP error: error sending request for url ("),
         "{shown}"
     );
-    assert!(shown.contains("refused"), "{shown}");
+    assert!(!reason.is_empty() && shown.ends_with(&reason), "{shown}");
+    #[cfg(target_os = "linux")]
+    assert!(
+        shown.ends_with("Connection refused (os error 111)"),
+        "{shown}"
+    );
     // In the message, so not behind `source()` as well.
     assert!(std::error::Error::source(&err).is_none());
 }

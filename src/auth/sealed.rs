@@ -160,6 +160,10 @@ mod tests {
         WinrmError::AuthFailed(what.to_string())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "the signature of the header-length check `parse` takes"
+    )]
     fn any_len(_: usize) -> Result<(), &'static str> {
         Ok(())
     }

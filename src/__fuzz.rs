@@ -8,6 +8,12 @@
 //! Wrappers (rather than `pub use`) keep the visibility of the wrapped items
 //! unchanged, so enabling the feature cannot widen the real API surface.
 
+#![expect(
+    clippy::must_use_candidate,
+    reason = "wrappers for the fuzz targets and the tests, which read every result: \
+              an attribute on each would say nothing to anybody"
+)]
+
 use crate::error::{NtlmError, SoapError, WinrmError};
 
 // ---------------------------------------------------------------------------
@@ -583,6 +589,10 @@ pub fn sanitize_host(input: &str) -> String {
 
 /// What the URL parser reads back from an endpoint URL.
 #[derive(Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "a report of what the parser saw, one independent fact per field"
+)]
 pub struct EndpointParts {
     /// The host as the parser normalised it (lowercase, punycode, IPv4).
     pub host: Option<String>,

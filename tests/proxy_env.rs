@@ -15,7 +15,10 @@
     clippy::indexing_slicing,
     clippy::arithmetic_side_effects,
     clippy::as_conversions,
+    clippy::cast_possible_truncation,
     clippy::too_many_lines,
+    clippy::similar_names,
+    clippy::assert_is_empty,
     reason = "test code"
 )]
 

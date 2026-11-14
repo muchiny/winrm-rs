@@ -70,6 +70,10 @@ enum Polled {
 pub struct Shell<'a> {
     client: &'a WinrmClient,
     host: String,
+    #[expect(
+        clippy::struct_field_names,
+        reason = "the protocol's own name (`ShellId`), and the name of the accessor"
+    )]
     shell_id: String,
     closed: bool,
     /// Resource URI used for all subsequent SOAP operations on this shell.

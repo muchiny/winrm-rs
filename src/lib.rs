@@ -126,6 +126,12 @@
 // these lints (Cargo.toml). `clippy.toml` exempts `#[test]` functions and
 // `#[cfg(test)]` modules from some of them, not from `as` or arithmetic, and
 // not modules gated on `cfg(all(test, ...))`.
+//
+// Of the pedantic group, test code follows everything but four lints:
+// `too_many_lines`; `cast_possible_truncation`, which goes with `as`;
+// `similar_names`, which refuses the names of the protocols side by side
+// (`ap_req` and `ap_rep`, `port` and `pport`); and `assert_is_empty`, whose
+// `assert_eq!(x, [] as [u8; 0])` reads worse than `assert!(x.is_empty())`.
 #![cfg_attr(
     test,
     allow(
@@ -135,7 +141,10 @@
         clippy::indexing_slicing,
         clippy::arithmetic_side_effects,
         clippy::as_conversions,
+        clippy::cast_possible_truncation,
         clippy::too_many_lines,
+        clippy::similar_names,
+        clippy::assert_is_empty,
         reason = "test code"
     )
 )]

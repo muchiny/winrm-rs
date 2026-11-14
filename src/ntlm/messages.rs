@@ -6,6 +6,17 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use zeroize::Zeroizing;
 
+// Which flags and helpers of `crypto.rs` this file needs depends on the
+// features (`credssp`, `__internal`) and on the tests, which reach them
+// through `use super::*`: a list of names would need a `cfg` per name.
+// Clippy does not look at wildcard imports in a test build, hence `not(test)`.
+#[cfg_attr(
+    not(test),
+    expect(
+        clippy::wildcard_imports,
+        reason = "the names in use change with the features: see above"
+    )
+)]
 use super::crypto::*;
 use crate::error::NtlmError;
 

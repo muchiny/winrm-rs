@@ -83,11 +83,14 @@ unsafe_code = "forbid"
 unreachable_pub = "warn"
 
 [lints.clippy]
+# The whole pedantic group (145 lints with clippy 1.100), at a lower priority
+# so that a lint named below keeps its own level. What the code does not
+# follow is an `#[expect(..., reason = "...")]` on the item. Test code is
+# held to the group too, four lints excepted: the top of src/lib.rs names
+# them and says why, and each file of tests/ repeats the list.
+pedantic = { level = "warn", priority = -1 }
 dbg_macro = "warn"
 todo = "warn"
-unreadable_literal = "warn"
-needless_raw_string_hashes = "warn"
-map_unwrap_or = "warn"
 # Hidden panics and silent overflow or truncation, mostly on server input.
 # Production code only: test code is exempt (clippy.toml, the
 # `cfg_attr(test, ...)` at the top of src/lib.rs, a header in each file of
@@ -99,9 +102,9 @@ panic = "warn"
 indexing_slicing = "warn"
 arithmetic_side_effects = "warn"
 as_conversions = "warn"
-# A function of the library is at most 100 lines (clippy's default
-# threshold). Test code is exempt the same way.
-too_many_lines = "warn"
+# A function of the library is at most 100 lines: `too_many_lines`, of the
+# pedantic group, with clippy's default threshold. Test code is exempt the
+# same way.
 # An exception is an `#[expect]`, which warns once nothing triggers it any
 # more, and says why. The crate-level `allow` of the test exemption (inner
 # attributes, which `allow_attributes` does not look at) keeps its reason.

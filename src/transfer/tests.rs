@@ -1164,11 +1164,12 @@ mod on_windows {
             assert!(ran.stdout.is_empty(), "{}", ran.stdout);
             let refusal = "RemotePathPolicy::LocalDrive refuses '";
             assert!(ran.stderr.contains(refusal), "{}", ran.stderr);
-            assert!(
-                ran.stderr.contains(r"\nul ' (drive type '"),
-                "{}",
-                ran.stderr
-            );
+            // The long name on .NET's current path handling; the device, at
+            // once, on the one Windows PowerShell 4 still uses.
+            let named = [r"\nul ' (drive type '", r"'\\.\nul' (drive type '"]
+                .into_iter()
+                .any(|end| ran.stderr.contains(end));
+            assert!(named, "{}", ran.stderr);
         } else {
             eprintln!("no short name on this volume: test skipped");
         }

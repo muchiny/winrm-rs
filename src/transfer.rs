@@ -97,24 +97,27 @@ pub(crate) fn validate_remote_path(path: &str) -> Result<(), WinrmError> {
 /// resolving or opening it, unless that drive is local (fixed, removable,
 /// CD-ROM or RAM disk): a mapped network drive and a `subst` drive made on
 /// a share are refused there. On a local drive the script resolves the path
-/// as .NET does and refuses it unless it is still a path on a drive letter.
-/// That is a second check of device names, after the list above: Windows
-/// Server 2012 R2 to 2022 resolve every DOS device name to a device, Server
-/// 2025 `NUL` alone. The error is a [`WinrmError::Transfer`] that quotes
-/// the host's answer:
+/// as .NET does and refuses it unless it is still a path on a drive letter
+/// and resolves to itself. That is a second check of device names, after
+/// the list above: Windows Server 2012 R2 to 2022 resolved every device
+/// name tried to a device, Server 2025 `nul` alone. The error is a
+/// [`WinrmError::Transfer`] that quotes the host's answer:
 /// `RemotePathPolicy::LocalDrive refuses 'T:\f.bin' (drive type 'Network')`.
 /// A drive letter the host does not have is refused the same way (drive
-/// type `NoRootDirectory`).
+/// type `NoRootDirectory`). A path .NET cannot resolve at all (an alternate
+/// data stream, a `?` or a `*` in it) fails with .NET's own error.
 ///
 /// What the policy does not cover:
 ///
 /// - A symbolic link or a junction on the host can still lead a
 ///   drive-absolute path to a share: neither check sees it.
-/// - Windows PowerShell, which runs the transfer scripts, contacts the
-///   network drives the session sees when it starts, whatever the script
-///   and the path, as it does for
-///   [`run_powershell`](crate::WinrmClient::run_powershell). The policy
-///   keeps a transfer from reading or writing a file on such a drive.
+/// - Windows PowerShell, which runs the transfer scripts, connects to the
+///   network drives the session sees when it starts, as the user of the
+///   session: under CredSSP or Basic, with its credentials. It does so
+///   whatever the script and the path, under either policy, and for
+///   [`run_powershell`](crate::WinrmClient::run_powershell) as well. The
+///   policy keeps a transfer from reading or writing a file on such a
+///   drive.
 ///
 /// Only the builder chooses the policy, with
 /// [`WinrmClientBuilder::remote_path_policy`](crate::WinrmClientBuilder::remote_path_policy);
@@ -320,8 +323,9 @@ impl WinrmClient {
     ///   built with `.remote_path_policy(RemotePathPolicy::Any)` lets all
     ///   of these through. The policy does not limit which local files a
     ///   path names, a symbolic link or a junction on the host is followed,
-    ///   and Windows PowerShell contacts the network drives the session
-    ///   sees when it starts, whatever the path.
+    ///   and Windows PowerShell connects to the network drives the session
+    ///   sees when it starts, as the user of the session, whatever the
+    ///   path.
     /// - Each chunk of the file, up to 2000 bytes, travels as base64 inside the
     ///   `powershell.exe -EncodedCommand` command line. A host that audits
     ///   process command lines (Security event 4688, Sysmon event 1) or logs
@@ -460,8 +464,9 @@ impl WinrmClient {
     ///   built with `.remote_path_policy(RemotePathPolicy::Any)` lets all
     ///   of these through. The policy does not limit which local files a
     ///   path names, a symbolic link or a junction on the host is followed,
-    ///   and Windows PowerShell contacts the network drives the session
-    ///   sees when it starts, whatever the path.
+    ///   and Windows PowerShell connects to the network drives the session
+    ///   sees when it starts, as the user of the session, whatever the
+    ///   path.
     /// - The file comes back as base64 on the command's stdout. PowerShell
     ///   transcription on the host, if enabled, records it.
     /// - `local_path` is written with this process's privileges. A symbolic
@@ -653,8 +658,9 @@ const LOCAL_DRIVE_TYPES: &str = "'Fixed', 'Removable', 'CDRom', 'Ram'";
 ///
 /// 1. The type of the drive (`$t`) is read from the letter the text starts
 ///    with, and only if the text starts with a letter, `:` and a separator.
-///    Reading it asks nothing of a share. A mapped network drive and a
-///    `subst` drive made on a share are of type `Network`.
+///    Reading it opened no connection to the share, measured for a `subst`
+///    drive made on one. A mapped network drive and a `subst` drive made on
+///    a share are of type `Network`.
 /// 2. The path is resolved as .NET does it (`[IO.Path]::GetFullPath`, which
 ///    `[IO.File]` applies to what it opens) only on a drive of one of the
 ///    [`LOCAL_DRIVE_TYPES`] (`$l`). Resolving a name that holds a `~` looks
@@ -663,23 +669,25 @@ const LOCAL_DRIVE_TYPES: &str = "'Fixed', 'Removable', 'CDRom', 'Ram'";
 ///    refusal then quotes the long names found there.
 /// 3. `action` runs only if the resolved path still starts with a drive
 ///    letter and resolves to itself. A device name the host knows resolves
-///    to `\\.\name` (every DOS device name on Windows Server 2012 R2 to
-///    2022, `NUL` alone on Server 2025); the short name of a file whose long
-///    name is a device name does so the second time it is resolved. What
-///    `action` opens is therefore the path that was checked.
+///    to `\\.\name` (every device name tried on Windows Server 2012 R2 to
+///    2022, `nul` alone on Server 2025). The short name of a file whose
+///    long name is a device name and a blank resolves to that long name,
+///    and that long name to the device. What `action` opens is therefore
+///    the path that was checked.
 ///
 /// `action` sits in the branch the check allows: a check that fails for a
 /// reason of its own runs nothing. The refusal is one line on stderr,
 /// written as it is and not thrown, so that the error the caller gets quotes
 /// that line and not the way PowerShell prints an error record. It names the
 /// path as the caller gave it when the drive is refused, as resolved when
-/// the drive is local.
+/// the drive is local. A path .NET cannot resolve ends the script with
+/// .NET's error, before `action`.
 ///
 /// The check cannot see a symbolic link or a junction on the way: the
 /// resolved path and the type of its drive are the same with or without
 /// one. It also comes after Windows PowerShell has started, and Windows
-/// PowerShell contacts the network drives of the session when it starts,
-/// whatever the script is.
+/// PowerShell connects to the network drives the session sees when it
+/// starts, whatever the script is.
 fn transfer_script(escaped_path: &str, policy: RemotePathPolicy, action: &str) -> String {
     match policy {
         RemotePathPolicy::Any => {

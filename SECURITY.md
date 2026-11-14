@@ -105,8 +105,9 @@ We will credit reporters in the release notes and CHANGELOG (unless you prefer t
     from a share, are local drives to the check;
   - a drive letter that a process of the same session, or an administrator
     of the host, redefines between the check and the opening of the file;
-  - the contact Windows PowerShell makes with the network drives the session
-    sees when it starts, before any script and whatever the path.
+  - the connection Windows PowerShell makes, as the user of the session, to
+    the network drives the session sees when it starts, before any script
+    and whatever the path.
 - What `danger_accept_invalid_proxy_certs(true)` gives up: the `https://`
   proxy is not authenticated. The WinRM server stays verified.
 - Windows server settings: `AllowUnencrypted = true`,

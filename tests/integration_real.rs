@@ -809,7 +809,7 @@ fn test_client_any_remote_path() -> Option<(WinrmClient, String)> {
 /// A `subst` run by the test's own command is seen by that command's logon
 /// session alone; run by SYSTEM, here through a scheduled task, it goes to
 /// the namespace all sessions share.
-const NETWORK_DRIVE_UP: &str = r"if (([IO.DriveInfo]'T').DriveType -ne 'NoRootDirectory') { 'InUse'; return }
+const NETWORK_DRIVE_UP: &str = r"if (([Environment]::GetLogicalDrives() -contains 'T:\') -or (([IO.DriveInfo]'T').DriveType -ne 'NoRootDirectory')) { 'InUse'; return }
 Remove-Item -LiteralPath 'C:\Windows\Temp\winrm-rs-t.bin' -ErrorAction SilentlyContinue
 'short names' | Set-Content -LiteralPath 'C:\Windows\Temp\winrm-rs-t-long-name.bin'
 & schtasks.exe /create /tn winrm-rs-netdrive /tr 'subst.exe T: \\localhost\C$\Windows\Temp' /sc once /st 00:00 /ru SYSTEM /f 2>&1 | Out-Null

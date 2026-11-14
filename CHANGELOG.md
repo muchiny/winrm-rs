@@ -48,9 +48,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `WinrmError::Transfer`, which quotes the host:
   `RemotePathPolicy::LocalDrive refuses 'T:\f.bin' (drive type 'Network')`.
   The order matters. Resolving a name that holds a `~` looks it up on the
-  drive, to expand a short name; reading the type of a drive asks nothing
-  of a share. The type is therefore read first, and a path on a network
-  drive is refused as the caller wrote it, without being resolved.
+  drive, to expand a short name; reading the type of a drive opened no
+  connection to the share (measured for a `subst` drive made on a share,
+  on Server 2012 R2 and 2025). The type is therefore read first, and a
+  path on a network drive is refused as the caller wrote it, without being
+  resolved.
   Resolving is also a second check of device names, after the client's
   list: a name the host resolves to `\\.\name` is refused there. Measured
   on Windows Server 2012 R2, 2016, 2019, 2022 and 2025: a `subst` drive on
@@ -70,11 +72,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
   What the check does not cover. A symbolic link or a junction on the host
   is still followed: neither check sees it. And Windows PowerShell
-  contacts the network drives the session sees when it starts, before any
-  script and whatever the path, as it does for `run_powershell` (measured
-  on Server 2012 R2, 2016 and 2025): the policy keeps a transfer from
-  reading or writing a file on such a drive, not the host from reaching
-  it. Under both policies the transfer scripts now stop at their first
+  connects to the network drives the session sees when it starts, as the
+  user of the session, so with its credentials under CredSSP or Basic. It
+  does so before any script and whatever the path, under either policy and
+  for `run_powershell` as well (measured on Server 2012 R2, 2016 and 2025;
+  `cmd.exe` does not): the policy keeps a transfer from reading or writing
+  a file on such a drive, not the host from connecting to it. Under both
+  policies the transfer scripts now stop at their first
   error (`$ErrorActionPreference = 'Stop'`), so the exit code no longer
   depends on which statement failed; no failure is known that the previous
   scripts reported as a success.

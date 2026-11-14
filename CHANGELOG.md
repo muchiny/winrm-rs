@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+
+- **The NTLM session key comes straight from the operating system.** It was
+  drawn from `rand`'s thread-local generator, whose state is never wiped and
+  can produce its past output again until it reseeds (every 64 KiB). A copy
+  of the key therefore outlived the sealing session, which is wiped when it
+  ends: someone able to read the process memory afterwards could recompute
+  the key and decrypt a recorded sealed exchange. The key is now read with
+  `SysRng`, which keeps no state. This covers NTLM over HTTP and HTTPS and
+  the NTLM exchange inside CredSSP. If the operating system's random source
+  fails, the handshake fails with `NtlmError::InvalidMessage`.
+
 ### Changed
 
 - **MSRV raised to 1.100.0** (from 1.99.0). `clippy.toml` and the MSRV job

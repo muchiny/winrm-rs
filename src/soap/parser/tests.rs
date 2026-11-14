@@ -311,12 +311,64 @@ fn an_id_is_the_first_one_that_has_text() {
     ));
 }
 
-/// The text of an element is what it holds itself, not what the elements
-/// inside it hold.
+/// An id is the text of its element, however that text is written.
 #[test]
 fn an_id_is_the_text_of_the_element_itself() {
-    let xml = "<rsp:ShellId>AB<x>no</x>C<!-- no -->D<![CDATA[E]]>&#70;</rsp:ShellId>";
+    let xml = "<rsp:ShellId>AB<!-- no -->C<![CDATA[D]]>&#69;<?pi?>F</rsp:ShellId>";
     assert_eq!(parse_shell_id(xml).unwrap(), "ABCDEF");
+}
+
+const ELEMENT_IN_TEXT: &str = "an element inside one that holds text alone";
+
+/// The protocol writes an id as text alone. With an element inside it, the
+/// text around that element is not the id the server meant: the answer is
+/// refused, not read as far as it can be.
+#[test]
+fn an_id_that_holds_an_element_is_refused() {
+    for xml in [
+        "<rsp:ShellId>AB<x>no</x>C</rsp:ShellId>",
+        "<rsp:ShellId>AB<x/></rsp:ShellId>",
+        "<rsp:ShellId><x/>AB</rsp:ShellId>",
+        "<rsp:ShellId><rsp:ShellId>AB</rsp:ShellId></rsp:ShellId>",
+        "<r><rsp:ShellId> <rsp:ShellId/> </rsp:ShellId><rsp:ShellId>AB</rsp:ShellId></r>",
+    ] {
+        assert_eq!(parse_error(parse_shell_id(xml)), ELEMENT_IN_TEXT, "{xml}");
+    }
+    // Once the id is read, another element of that name is not looked at.
+    let xml = "<r><rsp:ShellId>AB</rsp:ShellId><rsp:ShellId>C<x/></rsp:ShellId></r>";
+    assert_eq!(parse_shell_id(xml).unwrap(), "AB");
+    // And the id of another answer is an element like any other.
+    let xml = "<r><rsp:CommandId>C<x/></rsp:CommandId><rsp:ShellId>AB</rsp:ShellId></r>";
+    assert_eq!(parse_shell_id(xml).unwrap(), "AB");
+    assert_eq!(parse_error(parse_command_id(xml)), ELEMENT_IN_TEXT);
+}
+
+/// An answer that is a fault gives the fault, not an id: the ids in it, and
+/// those around it, are not read.
+#[test]
+fn an_id_is_not_read_from_a_fault() {
+    let fault = "<s:Fault><s:Code><s:Value>s:Receiver</s:Value></s:Code>\
+                 <rsp:ShellId>INSIDE</rsp:ShellId></s:Fault>";
+    for xml in [
+        envelope(fault),
+        format!(
+            "<s:Envelope><s:Header><rsp:ShellId>BEFORE</rsp:ShellId></s:Header>\
+             <s:Body>{fault}<rsp:ShellId>AFTER</rsp:ShellId></s:Body></s:Envelope>"
+        ),
+        // The response stops being XML after its fault.
+        format!("<s:Envelope><s:Body>{fault}</oops>"),
+        format!("<s:Envelope><s:Body>{fault}<rsp:ShellId>CUT"),
+    ] {
+        for id in [parse_shell_id(&xml), parse_command_id(&xml)] {
+            assert!(
+                matches!(&id, Err(SoapError::Fault { code, .. }) if code == "s:Receiver"),
+                "{xml}: {id:?}"
+            );
+        }
+    }
+    // A `Fault` element that is not the fault of the response is data.
+    let xml = envelope("<rsp:Shell><s:Fault><rsp:ShellId>X</rsp:ShellId></s:Fault></rsp:Shell>");
+    assert_eq!(parse_shell_id(&xml).unwrap(), "X");
 }
 
 #[test]
@@ -431,6 +483,104 @@ fn a_stream_that_is_not_base64_is_refused() {
         );
         let why = parse_error(parse_receive_output(&xml).map(|output| output.stdout));
         assert!(why.starts_with("base64 decode"), "{why}");
+    }
+}
+
+/// A stream and an exit code are text alone. With an element inside one, the
+/// text read would not be what the server wrote (the part after the element
+/// was dropped, and the exit code of a stream was taken): the answer is
+/// refused.
+#[test]
+fn a_stream_or_an_exit_code_that_holds_an_element_is_refused() {
+    for inner in [
+        r#"<rsp:Stream Name="stdout">QUJD<rsp:ExitCode>5</rsp:ExitCode>QUJD</rsp:Stream>"#,
+        r#"<rsp:Stream Name="stdout">QUJD<rsp:Stream Name="stdout">QUJD</rsp:Stream></rsp:Stream>"#,
+        r#"<rsp:Stream Name="stderr">QUJD<x/></rsp:Stream>"#,
+        r#"<rsp:Stream Name="pr"><x>QUJD</x></rsp:Stream>"#,
+        r#"<rsp:Stream><rsp:CommandState State="s"/></rsp:Stream>"#,
+        r#"<rsp:ExitCode>1<rsp:Stream Name="stdout">QUJD</rsp:Stream></rsp:ExitCode>"#,
+        "<rsp:ExitCode><rsp:ExitCode>1</rsp:ExitCode></rsp:ExitCode>",
+        "<rsp:ExitCode><x/>1</rsp:ExitCode>",
+    ] {
+        let xml = envelope(&format!(
+            "<rsp:ReceiveResponse>{inner}</rsp:ReceiveResponse>"
+        ));
+        let why = parse_error(parse_receive_output_raw(&xml).map(|output| output.done));
+        assert_eq!(why, ELEMENT_IN_TEXT, "{inner}");
+    }
+    // Once the exit code is read, another one is not looked at.
+    let xml = "<r><rsp:ExitCode>1</rsp:ExitCode><rsp:ExitCode>2<x/></rsp:ExitCode></r>";
+    assert_eq!(parse_receive_output_raw(xml).unwrap().exit_code, Some(1));
+}
+
+/// The attributes of a `Stream` and of a `CommandState` are read: one whose
+/// attributes are not well-formed is refused. Those of the other elements
+/// are not looked at.
+#[test]
+fn a_stream_with_malformed_attributes_is_refused() {
+    for element in [
+        r#"<rsp:Stream Name="stdout" End>aGk=</rsp:Stream>"#,
+        r#"<rsp:Stream End Name="stdout">aGk=</rsp:Stream>"#,
+        r"<rsp:Stream Name=stdout>aGk=</rsp:Stream>",
+        r#"<rsp:Stream Name="std&nbsp;out">aGk=</rsp:Stream>"#,
+        r#"<rsp:CommandState State="s" x/>"#,
+        r#"<rsp:CommandState State="&bogus;"/>"#,
+    ] {
+        let xml = format!("<r>{element}</r>");
+        let why = parse_error(parse_receive_output_raw(&xml).map(|output| output.done));
+        assert!(why.starts_with("malformed XML: "), "{element}: {why}");
+    }
+    let xml = r#"<r><x a b=c/><rsp:Stream Name="stdout">aGk=</rsp:Stream></r>"#;
+    assert_eq!(parse_receive_output_raw(xml).unwrap().stdout, b"hi");
+}
+
+/// The first thing an answer refuses is its error, and it comes before the
+/// place where the response stops being a document.
+#[test]
+fn the_first_refusal_is_the_error_of_the_answer() {
+    let bad = r#"<rsp:Stream Name="stdout">!!!</rsp:Stream>"#;
+    let nested = r#"<rsp:Stream Name="stdout">QUJD<x/></rsp:Stream>"#;
+    let why = |xml: String| parse_error(parse_receive_output_raw(&xml).map(|output| output.done));
+
+    assert!(why(format!("<r>{bad}{nested}</r>")).starts_with("base64 decode"));
+    assert_eq!(why(format!("<r>{nested}{bad}</r>")), ELEMENT_IN_TEXT);
+    assert!(why(format!("<r>{bad}</oops>")).starts_with("base64 decode"));
+    assert!(why(format!("<r></oops>{bad}")).starts_with("malformed XML: "));
+    // The element is refused where it opens, the text where its element
+    // closes.
+    let both = r#"<rsp:Stream Name="stdout">!!!<x/></rsp:Stream>"#;
+    assert_eq!(why(format!("<r>{both}</r>")), ELEMENT_IN_TEXT);
+}
+
+/// A fault is the answer, whatever else the response holds. The `TimedOut`
+/// fault of a poll stays that fault with a stream around it that cannot be
+/// read: taken for a refused answer, it would end the command.
+#[test]
+fn a_fault_comes_before_what_the_answer_refuses() {
+    let fault = "<s:Fault><s:Code><s:Value>s:Receiver</s:Value><s:Subcode>\
+                 <s:Value>w:TimedOut</s:Value></s:Subcode></s:Code></s:Fault>";
+    let bad = r#"<rsp:Stream Name="stdout">!!!not-base64!!!</rsp:Stream>"#;
+    for (before, after) in [
+        ("", bad),
+        ("", r#"<rsp:Stream Name="stdout">QUJD<x/></rsp:Stream>"#),
+        ("", r#"<rsp:Stream Name="stdout" End>QUJD</rsp:Stream>"#),
+        ("", "<n:EnumerationContext>c<x/></n:EnumerationContext>"),
+        ("", "<rsp:ShellId>c<x/></rsp:ShellId>"),
+        ("", "</oops>"),
+        (bad, ""),
+    ] {
+        let xml = format!(
+            "<s:Envelope><s:Header>{before}</s:Header><s:Body>{fault}{after}</s:Body></s:Envelope>"
+        );
+        for error in [
+            parse_receive_output_raw(&xml).map(|_| ()).unwrap_err(),
+            parse_receive_output(&xml).map(|_| ()).unwrap_err(),
+            parse_enumerate_response(&xml).map(|_| ()).unwrap_err(),
+            parse_shell_id(&xml).map(|_| ()).unwrap_err(),
+            check_soap_fault(&xml).unwrap_err(),
+        ] {
+            assert!(is_timed_out_fault(&error), "{before}{after}: {error:?}");
+        }
     }
 }
 
@@ -1033,6 +1183,49 @@ fn enumeration_context_is_the_first_one_that_has_text() {
     );
 }
 
+/// The context goes back to the server in the next Pull, as text. One that
+/// holds an element cannot be sent back as it was given: the answer is
+/// refused.
+#[test]
+fn an_enumeration_context_that_holds_an_element_is_refused() {
+    for context in [
+        "ctx<x/>",
+        "<x>ctx</x>",
+        "ctx<n:EndOfSequence/>",
+        "ctx<w:Items>i</w:Items>",
+        "<n:EnumerationContext>ctx</n:EnumerationContext>",
+    ] {
+        let xml = format!(
+            "<n:PullResponse><n:EnumerationContext>{context}</n:EnumerationContext>\
+             </n:PullResponse>"
+        );
+        assert_eq!(
+            parse_error(parse_enumerate_response(&xml)),
+            ELEMENT_IN_TEXT,
+            "{context}"
+        );
+    }
+    // Once the context is read, another one is not looked at.
+    let xml = "<r><n:EnumerationContext>one</n:EnumerationContext>\
+               <n:EnumerationContext>two<x/></n:EnumerationContext></r>";
+    assert_eq!(
+        parse_enumerate_response(xml).unwrap().1.as_deref(),
+        Some("one")
+    );
+}
+
+/// What the `Items` hold is data, given as written: a DTD or an entity in
+/// there is the caller's to read or to refuse, and none of it is a part of
+/// the answer.
+#[test]
+fn a_dtd_inside_the_items_is_data() {
+    let items = "<!DOCTYPE x [<!ENTITY a \"b\">]><p:X>&a;&nbsp;</p:X>";
+    assert_eq!(
+        parse_enumerate_response(&enumerate_page(items, "")).unwrap(),
+        (items.to_string(), Some("ctx-1".to_string()))
+    );
+}
+
 // --- What a response may hold ---
 
 /// A response that stops being XML is refused, and not read as far as it
@@ -1052,23 +1245,59 @@ fn a_response_that_is_not_well_formed_is_refused() {
         "<a>&amp</a>",
         "<a>&nbsp;</a>",
         "<s:Body><n:EnumerationContext>c</n:EnumerationContext><n:Items>x</n:Items <n:EndOfSequence/>",
+        // Not a document: nothing, text alone, two roots, text around the
+        // root.
+        "",
+        " \n",
+        "OK",
+        "<!-- c -->",
+        "<a/><b/>",
+        "<a/>tail",
+        "head<a/>",
     ] {
+        parse_error(parse_shell_id(xml));
         parse_error(parse_command_id(xml));
         parse_error(parse_receive_output_raw(xml).map(|output| output.done));
+        parse_error(parse_receive_output(xml).map(|output| output.done));
         parse_error(parse_enumerate_response(xml));
+        assert!(check_soap_fault(xml).is_ok(), "{xml}");
         assert_eq!(relates_to(xml), None, "{xml}");
     }
 }
 
-/// An id read before the response stops being XML stands: the walk ends at
-/// the id.
+/// The whole answer is read before any of it is returned: what comes before
+/// the place where a response stops being a document is not an answer.
 #[test]
-fn an_id_before_a_malformed_part_is_kept() {
-    assert_eq!(
-        parse_shell_id("<a><rsp:ShellId>X</rsp:ShellId></oops>").unwrap(),
-        "X"
-    );
-    parse_error(parse_shell_id("<a></oops><rsp:ShellId>X</rsp:ShellId>"));
+fn what_precedes_a_malformed_part_is_not_returned() {
+    for tail in ["</oops>", "<a>", "&nbsp;", "<b/>", "tail", "<!DOCTYPE x>"] {
+        let id = format!("<rsp:ShellId>X</rsp:ShellId>{tail}");
+        parse_error(parse_shell_id(&id));
+        let id = format!("<rsp:CommandId>X</rsp:CommandId>{tail}");
+        parse_error(parse_command_id(&id));
+        let streams = format!("<rsp:Stream Name=\"stdout\">aGk=</rsp:Stream>{tail}");
+        parse_error(parse_receive_output_raw(&streams).map(|output| output.stdout));
+        let page = format!("{}{tail}", enumerate_page("<p:X>1</p:X>", ""));
+        parse_error(parse_enumerate_response(&page));
+    }
+}
+
+/// `check_soap_fault` reads as far as the response is XML. A fault that
+/// comes after that place is not one it sees, and the parser of the answer,
+/// which reads everything, refuses the response.
+#[test]
+fn a_fault_after_a_malformed_part_is_a_refused_answer() {
+    let xml = "<s:Envelope><s:Header><rsp:ShellId>X</rsp:ShellId>&bogus;</s:Header><s:Body>\
+               <s:Fault><s:Code><s:Value>s:Receiver</s:Value></s:Code></s:Fault>\
+               </s:Body></s:Envelope>";
+    assert!(check_soap_fault(xml).is_ok());
+    let why = parse_error(parse_shell_id(xml));
+    assert!(why.contains("entity"), "{why}");
+
+    // Two roots: the first one says the response is no fault.
+    let xml = format!("<x/>{}", envelope("<s:Fault><s:Code/></s:Fault>"));
+    assert!(check_soap_fault(&xml).is_ok());
+    let why = parse_error(parse_receive_output_raw(&xml).map(|output| output.done));
+    assert!(why.contains("more than one root"), "{why}");
 }
 
 /// SOAP forbids a DTD, and without one a document cannot declare an entity.
@@ -1102,15 +1331,23 @@ fn declaration_comments_and_instructions_are_skipped() {
     assert_eq!(parse_shell_id(xml).unwrap(), "YES");
 }
 
-/// The items are cut out of the document by offset: a byte order mark the
-/// reader skips must not shift them.
+/// The items are cut out of the document by offset: the byte order marks
+/// the reader skips must not shift them. With two marks the items came out
+/// three bytes early (`ms><p:X>1</p`).
 #[test]
-fn a_byte_order_mark_does_not_shift_the_items() {
-    let xml = format!("\u{feff}{}", enumerate_page("<p:X>1</p:X>", ""));
-    assert_eq!(
-        parse_enumerate_response(&xml).unwrap(),
-        ("<p:X>1</p:X>".to_string(), Some("ctx-1".to_string()))
-    );
+fn byte_order_marks_do_not_shift_the_items() {
+    for marks in 0..4 {
+        let xml = format!(
+            "{}{}",
+            "\u{feff}".repeat(marks),
+            enumerate_page("<p:X>1</p:X>", "")
+        );
+        assert_eq!(
+            parse_enumerate_response(&xml).unwrap(),
+            ("<p:X>1</p:X>".to_string(), Some("ctx-1".to_string())),
+            "{marks} marks"
+        );
+    }
 }
 
 /// The error for a malformed response may quote it: bounded, and without
@@ -1134,7 +1371,8 @@ fn within(limit: Duration, work: impl FnOnce()) {
     assert!(started.elapsed() < limit, "took {:?}", started.elapsed());
 }
 
-/// 300 000 levels of nesting: nothing recurses, and a level costs a byte.
+/// 300 000 levels of nesting: nothing recurses, and a level costs a few
+/// bytes (its tag here, its name and an offset in the XML reader).
 #[test]
 fn deep_nesting_is_read_without_recursion() {
     let depth = 300_000;
@@ -1277,14 +1515,20 @@ proptest::proptest! {
         pieces in proptest::collection::vec(proptest::sample::select(PIECES), 0..48)
     ) {
         let xml = pieces.concat();
-        let _ = parse_shell_id(&xml);
-        let _ = parse_command_id(&xml);
         let _ = relates_to(&xml);
 
-        // A fault is a fault for every parser.
-        if check_soap_fault(&xml).is_err() {
-            proptest::prop_assert!(parse_receive_output(&xml).is_err());
-            proptest::prop_assert!(parse_enumerate_response(&xml).is_err());
+        // A fault is that fault for every parser.
+        if let Err(fault) = check_soap_fault(&xml) {
+            let fault = Err(fault.to_string());
+            for answer in [
+                parse_receive_output(&xml).map(|_| ()),
+                parse_receive_output_raw(&xml).map(|_| ()),
+                parse_enumerate_response(&xml).map(|_| ()),
+                parse_shell_id(&xml).map(|_| ()),
+                parse_command_id(&xml).map(|_| ()),
+            ] {
+                proptest::prop_assert_eq!(&answer.map_err(|error| error.to_string()), &fault);
+            }
         }
         if let Ok(output) = parse_receive_output(&xml) {
             proptest::prop_assert!(output.stdout.len() <= xml.len());
@@ -1292,20 +1536,25 @@ proptest::proptest! {
         }
         if let Ok((items, _)) = parse_enumerate_response(&xml) {
             proptest::prop_assert!(items.len() <= xml.len());
-            // An end marker after the document always ends the enumeration.
             proptest::prop_assert_eq!(
-                parse_enumerate_response(&format!("{xml}<w:EndOfSequence/>")).ok(),
+                parse_enumerate_response(&ended(&xml)).ok(),
                 Some((items, None))
             );
         }
     }
 }
 
-/// What `fuzz_soap_enumerate` asserts, on each way a document can end: when
-/// a page is read, the same page followed by an end marker gives the same
-/// items and no context.
+/// `page`, a response that is read, as the content of an element that ends
+/// with an end marker: the same items, and no context.
+fn ended(page: &str) -> String {
+    format!("<r>{page}<w:EndOfSequence/></r>")
+}
+
+/// What `fuzz_soap_enumerate` asserts, on each thing that can follow a page:
+/// when the response is read, an end marker after it all ends the
+/// enumeration with the same items.
 #[test]
-fn an_end_marker_after_any_ending_ends_the_enumeration() {
+fn an_end_marker_after_anything_ends_the_enumeration() {
     let page = enumerate_page("<p:X>1</p:X>", "");
     let mut read = 0;
     for tail in [
@@ -1350,19 +1599,20 @@ fn an_end_marker_after_any_ending_ends_the_enumeration() {
         "<!DOCTYPE",
         "<!DOCTYPE x>",
     ] {
-        let xml = format!("{page}{tail}");
-        if let Ok((items, _)) = parse_enumerate_response(&xml) {
+        let xml = format!("<r>{page}{tail}</r>");
+        if let Ok((items, context)) = parse_enumerate_response(&xml) {
             read += 1;
             assert_eq!(items, "<p:X>1</p:X>", "{tail:?}");
+            assert_eq!(context.as_deref(), Some("ctx-1"), "{tail:?}");
             assert_eq!(
-                parse_enumerate_response(&format!("{xml}<w:EndOfSequence/>")).ok(),
+                parse_enumerate_response(&ended(&xml)).ok(),
                 Some((items, None)),
                 "{tail:?}"
             );
         }
     }
-    // The endings that leave the document well-formed, at least.
-    assert!(read >= 14, "{read} documents read");
+    // The ones that leave the document well-formed.
+    assert_eq!(read, 14, "{read} documents read");
 }
 
 /// The start and the end tag of the elements a well-formed document is made
@@ -1410,65 +1660,82 @@ const LEAVES: &[&str] = &[
     "<x/>",
 ];
 
-/// A well-formed document: the elements the parsers read, nested at random.
+/// A well-formed document: one root, and the elements the parsers read
+/// nested in it at random.
 fn well_formed() -> impl proptest::strategy::Strategy<Value = String> {
     use proptest::strategy::Strategy as _;
 
-    let leaf = proptest::sample::select(LEAVES).prop_map(str::to_owned);
-    leaf.prop_recursive(8, 64, 5, |inner| {
+    let element = |inner| {
         (
             proptest::sample::select(ELEMENTS),
             proptest::collection::vec(inner, 0..5),
         )
             .prop_map(|((open, close), children)| format!("{open}{}{close}", children.concat()))
-    })
+    };
+    let leaf = proptest::sample::select(LEAVES).prop_map(str::to_owned);
+    element(leaf.prop_recursive(8, 64, 5, element).boxed())
 }
 
-fn unexpected(error: &SoapError) -> proptest::test_runner::TestCaseError {
-    proptest::test_runner::TestCaseError::fail(format!("{error:?}"))
+/// Whether `error` is what a parser may answer for a well-formed document:
+/// the fault the document is, or, when it is none, one of the `refusals` of
+/// that parser. Never a refusal of the document as XML.
+fn expected(
+    error: &SoapError,
+    fault: Option<&str>,
+    refusals: &[&str],
+) -> Result<(), proptest::test_runner::TestCaseError> {
+    let is_expected = match (error, fault) {
+        (SoapError::Fault { .. }, Some(fault)) => error.to_string() == fault,
+        (SoapError::ParseError(why), None) => refusals.iter().any(|start| why.starts_with(start)),
+        _ => false,
+    };
+    if is_expected {
+        Ok(())
+    } else {
+        Err(proptest::test_runner::TestCaseError::fail(format!(
+            "{error:?}, when the fault is {fault:?}"
+        )))
+    }
 }
 
 proptest::proptest! {
     #![proptest_config(proptest::prelude::ProptestConfig::with_cases(4000))]
 
-    /// A well-formed document is never refused as XML: it is an answer or a
-    /// fault, and it is the same one for every parser.
+    /// A well-formed document is never refused as XML: it is an answer, a
+    /// fault, or an answer with an element that does not hold what the
+    /// protocol writes there. And a fault is the same one for every parser.
     #[test]
     fn the_parsers_agree_on_a_well_formed_document(xml in well_formed()) {
-        let is_fault = check_soap_fault(&xml).is_err();
+        let fault = check_soap_fault(&xml).err().map(|fault| fault.to_string());
+        let fault = fault.as_deref();
 
         match parse_enumerate_response(&xml) {
             Ok((items, _)) => {
-                proptest::prop_assert!(!is_fault);
+                proptest::prop_assert_eq!(fault, None);
                 proptest::prop_assert!(items.len() <= xml.len());
                 proptest::prop_assert_eq!(
-                    parse_enumerate_response(&format!("{xml}<w:EndOfSequence/>")).ok(),
+                    parse_enumerate_response(&ended(&xml)).ok(),
                     Some((items, None))
                 );
             }
-            Err(SoapError::Fault { .. }) => proptest::prop_assert!(is_fault),
-            Err(other) => return Err(unexpected(&other)),
+            Err(error) => expected(&error, fault, &[ELEMENT_IN_TEXT])?,
         }
 
         match parse_receive_output_raw(&xml) {
             Ok(output) => {
-                proptest::prop_assert!(!is_fault);
+                proptest::prop_assert_eq!(fault, None);
                 proptest::prop_assert!(output.stdout.len() <= xml.len());
             }
-            Err(SoapError::Fault { .. }) => proptest::prop_assert!(is_fault),
-            // A stream that is not base64, the one thing left to refuse.
-            Err(SoapError::ParseError(why)) => {
-                proptest::prop_assert!(why.starts_with("base64 decode"), "{}", why);
-            }
-            Err(other) => return Err(unexpected(&other)),
+            Err(error) => expected(&error, fault, &[ELEMENT_IN_TEXT, "base64 decode"])?,
         }
 
         for id in [parse_shell_id(&xml), parse_command_id(&xml)] {
-            proptest::prop_assert!(
-                matches!(id, Ok(_) | Err(SoapError::MissingElement(_))),
-                "{:?}",
-                id
-            );
+            match id {
+                Ok(_) | Err(SoapError::MissingElement(_)) => {
+                    proptest::prop_assert_eq!(fault, None);
+                }
+                Err(error) => expected(&error, fault, &[ELEMENT_IN_TEXT])?,
+            }
         }
     }
 }

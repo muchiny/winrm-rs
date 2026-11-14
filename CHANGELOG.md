@@ -95,27 +95,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `Stream`, `CommandState`, `ExitCode`, `Items`, `EnumerationContext`,
   `EndOfSequence`) are read outside a fault and outside the `Items` of an
   enumeration. Prefixes stay free: namespaces are not resolved. What changes:
-  - an answer that is not well-formed XML is refused with
-    `SoapError::ParseError` (`malformed XML: ...`), where it was read as far
-    as the search went: unbalanced or mismatched tags, an answer cut short,
-    an entity XML does not define. An answer with a DTD is refused too. Two
-    cases stay as they were: a `ShellId` or a `CommandId` read before the
-    malformed part stands, and the body of an HTTP error that is not XML is
-    not an error of its own;
+  - an answer is read to its end before any of it is returned, and one that
+    is not an XML document is refused with `SoapError::ParseError`, where it
+    was read as far as the search went: unbalanced or mismatched tags, an
+    answer cut short, an empty body, text around the root element, a second
+    root element, an entity XML does not define, a DTD. This holds for
+    `ShellId` and `CommandId` too: an id that stands before a malformed
+    part is no longer returned. One case stays as it was: the body of an
+    HTTP error that is not XML is not an error of its own;
+  - a fault comes first. A response that is a fault gives that fault from
+    every parser, whatever else it holds: a Create or a Command response
+    that is a fault and has a `ShellId` in it no longer gives an id;
   - text is decoded: character references, the five predefined entities and
     CDATA sections are resolved, and comments are skipped, in an id, an
-    enumeration context, an exit code, a fault code and a fault reason. An
-    id or a context is escaped again when it goes into the next request, as
-    before. The items of `run_wql` are still returned as the server wrote
-    them;
+    enumeration context, an exit code, a fault code and a fault reason. A
+    character reference that names no character reads as U+FFFD. An id or a
+    context goes into the next request as the text it decodes to, escaped
+    as before: a context the server wrote with `&amp;` goes back with
+    `&amp;`, where it went back as `&amp;amp;`. The items of `run_wql` are
+    still returned as the server wrote them, and a DTD or an entity in them
+    is left there;
+  - an id, an enumeration context, a stream and an exit code are text
+    alone. An answer where one of them holds an element is refused, where
+    the text up to that element was taken;
   - attributes are read as attributes. A `Stream` is named by its `Name`
     wherever it stands among the others and whichever quote it uses, and a
     command is done when a `CommandState` element says so in its `State`,
-    where the URI of the `Done` state anywhere in the answer was enough;
+    where the URI of the `Done` state anywhere in the answer was enough. A
+    `Stream` or a `CommandState` whose attributes are not well-formed is
+    refused;
   - an element with attributes is read like one without (`ShellId`,
     `ExitCode`, `EnumerationContext`);
   - what a fault holds is the fault's: a `Stream` in its detail is not
     output.
+
+  What is still not checked: the characters of a name and of a text (a
+  control character a server writes in an id goes into the next request as
+  it is), and the attributes of the elements whose attributes are not
+  read.
 
   New dependency: `quick-xml` 0.42 without its default features
   (`#![forbid(unsafe_code)]`; its one dependency, `memchr`, was in the tree
@@ -223,9 +240,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (`<f:ProviderFault provider="WMI Provider" ...`): it now has the
   provider's message. The reason is the first message of the fault's detail
   that has text, else the fault's `Reason`, else a SOAP 1.1 `faultstring`.
-  The faults that read well keep their text (`w:TimedOut`,
+  The order changes for a server that writes `<s:Text>` without attribute
+  and a message in the detail: its reason was the `Text`, it is now the
+  message. The faults that read well keep their text (`w:TimedOut`,
   `w:InvalidSelectors`). The parser's tests now read answers captured from
-  a Windows Server 2012 R2 (`src/soap/parser/fixtures/`).
+  Windows Server 2012 R2 and 2025 (`src/soap/parser/fixtures/`).
 
 ### Documentation
 

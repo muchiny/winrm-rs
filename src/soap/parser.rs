@@ -1,6 +1,6 @@
 //! Response parsers for shell IDs, command IDs, and output streams.
 //!
-//! Each parser is a [`Visitor`] of one [`walk`] over the response (see
+//! Each parser is a visitor of one [`walk`] over the response (see
 //! [`super::xml`] for what a response may hold). Elements are matched by
 //! local name and by their place in the document:
 //!
@@ -10,11 +10,26 @@
 //! - `MessageID` and `RelatesTo` are children of the `Header`;
 //! - the elements of a successful answer (`ShellId`, `CommandId`, `Stream`,
 //!   `CommandState`, `ExitCode`, `Items`, `EnumerationContext`,
-//!   `EndOfSequence`) are taken wherever they are outside a fault and outside
-//!   the `Items` of an enumeration, which are data and are never read.
+//!   `EndOfSequence`) are taken wherever they are outside the fault and
+//!   outside the `Items` of an enumeration, which are data and are never
+//!   read.
+//!
+//! A parser of a successful answer reads the whole response
+//! ([`read_answer`]) and fails, in this order: with the fault, when the
+//! response is one; with a [`SoapError::ParseError`], when an element it
+//! reads is not what the protocol writes there (an element inside an id or
+//! a stream, a stream that is not base64) or when the response is not a
+//! document [`walk`] accepts. What it returns therefore comes from a
+//! response that was read to its end and is not a fault.
+//!
+//! [`check_soap_fault`] and the readers of the header are tolerant: they
+//! read as far as they need to, and keep what they have read of a response
+//! that then stops being a document.
 
 use std::ops::ControlFlow;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as B64;
 use quick_xml::events::BytesStart;
 
 use super::clixml::ClixmlDecoder;
@@ -42,19 +57,21 @@ pub struct ReceiveOutput {
 /// Extract the `ShellId` from a Create Shell response body.
 ///
 /// The text of the first `ShellId` element that has some, whatever its
-/// prefix. Returns [`SoapError::MissingElement`] if there is none, and
-/// [`SoapError::ParseError`] if the response stops being XML before one.
+/// prefix. Returns the [`SoapError::Fault`] if the response is one,
+/// [`SoapError::ParseError`] if it is not well-formed XML or if the id holds
+/// an element, and [`SoapError::MissingElement`] if it has no such element.
 pub(crate) fn parse_shell_id(xml: &str) -> Result<String, SoapError> {
-    first_text(xml, Tag::ShellId, "ShellId")
+    read_id(xml, Tag::ShellId, "ShellId")
 }
 
 /// Extract the `CommandId` from an Execute Command response body.
 ///
 /// The text of the first `CommandId` element that has some, whatever its
-/// prefix. Returns [`SoapError::MissingElement`] if there is none, and
-/// [`SoapError::ParseError`] if the response stops being XML before one.
+/// prefix. Returns the [`SoapError::Fault`] if the response is one,
+/// [`SoapError::ParseError`] if it is not well-formed XML or if the id holds
+/// an element, and [`SoapError::MissingElement`] if it has no such element.
 pub(crate) fn parse_command_id(xml: &str) -> Result<String, SoapError> {
-    first_text(xml, Tag::CommandId, "CommandId")
+    read_id(xml, Tag::CommandId, "CommandId")
 }
 
 /// Parse a Receive response to extract stdout, stderr, exit code, and completion state.
@@ -62,9 +79,9 @@ pub(crate) fn parse_command_id(xml: &str) -> Result<String, SoapError> {
 /// Decodes the base64 text of the `Stream` elements named `stdout` and
 /// `stderr`, reads `done` from a `CommandState` whose `State` is the `Done`
 /// URI, and the exit code from the first `ExitCode` that has text.
-/// Returns [`SoapError::ParseError`] if a stream is not base64 or the
-/// response is not well-formed XML, or a [`SoapError::Fault`] if the response
-/// is a SOAP fault.
+/// Returns the [`SoapError::Fault`] if the response is one, and
+/// [`SoapError::ParseError`] if it is not well-formed XML, or if a stream is
+/// not base64 or holds an element.
 ///
 /// PowerShell CLIXML on stderr is decoded within this one response, with a
 /// decoder finished at its end. A document split across Receive responses is
@@ -81,19 +98,11 @@ pub(crate) fn parse_receive_output(xml: &str) -> Result<ReceiveOutput, SoapError
 
 /// [`parse_receive_output`] with stderr returned exactly as the server sent it.
 pub(crate) fn parse_receive_output_raw(xml: &str) -> Result<ReceiveOutput, SoapError> {
-    let mut reader = ReceiveReader::default();
-    let walked = walk(xml, &mut reader);
-    if let Some(error) = reader.bad_stream {
-        return Err(SoapError::ParseError(error));
-    }
-    if let Some(fault) = reader.fault.fault() {
-        return Err(fault);
-    }
-    walked?;
+    let reader = read_answer(xml, ReceiveReader::default())?;
     Ok(ReceiveOutput {
         stdout: reader.stdout,
         stderr: reader.stderr,
-        exit_code: reader.exit_code.as_deref().and_then(exit_code),
+        exit_code: reader.exit_code.as_deref().and_then(parse_exit_code),
         done: reader.done,
     })
 }
@@ -103,7 +112,7 @@ pub(crate) fn parse_receive_output_raw(xml: &str) -> Result<ReceiveOutput, SoapE
 /// still running" (no `ExitCode` element) from "the server wrote an
 /// `ExitCode` that cannot be read" (a server malfunction, or a response that
 /// was tampered with).
-fn exit_code(text: &str) -> Option<i32> {
+fn parse_exit_code(text: &str) -> Option<i32> {
     match text.parse::<i32>() {
         Ok(code) => Some(code),
         Err(e) => {
@@ -124,13 +133,12 @@ fn exit_code(text: &str) -> Option<i32> {
 /// continuation via Pull: `None` once the response has an `EndOfSequence`
 /// element. What lies inside `Items` is data: an element with one of those
 /// names in there is not read.
+///
+/// Returns the [`SoapError::Fault`] if the response is one, and
+/// [`SoapError::ParseError`] if it is not well-formed XML or if the context
+/// holds an element.
 pub(crate) fn parse_enumerate_response(xml: &str) -> Result<(String, Option<String>), SoapError> {
-    let mut reader = EnumerateReader::default();
-    let walked = walk(xml, &mut reader);
-    if let Some(fault) = reader.fault.fault() {
-        return Err(fault);
-    }
-    walked?;
+    let reader = read_answer(xml, EnumerateReader::default())?;
     let context = if reader.end { None } else { reader.context };
     Ok((reader.items.unwrap_or_default().to_owned(), context))
 }
@@ -140,8 +148,9 @@ pub(crate) fn parse_enumerate_response(xml: &str) -> Result<(String, Option<Stri
 /// A fault is a `Fault` element that is the first child of the SOAP `Body`
 /// (SOAP 1.2 Part 1 §5.4), or the root of a document that is a fault alone.
 /// A `Fault` element anywhere else is data. Returns `Ok(())` if no fault is
-/// present, and also for a body that is not XML: only a fault is an error
-/// here.
+/// present, and also for a body that is not XML (the body of an HTTP error
+/// often is not): only a fault is an error here, and what makes a response
+/// an answer is for the parser of that answer to say.
 ///
 /// The code is the fault's subcode when it has one (`w:TimedOut`), else its
 /// code (`s:Receiver`). The reason is the first message of the fault's
@@ -149,8 +158,7 @@ pub(crate) fn parse_enumerate_response(xml: &str) -> Result<(String, Option<Stri
 /// text.
 pub(crate) fn check_soap_fault(xml: &str) -> Result<(), SoapError> {
     let mut reader = FaultReader::default();
-    // What follows a part that is not XML cannot hold a fault that was not
-    // read already.
+    // A fault that was read stands, whatever the response becomes after it.
     let _ = walk(xml, &mut reader);
     reader.fault().map_or(Ok(()), Err)
 }
@@ -194,60 +202,38 @@ pub(crate) fn check_relates_to(request: &str, response: &str) -> Result<(), Stri
     }
 }
 
-// --- Readers ---
-
-/// The text of the first `tag` element of `xml` that has some.
-fn first_text(xml: &str, tag: Tag, name: &str) -> Result<String, SoapError> {
-    let mut reader = TextReader::new(tag, false);
-    let walked = walk(xml, &mut reader);
-    match reader.found {
-        Some(text) => Ok(text),
-        None => {
-            walked?;
-            Err(SoapError::MissingElement(name.into()))
-        }
-    }
+/// `text` without the blanks around it, unless nothing is left.
+fn non_blank(text: &str) -> Option<String> {
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_owned())
 }
+
+// --- The header ---
 
 /// The text of the first `tag` child of the `Header` that has some. A header
 /// read before the document stops being XML stands.
 fn header_text(xml: &str, tag: Tag) -> Option<String> {
-    let mut reader = TextReader::new(tag, true);
+    let mut reader = HeaderReader {
+        tag,
+        own: OwnText::default(),
+        found: None,
+    };
     let _ = walk(xml, &mut reader);
     reader.found
 }
 
-/// Finds the first element with a given tag that holds text, and stops there.
-struct TextReader {
+/// Finds the first `tag` child of the envelope's `Header` that holds text.
+/// The search ends with the header.
+struct HeaderReader {
     tag: Tag,
-    /// Only a child of the envelope's `Header` counts, and the search ends
-    /// with the header. Otherwise the element counts wherever it is.
-    in_header: bool,
     own: OwnText,
-    /// The element's text, trimmed.
     found: Option<String>,
 }
 
-impl TextReader {
-    fn new(tag: Tag, in_header: bool) -> Self {
-        Self {
-            tag,
-            in_header,
-            own: OwnText::default(),
-            found: None,
-        }
-    }
-}
-
-impl Visitor<'_> for TextReader {
+impl Visitor<'_> for HeaderReader {
     fn open(&mut self, path: &[Tag], _start: &BytesStart<'_>) -> Step {
-        let wanted = if self.in_header {
-            matches!(path, [Tag::Envelope, Tag::Header, last] if *last == self.tag)
-        } else {
-            path.last() == Some(&self.tag)
-        };
-        if wanted {
-            self.own.start(path);
+        if matches!(path, [Tag::Envelope, Tag::Header, last] if *last == self.tag) {
+            self.own.start(path, ());
         }
         Step::Into
     }
@@ -257,18 +243,18 @@ impl Visitor<'_> for TextReader {
     }
 
     fn close(&mut self, path: &[Tag]) -> ControlFlow<()> {
-        if let Some(text) = self.own.finish(path).map(str::trim)
-            && !text.is_empty()
-        {
-            self.found = Some(text.to_owned());
-            return ControlFlow::Break(());
+        if let Some(((), text)) = self.own.finish(path) {
+            self.found = non_blank(text);
         }
-        if self.in_header && matches!(path, [Tag::Envelope, Tag::Header]) {
-            return ControlFlow::Break(());
+        if self.found.is_some() || matches!(path, [Tag::Envelope, Tag::Header]) {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
         }
-        ControlFlow::Continue(())
     }
 }
+
+// --- The fault ---
 
 /// Longest fault code kept, in characters (real codes are a few dozen).
 const FAULT_CODE_CHARS: usize = 256;
@@ -316,6 +302,13 @@ impl FaultTexts {
             FaultText::FaultString => &mut self.fault_string,
         }
     }
+
+    /// Keep what was read of `text`, unless it is blank.
+    fn keep(&mut self, text: FaultText, read: &str) {
+        if let Some(read) = non_blank(read) {
+            *self.slot(text) = Some(read);
+        }
+    }
 }
 
 /// Where the search for a fault stands.
@@ -332,20 +325,16 @@ enum FaultSearch {
     Absent,
 }
 
-/// Finds the fault of a response and reads its code and reason. A parser
-/// that reads something else from the response feeds one too, so that it
-/// never takes a fault for an answer.
+/// Finds the fault of a response and reads its code and reason.
 #[derive(Default)]
 struct FaultReader {
     search: FaultSearch,
-    own: OwnText,
-    /// The text `own` is reading.
-    reading: Option<FaultText>,
+    own: OwnText<FaultText>,
     texts: FaultTexts,
 }
 
 impl FaultReader {
-    /// Whether the element that just opened is the fault or lies inside it.
+    /// Whether the current element is the fault or lies inside it.
     fn inside(&self) -> bool {
         matches!(self.search, FaultSearch::Inside(_))
     }
@@ -384,15 +373,11 @@ impl FaultReader {
         // A message may hold a provider fault that holds a message: the one
         // that opens ends the reading of the one around it, which keeps the
         // text it had until there.
-        if let Some(around) = self.reading.take()
-            && let Some(read) = self.own.stop().map(str::trim)
-            && !read.is_empty()
-        {
-            *self.texts.slot(around) = Some(read.to_owned());
+        if let Some((around, read)) = self.own.stop() {
+            self.texts.keep(around, read);
         }
         if self.texts.slot(text).is_none() {
-            self.reading = Some(text);
-            self.own.start(path);
+            self.own.start(path, text);
         }
     }
 
@@ -409,11 +394,8 @@ impl FaultReader {
                 }
             }
             FaultSearch::Inside(depth) => {
-                if let Some(read) = self.own.finish(path).map(str::trim)
-                    && let Some(text) = self.reading.take()
-                    && !read.is_empty()
-                {
-                    *self.texts.slot(text) = Some(read.to_owned());
+                if let Some((text, read)) = self.own.finish(path) {
+                    self.texts.keep(text, read);
                 }
                 if path.len() == depth {
                     self.search = FaultSearch::Read;
@@ -471,99 +453,234 @@ impl Visitor<'_> for FaultReader {
     }
 }
 
-/// The text of a Receive response being read.
+// --- The answers ---
+
+/// What a parser reads of a successful answer: [`Visitor`], for the part of
+/// the response that is outside the fault, with a way to refuse what it is
+/// told.
+trait Answer<'a> {
+    /// An element opens. `Err` when the answer cannot hold it there.
+    fn open(&mut self, path: &[Tag], start: &BytesStart<'_>) -> Result<Step, SoapError>;
+
+    /// A piece of the text the current element holds directly.
+    fn text(&mut self, path: &[Tag], text: &str);
+
+    /// The content of an element whose [`Self::open`] answered [`Step::Raw`].
+    fn raw(&mut self, _path: &[Tag], _inner: &'a str) {}
+
+    /// The current element closes. `Err` when what it held is not what the
+    /// answer reads there.
+    fn close(&mut self, path: &[Tag]) -> Result<(), SoapError>;
+}
+
+/// Read a successful answer with `answer`. The whole response is read, and
+/// it is an error, in this order: for it to be a fault; for `answer` to
+/// refuse a part of it (the first refusal is the error); for it not to be a
+/// document [`walk`] accepts.
+fn read_answer<'a, A: Answer<'a>>(xml: &'a str, answer: A) -> Result<A, SoapError> {
+    let mut reader = AnswerReader {
+        fault: FaultReader::default(),
+        answer,
+        refused: None,
+    };
+    let walked = walk(xml, &mut reader);
+    if let Some(fault) = reader.fault.fault() {
+        return Err(fault);
+    }
+    if let Some(refused) = reader.refused {
+        return Err(refused);
+    }
+    walked?;
+    Ok(reader.answer)
+}
+
+/// An [`Answer`] behind the search for a fault: it is told what the response
+/// holds outside the fault, so that it never takes a part of a fault for a
+/// part of an answer.
+struct AnswerReader<A> {
+    fault: FaultReader,
+    answer: A,
+    /// Why the answer refused the response, the first time it did.
+    refused: Option<SoapError>,
+}
+
+impl<A> AnswerReader<A> {
+    fn refuse(&mut self, error: SoapError) {
+        if self.refused.is_none() {
+            self.refused = Some(error);
+        }
+    }
+}
+
+impl<'a, A: Answer<'a>> Visitor<'a> for AnswerReader<A> {
+    fn open(&mut self, path: &[Tag], start: &BytesStart<'_>) -> Step {
+        self.fault.on_open(path);
+        if self.fault.inside() {
+            return Step::Into;
+        }
+        match self.answer.open(path, start) {
+            Ok(step) => step,
+            Err(error) => {
+                self.refuse(error);
+                Step::Into
+            }
+        }
+    }
+
+    fn text(&mut self, path: &[Tag], text: &str) {
+        if self.fault.inside() {
+            self.fault.on_text(path, text);
+        } else {
+            self.answer.text(path, text);
+        }
+    }
+
+    fn raw(&mut self, path: &[Tag], inner: &'a str) {
+        self.answer.raw(path, inner);
+    }
+
+    fn close(&mut self, path: &[Tag]) -> ControlFlow<()> {
+        // The element that closes may be the fault itself.
+        let inside = self.fault.inside();
+        self.fault.on_close(path);
+        if !inside && let Err(error) = self.answer.close(path) {
+            self.refuse(error);
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// An element opens while `own` reads the text of one. The elements an
+/// answer's texts are read from hold text alone (an id, a number, base64):
+/// with an element inside, the text read would not be what the server wrote.
+fn text_alone<K>(own: &OwnText<K>) -> Result<(), SoapError> {
+    if own.reading() {
+        return Err(SoapError::ParseError(
+            "an element inside one that holds text alone".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The id an answer gives: the text of the first `tag` element that has
+/// some.
+fn read_id(xml: &str, tag: Tag, name: &str) -> Result<String, SoapError> {
+    let reader = IdReader {
+        tag,
+        own: OwnText::default(),
+        id: None,
+    };
+    read_answer(xml, reader)?
+        .id
+        .ok_or_else(|| SoapError::MissingElement(name.into()))
+}
+
+/// Reads the id of a Create or of a Command response.
+struct IdReader {
+    tag: Tag,
+    own: OwnText,
+    id: Option<String>,
+}
+
+impl Answer<'_> for IdReader {
+    fn open(&mut self, path: &[Tag], _start: &BytesStart<'_>) -> Result<Step, SoapError> {
+        text_alone(&self.own)?;
+        if self.id.is_none() && path.last() == Some(&self.tag) {
+            self.own.start(path, ());
+        }
+        Ok(Step::Into)
+    }
+
+    fn text(&mut self, path: &[Tag], text: &str) {
+        self.own.push(path, text);
+    }
+
+    fn close(&mut self, path: &[Tag]) -> Result<(), SoapError> {
+        if let Some(((), text)) = self.own.finish(path) {
+            self.id = non_blank(text);
+        }
+        Ok(())
+    }
+}
+
+/// The stream a `Stream` element carries a piece of.
 #[derive(Clone, Copy)]
-enum ReceiveText {
+enum StreamName {
     Stdout,
     Stderr,
     /// A stream with another name: checked as base64, then dropped.
-    OtherStream,
+    Other,
+}
+
+/// The texts a Receive response is read from.
+#[derive(Clone, Copy)]
+enum ReceiveText {
+    Stream(StreamName),
     ExitCode,
 }
 
 /// Reads a Receive response.
 #[derive(Default)]
 struct ReceiveReader {
-    fault: FaultReader,
-    own: OwnText,
-    /// The text `own` is reading.
-    reading: Option<ReceiveText>,
+    own: OwnText<ReceiveText>,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     /// The text of the first `ExitCode` that has some.
     exit_code: Option<String>,
     done: bool,
-    /// Why the first stream that is not base64 is not.
-    bad_stream: Option<String>,
 }
 
-impl Visitor<'_> for ReceiveReader {
-    fn open(&mut self, path: &[Tag], start: &BytesStart<'_>) -> Step {
-        self.fault.on_open(path);
-        if self.fault.inside() {
-            return Step::Into;
-        }
+impl Answer<'_> for ReceiveReader {
+    fn open(&mut self, path: &[Tag], start: &BytesStart<'_>) -> Result<Step, SoapError> {
+        text_alone(&self.own)?;
         match path.last() {
             Some(Tag::Stream) => {
-                self.reading = Some(match attribute(start, "Name").as_deref() {
-                    Some("stdout") => ReceiveText::Stdout,
-                    Some("stderr") => ReceiveText::Stderr,
-                    _ => ReceiveText::OtherStream,
-                });
-                self.own.start(path);
+                let stream = match attribute(start, "Name")?.as_deref() {
+                    Some("stdout") => StreamName::Stdout,
+                    Some("stderr") => StreamName::Stderr,
+                    _ => StreamName::Other,
+                };
+                self.own.start(path, ReceiveText::Stream(stream));
             }
             Some(Tag::CommandState) => {
-                if attribute(start, "State").as_deref() == Some(COMMAND_STATE_DONE) {
+                if attribute(start, "State")?.as_deref() == Some(COMMAND_STATE_DONE) {
                     self.done = true;
                 }
             }
             Some(Tag::ExitCode) if self.exit_code.is_none() => {
-                self.reading = Some(ReceiveText::ExitCode);
-                self.own.start(path);
+                self.own.start(path, ReceiveText::ExitCode);
             }
             _ => {}
         }
-        Step::Into
+        Ok(Step::Into)
     }
 
     fn text(&mut self, path: &[Tag], text: &str) {
-        self.fault.on_text(path, text);
         self.own.push(path, text);
     }
 
-    fn close(&mut self, path: &[Tag]) -> ControlFlow<()> {
-        use base64::Engine;
-        use base64::engine::general_purpose::STANDARD as B64;
-
-        self.fault.on_close(path);
-        if let Some(text) = self.own.finish(path)
-            && let Some(reading) = self.reading.take()
-        {
-            if matches!(reading, ReceiveText::ExitCode) {
-                let text = text.trim();
-                if !text.is_empty() {
-                    self.exit_code = Some(text.to_owned());
-                }
-            } else if !text.trim_ascii().is_empty() {
-                match (B64.decode(text.trim_ascii()), reading) {
-                    (Ok(bytes), ReceiveText::Stdout) => self.stdout.extend_from_slice(&bytes),
-                    (Ok(bytes), ReceiveText::Stderr) => self.stderr.extend_from_slice(&bytes),
-                    (Ok(_), ReceiveText::OtherStream | ReceiveText::ExitCode) => {}
-                    (Err(e), _) => {
-                        self.bad_stream
-                            .get_or_insert_with(|| format!("base64 decode: {e}"));
-                    }
+    fn close(&mut self, path: &[Tag]) -> Result<(), SoapError> {
+        match self.own.finish(path) {
+            Some((ReceiveText::Stream(stream), text)) => {
+                let bytes = B64
+                    .decode(text.trim_ascii())
+                    .map_err(|e| SoapError::ParseError(format!("base64 decode: {e}")))?;
+                match stream {
+                    StreamName::Stdout => self.stdout.extend_from_slice(&bytes),
+                    StreamName::Stderr => self.stderr.extend_from_slice(&bytes),
+                    StreamName::Other => {}
                 }
             }
+            Some((ReceiveText::ExitCode, text)) => self.exit_code = non_blank(text),
+            None => {}
         }
-        ControlFlow::Continue(())
+        Ok(())
     }
 }
 
 /// Reads an Enumerate or a Pull response.
 #[derive(Default)]
 struct EnumerateReader<'a> {
-    fault: FaultReader,
     own: OwnText,
     /// The content of the first `Items` that has some, trimmed.
     items: Option<&'a str>,
@@ -573,23 +690,19 @@ struct EnumerateReader<'a> {
     end: bool,
 }
 
-impl<'a> Visitor<'a> for EnumerateReader<'a> {
-    fn open(&mut self, path: &[Tag], _start: &BytesStart<'_>) -> Step {
-        self.fault.on_open(path);
-        if self.fault.inside() {
-            return Step::Into;
-        }
+impl<'a> Answer<'a> for EnumerateReader<'a> {
+    fn open(&mut self, path: &[Tag], _start: &BytesStart<'_>) -> Result<Step, SoapError> {
+        text_alone(&self.own)?;
         match path.last() {
-            Some(Tag::Items) => return Step::Raw,
+            Some(Tag::Items) => return Ok(Step::Raw),
             Some(Tag::EndOfSequence) => self.end = true,
-            Some(Tag::EnumerationContext) if self.context.is_none() => self.own.start(path),
+            Some(Tag::EnumerationContext) if self.context.is_none() => self.own.start(path, ()),
             _ => {}
         }
-        Step::Into
+        Ok(Step::Into)
     }
 
     fn text(&mut self, path: &[Tag], text: &str) {
-        self.fault.on_text(path, text);
         self.own.push(path, text);
     }
 
@@ -600,14 +713,11 @@ impl<'a> Visitor<'a> for EnumerateReader<'a> {
         }
     }
 
-    fn close(&mut self, path: &[Tag]) -> ControlFlow<()> {
-        self.fault.on_close(path);
-        if let Some(text) = self.own.finish(path).map(str::trim)
-            && !text.is_empty()
-        {
-            self.context = Some(text.to_owned());
+    fn close(&mut self, path: &[Tag]) -> Result<(), SoapError> {
+        if let Some(((), text)) = self.own.finish(path) {
+            self.context = non_blank(text);
         }
-        ControlFlow::Continue(())
+        Ok(())
     }
 }
 

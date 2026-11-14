@@ -1,0 +1,155 @@
+name: Mutants
+
+# Mutation testing of the whole library. cargo-mutants changes one piece of
+# code at a time (a return value, an operator, a deleted match arm), builds
+# the crate and runs the unit tests: a change no test notices is a line the
+# tests run without checking. Every mutant costs a build and a test run, and
+# there are about two thousand of them, which is far too long for a pull
+# request. So this runs every week and on request, split into shards that
+# each take their share of the mutants.
+#
+# It is not one of the jobs `CI passed` waits for: a mutant that survives
+# fails the `report` job of this workflow and nothing else.
+
+on:
+  schedule:
+    # 02:41 UTC on Sundays — off the hour to avoid the scheduler pile-up.
+    - cron: "41 2 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mutants-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # The number of shards: the length of `matrix.shard` below. Every shard
+  # must run with the same arguments, or they do not split the same list.
+  SHARDS: 16
+
+jobs:
+  shard:
+    name: shard ${{ matrix.shard }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      # Every shard reports, whatever the others find.
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-24
+        with:
+          toolchain: 1.100.0
+      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
+        with:
+          tool: cargo-mutants@27.1.0
+      # Both features are on, so that the code they gate is compiled: a mutant
+      # in code that is not compiled changes nothing and would be reported as
+      # one no test catches.
+      - name: Install krb5 and OpenSSL headers
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libssl-dev pkg-config
+
+      # No cache and no `--in-place`: cargo-mutants works on a copy of the
+      # tree and times its own baseline there, which sets the test timeout.
+      #
+      # Left out: `src/__fuzz.rs` (the fuzz and proptest surface, compiled
+      # only with `__internal`) and `src/test_proxy.rs` (a proxy for the
+      # tests). Neither is library code.
+      #
+      # `--lib`: the unit tests are the ones that have to catch a mutant.
+      - name: Mutants
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          # 0: every mutant was caught. 2: some survived. 3: some timed out.
+          # The last two are findings, which the `report` job counts; any
+          # other code (a baseline that fails, a usage error) fails this
+          # shard.
+          set +e
+          cargo mutants --no-shuffle -vV --shard "$SHARD/$SHARDS" \
+            --features credssp,kerberos \
+            --exclude src/__fuzz.rs --exclude src/test_proxy.rs \
+            -- --lib
+          code=$?
+          set -e
+          echo "cargo-mutants exit code: $code"
+          case "$code" in
+            0 | 2 | 3) ;;
+            *) exit "$code" ;;
+          esac
+
+      - name: Upload the outcome
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mutants-shard-${{ matrix.shard }}
+          path: |
+            mutants.out/caught.txt
+            mutants.out/missed.txt
+            mutants.out/timeout.txt
+            mutants.out/unviable.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+  report:
+    name: Report
+    runs-on: ubuntu-latest
+    needs: shard
+    if: always()
+    timeout-minutes: 10
+    steps:
+      # One directory per shard: shards/mutants-shard-<n>/.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: mutants-shard-*
+          path: shards
+
+      - name: Summary
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          lines() { if [ "$#" -gt 0 ]; then cat "$@" | wc -l; else echo 0; fi; }
+          reporting=(shards/mutants-shard-*/)
+          caught=$(lines shards/*/caught.txt)
+          missed=$(lines shards/*/missed.txt)
+          timed_out=$(lines shards/*/timeout.txt)
+          unviable=$(lines shards/*/unviable.txt)
+          {
+            echo "## Mutants"
+            echo
+            echo "| Shards reporting | Caught | Missed | Timed out | Unviable |"
+            echo "| --- | --- | --- | --- | --- |"
+            echo "| ${#reporting[@]} of $SHARDS | $caught | $missed | $timed_out | $unviable |"
+            if [ "$missed" -gt 0 ]; then
+              echo
+              echo "### Missed: no test notices the change"
+              echo
+              echo '```'
+              sort shards/*/missed.txt
+              echo '```'
+            fi
+            if [ "$timed_out" -gt 0 ]; then
+              echo
+              echo "### Timed out: the change makes a test run without end"
+              echo
+              echo '```'
+              sort shards/*/timeout.txt
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "${#reporting[@]}" -ne "$SHARDS" ]; then
+            echo "::error::${#reporting[@]} of $SHARDS shards reported: the result is partial"
+            exit 1
+          fi
+          if [ "$missed" -gt 0 ] || [ "$timed_out" -gt 0 ]; then
+            echo "::error::$missed mutants survived and $timed_out timed out: see the summary of this run"
+            exit 1
+          fi

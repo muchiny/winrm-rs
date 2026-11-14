@@ -394,19 +394,21 @@ match client.run_powershell("win-server", "Get-Service").await {
     Err(WinrmError::AuthRejected(why)) => eprintln!("refused: {why}"),
     // Nothing was sent: the configuration cannot work as written.
     Err(WinrmError::Config(why)) => eprintln!("fix the configuration: {why}"),
-    // The network path, or a deadline.
+    // The network path (connection, TLS) or a deadline. When the failure
+    // came after the request was sent, the command may have run.
     Err(e @ (WinrmError::Http(_) | WinrmError::Connection(_) | WinrmError::Timeout(_))) => {
-        eprintln!("not reached: {e}");
+        eprintln!("no answer: {e}");
     }
     // What the server answered: an HTTP status, or a SOAP fault with its code.
-    Err(WinrmError::HttpStatus { status, message }) => eprintln!("HTTP {status}: {message}"),
+    Err(WinrmError::HttpStatus { status, message, .. }) => eprintln!("HTTP {status}: {message}"),
     Err(WinrmError::Soap(fault)) => eprintln!("WinRM fault: {fault}"),
     Err(e) => return Err(e.into()),
 }
 ```
 
-The enum is `#[non_exhaustive]`, so the last arm stays. The other variants
-are `AuthFailed` (the authentication failed for another reason than the
+The enum is `#[non_exhaustive]`, so the last arm stays, and a pattern on a
+variant with named fields ends with `..`. The other variants are
+`Authentication` (the authentication failed for another reason than the
 server's refusal: a Kerberos ticket, a pinned certificate that does not
 match), `Protocol`, `Ntlm` and `CredSsp` (an answer that does not follow the
 protocol or does not verify), `OutputLimit` (`max_output_bytes`), `Transfer`

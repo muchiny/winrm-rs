@@ -435,8 +435,14 @@ fn user_agent_with_a_line_break_is_refused() {
             HttpTransport::new(config, WinrmCredentials::new("u", "p", ""))
         };
         for bad in ["agent\r\nX-Extra: 1", "agent\rx", "agent\nx"] {
+            // An option the HTTP client refuses, and nothing was sent:
+            // `Config`, not the `Http` of a failure on the network.
             assert!(
-                matches!(build(bad), Err(WinrmError::Http(_))),
+                matches!(
+                    build(bad),
+                    Err(WinrmError::Config(m))
+                        if m.starts_with("the HTTP client cannot be set up as configured: ")
+                ),
                 "{auth_method:?} accepted {bad:?}"
             );
         }
@@ -2231,7 +2237,8 @@ async fn unauthorized_on_a_reused_connection_is_not_resent() {
     assert_eq!(fake.handshakes(), 2, "log: {:?}", fake.log());
 }
 
-/// A 401 right after a fresh handshake is an authentication failure, not
+/// A 401 right after a fresh handshake is a connection that lost its
+/// session (`Connection`: bad credentials fail the handshake itself), not
 /// a reason to loop.
 #[tokio::test]
 async fn unauthorized_on_a_fresh_session_is_not_retried() {
@@ -2276,6 +2283,13 @@ async fn failed_sealed_request_is_never_resent() {
             content_type: "multipart/encrypted;protocol=\"application/HTTP-SPNEGO-session-encrypted\";boundary=\"Encrypted Boundary\"",
             body: b"--Encrypted Boundary\r\ngarbage".to_vec(),
         },
+        // What HTTP.sys answers while the WinRM service restarts: it holds
+        // no session and cannot seal.
+        Reply::Raw {
+            status: 503,
+            content_type: "text/html",
+            body: b"<h1>Service Unavailable</h1>".to_vec(),
+        },
     ];
     for (i, failure) in failures.into_iter().enumerate() {
         let (_server, fake, transport, host) = sealed_setup_with(|c| c.max_retries = 2).await;
@@ -2289,13 +2303,25 @@ async fn failed_sealed_request_is_never_resent() {
             .send_soap_with_retry(&host, "<b/>".into())
             .await
             .unwrap_err();
-        // A sealed answer is trusted and keeps its status; one that is not
-        // sealed, or does not unseal, is not what the protocol allows.
+        // A sealed answer is trusted and keeps its status. An error status
+        // that is not sealed keeps its status too, and its body is not
+        // quoted. A success that does not unseal is not what the protocol
+        // allows.
+        let unsealed = |status: u16, body: &str| {
+            matches!(
+                &err,
+                WinrmError::HttpStatus { status: got, message }
+                    if *got == status
+                        && message.contains("without sealing")
+                        && !message.contains(body)
+            )
+        };
         let expected = match i {
             0 => matches!(err, WinrmError::HttpStatus { status: 500, .. }),
             1 => matches!(err, WinrmError::HttpStatus { status: 400, .. }),
-            2 => matches!(&err, WinrmError::Protocol(m) if m.contains("without sealing")),
-            _ => matches!(&err, WinrmError::Protocol(m) if m.starts_with("NTLM sealed response: ")),
+            2 => unsealed(500, "TimedOut"),
+            3 => matches!(&err, WinrmError::Protocol(m) if m.starts_with("NTLM sealed response: ")),
+            _ => unsealed(503, "Service Unavailable</h1>"),
         };
         assert!(expected, "case {i}: got {err:?}");
         assert_eq!(
@@ -3070,7 +3096,7 @@ async fn credssp_pin_refuses_a_listener_with_another_certificate() {
     // The pin's refusal is the variant the other methods give it
     // (`kerberos_probe_reports_a_wrong_pin_as_such`), not a network failure.
     assert!(
-        matches!(&err, WinrmError::AuthFailed(m) if m.starts_with("CredSSP outer TLS")),
+        matches!(&err, WinrmError::Authentication(m) if m.starts_with("CredSSP outer TLS")),
         "{err}"
     );
     assert!(
@@ -3186,7 +3212,7 @@ async fn credssp_through_a_proxy_keeps_the_pin() {
     let t = credssp_proxied_transport(relay, format!("http://127.0.0.1:{pport}")).unwrap();
     let err = send_bounded(&t).await.unwrap_err();
     assert!(
-        matches!(&err, WinrmError::AuthFailed(m) if m.starts_with("CredSSP outer TLS")
+        matches!(&err, WinrmError::Authentication(m) if m.starts_with("CredSSP outer TLS")
             && m.contains("matches no pin_server_certificate_sha256 fingerprint")),
         "{err}"
     );
@@ -3551,7 +3577,10 @@ async fn ntlm_over_tls_without_a_peer_certificate_fails_closed() {
     .await
     .expect("did not finish in 20 s");
     assert!(
-        matches!(&result, Err(WinrmError::Ntlm(e)) if e.to_string().contains("certificate")),
+        matches!(
+            &result,
+            Err(WinrmError::Authentication(m)) if m.contains("reported no server certificate")
+        ),
         "got: {result:?}"
     );
     assert!(seen.lock().unwrap().is_empty(), "no Type 3 may be sent");
@@ -4505,7 +4534,10 @@ async fn ntlm_handshake_fails_closed_when_the_client_saw_two_certificates() {
     assert_eq!(send(port_a).await.unwrap(), "<ok/>");
     let second = send(port_b).await;
     assert!(
-        matches!(&second, Err(WinrmError::Ntlm(e)) if e.to_string().contains("several")),
+        matches!(
+            &second,
+            Err(WinrmError::Authentication(m)) if m.contains("several server certificates")
+        ),
         "got: {second:?}"
     );
     assert_eq!(seen_a.lock().unwrap().len(), 1);
@@ -6197,9 +6229,26 @@ async fn basic_against_sink(
     (result, read.load(Ordering::SeqCst))
 }
 
+/// The causes of the `reqwest` error of `result`, as [`error_chain`] gives
+/// them. The message of the `WinrmError` must give the reason too, which
+/// `reqwest` leaves to `source()`: the deepest cause (what `rustls` or the
+/// operating system reported) is in it.
 fn http_error_chain(result: Result<String, WinrmError>) -> String {
     match result {
-        Err(WinrmError::Http(e)) => error_chain(&e),
+        Err(WinrmError::Http(e)) => {
+            let chain = error_chain(&e);
+            let mut deepest: &(dyn std::error::Error + 'static) = &e;
+            while let Some(cause) = deepest.source() {
+                deepest = cause;
+            }
+            let reason = crate::error::quote_server_text(&deepest.to_string(), 256);
+            let message = WinrmError::Http(e).to_string();
+            assert!(
+                message.starts_with("WinRM HTTP error: ") && message.contains(&reason),
+                "{message:?} does not give {reason:?}"
+            );
+            chain
+        }
         other => panic!("expected WinrmError::Http, got {other:?}"),
     }
 }
@@ -6545,19 +6594,38 @@ async fn pin_accepts_a_matching_self_signed_listener_by_ip() {
     }
 }
 
+/// A listener that presents another certificate than the pinned one is
+/// refused before any byte is sent, with the methods that send through the
+/// shared client as with the others. It is the server failing to prove who
+/// it is, not a connection that could not be opened: `Authentication`,
+/// which `max_retries` does not retry.
 #[tokio::test]
 async fn pin_refuses_another_certificate() {
     use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM, RSA_CERT_PEM};
-    let (result, read) = basic_against_sink(
-        &pinned(&[&sha256_hex(RSA_CERT_PEM)]),
-        EC_CERT_PEM,
-        EC_KEY_PKCS8_PEM,
-        "127.0.0.1",
-    )
-    .await;
-    let chain = http_error_chain(result);
-    assert!(chain.contains("pin_server_certificate_sha256"), "{chain}");
-    assert_eq!(read, 0);
+    let client_files = pem_files("pin-client", EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+    for auth_method in [AuthMethod::Basic, AuthMethod::Certificate] {
+        let (port, read) = crate::test_pki::spawn_tls_sink(crate::test_pki::server_config(
+            EC_CERT_PEM,
+            EC_KEY_PKCS8_PEM,
+        ));
+        let mut config = tls_config(auth_method.clone(), port);
+        config.max_retries = 2;
+        if matches!(auth_method, AuthMethod::Certificate) {
+            config.client_cert_pem = Some(client_files.cert.clone());
+            config.client_key_pem = Some(client_files.key.clone());
+        }
+        let t = transport_with(config, &pinned(&[&sha256_hex(RSA_CERT_PEM)])).unwrap();
+        let err = send_basic(&t, "127.0.0.1").await.unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                WinrmError::Authentication(m) if m.contains("pin_server_certificate_sha256")
+            ),
+            "{auth_method:?}: {err:?}"
+        );
+        assert!(!HttpTransport::is_retryable(&err), "{auth_method:?}");
+        assert_eq!(read.load(Ordering::SeqCst), 0, "{auth_method:?}");
+    }
 }
 
 /// The certificate matches the pin, but the server signs the handshake
@@ -6606,10 +6674,10 @@ async fn pin_applies_to_shared_and_dedicated_legs() {
     let url = format!("https://127.0.0.1:{port}/wsman");
     let t = transport_with(ntlm(port), &wrong).unwrap();
     match ntlm_over_tls(&t, &url).await {
-        Err(WinrmError::AuthFailed(m)) => {
+        Err(WinrmError::Authentication(m)) => {
             assert!(m.contains("pinned certificate check"), "{m}");
         }
-        other => panic!("expected AuthFailed, got {other:?}"),
+        other => panic!("expected Authentication, got {other:?}"),
     }
     assert!(
         seen.lock().unwrap().is_empty(),
@@ -6858,10 +6926,10 @@ async fn credssp_tls_outer_honours_the_pin() {
     ));
     let t = transport_with(tls_config(AuthMethod::CredSsp, port), &opts).unwrap();
     match send_basic(&t, "127.0.0.1").await {
-        Err(WinrmError::AuthFailed(m)) => {
+        Err(WinrmError::Authentication(m)) => {
             assert!(m.starts_with("CredSSP outer TLS:"), "{m}");
         }
-        other => panic!("expected AuthFailed, got {other:?}"),
+        other => panic!("expected Authentication, got {other:?}"),
     }
     assert_eq!(read.load(Ordering::SeqCst), 0);
 }
@@ -6883,10 +6951,10 @@ async fn kerberos_probe_reports_a_wrong_pin_as_such() {
     )
     .unwrap();
     match send_basic(&t, "127.0.0.1").await {
-        Err(WinrmError::AuthFailed(m)) => {
+        Err(WinrmError::Authentication(m)) => {
             assert!(m.contains("pinned certificate check"), "{m}");
         }
-        other => panic!("expected AuthFailed, got {other:?}"),
+        other => panic!("expected Authentication, got {other:?}"),
     }
     assert_eq!(read.load(Ordering::SeqCst), 0);
 }

@@ -170,25 +170,37 @@ impl ProxyRoute {
     /// The `reqwest` proxies of this route: the explicit proxy for every
     /// request, else the environment's `http://` and `https://` proxies,
     /// each with the `NO_PROXY` exclusions.
+    ///
+    /// # Errors
+    ///
+    /// [`WinrmError::Config`] when `reqwest` refuses a proxy URL, which
+    /// [`parse_proxy_url`] makes unlikely. The URL may hold credentials, and
+    /// so may the text of `reqwest`'s error and of its causes: the message
+    /// quotes neither and says which proxy it is.
     pub(crate) fn reqwest_proxies(&self) -> Result<Vec<reqwest::Proxy>, WinrmError> {
-        let refused = |e: reqwest::Error| WinrmError::Http(e.without_url());
+        let refused = |which: &str| {
+            WinrmError::Config(format!(
+                "the {which} proxy URL is refused by the HTTP client (reqwest); it is not \
+                 quoted here, since it may hold credentials"
+            ))
+        };
         if let Some(explicit) = &self.explicit {
             return Ok(vec![
-                reqwest::Proxy::all(explicit.as_str()).map_err(refused)?,
+                reqwest::Proxy::all(explicit.as_str()).map_err(|_| refused("configured"))?,
             ]);
         }
         let mut proxies = Vec::new();
         if let Some(http) = &self.http {
             proxies.push(
                 reqwest::Proxy::http(http.as_str())
-                    .map_err(refused)?
+                    .map_err(|_| refused("environment's http"))?
                     .no_proxy(reqwest::NoProxy::from_string(&self.no)),
             );
         }
         if let Some(https) = &self.https {
             proxies.push(
                 reqwest::Proxy::https(https.as_str())
-                    .map_err(refused)?
+                    .map_err(|_| refused("environment's https"))?
                     .no_proxy(reqwest::NoProxy::from_string(&self.no)),
             );
         }

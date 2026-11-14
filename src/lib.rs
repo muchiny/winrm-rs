@@ -36,11 +36,33 @@
 //!
 //! # Error handling
 //!
-//! All fallible operations return `Result<T, WinrmError>`. The top-level
-//! [`WinrmError`] enum wraps transport errors ([`reqwest::Error`]), SOAP faults
-//! ([`SoapError`]), NTLM failures ([`NtlmError`]), and authentication
-//! rejections. Errors are designed for programmatic matching via `match` and
-//! for human-readable display via their [`Display`](std::fmt::Display) impls.
+//! All fallible operations return `Result<T, WinrmError>`. The variant of
+//! [`WinrmError`] says what failed, so that a program decides without
+//! reading a message:
+//!
+//! - [`WinrmError::Config`]: what was asked cannot be done as configured;
+//!   nothing was sent;
+//! - [`WinrmError::Http`] and [`WinrmError::Connection`]: the network path;
+//! - [`WinrmError::AuthRejected`]: the server refused the credentials or
+//!   the method. [`WinrmError::Authentication`]: the authentication failed
+//!   for another reason (a Kerberos ticket, a pinned certificate that does
+//!   not match);
+//! - [`WinrmError::HttpStatus`] and [`WinrmError::Soap`] ([`SoapError`]):
+//!   what the server answered. [`WinrmError::Protocol`],
+//!   [`WinrmError::Ntlm`] ([`NtlmError`]) and [`WinrmError::CredSsp`]
+//!   ([`CredSspError`]): an answer that does not follow the protocol or
+//!   does not verify;
+//! - [`WinrmError::Timeout`] and [`WinrmError::OutputLimit`]: a limit;
+//! - [`WinrmError::Transfer`] ([`TransferError`]): a file transfer;
+//! - [`WinrmError::Cancelled`]: the caller's own decision;
+//! - [`WinrmError::Internal`]: a bug of this crate.
+//!
+//! The enums are `#[non_exhaustive]`: a `match` needs a wildcard arm, and a
+//! pattern on a variant with named fields ends with `..`. The messages
+//! ([`Display`](std::fmt::Display)) are for people, and their wording can
+//! change between releases. No error has a
+//! [`source`](std::error::Error::source): what a variant wraps is part of
+//! its message.
 //!
 //! # Shell reuse
 //!
@@ -177,7 +199,7 @@ pub use command::{CommandOutput, encode_powershell_command, quote_powershell_str
 pub use config::{
     AuthMethod, EncryptionMode, ProxySessionAuth, TlsProvider, WinrmConfig, WinrmCredentials,
 };
-pub use error::{CredSspError, NtlmError, SoapError, TransferError, WinrmError};
+pub use error::{CredSspError, NtlmError, OutputKind, SoapError, TransferError, WinrmError};
 pub use request::{OutgoingRequest, RequestKind};
 pub use secrecy::{ExposeSecret, SecretString};
 pub use shell::Shell;

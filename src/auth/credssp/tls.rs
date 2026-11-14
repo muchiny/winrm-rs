@@ -102,7 +102,9 @@ impl OpenSslMemTls {
             Err(e) if e.code() == ErrorCode::WANT_READ || e.code() == ErrorCode::WANT_WRITE => {
                 Ok(false)
             }
-            Err(e) => Err(WinrmError::AuthFailed(format!("inner TLS handshake: {e}"))),
+            Err(e) => Err(WinrmError::Authentication(format!(
+                "CredSSP inner TLShandshake: {e}"
+            ))),
         }
     }
 
@@ -118,10 +120,10 @@ impl OpenSslMemTls {
         use std::io::Write;
         self.ssl
             .write_all(data)
-            .map_err(|e| WinrmError::AuthFailed(format!("inner TLS write: {e}")))?;
+            .map_err(|e| WinrmError::Authentication(format!("CredSSP inner TLSwrite: {e}")))?;
         self.ssl
             .flush()
-            .map_err(|e| WinrmError::AuthFailed(format!("inner TLS flush: {e}")))?;
+            .map_err(|e| WinrmError::Authentication(format!("CredSSP inner TLSflush: {e}")))?;
         Ok(())
     }
 
@@ -137,7 +139,9 @@ impl OpenSslMemTls {
                     break;
                 }
                 Err(e) => {
-                    return Err(WinrmError::AuthFailed(format!("inner TLS read: {e}")));
+                    return Err(WinrmError::Authentication(format!(
+                        "CredSSP inner TLSread: {e}"
+                    )));
                 }
             }
         }
@@ -145,13 +149,16 @@ impl OpenSslMemTls {
     }
 
     pub(super) fn peer_cert_der(&self) -> Result<Vec<u8>, WinrmError> {
-        let cert = self
-            .ssl
-            .ssl()
-            .peer_certificate()
-            .ok_or_else(|| WinrmError::AuthFailed("CredSSP: no peer cert".into()))?;
-        cert.to_der()
-            .map_err(|e| WinrmError::AuthFailed(format!("cert DER: {e}")))
+        let cert = self.ssl.ssl().peer_certificate().ok_or_else(|| {
+            WinrmError::Authentication(
+                "CredSSP inner TLS: the server presented no certificate".into(),
+            )
+        })?;
+        cert.to_der().map_err(|e| {
+            WinrmError::Authentication(format!(
+                "CredSSP inner TLS: the server certificate cannot be encoded: {e}"
+            ))
+        })
     }
 }
 
@@ -230,14 +237,19 @@ pub(super) fn build_inner_openssl_tls(
     // Configure() to disable hostname verification (we don't have one).
     let cfg = connector
         .configure()
-        .map_err(|e| WinrmError::AuthFailed(format!("ssl configure: {e}")))?
+        .map_err(|e| session_setup_error("configure", &e))?
         .verify_hostname(false)
         .use_server_name_indication(false);
     let ssl = cfg
         .into_ssl("credssp")
-        .map_err(|e| WinrmError::AuthFailed(format!("into_ssl: {e}")))?;
+        .map_err(|e| session_setup_error("into_ssl", &e))?;
 
-    OpenSslMemTls::client(ssl).map_err(|e| WinrmError::AuthFailed(format!("SslStream::new: {e}")))
+    OpenSslMemTls::client(ssl).map_err(|e| session_setup_error("SslStream::new", &e))
+}
+
+/// The error of the OpenSSL call `step` that sets up one inner TLS session.
+fn session_setup_error(step: &str, e: &dyn std::fmt::Display) -> WinrmError {
+    WinrmError::Authentication(format!("CredSSP inner TLS: session set-up ({step}): {e}"))
 }
 
 #[cfg(test)]

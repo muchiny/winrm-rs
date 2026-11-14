@@ -414,7 +414,7 @@ fn tls_server_end_point_is_prefix_and_signature_hash() {
     let mut expected = b"tls-server-end-point:".to_vec();
     expected.extend_from_slice(&Sha384::digest(&ec384));
     assert_eq!(tls_server_end_point(&ec384).unwrap(), expected);
-    assert!(tls_server_end_point(b"not a certificate").is_err());
+    assert!(tls_server_end_point(b"not a certificate").is_none());
 }
 
 /// Each fixture's CBT, as computed independently with Python
@@ -505,7 +505,7 @@ fn channel_bindings_use_the_signature_hash_per_rfc_5929() {
         ),
     ] {
         assert_eq!(
-            compute_channel_bindings(&der(pem)).ok(),
+            compute_channel_bindings(&der(pem)),
             Some(hex16(expected)),
             "{name}"
         );
@@ -513,11 +513,14 @@ fn channel_bindings_use_the_signature_hash_per_rfc_5929() {
 }
 
 /// A signature algorithm with no single hash (Ed25519) or an unknown
-/// one has no defined channel binding: refused, not guessed.
+/// one has no defined channel binding: refused, not guessed. The caller's
+/// error says so.
 #[test]
 fn channel_bindings_refuse_an_algorithm_without_a_hash() {
-    let err = compute_channel_bindings(&der(crate::test_pki::CBT_ED25519_PEM)).unwrap_err();
-    assert!(err.to_string().contains("signature algorithm"), "{err}");
+    let ed25519 = der(crate::test_pki::CBT_ED25519_PEM);
+    assert_eq!(compute_channel_bindings(&ed25519), None);
+    assert_eq!(tls_server_end_point(&ed25519), None);
+    assert!(NO_BINDING_HASH.contains("signature algorithm"));
 }
 
 /// Bytes that are not a certificate are refused, not hashed.
@@ -530,7 +533,7 @@ fn channel_bindings_refuse_a_non_certificate() {
         &[0x30, 0x80, 0x00, 0x00],
         &[0x30, 0x03, 0x30, 0x01, 0x00],
     ] {
-        assert!(compute_channel_bindings(bad).is_err(), "{bad:?}");
+        assert!(compute_channel_bindings(bad).is_none(), "{bad:?}");
     }
 }
 
@@ -541,11 +544,11 @@ fn channel_bindings_refuse_every_truncated_certificate() {
     let cert = der(crate::test_pki::CBT_RSA_PSS_SHA384_PEM);
     for len in 0..cert.len() {
         assert!(
-            compute_channel_bindings(&cert[..len]).is_err(),
+            compute_channel_bindings(&cert[..len]).is_none(),
             "length {len}"
         );
     }
-    assert!(compute_channel_bindings(&cert).is_ok());
+    assert!(compute_channel_bindings(&cert).is_some());
 }
 
 /// A minimal certificate-shaped DER: empty tbsCertificate, then a
@@ -643,7 +646,7 @@ proptest::proptest! {
             1 => cert.truncate(at.index(cert.len())),
             _ => cert.extend_from_slice(&tail),
         }
-        if let Ok(cbt) = compute_channel_bindings(&cert) {
+        if let Some(cbt) = compute_channel_bindings(&cert) {
             let allowed = [CbtHash::Sha224, CbtHash::Sha256, CbtHash::Sha384, CbtHash::Sha512]
                 .map(|h| channel_bindings_with(h, &cert));
             proptest::prop_assert!(allowed.contains(&cbt));

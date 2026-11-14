@@ -51,7 +51,7 @@ impl AuthTransport for CertificateAuth {
             .body(body)
             .send()
             .await
-            .map_err(WinrmError::Http)?;
+            .map_err(crate::auth::send_error)?;
 
         let status = resp.status();
         let body = crate::auth::read_text_capped(resp, self.max_response_bytes).await?;

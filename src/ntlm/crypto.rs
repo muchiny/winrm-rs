@@ -430,31 +430,18 @@ fn pss_hash(params: &[u8]) -> Option<CbtHash> {
 /// 3. Build `SEC_CHANNEL_BINDINGS` structure with the application data
 /// 4. MD5 hash of the entire structure → 16 bytes for `AV_CHANNEL_BINDINGS`
 ///
-/// # Errors
-///
-/// [`NtlmError::ChannelBinding`](crate::error::NtlmError::ChannelBinding)
-/// when the certificate cannot be read or its signature algorithm defines
-/// no channel binding (no single hash, as Ed25519, or unknown): a caller
-/// must then not authenticate without channel binding.
-pub(crate) fn compute_channel_bindings(
-    cert_der: &[u8],
-) -> Result<[u8; 16], crate::error::NtlmError> {
-    Ok(channel_bindings_with(
-        required_cbt_hash(cert_der)?,
-        cert_der,
-    ))
+/// `None` when the certificate cannot be read or its signature algorithm
+/// defines no channel binding (no single hash, as Ed25519, or unknown): a
+/// caller must then not authenticate without channel binding, and says why
+/// with [`NO_BINDING_HASH`].
+pub(crate) fn compute_channel_bindings(cert_der: &[u8]) -> Option<[u8; 16]> {
+    Some(channel_bindings_with(cbt_hash(cert_der)?, cert_der))
 }
 
-/// [`cbt_hash`], or the error for a certificate without channel binding.
-fn required_cbt_hash(cert_der: &[u8]) -> Result<CbtHash, crate::error::NtlmError> {
-    cbt_hash(cert_der).ok_or_else(|| {
-        crate::error::NtlmError::ChannelBinding(
-            "server certificate: unreadable, or its signature algorithm defines no channel \
-             binding hash (RFC 5929)"
-                .into(),
-        )
-    })
-}
+/// Why a certificate has no channel binding, for the error of the method
+/// that needed one ([`WinrmError::Authentication`](crate::error::WinrmError::Authentication)).
+pub(crate) const NO_BINDING_HASH: &str = "the server certificate is unreadable, or its signature \
+     algorithm defines no channel binding hash (RFC 5929)";
 
 /// The `tls-server-end-point` channel binding application data of a
 /// DER-encoded server certificate (RFC 5929 section 4): the prefix
@@ -462,13 +449,11 @@ fn required_cbt_hash(cert_der: &[u8]) -> Result<CbtHash, crate::error::NtlmError
 /// This is what a GSS-API mechanism (Kerberos) takes as the
 /// `application_data` of its channel bindings.
 ///
-/// # Errors
-///
-/// As [`compute_channel_bindings`]: no channel binding is defined for the
-/// certificate.
+/// `None` as [`compute_channel_bindings`]: no channel binding is defined
+/// for the certificate.
 #[cfg(any(feature = "kerberos", test))]
-pub(crate) fn tls_server_end_point(cert_der: &[u8]) -> Result<Vec<u8>, crate::error::NtlmError> {
-    Ok(end_point_app_data(required_cbt_hash(cert_der)?, cert_der))
+pub(crate) fn tls_server_end_point(cert_der: &[u8]) -> Option<Vec<u8>> {
+    Some(end_point_app_data(cbt_hash(cert_der)?, cert_der))
 }
 
 /// Steps 1 and 2: `tls-server-end-point:` and the certificate's hash.

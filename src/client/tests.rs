@@ -500,12 +500,41 @@ async fn ntlm_401_without_a_challenge_is_a_refusal_and_a_bad_token_is_not() {
         } else {
             matches!(
                 &err,
-                WinrmError::Ntlm(crate::error::NtlmError::InvalidMessage(m))
-                    if m.starts_with("base64 decode: ")
+                WinrmError::Protocol(m)
+                    if m.starts_with("NTLM: the server's Negotiate token is not base64: ")
             )
         };
         assert!(expected, "{challenge}: {err:?}");
     }
+}
+
+/// The challenge is looked for in every `WWW-Authenticate` header of the
+/// 401, not only in the first: a server that lists another method before
+/// `Negotiate` still gets its Type 3.
+#[tokio::test]
+async fn ntlm_finds_its_challenge_behind_another_www_authenticate_header() {
+    let server = MockServer::start().await;
+    // The handshake goes on to the Type 3, which this server answers 401:
+    // the credentials are refused, which is what tells the challenge was
+    // read. With the first header alone the error is the missing challenge.
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(401)
+                .append_header("WWW-Authenticate", "Basic realm=\"WSMAN\"")
+                .append_header(
+                    "WWW-Authenticate",
+                    crate::test_ntlm_server::challenge_header().as_str(),
+                ),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+    let client = WinrmClient::new(ntlm_config(server.address().port()), test_creds()).unwrap();
+    let err = client.create_shell("127.0.0.1").await.unwrap_err();
+    assert!(
+        matches!(&err, WinrmError::AuthRejected(m) if !m.contains("carries no Negotiate challenge")),
+        "{err:?}"
+    );
 }
 
 #[tokio::test]
@@ -584,13 +613,16 @@ async fn ntlm_uses_explicit_domain_when_set() {
 
 #[test]
 fn winrm_error_display() {
-    let err = WinrmError::AuthFailed("bad creds".into());
-    assert_eq!(format!("{err}"), "WinRM auth failed: bad creds");
+    let err = WinrmError::AuthRejected("bad creds".into());
+    assert_eq!(format!("{err}"), "WinRM authentication rejected: bad creds");
+
+    let err = WinrmError::Authentication("no ticket".into());
+    assert_eq!(format!("{err}"), "WinRM authentication error: no ticket");
 
     let err = WinrmError::Soap(crate::error::SoapError::MissingElement("ShellId".into()));
     assert!(format!("{err}").contains("SOAP"));
 
-    let err = WinrmError::Ntlm(crate::error::NtlmError::InvalidMessage("bad".into()));
+    let err = WinrmError::Ntlm(crate::error::NtlmError::Handshake("bad".into()));
     assert!(format!("{err}").contains("NTLM"));
 }
 
@@ -3324,7 +3356,7 @@ fn check_wql_cap_accepts_items_up_to_the_cap() {
     assert!(matches!(
         check_wql_cap("123456789", Some(8)),
         Err(WinrmError::OutputLimit {
-            what: "WQL enumeration",
+            what: crate::OutputKind::WqlEnumeration,
             limit: 8
         })
     ));

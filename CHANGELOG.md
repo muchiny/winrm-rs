@@ -28,16 +28,22 @@ After (3.0):
 
 | Variant | What failed | In 2.x |
 |---|---|---|
-| `Config(String)` | What was asked cannot be done as configured: options that contradict each other, a certificate or key file, a `host` that is not a host name, a proxy the method cannot use, a cargo feature that is off. Nothing was sent. | `AuthFailed` |
+| `Config(String)` | What was asked cannot be done as configured: options that contradict each other, a certificate or key file, a `host` that is not a host name, a proxy the method cannot use, a cargo feature that is off, an option the HTTP client refuses. Nothing was sent. | `AuthFailed`; `Http` for an option the HTTP client refuses |
 | `Http(reqwest::Error)` | The network path, where `reqwest` drives it. | `Http` |
 | `Connection(String)` | The network path, where the crate drives it: the CredSSP connection (TCP, proxy tunnel, TLS), a proxy that does not keep an authenticated connection, an authenticated NTLM or Kerberos connection the server closed. | `AuthFailed`; `Ntlm(NtlmError::InvalidMessage)` for the NTLM connection |
 | `AuthRejected(String)` | The server refused the credentials or the method: HTTP 401, or with CredSSP the NTSTATUS of a refused logon. | `AuthFailed`; `CredSsp(CredSspError::ServerError)` for the NTSTATUS |
-| `AuthFailed(String)` | The authentication failed for another reason: a Kerberos ticket, mutual authentication, a pinned certificate that does not match, the TLS session inside CredSSP. | `AuthFailed` |
-| `HttpStatus { status, message }` | An HTTP status that ends the exchange and is neither a SOAP fault nor a 401. | `AuthFailed` |
-| `Protocol(String)` | An answer that does not follow the protocol or cannot be trusted: a malformed token, an answer to a sealed request that is not sealed or has the wrong framing. | `AuthFailed`; `Ntlm(NtlmError::InvalidMessage)` for the NTLM framing |
-| `OutputLimit { what, limit }` | The output of a command or a WQL enumeration larger than `max_output_bytes`. | `Transfer` |
-| `Transfer(TransferError)` | A file transfer: `RemotePath`, `LocalRead { path, error }`, `LocalWrite { path, error }`, `Host`, `Decode`. | `Transfer(String)` |
-| `Internal(String)` | A state the crate should never reach: a bug to report. | `AuthFailed("internal: …")` |
+| `Authentication(String)` | The authentication failed for another reason than the server's refusal: a Kerberos ticket, a channel binding that cannot be computed, mutual authentication, a pinned certificate that does not match, the TLS session inside CredSSP. | `AuthFailed`; `Ntlm(NtlmError::InvalidMessage)` for the NTLM channel binding; `Http` for a pin that does not match with Basic or Certificate |
+| `HttpStatus { status, message, .. }` | An HTTP status that ends the exchange and is neither a SOAP fault nor a 401. | `AuthFailed`; `Ntlm(NtlmError::InvalidMessage)` for an error status the server did not seal |
+| `Protocol(String)` | An answer that does not follow the protocol or cannot be trusted: a malformed token, a successful answer to a sealed request that is not sealed, a sealed answer with the wrong framing. | `AuthFailed`; `Ntlm(NtlmError::InvalidMessage)` for the NTLM framing and for an NTLM token that is not base64 |
+| `OutputLimit { what, limit, .. }` | The output of a command or a WQL enumeration larger than `max_output_bytes`; `what` is an `OutputKind`. | `Transfer` |
+| `Transfer(TransferError)` | A file transfer: `RemotePath`, `LocalRead { path, error, .. }`, `LocalWrite { path, error, .. }`, `Host`, `Decode`. | `Transfer(String)` |
+| `Internal(String)` | A state the crate should never reach: a bug to report. | `AuthFailed("internal: …")`; `Transfer` for a local read or write whose task did not finish |
+
+`AuthFailed` and `NtlmError::InvalidMessage` are gone. Kept under those
+names with less in them, they would have let a program that matches them
+go on compiling while it stopped seeing refused credentials. Such a program
+now fails to compile, which shows every place that has to choose among the
+variants above.
 
 With CredSSP, Windows reports refused credentials as an NTSTATUS inside the
 handshake (`STATUS_LOGON_FAILURE` for an unknown account, measured on
@@ -49,37 +55,47 @@ answer to the first round of CredSSP (a server on which CredSSP is not
 enabled), the answer to its NTLM authenticate, and the answer to the NTLM
 negotiate message (a server that does not accept NTLM).
 
-`Ntlm`, `CredSsp`, `Soap`, `Timeout` and `Cancelled` keep their meaning.
-`NtlmError` has four variants where it had one: `InvalidMessage` (a message
-of the handshake that does not parse), `BadSignature` (a signature or a
-`mechListMIC` that does not verify), `ChannelBinding` (the channel binding
-cannot be computed) and `Session` (the random source failed, the sequence
-numbers are spent, or the session is unusable after an earlier error).
+`Soap`, `Timeout` and `Cancelled` are unchanged. `Ntlm` and `CredSsp` hold
+what the table leaves them. `NtlmError` has three variants where it had
+one: `Handshake` (a message of the handshake that does not parse, or a
+challenge this client refuses, such as one that does not negotiate signing
+and sealing), `BadSignature` (a signature or a `mechListMIC` that does not
+verify) and `Session` (the random source failed, the sequence numbers are
+spent, or the session is unusable after an earlier error).
 
 `WinrmError`, `NtlmError`, `CredSspError`, `SoapError`, the new
-`TransferError`, `AuthMethod` and `EncryptionMode` are `#[non_exhaustive]`.
+`TransferError` and `OutputKind`, `AuthMethod` and `EncryptionMode` are
+`#[non_exhaustive]`: a `match` on them needs a wildcard arm. So are the
+variants with named fields (`HttpStatus`, `OutputLimit`,
+`TransferError::LocalRead`, `TransferError::LocalWrite`): a pattern on one
+of them ends with `..`.
+
+No error of the crate has a `source()`. What an error wraps (a
+`reqwest::Error`, an `io::Error`, one of the enums above) is a field of its
+variant and is part of its message, so a report that walks the sources
+prints nothing twice.
 
 The messages follow. The text before the first colon names the variant
 (`WinRM configuration error: …`, `WinRM connection error: …`,
-`WinRM authentication rejected: …`, `WinRM request failed: …`,
-`WinRM protocol error: …`, `winrm-rs internal error: …`). An output over the
-limit no longer starts with `file transfer error: `. The messages of
-`NtlmError` start with `invalid message: `, `signature check failed: `,
-`channel binding: ` or `session: ` where they started with `NTLM error: `.
-The wording of a message is not part of the API.
+`WinRM authentication rejected: …`, `WinRM authentication error: …`,
+`WinRM request failed: …`, `WinRM protocol error: …`,
+`winrm-rs internal error: …`). An output over the limit no longer starts
+with `file transfer error: `. The messages of `NtlmError` start with
+`handshake: `, `signature check failed: ` or `session: ` where they started
+with `NTLM error: `. The wording of a message is not part of the API.
 
 Migration:
 
-- A `match` on one of these enums needs a wildcard arm.
 - To tell refused credentials from the rest, match `AuthRejected`; in 2.x
   that meant reading the message of an `AuthFailed`.
-- `Transfer(message)` becomes `Transfer(error)`: `error.to_string()` is the
-  message without its `file transfer error: ` prefix, and the variant of
+- `Transfer(message)` becomes `Transfer(error)`, and the variant of
   `TransferError` says whether the remote path, a local file or the host
-  refused. The output limit is `OutputLimit`.
+  refused. `error.to_string()` is the 2.x message without its
+  `file transfer error: ` prefix, except for a download that is not base64,
+  whose text changed. The output limit is `OutputLimit`.
 - A request whose authenticated NTLM or Kerberos connection the server had
   closed (`NOT resent` in the message) was an `Ntlm` or an `AuthFailed`
-  error: it is a `Connection` error.
+  error: it is a `Connection` error. The request may have run.
 - A program that reads the text of a message should match the variant.
 
 ### Security
@@ -208,12 +224,37 @@ Migration:
 
 ### Changed
 
-- **The errors are typed by cause** (breaking): `WinrmError` gains
-  `Config`, `Connection`, `AuthRejected`, `HttpStatus`, `Protocol`,
-  `OutputLimit` and `Internal`, `Transfer` holds a `TransferError`,
-  `NtlmError` gains `BadSignature`, `ChannelBinding` and `Session`, and the
-  error enums, `AuthMethod` and `EncryptionMode` are `#[non_exhaustive]`.
-  See *Upgrading from 2.x*.
+- **The errors are typed by cause** (breaking): `WinrmError` has `Config`,
+  `Connection`, `AuthRejected`, `Authentication`, `HttpStatus`, `Protocol`,
+  `OutputLimit` and `Internal` where it had `AuthFailed`, `Transfer` holds
+  a `TransferError`, `NtlmError` has `Handshake`, `BadSignature` and
+  `Session` where it had `InvalidMessage`, and the error enums,
+  `AuthMethod` and `EncryptionMode` are `#[non_exhaustive]`. See
+  *Upgrading from 2.x*.
+- **A pinned certificate that does not match is never retried.** With
+  Basic and Certificate it was a `WinrmError::Http`, which
+  `max_retries` retried as a connection that could not be opened. It is
+  `WinrmError::Authentication`, as with the other methods, and the request
+  fails at once. Nothing was sent in either case.
+- **With NTLM or Kerberos message encryption, an error status the server
+  did not seal keeps its status.** A 503 from HTTP.sys while the WinRM
+  service restarts, or a 502 from a proxy, is never sealed. It was an
+  `Ntlm` or an `AuthFailed` error with no status; it is
+  `WinrmError::HttpStatus`. Its body is still neither read nor quoted,
+  since nothing shows where it comes from.
+- **An option the HTTP client refuses is a `WinrmError::Config`**, not a
+  `WinrmError::Http`: a `user_agent` with a line break, a proxy URL
+  `reqwest` does not take. Nothing was sent, and `Http` is now only what
+  happens on the network. For a proxy, the message says which one it is
+  and quotes neither the URL nor `reqwest`'s error, since both may hold
+  the proxy's credentials.
+- **The errors of the TLS session inside CredSSP read alike**: they all
+  start with `CredSSP inner TLS`, where some started with `ssl configure`
+  or `cert DER`. The text of an outer TLS error is neutralised and bounded
+  like a server's, since it can quote the names of the certificate.
+- **NTLM looks for its challenge in every `WWW-Authenticate` header** of
+  the server's 401, not only in the first: a server or a proxy that lists
+  another method before `Negotiate` no longer fails the handshake.
 - **The message of `WinrmError::Http` gives the reason.** `reqwest` says
   which step failed and for which URL, and leaves the reason to the causes
   of its error, which the message did not show:

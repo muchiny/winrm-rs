@@ -99,18 +99,18 @@ fn create_negotiate_message_with_flags(flags: u32, include_version: bool) -> Vec
 ///
 /// Extracts the server challenge, negotiate flags, target info `AV_PAIRs`,
 /// NetBIOS domain name, and optional server timestamp. Returns
-/// [`NtlmError::InvalidMessage`] if the message is too short, has an invalid
+/// [`NtlmError::Handshake`] if the message is too short, has an invalid
 /// signature, or is not message type 2.
 pub(crate) fn parse_challenge(data: &[u8]) -> Result<ChallengeMessage, NtlmError> {
     let Some(header) = data.first_chunk::<32>() else {
-        return Err(NtlmError::InvalidMessage("Type 2 message too short".into()));
+        return Err(NtlmError::Handshake("Type 2 message too short".into()));
     };
     if &header[0..8] != SIGNATURE {
-        return Err(NtlmError::InvalidMessage("bad NTLMSSP signature".into()));
+        return Err(NtlmError::Handshake("bad NTLMSSP signature".into()));
     }
     let msg_type = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
     if msg_type != 2 {
-        return Err(NtlmError::InvalidMessage(format!(
+        return Err(NtlmError::Handshake(format!(
             "expected type 2, got {msg_type}"
         )));
     }
@@ -136,7 +136,7 @@ pub(crate) fn parse_challenge(data: &[u8]) -> Result<ChallengeMessage, NtlmError
                 .ok()
                 .and_then(|start| data.get(start..)?.get(..ti_len))
                 .ok_or_else(|| {
-                    NtlmError::InvalidMessage("NTLM Type 2: TargetInfo outside the message".into())
+                    NtlmError::Handshake("NTLM Type 2: TargetInfo outside the message".into())
                 })?
                 .to_vec();
             let (domain, ts) = parse_av_pairs(&ti);
@@ -186,14 +186,14 @@ pub(crate) fn check_challenge(ch: &ChallengeMessage, sealing: bool) -> Result<()
     let required = ALWAYS.iter().chain(SEALING.iter().filter(|_| sealing));
     for (bit, name) in required {
         if ch.negotiate_flags & bit == 0 {
-            return Err(NtlmError::InvalidMessage(format!(
+            return Err(NtlmError::Handshake(format!(
                 "NTLM Type 2: the server did not negotiate {name}"
             )));
         }
     }
     for (bit, name) in REFUSED {
         if ch.negotiate_flags & bit != 0 {
-            return Err(NtlmError::InvalidMessage(format!(
+            return Err(NtlmError::Handshake(format!(
                 "NTLM Type 2: the server set {name}, which this client refuses"
             )));
         }
@@ -204,7 +204,7 @@ pub(crate) fn check_challenge(ch: &ChallengeMessage, sealing: bool) -> Result<()
             (AV_NB_DOMAIN_NAME, "MsvAvNbDomainName"),
         ] {
             if !av_pairs(&ch.target_info).any(|(found, _)| found == id) {
-                return Err(NtlmError::InvalidMessage(format!(
+                return Err(NtlmError::Handshake(format!(
                     "NTLM Type 2: target info has no {name}"
                 )));
             }
@@ -238,7 +238,7 @@ pub(crate) fn log_challenge(ch: &ChallengeMessage) {
 /// is reported with the field that overflowed instead of being truncated.
 fn len16(what: &'static str, n: usize) -> Result<u16, NtlmError> {
     u16::try_from(n).map_err(|_| {
-        NtlmError::InvalidMessage(format!(
+        NtlmError::Handshake(format!(
             "NTLM Type 3: {what} is {n} bytes, more than a 16-bit length (65535) can hold"
         ))
     })
@@ -247,7 +247,7 @@ fn len16(what: &'static str, n: usize) -> Result<u16, NtlmError> {
 /// A byte position as the 32-bit offset an NTLM security buffer holds.
 fn to_u32(what: &'static str, n: usize) -> Result<u32, NtlmError> {
     u32::try_from(n).map_err(|_| {
-        NtlmError::InvalidMessage(format!(
+        NtlmError::Handshake(format!(
             "NTLM Type 3: {what} is {n} bytes, more than a 32-bit offset can hold"
         ))
     })
@@ -258,7 +258,7 @@ fn to_u32(what: &'static str, n: usize) -> Result<u32, NtlmError> {
 fn place(offset: &mut usize, len: u16) -> Result<u32, NtlmError> {
     let at = to_u32("message", *offset)?;
     *offset = offset.checked_add(usize::from(len)).ok_or_else(|| {
-        NtlmError::InvalidMessage("NTLM Type 3: message is too large to lay out".into())
+        NtlmError::Handshake("NTLM Type 3: message is too large to lay out".into())
     })?;
     Ok(at)
 }
@@ -774,16 +774,16 @@ pub(crate) fn encode_authorization(msg: &[u8]) -> String {
 /// Decode an NTLM Type 2 (Challenge) message from an HTTP `WWW-Authenticate` header.
 ///
 /// Expects the header value to start with `"Negotiate "` followed by a
-/// base64-encoded Type 2 message. Returns [`NtlmError::InvalidMessage`] if
+/// base64-encoded Type 2 message. Returns [`NtlmError::Handshake`] if
 /// the prefix is missing, the base64 is invalid, or the decoded bytes fail
 /// `parse_challenge` validation.
 pub(crate) fn decode_challenge_header(header: &str) -> Result<ChallengeMessage, NtlmError> {
     let token = header
         .strip_prefix("Negotiate ")
-        .ok_or_else(|| NtlmError::InvalidMessage("missing Negotiate prefix".into()))?;
+        .ok_or_else(|| NtlmError::Handshake("missing Negotiate prefix".into()))?;
     let bytes = B64
         .decode(token.trim_ascii())
-        .map_err(|e| NtlmError::InvalidMessage(format!("base64 decode: {e}")))?;
+        .map_err(|e| NtlmError::Handshake(format!("base64 decode: {e}")))?;
     parse_challenge(&bytes)
 }
 

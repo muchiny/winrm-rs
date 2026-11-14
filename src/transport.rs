@@ -423,7 +423,7 @@ fn check_pinned_certificate(
     if crate::auth::peer_certificate(resp, cert) == crate::auth::PeerCertificate::Known(pin) {
         Ok(())
     } else {
-        Err(WinrmError::AuthFailed(
+        Err(WinrmError::Authentication(
             "Kerberos over TLS: the answer did not come over a connection presenting the \
              certificate the authentication was bound to; refusing it"
                 .into(),
@@ -846,7 +846,15 @@ fn build_http_client(
     if let Some(gate) = gate {
         builder = builder.connector_layer(ConnGateLayer(gate));
     }
-    builder.build().map_err(WinrmError::Http)
+    // Nothing was sent, and the failure is one of the options: `Config`,
+    // where `Http` is what happens on the network. No request has a URL
+    // yet; `without_url` keeps it so whatever `reqwest` comes to put there.
+    builder.build().map_err(|e| {
+        WinrmError::Config(format!(
+            "the HTTP client cannot be set up as configured: {}",
+            crate::error::with_causes(&e.without_url())
+        ))
+    })
 }
 
 /// Refuses a configuration whose encryption mode the auth method cannot
@@ -1995,13 +2003,18 @@ impl HttpTransport {
 
         // Windows seals the answer to a sealed request, a SOAP fault (HTTP
         // 500) included. An error answer that is not sealed is not trusted:
-        // its body is neither parsed nor quoted.
+        // its body is neither parsed nor quoted. Its status is what any
+        // other route reports: HTTP.sys answers 503 while the service
+        // restarts and a proxy answers 502, neither of which can seal.
         if !status.is_success() && !labelled_sealed {
-            return Err(SealedFailure::Error(WinrmError::Protocol(format!(
-                "server answered a sealed {name} request without sealing: HTTP {status} \
-                 ({} bytes)",
-                bytes.len()
-            ))));
+            return Err(SealedFailure::Error(WinrmError::HttpStatus {
+                status: status.as_u16(),
+                message: format!(
+                    "server answered a sealed {name} request without sealing: HTTP {status} \
+                     ({} bytes, not quoted)",
+                    bytes.len()
+                ),
+            }));
         }
         let text = session.unseal(&bytes).map_err(SealedFailure::Error)?;
         if session.binds_answers_by_relates_to() {

@@ -169,7 +169,7 @@ fn parse_challenge_target_info_out_of_bounds() {
 
     assert!(matches!(
         parse_challenge(&msg),
-        Err(NtlmError::InvalidMessage(ref m)) if m == "NTLM Type 2: TargetInfo outside the message"
+        Err(NtlmError::Handshake(ref m)) if m == "NTLM Type 2: TargetInfo outside the message"
     ));
 }
 
@@ -285,11 +285,11 @@ fn decode_challenge_header_bad_base64() {
 
 #[test]
 fn ntlm_error_display() {
-    let err = NtlmError::InvalidMessage("test error".into());
-    assert_eq!(format!("{err}"), "invalid message: test error");
+    let err = NtlmError::Handshake("test error".into());
+    assert_eq!(format!("{err}"), "handshake: test error");
     assert_eq!(
         format!("{}", crate::error::WinrmError::Ntlm(err)),
-        "WinRM NTLM error: invalid message: test error"
+        "WinRM NTLM error: handshake: test error"
     );
 }
 
@@ -951,21 +951,21 @@ fn type3_with_oversized_target_info_is_an_error() {
     let mut ti = av(0x0003, &vec![0u8; 65_500]);
     ti.extend_from_slice(&av(0x0000, &[]));
     let err = full(&challenge_with(ti), "user", "HTTP/h", Some([0xAA; 16])).unwrap_err();
-    assert!(matches!(err, NtlmError::InvalidMessage(m) if m.contains("NtChallengeResponse")));
+    assert!(matches!(err, NtlmError::Handshake(m) if m.contains("NtChallengeResponse")));
 }
 
 #[test]
 fn type3_with_spn_over_32767_utf16_units_is_an_error() {
     let spn = "A".repeat(40_000);
     let err = full(&challenge_with(av(0x0000, &[])), "user", &spn, None).unwrap_err();
-    assert!(matches!(err, NtlmError::InvalidMessage(m) if m.contains("MsvAvTargetName")));
+    assert!(matches!(err, NtlmError::Handshake(m) if m.contains("MsvAvTargetName")));
 }
 
 #[test]
 fn type3_with_oversized_username_is_an_error() {
     let user = "U".repeat(40_000);
     let err = full(&challenge_with(av(0x0000, &[])), &user, "HTTP/h", None).unwrap_err();
-    assert!(matches!(err, NtlmError::InvalidMessage(m) if m.contains("UserName")));
+    assert!(matches!(err, NtlmError::Handshake(m) if m.contains("UserName")));
 }
 
 /// The AV list of a Type 3 (parsed back out of NtChallengeResponse): asserts
@@ -1346,7 +1346,7 @@ fn nb_ti() -> Vec<u8> {
 
 fn refusal(ch: &ChallengeMessage, sealing: bool) -> String {
     match check_challenge(ch, sealing) {
-        Err(NtlmError::InvalidMessage(m)) => m,
+        Err(NtlmError::Handshake(m)) => m,
         other => panic!("expected a refusal, got {other:?}"),
     }
 }
@@ -1400,7 +1400,7 @@ fn type2_target_info_out_of_bounds_is_refused() {
     t2[40..42].copy_from_slice(&8u16.to_le_bytes());
     t2[44..48].copy_from_slice(&48u32.to_le_bytes());
     assert!(
-        matches!(parse_challenge(&t2), Err(NtlmError::InvalidMessage(ref m)) if m == "NTLM Type 2: TargetInfo outside the message")
+        matches!(parse_challenge(&t2), Err(NtlmError::Handshake(ref m)) if m == "NTLM Type 2: TargetInfo outside the message")
     );
     // A zero-length buffer with any offset stays legal.
     t2[40..42].copy_from_slice(&0u16.to_le_bytes());

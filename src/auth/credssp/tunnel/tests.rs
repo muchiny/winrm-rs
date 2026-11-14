@@ -120,6 +120,18 @@ async fn dial_tunnel_reports_407_and_other_statuses() {
             "HTTP/1.1 200 OK\r\n\r\nEARLY",
             "CredSSP: the proxy sent data before the tunnel opened",
         ),
+        // What answers is not an HTTP proxy: the tunnel did not open, which
+        // is a failure of the connection like the three above.
+        (
+            "SSH-2.0-OpenSSH_9.6\r\n\r\n",
+            "CredSSP: the proxy did not answer CONNECT with an HTTP response: bad status \
+             line: SSH-2.0-OpenSSH_9.6",
+        ),
+        (
+            "HTTP/1.1 200 OK\r\nno colon here\r\n\r\n",
+            "CredSSP: the proxy did not answer CONNECT with an HTTP response: bad header \
+             line: no colon here",
+        ),
     ] {
         let (pport, _) = test_proxy::spawn_connect_proxy_answering(answer).await;
         // The target port is never reached: nothing listens on port 9.
@@ -433,13 +445,14 @@ async fn dial_tunnel_refuses_a_malformed_socks5_reply() {
 }
 
 /// What SOCKS5 cannot carry is refused before any of it is sent: a host
-/// name or a credential of more than 255 bytes.
+/// name or a credential of more than 255 bytes. The route and the endpoint
+/// refuse both as a configuration error before any dial, so here, after
+/// the greeting, it is a state the crate should not reach: `Internal`.
 #[tokio::test]
 async fn dial_tunnel_refuses_what_socks5_cannot_carry() {
-    // What was asked cannot go through SOCKS5: not a failure of the network.
-    fn config_error(res: Result<tokio::net::TcpStream, WinrmError>) -> String {
+    fn internal_error(res: Result<tokio::net::TcpStream, WinrmError>) -> String {
         match res {
-            Err(WinrmError::Config(m)) => m,
+            Err(WinrmError::Internal(m)) => m,
             Err(e) => panic!("{e:?}"),
             Ok(_) => panic!("the tunnel opened"),
         }
@@ -447,7 +460,7 @@ async fn dial_tunnel_refuses_what_socks5_cannot_carry() {
     let long = "a".repeat(256);
     let (pport, peer) = scripted_proxy(vec![vec![5, 0], SOCKS5_OPENED.to_vec()]).await;
     assert_eq!(
-        config_error(bounded(dial_tunnel(&socks5_dial(pport, None, true), &long, 9)).await),
+        internal_error(bounded(dial_tunnel(&socks5_dial(pport, None, true), &long, 9)).await),
         "CredSSP: host name too long for SOCKS5"
     );
     assert_eq!(bounded(peer).await.unwrap(), vec![vec![5, 1, 0]]);
@@ -456,7 +469,7 @@ async fn dial_tunnel_refuses_what_socks5_cannot_carry() {
         let (pport, peer) = scripted_proxy(vec![vec![5, 2], vec![1, 0]]).await;
         let dial = socks5_dial(pport, Some(user_pass), false);
         assert_eq!(
-            config_error(bounded(dial_tunnel(&dial, "127.0.0.1", 9)).await),
+            internal_error(bounded(dial_tunnel(&dial, "127.0.0.1", 9)).await),
             crate::transport::proxy::SOCKS5_CREDENTIALS_TOO_LONG
         );
         assert_eq!(bounded(peer).await.unwrap(), vec![vec![5, 2, 0, 2]]);

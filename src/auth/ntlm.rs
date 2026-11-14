@@ -8,7 +8,7 @@ use zeroize::Zeroizing;
 
 use crate::auth::AuthTransport;
 use crate::auth::sealed;
-use crate::error::{NtlmError, WinrmError};
+use crate::error::WinrmError;
 use crate::ntlm;
 
 /// NTLM authentication transport.
@@ -211,10 +211,15 @@ impl NtlmAuth {
             gate.check_answer(resp.status(), resp.headers())?;
         }
 
+        // The challenge is the `WWW-Authenticate` value that carries a
+        // `Negotiate` token. A server, or a proxy on the way, may list
+        // another method first, each in a header of its own.
         let www_auth = resp
             .headers()
-            .get("WWW-Authenticate")
-            .and_then(|v| v.to_str().ok())
+            .get_all("WWW-Authenticate")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .find(|value| value.starts_with("Negotiate "))
             .ok_or_else(|| WinrmError::AuthRejected(NO_CHALLENGE.into()))?
             .to_string();
 
@@ -224,12 +229,12 @@ impl NtlmAuth {
         let peer_certificate = match crate::auth::peer_certificate(&resp, cert) {
             crate::auth::PeerCertificate::Known(der) => Some(der),
             crate::auth::PeerCertificate::Ambiguous if url.starts_with("https://") => {
-                return Err(WinrmError::Ntlm(NtlmError::ChannelBinding(
+                return Err(WinrmError::Authentication(
                     "NTLM over TLS: this client has seen several server certificates and cannot \
                      tell which one its connection uses; refusing to authenticate without a \
                      certain channel binding"
                         .into(),
-                )));
+                ));
             }
             crate::auth::PeerCertificate::Ambiguous | crate::auth::PeerCertificate::Unknown => None,
         };
@@ -270,7 +275,9 @@ impl NtlmAuth {
             base64::engine::general_purpose::STANDARD
                 .decode(token.trim_ascii())
                 .map_err(|e| {
-                    WinrmError::Ntlm(NtlmError::InvalidMessage(format!("base64 decode: {e}")))
+                    WinrmError::Protocol(format!(
+                        "NTLM: the server's Negotiate token is not base64: {e}"
+                    ))
                 })?
         };
         let challenge = ntlm::decode_challenge_header(www_auth).map_err(WinrmError::Ntlm)?;
@@ -294,15 +301,19 @@ impl NtlmAuth {
         // the handshake instead of authenticating unbound.
         let channel_bindings = if url.starts_with("https://") {
             let cert_der = negotiated.peer_certificate.as_deref().ok_or_else(|| {
-                WinrmError::Ntlm(NtlmError::ChannelBinding(
+                WinrmError::Authentication(
                     "NTLM over TLS: the connection reported no server certificate to bind \
                      the authentication to (channel binding)"
                         .into(),
-                ))
+                )
             })?;
             Some(
-                crate::ntlm::crypto::compute_channel_bindings(cert_der)
-                    .map_err(WinrmError::Ntlm)?,
+                crate::ntlm::crypto::compute_channel_bindings(cert_der).ok_or_else(|| {
+                    WinrmError::Authentication(format!(
+                        "NTLM channel binding: {}",
+                        crate::ntlm::crypto::NO_BINDING_HASH
+                    ))
+                })?,
             )
         } else {
             None

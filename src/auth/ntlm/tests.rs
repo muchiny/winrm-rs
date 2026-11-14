@@ -1,4 +1,5 @@
 use super::*;
+use crate::error::NtlmError;
 use crate::ntlm::SealingSession;
 
 const ENCRYPTED_BOUNDARY: &str = "--Encrypted Boundary";

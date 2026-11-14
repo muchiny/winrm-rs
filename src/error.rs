@@ -14,12 +14,12 @@ use std::path::PathBuf;
 /// - the network path: [`Http`](Self::Http),
 ///   [`Connection`](Self::Connection);
 /// - the authentication: [`AuthRejected`](Self::AuthRejected) when the
-///   server refuses the credentials, [`AuthFailed`](Self::AuthFailed)
+///   server refuses the credentials, [`Authentication`](Self::Authentication)
 ///   otherwise;
 /// - what the server answered: [`HttpStatus`](Self::HttpStatus) and
 ///   [`Soap`](Self::Soap), and when the answer does not follow the protocol
-///   [`Protocol`](Self::Protocol), [`Ntlm`](Self::Ntlm) and
-///   [`CredSsp`](Self::CredSsp);
+///   or does not verify [`Protocol`](Self::Protocol), [`Ntlm`](Self::Ntlm)
+///   and [`CredSsp`](Self::CredSsp);
 /// - a limit: [`Timeout`](Self::Timeout), [`OutputLimit`](Self::OutputLimit);
 /// - a file transfer: [`Transfer`](Self::Transfer);
 /// - the caller's own decision: [`Cancelled`](Self::Cancelled);
@@ -28,7 +28,13 @@ use std::path::PathBuf;
 /// The messages are for people: their wording is not part of the API.
 ///
 /// This enum and the ones it holds are `#[non_exhaustive]`: a later release
-/// may add a variant, so a `match` on them needs a wildcard arm.
+/// may add a variant, so a `match` on them needs a wildcard arm. The
+/// variants with named fields are `#[non_exhaustive]` too: a later release
+/// may add a field, so a pattern on one of them ends with `..`.
+///
+/// No error of this crate has a [`source`](std::error::Error::source). What
+/// a variant wraps is its field and is part of its message, so a report
+/// that prints an error and then its sources shows nothing twice.
 ///
 /// Codes, reasons and quoted bodies come from the server. Control and
 /// bidirectional formatting characters are neutralised (line breaks become
@@ -39,9 +45,9 @@ pub enum WinrmError {
     /// What was asked cannot be done as configured: an option that
     /// contradicts another, a certificate or key file that cannot be read
     /// or does not parse, a `host` argument that is not a host name, a proxy
-    /// the method cannot go through, an authentication method whose cargo
-    /// feature is off, a TLS library that cannot be set up as asked.
-    /// Nothing was sent.
+    /// URL that cannot be used or a proxy the method cannot go through, an
+    /// authentication method whose cargo feature is off, a TLS library or an
+    /// HTTP client that cannot be set up as asked. Nothing was sent.
     #[error("WinRM configuration error: {0}")]
     Config(String),
     /// HTTP transport error from `reqwest` (connection refused, timeout, TLS, etc.).
@@ -57,8 +63,10 @@ pub enum WinrmError {
     /// to it, where the crate drives it itself:
     /// - with [`AuthMethod::CredSsp`](crate::AuthMethod::CredSsp): the TCP
     ///   connection, the proxy tunnel (a proxy that refuses its own
-    ///   credentials included), the TLS session, a connection closed in the
-    ///   middle of an answer;
+    ///   credentials or answers something that is not HTTP included), the
+    ///   TLS session, a connection closed in the middle of an answer. The
+    ///   last exchange of the handshake carries the request: a connection
+    ///   that breaks during it may leave the request run on the server;
     /// - a proxy that does not keep the connection an NTLM or Kerberos
     ///   session is bound to;
     /// - an authenticated NTLM or Kerberos connection the server closed,
@@ -81,36 +89,44 @@ pub enum WinrmError {
     AuthRejected(String),
     /// The authentication could not be completed, for another reason than
     /// the server refusing the credentials: Kerberos could not get or use a
-    /// ticket, compute a channel binding or seal a request, the server did
-    /// not prove who it is (mutual authentication, a pinned certificate, the
-    /// certificate a Kerberos exchange was bound to), or the TLS session
-    /// inside CredSSP failed.
-    #[error("WinRM auth failed: {0}")]
-    AuthFailed(String),
+    /// ticket or seal a request, the channel binding of NTLM or Kerberos
+    /// over HTTPS cannot be computed (no server certificate reported,
+    /// several certificates seen, a certificate whose signature algorithm
+    /// defines no binding hash, as Ed25519), the server did not prove who
+    /// it is (mutual authentication, a pinned certificate that does not
+    /// match, the certificate a Kerberos exchange was bound to), or the TLS
+    /// session inside CredSSP failed.
+    ///
+    /// In 2.x this was part of `AuthFailed`, which also held the refusals
+    /// that are now [`AuthRejected`](Self::AuthRejected).
+    #[error("WinRM authentication error: {0}")]
+    Authentication(String),
     /// The endpoint answered with an HTTP status that ends the exchange and
     /// is neither a SOAP fault ([`Soap`](Self::Soap)) nor a refusal of the
     /// credentials ([`AuthRejected`](Self::AuthRejected)): 404 for a path
     /// that is not the WinRM endpoint, 503 from a busy server, any status
-    /// but 401 where a handshake expects the server's challenge.
+    /// but 401, a success included, where a handshake expects the server's
+    /// challenge.
     #[error("WinRM request failed: {message}")]
+    #[non_exhaustive]
     HttpStatus {
         /// The HTTP status code.
         status: u16,
-        /// The status, the step that got it and the start of the answer's
-        /// body.
+        /// The status, the step that got it and, where the answer can be
+        /// attributed to the server, the start of its body.
         message: String,
     },
     /// What the server sent does not follow the protocol, or cannot be
     /// trusted: a malformed authentication token, a handshake the server
-    /// gives up half-way, an answer to a sealed request that is not sealed,
-    /// has the wrong framing or does not answer that request, a Kerberos
-    /// answer that does not unseal, an HTTP answer the CredSSP connection
-    /// cannot read.
+    /// gives up half-way, a successful answer to a sealed request that is
+    /// not sealed, a sealed answer that has the wrong framing or does not
+    /// answer that request, a Kerberos answer that does not unseal, an HTTP
+    /// answer the CredSSP connection cannot read.
     #[error("WinRM protocol error: {0}")]
     Protocol(String),
-    /// NTLM error: a message of the handshake that does not parse, a
-    /// signature that does not verify, a channel binding that cannot be
-    /// computed.
+    /// NTLM error: a message of the handshake that does not parse or that
+    /// this client refuses, a signature that does not verify, a session
+    /// that cannot seal or sign any more.
     #[error("WinRM NTLM error: {0}")]
     Ntlm(NtlmError),
     /// CredSSP protocol error.
@@ -147,9 +163,10 @@ pub enum WinrmError {
     /// [`WinrmConfig::max_output_bytes`](crate::WinrmConfig::max_output_bytes)
     /// allows.
     #[error("{what} exceeded max_output_bytes ({limit})")]
+    #[non_exhaustive]
     OutputLimit {
-        /// What grew past the limit, as the message names it.
-        what: &'static str,
+        /// What grew past the limit.
+        what: OutputKind,
         /// The limit that was exceeded.
         limit: usize,
     },
@@ -165,6 +182,28 @@ pub enum WinrmError {
     /// request was not sent, or its answer was refused.
     #[error("winrm-rs internal error: {0}")]
     Internal(String),
+}
+
+/// What grew past
+/// [`WinrmConfig::max_output_bytes`](crate::WinrmConfig::max_output_bytes),
+/// in a [`WinrmError::OutputLimit`]. Its `Display` is how the message of
+/// the error names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum OutputKind {
+    /// What a command wrote on its standard output and error streams.
+    CommandOutput,
+    /// The items a WQL enumeration returned.
+    WqlEnumeration,
+}
+
+impl std::fmt::Display for OutputKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::CommandOutput => "command output",
+            Self::WqlEnumeration => "WQL enumeration",
+        })
+    }
 }
 
 /// The error for an HTTP status that ends an exchange and is not a SOAP
@@ -187,19 +226,23 @@ const MAX_CAUSE_CHARS: usize = 256;
 
 /// `error` and its causes as one message, each cause after `": "`.
 ///
-/// For an error that leaves its reason to `source()`, as `reqwest` does. A
-/// cause whose text the message already holds is not repeated: some errors
-/// print their source themselves. The causes are the errors of other
-/// libraries (`hyper`, `rustls`, the operating system), so their text is
-/// bounded and goes through [`quote_server_text`] like a server's.
-fn with_causes(error: &(dyn std::error::Error + 'static)) -> String {
+/// For an error that leaves its reason to `source()`, as `reqwest` does.
+/// Some errors print their source themselves: a cause is left out when the
+/// error just above it already prints it, and only then, so that a cause
+/// is never dropped because its words occur elsewhere in the message. The
+/// causes are the errors of other libraries (`hyper`, `rustls`, the
+/// operating system), so their text is bounded and goes through
+/// [`quote_server_text`] like a server's.
+pub(crate) fn with_causes(error: &(dyn std::error::Error + 'static)) -> String {
     let mut message = error.to_string();
+    let mut parent = message.clone();
     for cause in std::iter::successors(error.source(), |cause| cause.source()).take(MAX_CAUSES) {
-        let text = quote_server_text(&cause.to_string(), MAX_CAUSE_CHARS);
-        if !text.is_empty() && !message.contains(&text) {
+        let text = cause.to_string();
+        if !text.is_empty() && !parent.contains(&text) {
             message.push_str(": ");
-            message.push_str(&text);
+            message.push_str(&quote_server_text(&text, MAX_CAUSE_CHARS));
         }
+        parent = text;
     }
     message
 }
@@ -281,6 +324,7 @@ pub enum TransferError {
     RemotePath(String),
     /// The local file of an upload could not be read. Nothing was sent.
     #[error("failed to read local file {}: {error}", path.display())]
+    #[non_exhaustive]
     LocalRead {
         /// The local file.
         path: PathBuf,
@@ -288,8 +332,13 @@ pub enum TransferError {
         error: std::io::Error,
     },
     /// The local file of a download could not be written. The remote file
-    /// was read; the local file is left as it was.
+    /// was read. The local file is replaced through a temporary file and a
+    /// rename, which leave it as it was when they fail. Where it has to be
+    /// rewritten in place (a file with several hard links, an owner the
+    /// replacement could not keep, a directory in which no file can be
+    /// created), a write that fails leaves it truncated.
     #[error("failed to write local file {}: {error}", path.display())]
+    #[non_exhaustive]
     LocalWrite {
         /// The local file.
         path: PathBuf,
@@ -355,31 +404,35 @@ pub enum SoapError {
 /// Errors from the NTLM authentication protocol layer.
 ///
 /// What the transport does with an authenticated NTLM connection is not
-/// here: a connection the server closed is
-/// [`WinrmError::Connection`], an answer that is not sealed or has the
-/// wrong framing is [`WinrmError::Protocol`].
+/// here: a connection the server closed is [`WinrmError::Connection`], an
+/// answer that is not sealed or has the wrong framing is
+/// [`WinrmError::Protocol`], and a channel binding that cannot be computed
+/// is [`WinrmError::Authentication`].
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum NtlmError {
-    /// An NTLM message is structurally invalid: a challenge that is too
-    /// short, has a bad `NTLMSSP` signature, the wrong message type, corrupt
-    /// base64 or a field outside the message; or a field of an outgoing
-    /// message too large for its 16-bit length or 32-bit offset.
-    #[error("invalid message: {0}")]
-    InvalidMessage(String),
+    /// The handshake cannot go on with the message at hand:
+    /// - a challenge that is structurally invalid: too short, a bad
+    ///   `NTLMSSP` signature, the wrong message type, a field outside the
+    ///   message;
+    /// - a challenge this client refuses: one that does not negotiate what
+    ///   the session needs (NTLMv2 session security and 128-bit keys; with
+    ///   message encryption, signing, sealing and key exchange too, and the
+    ///   server's names), or that asks for an anonymous or a datagram
+    ///   session;
+    /// - a field of an outgoing message too large for its 16-bit length or
+    ///   32-bit offset.
+    ///
+    /// In 2.x this was part of `InvalidMessage`, which held every NTLM
+    /// error.
+    #[error("handshake: {0}")]
+    Handshake(String),
     /// A signature does not verify: the one of a sealed answer, or the
     /// `mechListMIC` of the SPNEGO exchange inside CredSSP (its size, its
     /// version, its sequence number or its checksum). The message was
     /// altered on the way, or the two ends do not share the session.
     #[error("signature check failed: {0}")]
     BadSignature(String),
-    /// NTLM over HTTPS cannot compute the channel binding that ties the
-    /// authentication to the TLS connection: no server certificate
-    /// reported, several certificates seen, or a certificate whose
-    /// signature algorithm defines no binding hash (Ed25519, unknown
-    /// algorithms). Nothing was sent that holds the credentials.
-    #[error("channel binding: {0}")]
-    ChannelBinding(String),
     /// The session cannot be set up, or cannot seal or sign any more: the
     /// operating system's random source failed while the session key was
     /// drawn, an earlier message of the session failed its check (the two
@@ -390,157 +443,4 @@ pub enum NtlmError {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn quote_server_text_neutralises_controls_and_bidi() {
-        assert_eq!(quote_server_text("a\tb\r\n\r\nc", 64), "a b c");
-        assert_eq!(
-            quote_server_text("  x\u{202E}y\u{7f}z\u{85}\u{2028}\n", 64),
-            r"x\u{202e}y\u{7f}z\u{85}\u{2028}"
-        );
-        assert_eq!(quote_server_text("plain é text", 64), "plain é text");
-        assert_eq!(
-            quote_server_text(&"\u{1b}".repeat(40), 32),
-            format!("{}… [40 bytes in total]", r"\u{1b}".repeat(32))
-        );
-    }
-
-    #[test]
-    fn a_401_is_the_refusal_of_the_credentials_and_any_other_status_keeps_its_code() {
-        assert!(matches!(
-            status_error(401, "HTTP 401 Unauthorized".into()),
-            WinrmError::AuthRejected(message) if message == "HTTP 401 Unauthorized"
-        ));
-        for status in [400, 403, 404, 500, 503] {
-            assert!(matches!(
-                status_error(status, "refused".into()),
-                WinrmError::HttpStatus { status: got, message }
-                    if got == status && message == "refused"
-            ));
-        }
-    }
-
-    /// An error that says `text` and leaves `source` to `source()`.
-    #[derive(Debug)]
-    struct Link {
-        text: &'static str,
-        source: Option<Box<Link>>,
-    }
-
-    impl Link {
-        fn chain(texts: &[&'static str]) -> Self {
-            let (first, rest) = texts.split_first().unwrap();
-            Self {
-                text: first,
-                source: (!rest.is_empty()).then(|| Box::new(Self::chain(rest))),
-            }
-        }
-    }
-
-    impl std::fmt::Display for Link {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str(self.text)
-        }
-    }
-
-    impl std::error::Error for Link {
-        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-            self.source
-                .as_deref()
-                .map(|link| link as &(dyn std::error::Error + 'static))
-        }
-    }
-
-    #[test]
-    fn with_causes_gives_each_cause_once_and_stops() {
-        assert_eq!(with_causes(&Link::chain(&["alone"])), "alone");
-        assert_eq!(
-            with_causes(&Link::chain(&[
-                "error sending request",
-                "client error (Connect)",
-                "tcp connect error",
-                "Connection refused (os error 111)",
-            ])),
-            "error sending request: client error (Connect): tcp connect error: \
-             Connection refused (os error 111)"
-        );
-        // A cause the message already holds, and one that says nothing.
-        assert_eq!(
-            with_causes(&Link::chain(&[
-                "tls: bad certificate",
-                "bad certificate",
-                "",
-                "expired"
-            ])),
-            "tls: bad certificate: expired"
-        );
-        // The text of a cause is another library's: neutralised and bounded.
-        assert_eq!(
-            with_causes(&Link::chain(&["tls", "bad\r\n\u{1b}[31m name"])),
-            r"tls: bad \u{1b}[31m name"
-        );
-        let long_cause: &'static str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
-             0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
-             0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
-             0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
-             and more";
-        assert_eq!(
-            with_causes(&Link::chain(&["tls", long_cause])),
-            format!(
-                "tls: {}… [{} bytes in total]",
-                &long_cause[..MAX_CAUSE_CHARS],
-                long_cause.len()
-            )
-        );
-        // The error itself, then no more than `MAX_CAUSES` causes.
-        let long = [
-            "e0", "e1", "e2", "e3", "e4", "e5", "e6", "e7", "e8", "e9", "e10",
-        ];
-        assert_eq!(
-            with_causes(&Link::chain(&long)),
-            "e0: e1: e2: e3: e4: e5: e6: e7: e8"
-        );
-    }
-
-    #[test]
-    fn an_error_names_its_cause_once() {
-        let cases = [
-            (
-                WinrmError::Ntlm(NtlmError::BadSignature("checksum mismatch".into())),
-                "WinRM NTLM error: signature check failed: checksum mismatch",
-            ),
-            (
-                WinrmError::Transfer(TransferError::Host("download failed: no such file".into())),
-                "file transfer error: download failed: no such file",
-            ),
-            (
-                WinrmError::Transfer(TransferError::LocalRead {
-                    path: PathBuf::from("in.bin"),
-                    error: std::io::Error::other("denied"),
-                }),
-                "file transfer error: failed to read local file in.bin: denied",
-            ),
-            (
-                WinrmError::OutputLimit {
-                    what: "command output",
-                    limit: 16,
-                },
-                "command output exceeded max_output_bytes (16)",
-            ),
-            (
-                WinrmError::HttpStatus {
-                    status: 503,
-                    message: "HTTP 503 Service Unavailable: busy".into(),
-                },
-                "WinRM request failed: HTTP 503 Service Unavailable: busy",
-            ),
-        ];
-        for (error, shown) in cases {
-            assert_eq!(error.to_string(), shown);
-            // The message already holds the cause, so no `source` repeats it.
-            assert!(std::error::Error::source(&error).is_none());
-        }
-    }
-}
+mod tests;

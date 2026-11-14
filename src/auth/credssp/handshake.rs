@@ -273,8 +273,13 @@ fn server_challenge(
 /// `pubKeyAuth` is computed over (MS-CSSP 2.2.2.5).
 fn subject_public_key(cert_der: &[u8]) -> Result<Vec<u8>, WinrmError> {
     use x509_cert::der::Decode;
-    let cert = x509_cert::Certificate::from_der(cert_der)
-        .map_err(|e| WinrmError::Protocol(format!("CredSSP cert parse: {e}")))?;
+    // As the other failures of that certificate (`credssp/tls.rs`): the
+    // server did not show a key the delegation can be bound to.
+    let cert = x509_cert::Certificate::from_der(cert_der).map_err(|e| {
+        WinrmError::Authentication(format!(
+            "CredSSP inner TLS: the server certificate does not parse: {e}"
+        ))
+    })?;
     Ok(cert
         .tbs_certificate()
         .subject_public_key_info()

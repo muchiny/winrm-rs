@@ -56,7 +56,7 @@ impl<S> WinrmClientBuilder<S> {
     ///
     /// A missing process provider with [`TlsProvider::ProcessDefault`] is
     /// reported as [`WinrmError::Config`], like the other TLS setup
-    /// errors, since `WinrmError` has no dedicated variant.
+    /// errors: the client is not built and nothing is sent.
     pub fn tls_provider(mut self, provider: TlsProvider) -> Self {
         self.options.tls.provider = Some(provider);
         self

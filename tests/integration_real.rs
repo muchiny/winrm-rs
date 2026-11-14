@@ -1261,7 +1261,7 @@ async fn streaming_clixml_stderr_yields_records_before_exit() {
 
 // === Output cap ===
 
-/// Hitting `max_output_bytes` aborts the call with `Transfer`, and the shell
+/// Hitting `max_output_bytes` aborts the call with `OutputLimit`, and the shell
 /// the call opened must not stay behind on the server.
 ///
 /// Only shells carrying this test's own `IdleTimeOut` are counted, so the
@@ -4707,7 +4707,7 @@ async fn certificate_auth_unmapped_cert_is_rejected() {
 /// lockout: Windows answers a wrong password and an unknown account alike.
 #[tokio::test]
 #[ignore = "needs the Windows bench: see the head of this file"]
-async fn refused_credentials_are_auth_rejected_by_every_method() {
+async fn refused_credentials_are_auth_rejected_by_basic_ntlm_and_credssp() {
     let (host, basic, _) = test_settings().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let unknown = || WinrmCredentials::new("winrm-rs-no-such-account", "no-such-password", "");
     // The bench listener is self-signed: pinned, as Basic and CredSSP need.
@@ -5688,7 +5688,7 @@ async fn assert_split_relay_fails_at_the_handshake() {
             relay.requests()
         );
         assert!(
-            matches!(&err, WinrmError::AuthFailed(m) if m.contains("TLS handshake refused") && m.contains("pinned")),
+            matches!(&err, WinrmError::Authentication(m) if m.contains("TLS handshake refused") && m.contains("pinned")),
             "{mode:?}: expected the pinned verifier's refusal, got {err:?}"
         );
     }

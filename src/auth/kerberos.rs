@@ -113,7 +113,7 @@ mod wire {
     /// Error for a request the Kerberos library of this machine could not
     /// seal, or sealed in a layout Windows does not read. Nothing was sent.
     pub(super) fn wrap_error(what: impl std::fmt::Display) -> WinrmError {
-        WinrmError::AuthFailed(format!("Kerberos message encryption: {what}"))
+        WinrmError::Authentication(format!("Kerberos message encryption: {what}"))
     }
 
     /// Turn a wrap token produced by `gss_wrap_iov` with separate header, data,
@@ -272,7 +272,7 @@ mod wire {
         };
         match peer {
             crate::auth::PeerCertificate::Known(der) if der.as_slice() == bound => Ok(()),
-            _ => Err(WinrmError::AuthFailed(
+            _ => Err(WinrmError::Authentication(
                 "Kerberos over TLS: the connection that carried the AP-REQ did not present the \
                  certificate its channel binding was computed for; refusing the context"
                     .into(),
@@ -310,7 +310,7 @@ mod wire {
         server_token: Option<Vec<u8>>,
     ) -> Result<P::Ctx, WinrmError> {
         let server_token = server_token.ok_or_else(|| {
-            WinrmError::AuthFailed(
+            WinrmError::Authentication(
                 "Kerberos: the server sent no mutual authentication token, so no context \
                  for message encryption"
                     .into(),
@@ -326,7 +326,7 @@ mod wire {
                      support"
                     .into(),
             )),
-            Err(e) => Err(WinrmError::AuthFailed(format!(
+            Err(e) => Err(WinrmError::Authentication(format!(
                 "Kerberos mutual authentication failed: {e}"
             ))),
         }
@@ -484,7 +484,7 @@ impl KerberosAuth {
                 &service_principal,
                 channel_bindings.as_deref(),
             )
-            .map_err(|e| WinrmError::AuthFailed(format!("Kerberos init: {e}")))?;
+            .map_err(|e| WinrmError::Authentication(format!("Kerberos init: {e}")))?;
             Ok((ctx, format!("Negotiate {}", B64.encode(&*token))))
         })
         .await
@@ -530,7 +530,7 @@ impl KerberosAuth {
         match peer {
             crate::auth::PeerCertificate::Known(der) => Ok(der),
             crate::auth::PeerCertificate::Ambiguous | crate::auth::PeerCertificate::Unknown => {
-                Err(WinrmError::AuthFailed(
+                Err(WinrmError::Authentication(
                     "Kerberos over TLS: the server certificate of the connection is unknown or \
                      ambiguous; refusing to authenticate without a certain channel binding"
                         .into(),
@@ -580,9 +580,15 @@ impl KerberosAuth {
         };
         let bindings = bound
             .as_deref()
-            .map(crate::ntlm::crypto::tls_server_end_point)
-            .transpose()
-            .map_err(|e| WinrmError::AuthFailed(format!("Kerberos channel binding: {e}")))?;
+            .map(|der| {
+                crate::ntlm::crypto::tls_server_end_point(der).ok_or_else(|| {
+                    WinrmError::Authentication(format!(
+                        "Kerberos channel binding: {}",
+                        crate::ntlm::crypto::NO_BINDING_HASH
+                    ))
+                })
+            })
+            .transpose()?;
         let (pending, auth_header) = self.initiate(bindings).await?;
         let resp = http
             .post(url)
@@ -652,7 +658,7 @@ impl AuthTransport for KerberosAuth {
             .body(body)
             .send()
             .await
-            .map_err(WinrmError::Http)?;
+            .map_err(crate::auth::send_error)?;
 
         // Handle mutual auth (server sends back a token).
         //
@@ -661,7 +667,7 @@ impl AuthTransport for KerberosAuth {
         // step() error would let an unauthenticated server pass.
         if let Some(server_token) = Self::server_token(resp.headers())? {
             ctx.step(&server_token).map_err(|e| {
-                WinrmError::AuthFailed(format!("Kerberos mutual authentication failed: {e}"))
+                WinrmError::Authentication(format!("Kerberos mutual authentication failed: {e}"))
             })?;
         }
 

@@ -1144,7 +1144,8 @@ async fn shell_run_command_terminates_the_command_past_max_output_bytes() {
 
     match err {
         WinrmError::OutputLimit { what, limit } => {
-            assert_eq!((what, limit), ("command output", 4));
+            assert_eq!((what, limit), (crate::OutputKind::CommandOutput, 4));
+            assert_eq!(what.to_string(), "command output");
         }
         other => panic!("got {other:?}"),
     }

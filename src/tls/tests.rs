@@ -156,7 +156,9 @@ fn pinned_verifier_leaves_the_proxy_leg_unpinned() {
 fn pin_without_a_target_is_refused() {
     let verifier = CertCapturingVerifier::new(Arc::new(AcceptAllVerifier), None);
     let handle = verifier.cert_handle();
-    assert!(handle.pin(vec![1]).is_err());
+    // The caller pins the certificate of a TLS session with the target:
+    // without a target it is a state the crate should not reach.
+    assert!(matches!(handle.pin(vec![1]), Err(WinrmError::Internal(_))));
     assert_eq!(handle.pinned(), None);
 }
 

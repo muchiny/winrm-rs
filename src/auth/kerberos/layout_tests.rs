@@ -58,8 +58,11 @@ fn windows_layout_appends_padding_to_the_data() {
 fn windows_layout_refuses_an_emulated_iov_wrap() {
     let err = windows_layout(&[], b"whole-token", &[], &[]).unwrap_err();
     assert!(
-        err.to_string().contains("no separate wrap token header"),
-        "{err}"
+        matches!(
+            &err,
+            WinrmError::Authentication(m) if m.contains("no separate wrap token header")
+        ),
+        "{err:?}"
     );
 }
 
@@ -89,7 +92,7 @@ fn windows_layout_refuses_what_is_not_a_sealed_initiator_wrap_token() {
         mutate(&mut header);
         let err = windows_layout(&header, &data, &padding, &trailer).unwrap_err();
         assert!(
-            matches!(err, WinrmError::AuthFailed(ref m) if m.contains("Kerberos message encryption")),
+            matches!(err, WinrmError::Authentication(ref m) if m.contains("Kerberos message encryption")),
             "{name}: {err:?}"
         );
     }
@@ -240,8 +243,8 @@ impl wire::PendingStep for FakePending {
 
 fn auth_failed(result: Result<u8, WinrmError>) -> String {
     match result {
-        Err(WinrmError::AuthFailed(m)) => m,
-        other => panic!("expected AuthFailed, got {other:?}"),
+        Err(WinrmError::Authentication(m)) => m,
+        other => panic!("expected Authentication, got {other:?}"),
     }
 }
 
@@ -310,11 +313,11 @@ fn bound_certificate_must_be_the_known_same_certificate() {
         PeerCertificate::Unknown,
     ] {
         match wire::check_bound_certificate(Some(&der), &peer) {
-            Err(WinrmError::AuthFailed(m)) => assert!(
+            Err(WinrmError::Authentication(m)) => assert!(
                 m.contains("did not present the certificate its channel binding was computed for"),
                 "{m}"
             ),
-            other => panic!("expected AuthFailed for {peer:?}, got {other:?}"),
+            other => panic!("expected Authentication for {peer:?}, got {other:?}"),
         }
     }
 }

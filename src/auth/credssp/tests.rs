@@ -412,6 +412,21 @@ async fn error_code_of_a_refused_logon_is_auth_rejected() {
             "{code:#010x}: {log:?}"
         );
     }
+    // The round that reports it does not matter: a server may refuse the
+    // logon in its answer to the NTLM negotiate.
+    let (err, log) = refused(Fault::ErrorCodeAtChallenge(0xC000_0072), 1 << 20).await;
+    assert!(
+        matches!(
+            &err,
+            WinrmError::AuthRejected(m)
+                if m == "CredSSP: the server refused the logon: STATUS_ACCOUNT_DISABLED (0xc0000072)"
+        ),
+        "{err:?}"
+    );
+    assert!(
+        !log.iter().any(|e| matches!(e, Event::Delegated { .. })),
+        "{log:?}"
+    );
     // Its neighbours are not refusals of a logon.
     for code in [
         0xC000_0063,

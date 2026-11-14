@@ -112,12 +112,17 @@ impl CredSspConnection {
             .connect(endpoint.server_name.clone(), tcp)
             .await
             .map_err(|e| {
-                let message = format!("CredSSP outer TLS: {e}");
+                // The text of a TLS error can quote what the server sent
+                // (the names of its certificate): neutralised and bounded.
+                let message = format!(
+                    "CredSSP outer TLS: {}",
+                    crate::error::quote_server_text(&e.to_string(), 512)
+                );
                 // A pinned certificate that does not match is the server
                 // failing to prove who it is, as for the other methods
                 // (`crate::auth::send_error`), not a network failure.
                 if crate::tls::is_pin_mismatch(&e) {
-                    WinrmError::AuthFailed(message)
+                    WinrmError::Authentication(message)
                 } else {
                     WinrmError::Connection(message)
                 }

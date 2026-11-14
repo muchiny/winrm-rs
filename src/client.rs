@@ -65,18 +65,21 @@ use crate::transport::{HttpTransport, TransportOptions};
 ///   server closed;
 /// - [`WinrmError::AuthRejected`]: the server refuses the credentials or
 ///   the method (HTTP 401, or with CredSSP the NTSTATUS of a refused
-///   logon). [`WinrmError::AuthFailed`]: the authentication fails otherwise
-///   (no Kerberos ticket, a server that does not prove who it is, a pinned
+///   logon). [`WinrmError::Authentication`]: the authentication fails
+///   otherwise (no Kerberos ticket, a channel binding that cannot be
+///   computed, a server that does not prove who it is, a pinned
 ///   certificate that does not match);
-/// - [`WinrmError::HttpStatus`]: the server answers an HTTP status that is
-///   neither a success, nor a SOAP fault, nor a 401;
+/// - [`WinrmError::HttpStatus`]: the server answers an HTTP status that
+///   ends the exchange and is neither a SOAP fault nor a 401 (a 404, a
+///   503, or any status but 401 where a handshake expects a challenge);
 /// - [`WinrmError::Protocol`]: an answer that does not follow the protocol
-///   or cannot be trusted, such as an answer to a sealed request that the
-///   server did not seal. [`WinrmError::Ntlm`]: a malformed NTLM message, a
-///   signature that does not verify
-///   ([`NtlmError::BadSignature`](crate::NtlmError::BadSignature)), a
-///   channel binding that cannot be computed. [`WinrmError::CredSsp`]: a
-///   message of that protocol is malformed or fails its checks;
+///   or cannot be trusted, such as a successful answer to a sealed request
+///   that the server did not seal. [`WinrmError::Ntlm`]: an NTLM challenge
+///   that is malformed or that this client refuses, a signature that does
+///   not verify
+///   ([`NtlmError::BadSignature`](crate::NtlmError::BadSignature)).
+///   [`WinrmError::CredSsp`]: a message of that protocol is malformed or
+///   fails its checks;
 /// - [`WinrmError::Soap`]: the server answers a fault
 ///   ([`SoapError::Fault`](crate::SoapError::Fault)), or a body that is not
 ///   an XML document, is larger than the response limit, or is not built
@@ -751,7 +754,7 @@ impl WinrmClient {
             {
                 self.signal_terminate(host, shell_id, command_id).await.ok();
                 return Err(WinrmError::OutputLimit {
-                    what: "command output",
+                    what: crate::error::OutputKind::CommandOutput,
                     limit: cap,
                 });
             }
@@ -1290,7 +1293,7 @@ impl WinrmClient {
 fn check_wql_cap(items: &str, cap: Option<usize>) -> Result<(), WinrmError> {
     match cap {
         Some(cap) if items.len() > cap => Err(WinrmError::OutputLimit {
-            what: "WQL enumeration",
+            what: crate::error::OutputKind::WqlEnumeration,
             limit: cap,
         }),
         _ => Ok(()),

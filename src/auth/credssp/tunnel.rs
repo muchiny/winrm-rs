@@ -153,7 +153,16 @@ async fn http_connect(
             "CredSSP: proxy response head too large".into(),
         ));
     }
-    let head = parse_response_head(buf.get(..head_end).unwrap_or_default())?;
+    // What the proxy answered is not an HTTP response: the tunnel did not
+    // open, which is a failure of the connection like the others here.
+    let head =
+        parse_response_head(buf.get(..head_end).unwrap_or_default()).map_err(|e| match e {
+            WinrmError::Protocol(what) => WinrmError::Connection(format!(
+                "CredSSP: the proxy did not answer CONNECT with an HTTP response: {}",
+                what.strip_prefix("CredSSP: ").unwrap_or(&what)
+            )),
+            other => other,
+        })?;
     match head.status {
         200..=299 if buf.len() > head_end => Err(WinrmError::Connection(
             "CredSSP: the proxy sent data before the tunnel opened".into(),
@@ -209,8 +218,12 @@ async fn socks5_negotiate(
     match (choice, user_pass) {
         ([5, 0], _) => Ok(()),
         ([5, 2], Some((user, pass))) => {
-            let too_long =
-                || WinrmError::Config(crate::transport::proxy::SOCKS5_CREDENTIALS_TOO_LONG.into());
+            // The route refuses such credentials before any dial
+            // (`ProxyRoute::credssp_dial`): here it is a bug, found after
+            // the greeting was sent.
+            let too_long = || {
+                WinrmError::Internal(crate::transport::proxy::SOCKS5_CREDENTIALS_TOO_LONG.into())
+            };
             let ulen = u8::try_from(user.len()).map_err(|_| too_long())?;
             let plen = u8::try_from(pass.len()).map_err(|_| too_long())?;
             let mut auth = Zeroizing::new(Vec::with_capacity(515));
@@ -271,8 +284,12 @@ async fn socks5_request(host: &str, port: u16, remote_dns: bool) -> Result<Vec<u
             request.extend_from_slice(&ip.octets());
         }
         None => {
-            let len = u8::try_from(host.len())
-                .map_err(|_| WinrmError::Config("CredSSP: host name too long for SOCKS5".into()))?;
+            // The endpoint's host is a TLS server name, at most 253 bytes
+            // (`CredSspEndpoint`): here it is a bug, found after the
+            // greeting was sent.
+            let len = u8::try_from(host.len()).map_err(|_| {
+                WinrmError::Internal("CredSSP: host name too long for SOCKS5".into())
+            })?;
             request.extend_from_slice(&[3, len]);
             request.extend_from_slice(host.as_bytes());
         }

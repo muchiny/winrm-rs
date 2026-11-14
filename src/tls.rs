@@ -249,14 +249,17 @@ impl CertHandle {
     ///
     /// Fails, pinning nothing, when the verifier has no target server name
     /// (the endpoint host is not a valid TLS server name): a pin could then
-    /// not take effect, and the caller must not go on as if it did.
+    /// not take effect, and the caller must not go on as if it did. The
+    /// caller pins the certificate of a TLS session it has just had with
+    /// that host, so this is [`WinrmError::Internal`]: a state the crate
+    /// should not reach, found after a request was sent.
     #[cfg_attr(
         not(any(test, feature = "kerberos")),
         expect(dead_code, reason = "only Kerberos pins a certificate")
     )]
     pub(crate) fn pin(&self, cert_der: Vec<u8>) -> Result<(), WinrmError> {
         if !self.has_target {
-            return Err(WinrmError::Config(
+            return Err(WinrmError::Internal(
                 "TLS: the endpoint host is not a valid TLS server name, so the server \
                  certificate cannot be pinned; refusing to authenticate"
                     .into(),

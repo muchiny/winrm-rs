@@ -40,7 +40,7 @@ const SEQ_EXHAUSTED: &str = "sequence number exhausted";
 const SESSION_DEAD: &str = "unusable after an earlier error";
 
 /// The error of a session that cannot seal or sign any more.
-fn invalid(what: &str) -> NtlmError {
+fn session_error(what: &str) -> NtlmError {
     NtlmError::Session(what.into())
 }
 
@@ -232,7 +232,7 @@ impl SealingSession {
         op: impl FnOnce(&mut Self) -> Result<T, NtlmError>,
     ) -> Result<T, NtlmError> {
         if self.poisoned {
-            return Err(invalid(SESSION_DEAD));
+            return Err(session_error(SESSION_DEAD));
         }
         let result = op(self);
         if result.is_err() {
@@ -254,7 +254,9 @@ impl SealingSession {
     /// client sequence number is exhausted.
     pub(crate) fn seal(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, NtlmError> {
         self.guarded(|s| {
-            let seq = s.client_seq_num.ok_or_else(|| invalid(SEQ_EXHAUSTED))?;
+            let seq = s
+                .client_seq_num
+                .ok_or_else(|| session_error(SEQ_EXHAUSTED))?;
             // 1. Compute signature: HMAC_MD5(sign_key, seq_num + plaintext)[0..8]
             let mac = hmac_md5_parts(&s.client_sign_key, &[&seq.to_le_bytes(), plaintext]);
             let mut checksum = checksum_head(&mac);
@@ -295,7 +297,9 @@ impl SealingSession {
     /// [`Self::sign`] on a session already checked live.
     #[cfg(any(test, feature = "credssp", feature = "__internal"))]
     fn sign_live(&mut self, data: &[u8]) -> Result<[u8; 16], NtlmError> {
-        let seq = self.client_seq_num.ok_or_else(|| invalid(SEQ_EXHAUSTED))?;
+        let seq = self
+            .client_seq_num
+            .ok_or_else(|| session_error(SEQ_EXHAUSTED))?;
         let mac = hmac_md5_parts(&self.client_sign_key, &[&seq.to_le_bytes(), data]);
         let mut checksum = checksum_head(&mac);
         // KEY_EXCH path: encrypt the checksum with the client RC4 stream.
@@ -371,7 +375,9 @@ impl SealingSession {
             if version != SIGNATURE_VERSION {
                 return Err(bad_signature("mechListMIC bad signature version"));
             }
-            let seq = s.server_seq_num.ok_or_else(|| invalid(SEQ_EXHAUSTED))?;
+            let seq = s
+                .server_seq_num
+                .ok_or_else(|| session_error(SEQ_EXHAUSTED))?;
             if sig_seq != seq {
                 return Err(bad_signature("mechListMIC sequence number mismatch"));
             }
@@ -425,7 +431,9 @@ impl SealingSession {
             }
 
             // Verify sequence number (unencrypted field)
-            let seq = s.server_seq_num.ok_or_else(|| invalid(SEQ_EXHAUSTED))?;
+            let seq = s
+                .server_seq_num
+                .ok_or_else(|| session_error(SEQ_EXHAUSTED))?;
             if sig_seq != seq {
                 return Err(bad_signature("sequence number mismatch"));
             }

@@ -234,7 +234,7 @@ impl<'a> Shell<'a> {
             Ok(Ok(Polled::OverCap(cap))) => {
                 self.terminate_best_effort(&command_id).await;
                 Err(WinrmError::OutputLimit {
-                    what: crate::error::OutputKind::CommandOutput,
+                    kind: crate::error::OutputKind::CommandOutput,
                     limit: cap,
                 })
             }

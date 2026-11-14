@@ -33,7 +33,46 @@ fn membio_write_appends_to_outgoing_and_read_drains_incoming() {
 fn openssl_inner_tls_peer_cert_before_handshake_errors() {
     let tls = build_inner_openssl_tls(&no_verify().inner).expect("build inner tls");
     // No handshake completed → no peer cert available
-    assert!(tls.peer_cert_der().is_err());
+    let err = tls.peer_cert_der().unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            WinrmError::Authentication(m)
+                if m == "CredSSP inner TLS: the server presented no certificate"
+        ),
+        "{err:?}"
+    );
+}
+
+/// What comes in place of the server's TLS flight ends the handshake, and
+/// the errors of the inner session all read `CredSSP inner TLS <step>: `.
+#[test]
+fn openssl_inner_tls_errors_name_the_session_and_the_step() {
+    let mut tls = build_inner_openssl_tls(&no_verify().inner).expect("build inner tls");
+    assert!(!tls.handshake_step().unwrap());
+    tls.drain_outgoing();
+    tls.feed_incoming(b"HTTP/1.1 400 Bad Request\r\n\r\n");
+    let err = tls.handshake_step().unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            WinrmError::Authentication(m) if m.starts_with("CredSSP inner TLS handshake: ")
+        ),
+        "{err:?}"
+    );
+
+    let shown = |e: WinrmError| match e {
+        WinrmError::Authentication(m) => m,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        shown(inner_tls_error("read", &"bad\r\n\u{1b}[31m record")),
+        r"CredSSP inner TLS read: bad \u{1b}[31m record"
+    );
+    assert_eq!(
+        shown(session_setup_error("into_ssl", &"no memory")),
+        "CredSSP inner TLS session set-up (into_ssl): no memory"
+    );
 }
 
 #[test]

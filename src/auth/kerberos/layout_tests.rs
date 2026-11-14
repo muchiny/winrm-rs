@@ -241,7 +241,7 @@ impl wire::PendingStep for FakePending {
     }
 }
 
-fn auth_failed(result: Result<u8, WinrmError>) -> String {
+fn authentication_error(result: Result<u8, WinrmError>) -> String {
     match result {
         Err(WinrmError::Authentication(m)) => m,
         other => panic!("expected Authentication, got {other:?}"),
@@ -261,14 +261,14 @@ fn establish_refuses_a_missing_ap_rep() {
         ctx: 1,
         extra_token: false,
     }));
-    let m = auth_failed(wire::finish_mutual(pending, None));
+    let m = authentication_error(wire::finish_mutual(pending, None));
     assert!(m.contains("no mutual authentication token"), "{m}");
 }
 
 #[test]
 fn establish_refuses_a_failed_ap_rep_step() {
     let pending = FakePending(Err("boom".into()));
-    let m = auth_failed(wire::finish_mutual(pending, Some(vec![1])));
+    let m = authentication_error(wire::finish_mutual(pending, Some(vec![1])));
     assert!(m.contains("Kerberos mutual authentication failed"), "{m}");
     assert!(m.contains("boom"), "{m}");
 }

@@ -1143,9 +1143,9 @@ async fn shell_run_command_terminates_the_command_past_max_output_bytes() {
     let err = shell.run_command("x", &[]).await.unwrap_err();
 
     match err {
-        WinrmError::OutputLimit { what, limit } => {
-            assert_eq!((what, limit), (crate::OutputKind::CommandOutput, 4));
-            assert_eq!(what.to_string(), "command output");
+        WinrmError::OutputLimit { kind, limit } => {
+            assert_eq!((kind, limit), (crate::OutputKind::CommandOutput, 4));
+            assert_eq!(kind.to_string(), "command output");
         }
         other => panic!("got {other:?}"),
     }

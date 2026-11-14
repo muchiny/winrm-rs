@@ -1023,9 +1023,9 @@ impl HttpTransport {
     /// environment through `var`.
     ///
     /// Builds the underlying HTTP client with the configured timeouts and TLS
-    /// settings. Returns [`WinrmError::Http`] if the HTTP client cannot be
-    /// constructed, and [`WinrmError::Config`] if the authentication
-    /// method cannot be set up: Certificate or CredSSP without HTTPS, CredSSP
+    /// settings. Returns [`WinrmError::Config`] if the HTTP client cannot be
+    /// constructed as configured or if the authentication method cannot be
+    /// set up: Certificate or CredSSP without HTTPS, CredSSP
     /// or Basic over HTTPS with `accept_invalid_certs`, Certificate auth
     /// without a usable certificate and key, a crypto
     /// provider, TLS verifier or client certificate that rustls rejects, an
@@ -2006,12 +2006,15 @@ impl HttpTransport {
         // its body is neither parsed nor quoted. Its status is what any
         // other route reports: HTTP.sys answers 503 while the service
         // restarts and a proxy answers 502, neither of which can seal.
+        // Nothing authenticates that status, though, and the request was
+        // delivered: the message says so, for whoever would retry on it.
         if !status.is_success() && !labelled_sealed {
             return Err(SealedFailure::Error(WinrmError::HttpStatus {
                 status: status.as_u16(),
                 message: format!(
                     "server answered a sealed {name} request without sealing: HTTP {status} \
-                     ({} bytes, not quoted)",
+                     ({} bytes, not quoted); nothing proves where this answer comes from, and \
+                     the request may have run",
                     bytes.len()
                 ),
             }));

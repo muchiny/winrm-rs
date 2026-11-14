@@ -399,8 +399,10 @@ match client.run_powershell("win-server", "Get-Service").await {
     Err(e @ (WinrmError::Http(_) | WinrmError::Connection(_) | WinrmError::Timeout(_))) => {
         eprintln!("no answer: {e}");
     }
-    // What the server answered: an HTTP status, or a SOAP fault with its code.
+    // An HTTP status that ends the exchange. The request was sent and may
+    // have run: retry on a 503 only what is safe to run twice.
     Err(WinrmError::HttpStatus { status, message, .. }) => eprintln!("HTTP {status}: {message}"),
+    // A SOAP fault, with its code.
     Err(WinrmError::Soap(fault)) => eprintln!("WinRM fault: {fault}"),
     Err(e) => return Err(e.into()),
 }

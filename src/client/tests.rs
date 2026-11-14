@@ -513,28 +513,34 @@ async fn ntlm_401_without_a_challenge_is_a_refusal_and_a_bad_token_is_not() {
 /// `Negotiate` still gets its Type 3.
 #[tokio::test]
 async fn ntlm_finds_its_challenge_behind_another_www_authenticate_header() {
-    let server = MockServer::start().await;
-    // The handshake goes on to the Type 3, which this server answers 401:
-    // the credentials are refused, which is what tells the challenge was
-    // read. With the first header alone the error is the missing challenge.
-    Mock::given(method("POST"))
-        .respond_with(
-            ResponseTemplate::new(401)
-                .append_header("WWW-Authenticate", "Basic realm=\"WSMAN\"")
-                .append_header(
-                    "WWW-Authenticate",
-                    crate::test_ntlm_server::challenge_header().as_str(),
-                ),
-        )
-        .expect(2)
-        .mount(&server)
-        .await;
-    let client = WinrmClient::new(ntlm_config(server.address().port()), test_creds()).unwrap();
-    let err = client.create_shell("127.0.0.1").await.unwrap_err();
-    assert!(
-        matches!(&err, WinrmError::AuthRejected(m) if !m.contains("carries no Negotiate challenge")),
-        "{err:?}"
-    );
+    let challenge = crate::test_ntlm_server::challenge_header();
+    let basic = "Basic realm=\"WSMAN\"";
+    for (first, second) in [(basic, challenge.as_str()), (challenge.as_str(), basic)] {
+        let server = MockServer::start().await;
+        // The handshake goes on to the Type 3, which this server answers
+        // 401: the credentials are refused, with the message of that step.
+        // It is what tells the challenge was read: with the `Basic` header
+        // alone the error is the missing challenge, after one request.
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .append_header("WWW-Authenticate", first)
+                    .append_header("WWW-Authenticate", second),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        let client = WinrmClient::new(ntlm_config(server.address().port()), test_creds()).unwrap();
+        let err = client.create_shell("127.0.0.1").await.unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                WinrmError::AuthRejected(m)
+                    if m == "NTLM authentication rejected (bad credentials or CBT mismatch)"
+            ),
+            "{first}: {err:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -3356,7 +3362,7 @@ fn check_wql_cap_accepts_items_up_to_the_cap() {
     assert!(matches!(
         check_wql_cap("123456789", Some(8)),
         Err(WinrmError::OutputLimit {
-            what: crate::OutputKind::WqlEnumeration,
+            kind: crate::OutputKind::WqlEnumeration,
             limit: 8
         })
     ));

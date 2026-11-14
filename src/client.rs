@@ -119,9 +119,9 @@ impl WinrmClient {
     ///
     /// # Errors
     ///
-    /// [`WinrmError::Http`] if the HTTP client cannot be constructed.
     /// [`WinrmError::Config`] for a configuration refused before anything
-    /// is sent: Basic over plain HTTP without `EncryptionMode::Never`; Basic
+    /// is sent: an option the HTTP client does not take (a `user_agent`
+    /// with a line break); Basic over plain HTTP without `EncryptionMode::Never`; Basic
     /// over HTTPS with `accept_invalid_certs`; `EncryptionMode::Always` with
     /// a method that does not seal; Certificate or CredSSP without
     /// `use_tls`; CredSSP with `accept_invalid_certs` or with a proxy it
@@ -754,7 +754,7 @@ impl WinrmClient {
             {
                 self.signal_terminate(host, shell_id, command_id).await.ok();
                 return Err(WinrmError::OutputLimit {
-                    what: crate::error::OutputKind::CommandOutput,
+                    kind: crate::error::OutputKind::CommandOutput,
                     limit: cap,
                 });
             }
@@ -1293,7 +1293,7 @@ impl WinrmClient {
 fn check_wql_cap(items: &str, cap: Option<usize>) -> Result<(), WinrmError> {
     match cap {
         Some(cap) if items.len() > cap => Err(WinrmError::OutputLimit {
-            what: crate::error::OutputKind::WqlEnumeration,
+            kind: crate::error::OutputKind::WqlEnumeration,
             limit: cap,
         }),
         _ => Ok(()),

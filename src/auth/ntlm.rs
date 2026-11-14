@@ -43,8 +43,9 @@ pub(crate) type SessionKey = Box<Zeroizing<[u8; 16]>>;
 struct Negotiated {
     /// The Type 1 that was sent: the MIC of the Type 3 covers it.
     type1: Vec<u8>,
-    /// The `WWW-Authenticate` value of the `401`, which carries the Type 2.
-    www_auth: String,
+    /// The token of the `Negotiate` challenge of the `401`: the Type 2, in
+    /// base64 as the server sent it.
+    token: String,
     /// The server certificate of the connection that carried the challenge,
     /// when it is known.
     peer_certificate: Option<Vec<u8>>,
@@ -214,13 +215,14 @@ impl NtlmAuth {
         // The challenge is the `WWW-Authenticate` value that carries a
         // `Negotiate` token. A server, or a proxy on the way, may list
         // another method first, each in a header of its own.
-        let www_auth = resp
+        let token = resp
             .headers()
             .get_all("WWW-Authenticate")
             .iter()
             .filter_map(|value| value.to_str().ok())
-            .find(|value| value.starts_with("Negotiate "))
+            .find_map(|value| value.strip_prefix("Negotiate "))
             .ok_or_else(|| WinrmError::AuthRejected(NO_CHALLENGE.into()))?
+            .trim_ascii()
             .to_string();
 
         // Over TLS, the channel binding token must come from the certificate
@@ -244,7 +246,7 @@ impl NtlmAuth {
 
         Ok(Negotiated {
             type1,
-            www_auth,
+            token,
             peer_certificate,
         })
     }
@@ -265,22 +267,19 @@ impl NtlmAuth {
         negotiated: &Negotiated,
         sealing: bool,
     ) -> Result<(Vec<u8>, SessionKey), WinrmError> {
-        // Decode the challenge and keep the raw Type 2 bytes for the MIC.
-        let www_auth = negotiated.www_auth.as_str();
-        let token = www_auth
-            .strip_prefix("Negotiate ")
-            .ok_or_else(|| WinrmError::AuthRejected(NO_CHALLENGE.into()))?;
+        // Decode the challenge once: the raw Type 2 bytes go into the MIC.
+        let token = negotiated.token.as_str();
         let type2_raw = {
             use base64::Engine;
             base64::engine::general_purpose::STANDARD
-                .decode(token.trim_ascii())
+                .decode(token)
                 .map_err(|e| {
                     WinrmError::Protocol(format!(
                         "NTLM: the server's Negotiate token is not base64: {e}"
                     ))
                 })?
         };
-        let challenge = ntlm::decode_challenge_header(www_auth).map_err(WinrmError::Ntlm)?;
+        let challenge = ntlm::parse_challenge(&type2_raw).map_err(WinrmError::Ntlm)?;
         // A Type 2 holds no secret (server challenge, names, timestamp). It is
         // logged before the check, so a refused challenge is visible too.
         tracing::trace!(target: "winrm_rs::ntlm::challenge", type2 = %token, "NTLM challenge received");

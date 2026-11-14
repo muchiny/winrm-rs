@@ -85,6 +85,10 @@ pub enum WinrmError {
     /// accept (its 401 does not go on with the handshake). With NTLM and
     /// Kerberos over HTTPS it is also what a refused channel binding gives,
     /// and with CredSSP a refused binding to the server's public key.
+    ///
+    /// A 401 on an NTLM or Kerberos connection that had authenticated is
+    /// not this refusal: the server closed that connection, which is
+    /// [`Connection`](Self::Connection).
     #[error("WinRM authentication rejected: {0}")]
     AuthRejected(String),
     /// The authentication could not be completed, for another reason than
@@ -107,6 +111,13 @@ pub enum WinrmError {
     /// that is not the WinRM endpoint, 503 from a busy server, any status
     /// but 401, a success included, where a handshake expects the server's
     /// challenge.
+    ///
+    /// The status came after the request was sent, so the request may have
+    /// run: retry on a 502 or a 503 only what is safe to run twice. Over
+    /// plain HTTP nothing proves the server sent it. With NTLM or Kerberos
+    /// message encryption, an error status the server did not seal is
+    /// reported here with its code, and anyone on the path can have
+    /// written it: the message says so.
     #[error("WinRM request failed: {message}")]
     #[non_exhaustive]
     HttpStatus {
@@ -117,11 +128,12 @@ pub enum WinrmError {
         message: String,
     },
     /// What the server sent does not follow the protocol, or cannot be
-    /// trusted: a malformed authentication token, a handshake the server
-    /// gives up half-way, a successful answer to a sealed request that is
-    /// not sealed, a sealed answer that has the wrong framing or does not
-    /// answer that request, a Kerberos answer that does not unseal, an HTTP
-    /// answer the CredSSP connection cannot read.
+    /// trusted: an authentication token that is not base64 or does not
+    /// parse (an NTLM challenge that does not parse is [`Ntlm`](Self::Ntlm)),
+    /// a handshake the server gives up half-way, a successful answer to a
+    /// sealed request that is not sealed, a sealed answer that has the wrong
+    /// framing or does not answer that request, a Kerberos answer that does
+    /// not unseal, an HTTP answer the CredSSP connection cannot read.
     #[error("WinRM protocol error: {0}")]
     Protocol(String),
     /// NTLM error: a message of the handshake that does not parse or that
@@ -162,11 +174,11 @@ pub enum WinrmError {
     /// What a command printed, or a WQL enumeration returned, is larger than
     /// [`WinrmConfig::max_output_bytes`](crate::WinrmConfig::max_output_bytes)
     /// allows.
-    #[error("{what} exceeded max_output_bytes ({limit})")]
+    #[error("{kind} exceeded max_output_bytes ({limit})")]
     #[non_exhaustive]
     OutputLimit {
         /// What grew past the limit.
-        what: OutputKind,
+        kind: OutputKind,
         /// The limit that was exceeded.
         limit: usize,
     },
@@ -393,6 +405,7 @@ pub enum SoapError {
     /// spaces, the rest `\u{..}` escapes), but the text itself is not
     /// trustworthy.
     #[error("SOAP fault [{code}]: {reason}")]
+    #[non_exhaustive]
     Fault {
         /// Fault code, typically a WS-Addressing or WS-Management URI.
         code: String,
@@ -404,10 +417,11 @@ pub enum SoapError {
 /// Errors from the NTLM authentication protocol layer.
 ///
 /// What the transport does with an authenticated NTLM connection is not
-/// here: a connection the server closed is [`WinrmError::Connection`], an
-/// answer that is not sealed or has the wrong framing is
-/// [`WinrmError::Protocol`], and a channel binding that cannot be computed
-/// is [`WinrmError::Authentication`].
+/// here: a connection the server closed is [`WinrmError::Connection`], a
+/// successful answer that is not sealed or a sealed one with the wrong
+/// framing is [`WinrmError::Protocol`], an error status that is not sealed
+/// is [`WinrmError::HttpStatus`], and a channel binding that cannot be
+/// computed is [`WinrmError::Authentication`].
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum NtlmError {

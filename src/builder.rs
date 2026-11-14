@@ -562,9 +562,9 @@ impl WinrmClientBuilder<Ready> {
     ///
     /// # Errors
     ///
-    /// [`WinrmError::Http`] if the underlying HTTP client cannot be
-    /// constructed. [`WinrmError::Config`] when the configuration is
-    /// refused before anything is sent:
+    /// [`WinrmError::Config`] when the configuration is refused before
+    /// anything is sent, an option the HTTP client does not take (a
+    /// `user_agent` with a line break) included:
     ///
     /// - `AuthMethod::Basic` over plain HTTP, unless `encryption` is
     ///   `EncryptionMode::Never`;

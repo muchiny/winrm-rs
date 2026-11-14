@@ -102,9 +102,7 @@ impl OpenSslMemTls {
             Err(e) if e.code() == ErrorCode::WANT_READ || e.code() == ErrorCode::WANT_WRITE => {
                 Ok(false)
             }
-            Err(e) => Err(WinrmError::Authentication(format!(
-                "CredSSP inner TLShandshake: {e}"
-            ))),
+            Err(e) => Err(inner_tls_error("handshake", &e)),
         }
     }
 
@@ -120,10 +118,8 @@ impl OpenSslMemTls {
         use std::io::Write;
         self.ssl
             .write_all(data)
-            .map_err(|e| WinrmError::Authentication(format!("CredSSP inner TLSwrite: {e}")))?;
-        self.ssl
-            .flush()
-            .map_err(|e| WinrmError::Authentication(format!("CredSSP inner TLSflush: {e}")))?;
+            .map_err(|e| inner_tls_error("write", &e))?;
+        self.ssl.flush().map_err(|e| inner_tls_error("flush", &e))?;
         Ok(())
     }
 
@@ -138,11 +134,7 @@ impl OpenSslMemTls {
                 Err(e) if e.code() == ErrorCode::WANT_READ || e.code() == ErrorCode::WANT_WRITE => {
                     break;
                 }
-                Err(e) => {
-                    return Err(WinrmError::Authentication(format!(
-                        "CredSSP inner TLSread: {e}"
-                    )));
-                }
+                Err(e) => return Err(inner_tls_error("read", &e)),
             }
         }
         Ok(out)
@@ -154,11 +146,8 @@ impl OpenSslMemTls {
                 "CredSSP inner TLS: the server presented no certificate".into(),
             )
         })?;
-        cert.to_der().map_err(|e| {
-            WinrmError::Authentication(format!(
-                "CredSSP inner TLS: the server certificate cannot be encoded: {e}"
-            ))
-        })
+        cert.to_der()
+            .map_err(|e| inner_tls_error("certificate (it cannot be encoded)", &e))
     }
 }
 
@@ -249,7 +238,19 @@ pub(super) fn build_inner_openssl_tls(
 
 /// The error of the OpenSSL call `step` that sets up one inner TLS session.
 fn session_setup_error(step: &str, e: &dyn std::fmt::Display) -> WinrmError {
-    WinrmError::Authentication(format!("CredSSP inner TLS: session set-up ({step}): {e}"))
+    inner_tls_error(&format!("session set-up ({step})"), e)
+}
+
+/// The error of the inner TLS session at `step`:
+/// [`WinrmError::Authentication`], the message starting with
+/// `CredSSP inner TLS`. The text of an OpenSSL error is made of fixed
+/// strings and numbers; it is neutralised and bounded like a server's all
+/// the same, as the text of an outer TLS error is.
+fn inner_tls_error(step: &str, e: &dyn std::fmt::Display) -> WinrmError {
+    WinrmError::Authentication(format!(
+        "CredSSP inner TLS {step}: {}",
+        crate::error::quote_server_text(&e.to_string(), 512)
+    ))
 }
 
 #[cfg(test)]

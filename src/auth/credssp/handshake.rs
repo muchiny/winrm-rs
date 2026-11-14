@@ -539,6 +539,21 @@ mod tests {
     use super::*;
     use crate::auth::credssp::response::ResponseReader;
 
+    /// As the other failures of the inner certificate: the server showed
+    /// no key the delegation can be bound to.
+    #[test]
+    fn a_certificate_that_does_not_parse_is_an_authentication_error() {
+        let err = subject_public_key(b"not a certificate").unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                WinrmError::Authentication(m)
+                    if m.starts_with("CredSSP inner TLS: the server certificate does not parse: ")
+            ),
+            "{err:?}"
+        );
+    }
+
     #[test]
     fn extract_credssp_token_str_simple() {
         assert_eq!(

@@ -166,14 +166,14 @@ fn an_error_names_its_cause_once() {
         ),
         (
             WinrmError::OutputLimit {
-                what: OutputKind::CommandOutput,
+                kind: OutputKind::CommandOutput,
                 limit: 16,
             },
             "command output exceeded max_output_bytes (16)",
         ),
         (
             WinrmError::OutputLimit {
-                what: OutputKind::WqlEnumeration,
+                kind: OutputKind::WqlEnumeration,
                 limit: 8,
             },
             "WQL enumeration exceeded max_output_bytes (8)",

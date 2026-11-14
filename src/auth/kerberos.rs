@@ -712,7 +712,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn stub_returns_auth_failed_error() {
+    async fn stub_returns_a_config_error() {
         let auth = KerberosAuth {
             service_principal: "HTTP/test".into(),
             max_response_bytes: 1024,

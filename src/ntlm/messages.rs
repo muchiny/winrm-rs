@@ -777,6 +777,11 @@ pub(crate) fn encode_authorization(msg: &[u8]) -> String {
 /// base64-encoded Type 2 message. Returns [`NtlmError::Handshake`] if
 /// the prefix is missing, the base64 is invalid, or the decoded bytes fail
 /// `parse_challenge` validation.
+///
+/// The handshake does not call it: it picks the header and decodes the
+/// token itself (`auth/ntlm.rs`), then calls [`parse_challenge`]. This is
+/// the whole path in one call, for the tests and the fuzz target.
+#[cfg(any(test, feature = "__internal"))]
 pub(crate) fn decode_challenge_header(header: &str) -> Result<ChallengeMessage, NtlmError> {
     let token = header
         .strip_prefix("Negotiate ")

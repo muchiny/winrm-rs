@@ -529,7 +529,7 @@ fn cert_tls_config(files: &PemFiles) -> WinrmConfig {
 }
 
 /// Build the transport and return the `Config` message, or panic.
-fn cert_auth_failed(config: WinrmConfig) -> String {
+fn cert_config_error(config: WinrmConfig) -> String {
     match HttpTransport::new(config, WinrmCredentials::new("u", "p", "")) {
         Err(WinrmError::Config(msg)) => msg,
         Err(e) => panic!("expected Config, got: {e:?}"),
@@ -567,7 +567,7 @@ fn certificate_auth_over_tls_accepts_pkcs1_key() {
 #[test]
 fn certificate_auth_empty_cert_file_is_a_clear_error() {
     let files = pem_files("emptycert", "", crate::test_pki::EC_KEY_PKCS8_PEM);
-    let msg = cert_auth_failed(cert_tls_config(&files));
+    let msg = cert_config_error(cert_tls_config(&files));
     assert!(msg.contains("no certificate"), "{msg}");
     assert!(msg.contains(&files.cert), "names the file: {msg}");
 }
@@ -576,7 +576,7 @@ fn certificate_auth_empty_cert_file_is_a_clear_error() {
 fn certificate_auth_key_file_without_key_is_a_clear_error() {
     use crate::test_pki::EC_CERT_PEM;
     let files = pem_files("nokey", EC_CERT_PEM, EC_CERT_PEM);
-    let msg = cert_auth_failed(cert_tls_config(&files));
+    let msg = cert_config_error(cert_tls_config(&files));
     assert!(msg.contains("no private key"), "{msg}");
     assert!(msg.contains(&files.key), "names the file: {msg}");
 }
@@ -601,7 +601,7 @@ fn certificate_auth_key_material_in_key_path_is_never_echoed() {
     use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
     let files = pem_files("redactkey", EC_CERT_PEM, EC_KEY_PKCS8_PEM);
     for value in [EC_KEY_PKCS8_PEM.to_string(), one_line_key_body()] {
-        let msg = cert_auth_failed(WinrmConfig {
+        let msg = cert_config_error(WinrmConfig {
             client_key_pem: Some(value.clone()),
             ..cert_tls_config(&files)
         });
@@ -618,7 +618,7 @@ fn certificate_auth_key_material_in_cert_path_is_never_echoed() {
         one_line_key_body(),
     ] {
         // The cert file is read first, so that read fails.
-        let msg = cert_auth_failed(WinrmConfig {
+        let msg = cert_config_error(WinrmConfig {
             client_cert_pem: Some(value.clone()),
             ..cert_tls_config(&files)
         });
@@ -630,7 +630,7 @@ fn certificate_auth_key_material_in_cert_path_is_never_echoed() {
 fn certificate_auth_missing_path_is_still_named() {
     use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
     let files = pem_files("namedpath", EC_CERT_PEM, EC_KEY_PKCS8_PEM);
-    let msg = cert_auth_failed(WinrmConfig {
+    let msg = cert_config_error(WinrmConfig {
         client_key_pem: Some("/nonexistent/winrm-rs/client.key".into()),
         ..cert_tls_config(&files)
     });
@@ -641,7 +641,7 @@ fn certificate_auth_missing_path_is_still_named() {
 fn certificate_auth_garbled_key_pem_is_rejected_without_echoing_it() {
     let garbled = "-----BEGIN PRIVATE KEY-----\nTOPSECRET*&^%$#\n-----END PRIVATE KEY-----\n";
     let files = pem_files("garbled", crate::test_pki::EC_CERT_PEM, garbled);
-    let msg = cert_auth_failed(cert_tls_config(&files));
+    let msg = cert_config_error(cert_tls_config(&files));
     assert!(msg.contains("invalid PEM"), "{msg}");
     assert!(!msg.contains("TOPSECRET"), "key material echoed: {msg}");
 }
@@ -651,7 +651,7 @@ fn certificate_auth_unsupported_key_type_is_rejected() {
     // Valid PEM framing and base64, but not a key rustls can load.
     let bogus = "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n";
     let files = pem_files("bogus", crate::test_pki::EC_CERT_PEM, bogus);
-    let msg = cert_auth_failed(cert_tls_config(&files));
+    let msg = cert_config_error(cert_tls_config(&files));
     assert!(msg.contains("rejected"), "{msg}");
 }
 
@@ -659,7 +659,7 @@ fn certificate_auth_unsupported_key_type_is_rejected() {
 fn certificate_auth_key_not_matching_certificate_is_rejected() {
     use crate::test_pki::{EC_CERT_PEM, RSA_KEY_PKCS1_PEM};
     let files = pem_files("mismatch", EC_CERT_PEM, RSA_KEY_PKCS1_PEM);
-    let msg = cert_auth_failed(cert_tls_config(&files));
+    let msg = cert_config_error(cert_tls_config(&files));
     assert!(msg.contains("rejected"), "{msg}");
 }
 
@@ -672,7 +672,7 @@ fn certificate_auth_over_http_is_rejected_before_reading_pem() {
         client_key_pem: Some("/nonexistent/key.pem".into()),
         ..Default::default()
     };
-    let msg = cert_auth_failed(config);
+    let msg = cert_config_error(config);
     assert_eq!(msg, "Certificate auth requires HTTPS (set use_tls = true)");
 }
 
@@ -687,7 +687,7 @@ fn certificate_auth_cert_path_that_is_a_directory_is_rejected() {
         client_cert_pem: Some(files.dir.to_string_lossy().into()),
         ..cert_tls_config(&files)
     };
-    let msg = cert_auth_failed(config);
+    let msg = cert_config_error(config);
     assert!(msg.contains("not a regular file"), "{msg}");
 }
 
@@ -720,7 +720,7 @@ fn certificate_auth_key_file_over_the_size_limit_is_rejected() {
     use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
     let key = padded_pem(&format!("\n{EC_KEY_PKCS8_PEM}"), 1024 * 1024 + 1);
     let files = pem_files("keyhuge", EC_CERT_PEM, &key);
-    let msg = cert_auth_failed(cert_tls_config(&files));
+    let msg = cert_config_error(cert_tls_config(&files));
     assert!(msg.contains("larger than"), "{msg}");
     assert!(msg.contains(&files.key), "names the file: {msg}");
     assert!(!msg.contains("MIG"), "key material echoed: {msg}");
@@ -731,7 +731,7 @@ fn certificate_auth_cert_file_over_the_size_limit_is_rejected() {
     use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
     let cert = padded_pem(&format!("\n{EC_CERT_PEM}"), 1024 * 1024 + 1);
     let files = pem_files("certhuge", &cert, EC_KEY_PKCS8_PEM);
-    let msg = cert_auth_failed(cert_tls_config(&files));
+    let msg = cert_config_error(cert_tls_config(&files));
     assert!(msg.contains("larger than"), "{msg}");
     assert!(msg.contains(&files.cert), "names the file: {msg}");
 }
@@ -740,7 +740,7 @@ fn certificate_auth_cert_file_over_the_size_limit_is_rejected() {
 fn certificate_auth_encrypted_pkcs8_key_is_rejected_as_encrypted() {
     use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_ENCRYPTED_PEM};
     let files = pem_files("encpkcs8", EC_CERT_PEM, EC_KEY_PKCS8_ENCRYPTED_PEM);
-    let msg = cert_auth_failed(cert_tls_config(&files));
+    let msg = cert_config_error(cert_tls_config(&files));
     assert!(
         msg.contains("encrypted private keys are not supported"),
         "{msg}"
@@ -752,7 +752,7 @@ fn certificate_auth_encrypted_pkcs8_key_is_rejected_as_encrypted() {
 fn certificate_auth_legacy_encrypted_key_is_rejected_as_encrypted() {
     use crate::test_pki::{EC_CERT_PEM, EC_KEY_SEC1_LEGACY_ENCRYPTED_PEM};
     let files = pem_files("enclegacy", EC_CERT_PEM, EC_KEY_SEC1_LEGACY_ENCRYPTED_PEM);
-    let msg = cert_auth_failed(cert_tls_config(&files));
+    let msg = cert_config_error(cert_tls_config(&files));
     assert!(
         msg.contains("encrypted private keys are not supported"),
         "{msg}"
@@ -1105,7 +1105,7 @@ async fn a_success_status_with_a_body_that_is_no_answer_is_an_error() {
 }
 
 #[tokio::test]
-async fn send_basic_auth_failed_returns_error() {
+async fn send_basic_403_is_an_http_status() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(403).set_body_string("Forbidden"))

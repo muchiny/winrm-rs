@@ -4697,11 +4697,15 @@ async fn certificate_auth_unmapped_cert_is_rejected() {
 
 // === Refused credentials ===
 
-/// Credentials the server refuses are `WinrmError::AuthRejected` whatever
-/// the method: the variant a caller matches on to ask for them again, where
-/// any other failure is one to report or to retry. Each method meets the
-/// refusal at another step: Basic on its first answer, NTLM after its
-/// Type 3, CredSSP after the NTLM exchange inside its TLS session.
+/// Credentials the server refuses are `WinrmError::AuthRejected` with
+/// Basic, NTLM and CredSSP: the variant a caller matches on to ask for them
+/// again, where any other failure is one to report or to retry. Each method
+/// meets the refusal at another step: Basic on its first answer, NTLM after
+/// its Type 3, CredSSP after the NTLM exchange inside its TLS session.
+/// A certificate mapped to no account is
+/// `certificate_auth_unmapped_cert_is_rejected`. Kerberos is not measured:
+/// a client with wrong credentials gets no ticket and never reaches the
+/// server.
 ///
 /// The account does not exist, so that no real account moves towards a
 /// lockout: Windows answers a wrong password and an unknown account alike.

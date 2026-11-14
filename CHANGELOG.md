@@ -35,7 +35,7 @@ After (3.0):
 | `Authentication(String)` | The authentication failed for another reason than the server's refusal: a Kerberos ticket, a channel binding that cannot be computed, mutual authentication, a pinned certificate that does not match, the TLS session inside CredSSP. | `AuthFailed`; `Ntlm(NtlmError::InvalidMessage)` for the NTLM channel binding; `Http` for a pin that does not match with Basic or Certificate |
 | `HttpStatus { status, message, .. }` | An HTTP status that ends the exchange and is neither a SOAP fault nor a 401. | `AuthFailed`; `Ntlm(NtlmError::InvalidMessage)` for an error status the server did not seal |
 | `Protocol(String)` | An answer that does not follow the protocol or cannot be trusted: a malformed token, a successful answer to a sealed request that is not sealed, a sealed answer with the wrong framing. | `AuthFailed`; `Ntlm(NtlmError::InvalidMessage)` for the NTLM framing and for an NTLM token that is not base64 |
-| `OutputLimit { what, limit, .. }` | The output of a command or a WQL enumeration larger than `max_output_bytes`; `what` is an `OutputKind`. | `Transfer` |
+| `OutputLimit { kind, limit, .. }` | The output of a command or a WQL enumeration larger than `max_output_bytes`; `kind` is an `OutputKind`. | `Transfer` |
 | `Transfer(TransferError)` | A file transfer: `RemotePath`, `LocalRead { path, error, .. }`, `LocalWrite { path, error, .. }`, `Host`, `Decode`. | `Transfer(String)` |
 | `Internal(String)` | A state the crate should never reach: a bug to report. | `AuthFailed("internal: …")`; `Transfer` for a local read or write whose task did not finish |
 
@@ -67,8 +67,11 @@ spent, or the session is unusable after an earlier error).
 `TransferError` and `OutputKind`, `AuthMethod` and `EncryptionMode` are
 `#[non_exhaustive]`: a `match` on them needs a wildcard arm. So are the
 variants with named fields (`HttpStatus`, `OutputLimit`,
-`TransferError::LocalRead`, `TransferError::LocalWrite`): a pattern on one
-of them ends with `..`.
+`SoapError::Fault`, `TransferError::LocalRead`,
+`TransferError::LocalWrite`): a pattern on one of them ends with `..`, and
+only this crate can build one. A test double that returned
+`SoapError::Fault { code, reason }` has to get its fault from a parsed
+answer.
 
 No error of the crate has a `source()`. What an error wraps (a
 `reqwest::Error`, an `io::Error`, one of the enums above) is a field of its
@@ -240,8 +243,11 @@ Migration:
   did not seal keeps its status.** A 503 from HTTP.sys while the WinRM
   service restarts, or a 502 from a proxy, is never sealed. It was an
   `Ntlm` or an `AuthFailed` error with no status; it is
-  `WinrmError::HttpStatus`. Its body is still neither read nor quoted,
-  since nothing shows where it comes from.
+  `WinrmError::HttpStatus`. Its body is still neither parsed nor quoted,
+  since nothing shows where it comes from. The same holds for the status:
+  over plain HTTP anyone on the path can have written it, and the request
+  was delivered, so it may have run. The message says both; retry on such
+  a status only what is safe to run twice.
 - **An option the HTTP client refuses is a `WinrmError::Config`**, not a
   `WinrmError::Http`: a `user_agent` with a line break, a proxy URL
   `reqwest` does not take. Nothing was sent, and `Http` is now only what
@@ -250,8 +256,9 @@ Migration:
   the proxy's credentials.
 - **The errors of the TLS session inside CredSSP read alike**: they all
   start with `CredSSP inner TLS`, where some started with `ssl configure`
-  or `cert DER`. The text of an outer TLS error is neutralised and bounded
-  like a server's, since it can quote the names of the certificate.
+  or `cert DER`. The text of a TLS error, outer or inner, is neutralised
+  and bounded like a server's: an outer one can quote the names of the
+  certificate.
 - **NTLM looks for its challenge in every `WWW-Authenticate` header** of
   the server's 401, not only in the first: a server or a proxy that lists
   another method before `Negotiate` no longer fails the handshake.

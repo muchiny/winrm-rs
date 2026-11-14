@@ -39,6 +39,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   size.** With a long proxy password or host name the buffer grew while it
   was written, which freed its first copy, `Proxy-Authorization` value
   included, without wiping it.
+- **The proxy URL is parsed once for routing, not at every decision.** To
+  tell whether a request goes through the proxy, the client built a
+  `hyper-util` matcher from the proxy URL each time: for a CredSSP request
+  of a client that follows the environment's proxies, for an NTLM or
+  Kerberos authentication to an `http://` endpoint, and after a connection
+  error. Each build parsed the URL, proxy password included, into copies
+  that were freed without being wiped. The matcher is now built with the
+  client. What `reqwest` and `hyper-util` keep of the proxy credentials for
+  the life of the client is unchanged, and `hyper-util` still copies a
+  SOCKS user name and password at each of those decisions.
 - **Raw stderr written while a CLIXML document is open is no longer lost.**
   `powershell.exe` keeps its `<Objs>` document open until it exits, and a
   native command can write to stderr in the meantime. The decoder behind

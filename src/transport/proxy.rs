@@ -65,6 +65,12 @@ pub(crate) struct ProxyRoute {
     https: Option<Zeroizing<String>>,
     /// The environment's exclusions (`NO_PROXY`), `""` when unset.
     no: String,
+    /// The `hyper-util` matcher of the four values above, the one `reqwest`
+    /// builds from [`Self::reqwest_proxies`]. It is built once, with the
+    /// route: building it parses the proxy URLs, credentials included, into
+    /// copies that `hyper-util` does not wipe, so a matcher built for each
+    /// routing decision would leave such copies behind at every request.
+    matcher: Matcher,
 }
 
 impl std::fmt::Debug for ProxyRoute {
@@ -82,14 +88,33 @@ impl std::fmt::Debug for ProxyRoute {
 }
 
 impl ProxyRoute {
+    /// The route of these proxies, each already normalised by
+    /// [`parse_proxy_url`], with its matcher.
+    fn new(
+        explicit: Option<Zeroizing<String>>,
+        http: Option<Zeroizing<String>>,
+        https: Option<Zeroizing<String>>,
+        no: String,
+    ) -> Self {
+        let builder = match &explicit {
+            Some(explicit) => Matcher::builder().all(explicit.as_str()),
+            None => Matcher::builder()
+                .http(http.as_deref().map_or("", String::as_str))
+                .https(https.as_deref().map_or("", String::as_str))
+                .no(no.as_str()),
+        };
+        Self {
+            matcher: builder.build(),
+            explicit,
+            http,
+            https,
+            no,
+        }
+    }
+
     /// No proxy at all.
     fn direct() -> Self {
-        Self {
-            explicit: None,
-            http: None,
-            https: None,
-            no: String::new(),
-        }
+        Self::new(None, None, None, String::new())
     }
 
     /// Resolve the route of a client built from `config`, reading the
@@ -117,12 +142,8 @@ impl ProxyRoute {
         var: impl Fn(&str) -> Option<String>,
     ) -> Result<Self, WinrmError> {
         if let Some(secret) = config.proxy.as_ref() {
-            return Ok(Self {
-                explicit: Some(Zeroizing::new(String::from(parse_proxy_url(
-                    secret.expose_secret(),
-                )?))),
-                ..Self::direct()
-            });
+            let explicit = Zeroizing::new(String::from(parse_proxy_url(secret.expose_secret())?));
+            return Ok(Self::new(Some(explicit), None, None, String::new()));
         }
         if !use_env || var("REQUEST_METHOD").is_some() {
             return Ok(Self::direct());
@@ -140,12 +161,7 @@ impl ProxyRoute {
             .and_then(|(name, raw)| usable(name, &raw))
             .or(all);
         let no = first(NO_PROXY).map_or_default(|(_, value)| value.to_string());
-        Ok(Self {
-            explicit: None,
-            http,
-            https,
-            no,
-        })
+        Ok(Self::new(None, http, https, no))
     }
 
     /// The `reqwest` proxies of this route: the explicit proxy for every
@@ -188,17 +204,14 @@ impl ProxyRoute {
     /// The `hyper-util` interception of a request to `endpoint_url`: the
     /// proxy (its URI without user info) and the credentials it gets, or
     /// `None` when the request goes direct.
+    ///
+    /// The interception is a clone of the matcher's. A `Basic` header value
+    /// shares its buffer, but the user name and password of a SOCKS proxy
+    /// are copied, and `hyper-util` does not wipe that copy.
     fn intercept(&self, endpoint_url: &str) -> Option<Intercept> {
         let url = reqwest::Url::parse(endpoint_url).ok()?;
         let uri: http::Uri = url.as_str().parse().ok()?;
-        let builder = match &self.explicit {
-            Some(explicit) => Matcher::builder().all(explicit.as_str()),
-            None => Matcher::builder()
-                .http(self.http.as_deref().map_or("", String::as_str))
-                .https(self.https.as_deref().map_or("", String::as_str))
-                .no(self.no.as_str()),
-        };
-        builder.build().intercept(&uri)
+        self.matcher.intercept(&uri)
     }
 
     /// With `use_env == false`, only `WinrmConfig::proxy` counts; with `true`,

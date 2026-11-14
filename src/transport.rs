@@ -1507,8 +1507,7 @@ impl HttpTransport {
     #[cfg(feature = "kerberos")]
     async fn kerberos_proxy_probe(&self, url: &str) -> Result<(), WinrmError> {
         // Only a gated URL is ever kept, so a kept answer is read before the
-        // route's matcher is built: a proxy that announced it needs nothing
-        // more.
+        // route is asked: a proxy that announced it needs nothing more.
         let known = self
             .proxy_probes
             .lock()

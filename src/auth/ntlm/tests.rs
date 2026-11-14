@@ -384,3 +384,27 @@ fn unseal_body_reads_length_only_from_original_content() {
     ));
     assert!(unseal_err(&no_line).contains("OriginalContent Length"));
 }
+
+/// Plain HTTP has no channel to bind: a client whose verifier has seen
+/// several certificates, on other connections, still authenticates there.
+/// Only over TLS does that record stop the handshake.
+#[tokio::test]
+async fn several_seen_certificates_do_not_stop_ntlm_over_plain_http() {
+    let server = wiremock::MockServer::start().await;
+    let fake = crate::test_ntlm_server::FakeNtlmServer::mount(&server).await;
+    let auth = NtlmAuth {
+        username: crate::test_ntlm_server::USER.into(),
+        password: Zeroizing::new(crate::test_ntlm_server::PASS.into()),
+        domain: String::new(),
+        max_response_bytes: 1 << 20,
+        proxy_gate: None,
+        workstation: None,
+    };
+    let seen = crate::tls::CertHandle::with(crate::tls::Captured::Several);
+    let http = crate::transport::test_http_client();
+
+    auth.authenticate(&http, Some(&seen), &format!("{}/wsman", server.uri()))
+        .await
+        .unwrap();
+    assert_eq!(fake.handshakes(), 1);
+}

@@ -2075,3 +2075,14 @@ fn stalled_inner_tls_hits_the_round_bound() {
     );
     assert_eq!(rounds(&log.lock().unwrap()).len(), 1);
 }
+
+/// The nonce of `pubKeyAuth` comes from the CSPRNG: two of them differ.
+/// `CREDSSP_FIXED_NONCE` pins it in a debug build with `__internal`; the
+/// test has nothing to check then.
+#[test]
+fn client_nonces_differ() {
+    if std::env::var_os("CREDSSP_FIXED_NONCE").is_some() {
+        return;
+    }
+    assert_ne!(client_nonce(), client_nonce());
+}

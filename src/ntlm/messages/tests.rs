@@ -875,6 +875,70 @@ fn type3_exchanges_a_session_key_the_challenge_did_not_offer() {
     assert_eq!(u16::from_le_bytes([type3[52], type3[53]]), 16);
 }
 
+/// The header of a Type 3 is 64 bytes, 8 more with a version and 16 more
+/// with a MIC, its last field: the payload starts right after it.
+#[test]
+fn type3_header_size_follows_the_version_flag_and_the_mic() {
+    for (flags, mic, header) in [
+        (0, false, 64usize),
+        (NEGOTIATE_VERSION, false, 72),
+        (0, true, 80),
+        (NEGOTIATE_VERSION, true, 88),
+        // Another flag is not a version.
+        (NEGOTIATE_KEY_EXCH, false, 64),
+    ] {
+        let fields = Type3Fields {
+            flags,
+            mic,
+            lm_response: b"LM",
+            nt_response: b"NT!",
+            domain: &[],
+            user: &[],
+            workstation: &[],
+            encrypted_session_key: &[],
+        };
+        let (msg, mic_pos) = fields.encode().unwrap();
+        // LmChallengeResponse is the first field of the payload.
+        assert_eq!(
+            msg[16..20],
+            u32::try_from(header).unwrap().to_le_bytes(),
+            "flags {flags:#x}, mic {mic}"
+        );
+        assert_eq!(&msg[header..], b"LMNT!", "flags {flags:#x}, mic {mic}");
+        assert_eq!(mic_pos, if mic { header - 16 } else { header });
+    }
+}
+
+/// The CredSSP Type 3 echoes the flags of the challenge, without those a
+/// Type 3 never echoes, and always asks for sealing, signing, a version and
+/// a key exchange, whether the challenge offers them or not.
+#[cfg(feature = "credssp")]
+#[test]
+fn credssp_type3_flags_are_the_challenge_flags_plus_the_required_ones() {
+    let required = NEGOTIATE_SEAL | NEGOTIATE_SIGN | NEGOTIATE_VERSION | NEGOTIATE_KEY_EXCH;
+    let offered = build_test_challenge_for_credssp().negotiate_flags;
+    for server_flags in [offered | required, offered & !required] {
+        let mut challenge = build_test_challenge_for_credssp();
+        challenge.negotiate_flags = server_flags;
+        let (msg, _) = create_authenticate_message_credssp(
+            &challenge,
+            "vagrant",
+            "vagrant",
+            "",
+            "HTTP/host",
+            &create_negotiate_message_credssp(),
+            &[0u8; 32],
+        )
+        .unwrap();
+        let flags = u32::from_le_bytes(msg[60..64].try_into().unwrap());
+        assert_eq!(
+            flags,
+            (server_flags & !TYPE3_NEVER_ECHO) | required,
+            "challenge flags {server_flags:#010x}"
+        );
+    }
+}
+
 #[test]
 fn type3_with_oversized_target_info_is_an_error() {
     // One AV pair of 65500 bytes (its own length still fits in 16 bits)

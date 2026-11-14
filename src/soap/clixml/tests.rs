@@ -237,6 +237,47 @@ fn oversized_record_decides_the_same_whole_or_sliced() {
     assert!(whole.starts_with("<S S=\"Error\">xxx"));
 }
 
+/// The bound is on the bytes of one record: `MAX_PENDING` of them are still
+/// held, one more gives the document up.
+#[test]
+fn an_unfinished_record_is_given_up_one_byte_past_the_bound() {
+    let mut d = ClixmlDecoder::new();
+    assert!(d.push(b"#< CLIXML\r\n<Objs>").is_empty());
+    let mut record = b"<S S=\"Error\">".to_vec();
+    record.resize(MAX_PENDING, b'x');
+    assert!(d.push(&record).is_empty(), "a record at the bound is held");
+    assert_eq!(d.pending.len(), MAX_PENDING);
+
+    let out = d.push(b"x");
+    assert_eq!(out.len(), MAX_PENDING + 1);
+    assert!(
+        out.starts_with(b"<S S=\"Error\">xxx"),
+        "{:?}",
+        out.get(..32)
+    );
+    assert!(d.pending.is_empty(), "{} bytes held", d.pending.len());
+}
+
+/// The same bound on a root start tag that does not end.
+#[test]
+fn an_unfinished_root_tag_is_given_up_one_byte_past_the_bound() {
+    let mut d = ClixmlDecoder::new();
+    let mut stream = b"#< CLIXML\r\n".to_vec();
+    let marker_line = stream.len();
+    stream.extend_from_slice(b"<Objs ");
+    stream.resize(marker_line + MAX_PENDING, b'x');
+    assert!(
+        d.push(&stream).is_empty(),
+        "a root tag at the bound is held"
+    );
+    assert_eq!(d.pending.len(), MAX_PENDING);
+
+    let out = d.push(b"x");
+    assert_eq!(out.len(), MAX_PENDING + 1);
+    assert!(out.starts_with(b"<Objs xxx"), "{:?}", out.get(..32));
+    assert!(d.pending.is_empty(), "{} bytes held", d.pending.len());
+}
+
 // Nested PowerShell: the inner powershell.exe writes its own marker and
 // document into the outer one's stderr, so one marker can be followed by
 // another marker, and one marker by several documents.

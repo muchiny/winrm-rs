@@ -65,14 +65,17 @@ pub(crate) struct ProxyRoute {
     https: Option<Zeroizing<String>>,
     /// The environment's exclusions (`NO_PROXY`), `""` when unset.
     no: String,
-    /// The `hyper-util` matcher of the four values above, the one `reqwest`
-    /// builds from [`Self::reqwest_proxies`]. It is built once, with the
-    /// route: building it parses the proxy URLs, credentials included, into
-    /// copies that `hyper-util` does not wipe, so a matcher built for each
-    /// routing decision would leave such copies behind at every request.
+    /// The `hyper-util` matcher of the four values above, equivalent to the
+    /// one `reqwest` builds from [`Self::reqwest_proxies`]. It is built once,
+    /// with the route: building it parses the proxy URLs, credentials
+    /// included, into copies that `hyper-util` does not wipe, so a matcher
+    /// built for each routing decision would leave such copies behind at
+    /// every request.
     matcher: Matcher,
 }
 
+// Written by hand, not derived: the matcher holds the proxy credentials and
+// is left out, and the URLs are shown without their user info.
 impl std::fmt::Debug for ProxyRoute {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let shown = |url: &Option<Zeroizing<String>>| {

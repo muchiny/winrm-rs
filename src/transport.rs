@@ -521,6 +521,10 @@ pub(crate) struct HttpTransport {
     /// [`crate::tls::ProxyRoutingVerifier`]), so a host with one of these
     /// names is refused (see [`Self::checked_endpoint`]). Empty otherwise.
     shared_proxy_names: Vec<rustls::pki_types::ServerName<'static>>,
+    /// The server names of the `https://` proxy of [`Self::route`], read
+    /// from it once: the verifier of each dedicated connection takes them
+    /// from here, and the proxy URL is not parsed again for it.
+    proxy_names: Vec<rustls::pki_types::ServerName<'static>>,
     /// The proxy route of every client of this transport, resolved once at
     /// construction.
     route: proxy::ProxyRoute,
@@ -1100,7 +1104,7 @@ impl HttpTransport {
         let pinned = !opts.tls.pins.is_empty();
         let shared_proxy_names =
             if config.use_tls && (pinned || opts.tls.accept_invalid_proxy_certs) {
-                proxy_names
+                proxy_names.clone()
             } else {
                 Vec::new()
             };
@@ -1161,6 +1165,7 @@ impl HttpTransport {
             before_send: None,
             log_soap_bodies: false,
             shared_proxy_names,
+            proxy_names,
             route,
             options: opts,
             proxy_warned: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -1688,7 +1693,7 @@ impl HttpTransport {
                     Arc::clone(verifier),
                     url_server_name(&self.endpoint(host)),
                 )
-                .with_proxies(self.route.https_proxy_server_names());
+                .with_proxies(self.proxy_names.clone());
                 let handle = capturing.cert_handle();
                 tls.dangerous()
                     .set_certificate_verifier(Arc::new(capturing));

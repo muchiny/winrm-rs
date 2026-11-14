@@ -618,6 +618,38 @@ fn credssp_dial_ignores_env_proxies_without_opt_in() {
     ));
 }
 
+/// One route answers every request of its client: asked again, for the same
+/// endpoint or for another, it gives the same dial, credentials included.
+#[cfg(feature = "credssp")]
+#[test]
+fn credssp_dial_answers_the_same_each_time_it_is_asked() {
+    let route = ProxyRoute::resolve(&WinrmConfig::default(), true, |n: &str| match n {
+        "ALL_PROXY" => Some("socks5h://user:pw@10.0.0.1".to_string()),
+        "NO_PROXY" => Some("direct.corp".to_string()),
+        _ => None,
+    })
+    .unwrap();
+    for _ in 0..3 {
+        match route.credssp_dial(EP, true).unwrap() {
+            CredSspDial::Socks5 {
+                proxy,
+                user_pass: Some((user, pass)),
+                remote_dns: true,
+            } => {
+                assert_eq!(proxy, "10.0.0.1:1080");
+                assert_eq!((user.as_str(), pass.as_str()), ("user", "pw"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            route
+                .credssp_dial("https://direct.corp:5986/wsman", true)
+                .unwrap(),
+            CredSspDial::Direct
+        ));
+    }
+}
+
 #[cfg(feature = "credssp")]
 #[test]
 fn credssp_dial_debug_redacts_credentials() {

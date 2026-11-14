@@ -43,12 +43,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   tell whether a request goes through the proxy, the client built a
   `hyper-util` matcher from the proxy URL each time: for a CredSSP request
   of a client that follows the environment's proxies, for an NTLM or
-  Kerberos authentication to an `http://` endpoint, and after a connection
-  error. Each build parsed the URL, proxy password included, into copies
-  that were freed without being wiped. The matcher is now built with the
-  client. What `reqwest` and `hyper-util` keep of the proxy credentials for
-  the life of the client is unchanged, and `hyper-util` still copies a
-  SOCKS user name and password at each of those decisions.
+  Kerberos authentication to an `http://` endpoint under a
+  `ProxySessionAuth` other than `Allow`, and after a connection error. Each
+  build parsed the URL, proxy password included, into copies that were
+  freed without being wiped. Each dedicated connection also parsed it
+  again for the TLS name of an `https://` proxy. The matcher and that name
+  are now read once, with the client. Unchanged: `reqwest` parses the proxy
+  URL for each client it builds, one per dedicated connection, and keeps
+  what it parsed as long as that client, and `hyper-util` still copies a
+  SOCKS user name and password at each routing decision.
 - **Raw stderr written while a CLIXML document is open is no longer lost.**
   `powershell.exe` keeps its `<Objs>` document open until it exits, and a
   native command can write to stderr in the meantime. The decoder behind

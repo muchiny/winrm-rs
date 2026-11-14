@@ -39,6 +39,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   size.** With a long proxy password or host name the buffer grew while it
   was written, which freed its first copy, `Proxy-Authorization` value
   included, without wiping it.
+- **Raw stderr written while a CLIXML document is open is no longer lost.**
+  `powershell.exe` keeps its `<Objs>` document open until it exits, and a
+  native command can write to stderr in the meantime. The decoder behind
+  `CommandOutput::stderr`, `Shell::receive_next` and `StderrDecoder` skipped
+  any text between two records, and read any `<` as the start of a record,
+  which it then dropped: after `a < b`, `<stdin>:1: error` or the
+  `#< CLIXML` line of a nested `powershell.exe`, the rest of stderr was held
+  back and dropped when the command ended (past 16 MiB it was released raw).
+  Text reaching stderr could thus hide the errors that followed it.
+  Inside a document, CLIXML is now recognised by the bytes `powershell.exe`
+  writes: `<S S="` starts a string record, `<Obj S="` an object record,
+  `<Objs` the root tag of a document inside this one, and `</Objs>` closes
+  the innermost open document. A record must also be well-formed: a `<`
+  inside a tag, or a tag other than `</S>` inside a string record, makes its
+  bytes text. Everything else passes through. The documents
+  `powershell.exe` writes decode as before. What changes for other input:
+  - a tag that is none of those (another name, an `<S>` or `<Obj>` that
+    names no stream, a lone end tag, a comment) comes out as text instead of
+    being dropped, and so does a `<` left unfinished at the end of the
+    stream;
+  - a record that is not well-formed comes out as text, instead of being
+    decoded up to its first `<` or of taking in the records after it;
+  - a document inside an open one (nested `powershell.exe`) has its records
+    decoded instead of being dropped whole, and its `#< CLIXML` line comes
+    out as text;
+  - the blank bytes between a record or a root tag and the raw text after
+    it are dropped, as they are between two records.
+
+  Raw text that holds a whole well-formed record is still read as that
+  record, and an `<Obj S="` that nothing closes still holds what follows
+  it.
 
 ### Changed
 

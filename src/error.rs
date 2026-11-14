@@ -128,7 +128,7 @@ pub enum CredSspError {
     /// ASN.1 DER encoding or decoding error.
     #[error("ASN.1 decode error: {0}")]
     Asn1Decode(String),
-    /// Server public key verification failed (possible MiTM).
+    /// Server public key verification failed (possible man-in-the-middle).
     #[error("server public key mismatch")]
     PublicKeyMismatch,
     /// Server returned an NTSTATUS error code.

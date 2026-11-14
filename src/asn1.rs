@@ -21,7 +21,7 @@ const NTLM_OID: &[u8] = &[
     0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a,
 ];
 
-/// Parsed TSRequest structure.
+/// Parsed `TSRequest` structure.
 #[derive(Debug, Clone)]
 #[cfg_attr(
     not(feature = "__internal"),
@@ -115,7 +115,7 @@ fn encode_integer_value(value: u32) -> Vec<u8> {
 
 // --- CredSSP Structure Encoding ---
 
-/// Encode a TSRequest message (MS-CSSP 2.2.1).
+/// Encode a `TSRequest` message (MS-CSSP 2.2.1).
 pub(crate) fn encode_ts_request(
     version: u32,
     nego_token: Option<&[u8]>,
@@ -180,7 +180,7 @@ fn push_utf16le(out: &mut Vec<u8>, s: &str) {
     }
 }
 
-/// Sizes of the nested TSCredentials parts, outermost last:
+/// Sizes of the nested `TSCredentials` parts, outermost last:
 /// `(pwd_content, pwd_seq, octet, outer_content)`.
 fn ts_credentials_sizes(domain: &str, username: &str, password: &str) -> [usize; 4] {
     // Each field is `[n] { OCTET STRING { utf16 } }`.
@@ -195,7 +195,7 @@ fn ts_credentials_sizes(domain: &str, username: &str, password: &str) -> [usize;
     [pwd_content, pwd_seq, octet, outer_content]
 }
 
-/// Encode TSCredentials (MS-CSSP 2.2.1.2).
+/// Encode `TSCredentials` (MS-CSSP 2.2.1.2).
 ///
 /// The DER is written once, in a buffer of its exact size, so it is never
 /// reallocated and no intermediate copy of the credentials is left behind.
@@ -233,9 +233,9 @@ pub(crate) fn encode_ts_credentials(
     out
 }
 
-/// Wrap an NTLM Type 1 message in SPNEGO NegTokenInit (RFC 4178).
+/// Wrap an NTLM Type 1 message in SPNEGO `NegTokenInit` (RFC 4178).
 ///
-/// Produces: APPLICATION[0] { OID(SPNEGO), NegTokenInit{mechTypes: [NTLM], mechToken: ntlm_type1} }
+/// Produces: `APPLICATION[0] { OID(SPNEGO), NegTokenInit{mechTypes: [NTLM], mechToken: ntlm_type1} }`
 pub(crate) fn encode_spnego_init(ntlm_token: &[u8]) -> Vec<u8> {
     // mechTypes: SEQUENCE OF OID = { NTLM_OID }
     let mech_types = encode_context_tag(0, &encode_sequence(NTLM_OID));
@@ -255,12 +255,12 @@ pub(crate) fn encode_spnego_init(ntlm_token: &[u8]) -> Vec<u8> {
     encode_tlv(0x60, &gss_contents)
 }
 
-/// Wrap an NTLM Type 3 message in SPNEGO NegTokenResp (RFC 4178).
+/// Wrap an NTLM Type 3 message in SPNEGO `NegTokenResp` (RFC 4178).
 ///
 /// `mech_list_mic` if Some is the 16-byte NTLMSSP signature computed over
-/// the encoded mech_type_list (DER SEQUENCE OF OID containing NTLM). It is
+/// the encoded `mech_type_list` (DER SEQUENCE OF OID containing NTLM). It is
 /// REQUIRED by Windows CredSSP servers — without it the server returns
-/// STATUS_LOGON_FAILURE / SubStatus 0xC000006A.
+/// `STATUS_LOGON_FAILURE` / `SubStatus` 0xC000006A.
 pub(crate) fn encode_spnego_response(ntlm_token: &[u8], mech_list_mic: Option<&[u8]>) -> Vec<u8> {
     // negState: [0] ENUMERATED (1 = accept-incomplete)
     let neg_state = encode_context_tag(0, &[0x0a, 0x01, 0x01]);
@@ -276,7 +276,7 @@ pub(crate) fn encode_spnego_response(ntlm_token: &[u8], mech_list_mic: Option<&[
     encode_context_tag(1, &encode_sequence(&contents))
 }
 
-/// DER-encoded mech_type_list containing only NTLM OID — used as input to
+/// DER-encoded `mech_type_list` containing only NTLM OID — used as input to
 /// the SPNEGO mechListMIC HMAC. Matches `pack_mech_type_list([NTLM])` in pyspnego.
 pub(crate) const MECH_TYPE_LIST_NTLM: &[u8] = &[
     0x30, 0x0c, 0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a,
@@ -304,7 +304,7 @@ fn decode_length(data: &[u8]) -> Result<(usize, &[u8]), CredSspError> {
     }
 }
 
-/// Read a TLV (tag-length-value) at the start of data. Returns (tag, value_bytes, bytes after the TLV).
+/// Read a TLV (tag-length-value) at the start of data. Returns (tag, `value_bytes`, bytes after the TLV).
 fn read_tlv(data: &[u8]) -> Result<(u8, &[u8], &[u8]), CredSspError> {
     let Some((&tag, after_tag)) = data.split_first() else {
         return Err(CredSspError::Asn1Decode("unexpected end of data".into()));
@@ -394,7 +394,7 @@ fn decode_integer(data: &[u8]) -> Result<u32, CredSspError> {
     Ok(result)
 }
 
-/// Decode a TSRequest from DER bytes (MS-CSSP 2.2.1).
+/// Decode a `TSRequest` from DER bytes (MS-CSSP 2.2.1).
 pub(crate) fn decode_ts_request(data: &[u8]) -> Result<TsRequest, CredSspError> {
     let (tag, seq_data, _) = read_tlv(data)?;
     if tag != TAG_SEQUENCE {
@@ -461,7 +461,7 @@ fn decode_nego_data(d: &[u8]) -> Result<Vec<u8>, CredSspError> {
     Ok(value.to_vec())
 }
 
-/// Extract the inner NTLM token from a SPNEGO message (NegTokenInit or NegTokenResp).
+/// Extract the inner NTLM token from a SPNEGO message (`NegTokenInit` or `NegTokenResp`).
 pub(crate) fn decode_spnego_token(data: &[u8]) -> Result<Vec<u8>, CredSspError> {
     let (tag, contents, _) = read_tlv(data)?;
 
@@ -497,7 +497,7 @@ pub(crate) fn decode_spnego_token(data: &[u8]) -> Result<Vec<u8>, CredSspError> 
     }
 }
 
-/// Extract the `mechListMIC` (`[3] OCTET STRING`) from a SPNEGO NegTokenResp,
+/// Extract the `mechListMIC` (`[3] OCTET STRING`) from a SPNEGO `NegTokenResp`,
 /// if present: [`decode_spnego_final`] without the `negState`.
 ///
 /// The client does not call it, it reads the server's final token with
@@ -559,9 +559,9 @@ pub(crate) fn decode_spnego_final(
     Ok((state, mic))
 }
 
-/// Extract SubjectPublicKey from a DER-encoded X.509 certificate.
+/// Extract `SubjectPublicKey` from a DER-encoded X.509 certificate.
 ///
-/// Navigates: Certificate → TBSCertificate → SubjectPublicKeyInfo → SubjectPublicKey (BIT STRING).
+/// Navigates: Certificate → `TBSCertificate` → `SubjectPublicKeyInfo` → `SubjectPublicKey` (BIT STRING).
 /// Returns the raw public key bytes (without the BIT STRING unused-bits prefix byte).
 ///
 /// The client does not call it: it reads the key with `x509-cert`
@@ -605,7 +605,7 @@ pub(crate) fn extract_subject_public_key(cert_der: &[u8]) -> Result<Vec<u8>, Cre
 
 // --- Acceptor-side helpers for the in-process CredSSP test server ---
 
-/// A TSRequest that carries only a version and an error code
+/// A `TSRequest` that carries only a version and an error code
 /// (`SEQUENCE { [0] version, [4] errorCode }`), as Windows sends on failure.
 #[cfg(test)]
 pub(crate) fn encode_ts_request_error(version: u32, error_code: u32) -> Vec<u8> {
@@ -614,7 +614,7 @@ pub(crate) fn encode_ts_request_error(version: u32, error_code: u32) -> Vec<u8> 
     encode_sequence(&contents)
 }
 
-/// The server's final SPNEGO NegTokenResp: a negState and an optional
+/// The server's final SPNEGO `NegTokenResp`: a negState and an optional
 /// mechListMIC, no responseToken (the shape Server 2025 sends).
 #[cfg(test)]
 pub(crate) fn encode_spnego_final(neg_state: u8, mech_list_mic: Option<&[u8]>) -> Vec<u8> {
@@ -625,7 +625,7 @@ pub(crate) fn encode_spnego_final(neg_state: u8, mech_list_mic: Option<&[u8]>) -
     encode_context_tag(1, &encode_sequence(&contents))
 }
 
-/// Decode TSCredentials holding TSPasswordCreds into
+/// Decode `TSCredentials` holding `TSPasswordCreds` into
 /// `(domain, user, password)`, the inverse of [`encode_ts_credentials`].
 #[cfg(test)]
 pub(crate) fn decode_ts_credentials(der: &[u8]) -> Result<(String, String, String), CredSspError> {

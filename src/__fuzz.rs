@@ -142,12 +142,12 @@ pub fn to_utf16le(s: &str) -> Vec<u8> {
     crate::ntlm::crypto::to_utf16le(s)
 }
 
-/// NTOWFv1: MD4 of the UTF-16-LE password.
+/// `NTOWFv1`: MD4 of the UTF-16-LE password.
 pub fn compute_nt_hash(password: &str) -> [u8; 16] {
     *crate::ntlm::crypto::compute_nt_hash(password)
 }
 
-/// NTOWFv2: HMAC-MD5 over uppercased user + domain.
+/// `NTOWFv2`: HMAC-MD5 over uppercased user + domain.
 pub fn compute_ntlmv2_hash(nt_hash: &[u8; 16], username: &str, domain: &str) -> [u8; 16] {
     *crate::ntlm::crypto::compute_ntlmv2_hash(nt_hash, username, domain)
 }
@@ -406,7 +406,7 @@ pub fn signal_terminate_request(
     )
 }
 
-/// Delete carries the shell's own ResourceURI since 1.2.1 — a caller-supplied
+/// Delete carries the shell's own `ResourceURI` since 1.2.1 — a caller-supplied
 /// string spliced into the header, so it is part of the injection surface.
 pub fn delete_shell_request(
     endpoint: &str,
@@ -517,7 +517,7 @@ pub fn signal_psrp_ctrl_c_request(
     )
 }
 
-/// Send carries the shell's own ResourceURI, like Delete: a caller-supplied
+/// Send carries the shell's own `ResourceURI`, like Delete: a caller-supplied
 /// string spliced into the header, so it is part of the injection surface.
 #[expect(clippy::too_many_arguments, reason = "mirrors the wrapped builder")]
 pub fn send_input_request(

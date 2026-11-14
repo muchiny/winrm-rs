@@ -269,7 +269,7 @@ async fn a_kind_aware_hook_lets_the_stop_and_delete_through() {
     assert!(bodies[2].contains(&format!("<rsp:Code>{SIGNAL_CTRL_C}</rsp:Code>")));
 }
 
-/// The same hook lets the PSRP stop through (PowerShell ResourceURI, PSRP code).
+/// The same hook lets the PSRP stop through (PowerShell `ResourceURI`, PSRP code).
 #[tokio::test]
 async fn a_kind_aware_hook_lets_the_psrp_stop_through() {
     use crate::RequestKind;

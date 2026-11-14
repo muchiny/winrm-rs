@@ -31,13 +31,13 @@ const CHUNK_SIZE: usize = 2000;
 /// wrapper and the separators WinRS adds.
 const CMD_LINE_BUDGET: usize = 8100;
 
-/// Maximum allowed remote path length (Windows MAX_PATH).
+/// Maximum allowed remote path length (Windows `MAX_PATH`).
 const MAX_REMOTE_PATH_LEN: usize = 260;
 
 /// Reject remote paths that are too long for Windows or contain control characters.
 ///
 /// Rejects paths containing control characters (`\x00`-`\x1F` except `\t`)
-/// or exceeding Windows MAX_PATH.
+/// or exceeding Windows `MAX_PATH`.
 ///
 /// The length bound is applied to the UTF-8 **byte** length, which is at
 /// least as strict as the 260-WCHAR limit Windows enforces: a non-ASCII path

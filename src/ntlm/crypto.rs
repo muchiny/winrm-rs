@@ -80,13 +80,13 @@ pub(crate) const AV_SINGLE_HOST: u16 = 0x0008;
 pub(crate) const AV_TARGET_NAME: u16 = 0x0009;
 pub(crate) const AV_CHANNEL_BINDINGS: u16 = 0x000A;
 
-/// Bit in AV_FLAGS indicating that the server's account authentication is
+/// Bit in `AV_FLAGS` indicating that the server's account authentication is
 /// constrained (MS-NLMP 2.2.2.1); the only server flag the client echoes.
 pub(crate) const AV_FLAG_CONSTRAINED: u32 = 0x0000_0001;
-/// Bit in AV_FLAGS indicating that a MIC is present in the AUTHENTICATE_MESSAGE.
+/// Bit in `AV_FLAGS` indicating that a MIC is present in the `AUTHENTICATE_MESSAGE`.
 pub(crate) const AV_FLAG_MIC: u32 = 0x0000_0002;
 
-/// NT Hash = MD4(UTF-16LE(password)) (MS-NLMP 3.3.1, NTOWFv1).
+/// NT Hash = MD4(UTF-16LE(password)) (MS-NLMP 3.3.1, `NTOWFv1`).
 ///
 /// The result is password-equivalent, so it is wiped when dropped, as are the
 /// UTF-16 copy of the password and the digest's output buffer.
@@ -101,7 +101,7 @@ pub(crate) fn compute_nt_hash(password: &str) -> Zeroizing<[u8; 16]> {
     hash
 }
 
-/// NTLMv2 Hash = HMAC-MD5(NT_Hash, UTF-16LE(UPPER(username) + domain)) (MS-NLMP 3.3.2, NTOWFv2).
+/// NTLMv2 Hash = HMAC-MD5(NT_Hash, UTF-16LE(UPPER(username) + domain)) (MS-NLMP 3.3.2, `NTOWFv2`).
 ///
 /// Password-equivalent: the result is wiped when dropped.
 pub(crate) fn compute_ntlmv2_hash(
@@ -228,7 +228,7 @@ pub(crate) fn av_pairs(data: &[u8]) -> impl Iterator<Item = (u16, &[u8])> + '_ {
     })
 }
 
-/// Parse AV_PAIRs from target info, extracting domain name and timestamp.
+/// Parse `AV_PAIRs` from target info, extracting domain name and timestamp.
 ///
 /// The first `MsvAvNbDomainName` wins, and the first `MsvAvTimestamp` whose
 /// value is 8 bytes wins.

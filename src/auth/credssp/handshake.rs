@@ -175,8 +175,8 @@ async fn inner_tls_handshake(
     )))
 }
 
-/// One round carrying a TSRequest: send `request` in the inner TLS session,
-/// with `body`, and decode the TSRequest of the answer.
+/// One round carrying a `TSRequest`: send `request` in the inner TLS session,
+/// with `body`, and decode the `TSRequest` of the answer.
 async fn ts_round(
     conn: &mut CredSspConnection,
     inner: &mut OpenSslMemTls,
@@ -190,7 +190,7 @@ async fn ts_round(
     asn1::decode_ts_request(&inner.read_plaintext()?).map_err(WinrmError::CredSsp)
 }
 
-/// Refuse a TSRequest in which the server reports an error (an NTSTATUS in
+/// Refuse a `TSRequest` in which the server reports an error (an NTSTATUS in
 /// `errorCode`).
 fn refuse_error_code(answer: &asn1::TsRequest) -> Result<(), WinrmError> {
     match answer.error_code {
@@ -220,7 +220,7 @@ fn server_challenge(
     Ok((type2, challenge))
 }
 
-/// The SubjectPublicKey of the certificate `cert_der`: the contents of its
+/// The `SubjectPublicKey` of the certificate `cert_der`: the contents of its
 /// bit string (a PKCS#1 `RSAPublicKey` for an RSA certificate), which is what
 /// `pubKeyAuth` is computed over (MS-CSSP 2.2.2.5).
 fn subject_public_key(cert_der: &[u8]) -> Result<Vec<u8>, WinrmError> {
@@ -273,7 +273,7 @@ impl KeyBinding {
     }
 }
 
-/// The client's answer to the challenge: the TSRequest of the authenticate
+/// The client's answer to the challenge: the `TSRequest` of the authenticate
 /// round (the NTLM Type 3 with its mechListMIC, `pubKeyAuth`, the nonce) and
 /// the NTLM session it opens.
 ///
@@ -396,10 +396,10 @@ fn verify_server_proof(
     Ok(())
 }
 
-/// The TSRequest of the delegation round: the TSCredentials, sealed, in
+/// The `TSRequest` of the delegation round: the `TSCredentials`, sealed, in
 /// `authInfo`.
 ///
-/// Not `async`: the cleartext TSCredentials are wiped before the round that
+/// Not `async`: the cleartext `TSCredentials` are wiped before the round that
 /// carries them is posted, which can last as long as the WS-Man operation
 /// (`operation_timeout_secs`).
 fn delegation(auth: &CredSspAuth, session: &mut SealingSession) -> Result<Vec<u8>, WinrmError> {
@@ -418,7 +418,7 @@ fn delegation(auth: &CredSspAuth, session: &mut SealingSession) -> Result<Vec<u8
 /// handshake, NTLM negotiate, then NTLM authenticate with `pubKeyAuth`, whose
 /// answer must carry the server's final SPNEGO token and `pubKeyAuth`. Each
 /// round posts `body_for_auth`. Returns the `Authorization` value of the
-/// delegation round (the TSRequest with the sealed TSCredentials in
+/// delegation round (the `TSRequest` with the sealed `TSCredentials` in
 /// `authInfo`), which the caller posts with the request body.
 pub(super) async fn authenticate(
     conn: &mut CredSspConnection,

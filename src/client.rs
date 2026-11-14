@@ -1081,10 +1081,10 @@ impl WinrmClient {
         Ok(Shell::new(self, host.to_string(), shell_id))
     }
 
-    /// Delete a shell that lives under a non-default ResourceURI.
+    /// Delete a shell that lives under a non-default `ResourceURI`.
     ///
     /// Delete is plugin-addressed like every other shell operation. A PSRP
-    /// shell deleted with the `cmd` ResourceURI is reported as not found and
+    /// shell deleted with the `cmd` `ResourceURI` is reported as not found and
     /// stays alive server-side, so `Shell::close` passes the URI the shell
     /// was created with.
     pub(crate) async fn delete_shell_with_resource_uri(

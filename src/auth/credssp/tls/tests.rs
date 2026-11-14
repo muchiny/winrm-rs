@@ -80,7 +80,7 @@ fn inner_ssl_comes_from_the_cached_context() {
 }
 
 /// The first TLS record a client with `config` sends to a listener that
-/// never answers: its ClientHello.
+/// never answers: its `ClientHello`.
 async fn captured_client_hello(config: Arc<rustls::ClientConfig>) -> Vec<u8> {
     use std::io::Read;
 
@@ -108,7 +108,7 @@ async fn captured_client_hello(config: Arc<rustls::ClientConfig>) -> Vec<u8> {
     reader.join().unwrap()
 }
 
-/// Every extension type of a ClientHello record, sorted: rustls shuffles
+/// Every extension type of a `ClientHello` record, sorted: rustls shuffles
 /// the extension order on every hello.
 fn client_hello_extension_types(record: &[u8]) -> Vec<u16> {
     // Record header 5, handshake header 4, version 2, random 32.

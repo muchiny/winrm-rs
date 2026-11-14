@@ -203,9 +203,9 @@ pub(crate) fn create_shell_request(endpoint: &str, config: &crate::config::Winrm
 /// * Resource URI is `http://schemas.microsoft.com/powershell/Microsoft.PowerShell`
 ///   (or a custom configuration endpoint).
 /// * The body contains `<creationXml>` with base64-encoded PSRP opening
-///   fragments (SessionCapability + InitRunspacePool).
+///   fragments (`SessionCapability` + `InitRunspacePool`).
 /// * Streams are `stdin stdout stderr` via `pr` (PowerShell Remoting) not
-///   `rsp` (RemoteShell Protocol).
+///   `rsp` (`RemoteShell` Protocol).
 pub(crate) fn create_psrp_shell_request(
     endpoint: &str,
     config: &crate::config::WinrmConfig,
@@ -256,9 +256,9 @@ pub(crate) fn create_psrp_shell_request(
     )
 }
 
-/// Build a WS-Man Execute Command envelope with a caller-specified CommandId.
+/// Build a WS-Man Execute Command envelope with a caller-specified `CommandId`.
 ///
-/// Used by PSRP where the CommandId must be the pipeline's UUID and
+/// Used by PSRP where the `CommandId` must be the pipeline's UUID and
 /// the first pipeline fragment is passed as a base64 argument.
 #[expect(
     clippy::too_many_arguments,
@@ -304,7 +304,7 @@ pub(crate) fn execute_command_with_id_request(
     )
 }
 
-/// Build a PSRP-specific Receive SOAP envelope (stdout only, optional CommandId).
+/// Build a PSRP-specific Receive SOAP envelope (stdout only, optional `CommandId`).
 pub(crate) fn receive_psrp_request(
     endpoint: &str,
     shell_id: &str,
@@ -499,13 +499,13 @@ pub(crate) fn signal_terminate_request(
 }
 
 /// Build a WS-Management Delete Shell SOAP envelope (MS-WSMV 3.1.4.3) for a
-/// specific ResourceURI.
+/// specific `ResourceURI`.
 ///
 /// Deletes the remote shell identified by `shell_id`, releasing all
 /// server-side resources. This is the WS-Transfer Delete operation.
 ///
 /// Delete is addressed to a plugin, exactly like Create, Receive and Send. A
-/// PSRP shell lives under the PowerShell ResourceURI, so deleting it with the
+/// PSRP shell lives under the PowerShell `ResourceURI`, so deleting it with the
 /// `cmd` URI makes the server answer `InvalidSelectors: the shell was not
 /// found` — and leave the PSRP shell running. Those orphans accumulate until
 /// `MaxShellsPerUser` is reached and every later Create fails with
@@ -639,7 +639,7 @@ pub(crate) fn send_input_request_with_uri(
     )
 }
 
-/// Build a PSRP-specific Send SOAP envelope (no CommandId on the stream).
+/// Build a PSRP-specific Send SOAP envelope (no `CommandId` on the stream).
 pub(crate) fn send_psrp_request(
     endpoint: &str,
     shell_id: &str,

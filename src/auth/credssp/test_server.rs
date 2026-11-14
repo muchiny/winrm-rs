@@ -73,9 +73,9 @@ pub(crate) enum Fault {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Event {
     /// One HTTP request: its `Content-Length`, and whether its decrypted
-    /// TSRequest carried `[2] authInfo`.
+    /// `TSRequest` carried `[2] authInfo`.
     Round { body_len: usize, auth_info: bool },
-    /// TSCredentials decrypted: the password of `user` reached the server.
+    /// `TSCredentials` decrypted: the password of `user` reached the server.
     Delegated { user: String },
     /// The SOAP body of the delegation round, answered `200`.
     Executed { body: String },
@@ -324,7 +324,7 @@ fn inner_acceptor() -> Result<OpenSslMemTls, String> {
     OpenSslMemTls::server(ssl).map_err(e)
 }
 
-/// The SubjectPublicKey of the inner certificate, read with the crate's own
+/// The `SubjectPublicKey` of the inner certificate, read with the crate's own
 /// DER walker (not the client's `x509_cert` path).
 fn inner_subject_public_key() -> Vec<u8> {
     use rustls::pki_types::CertificateDer;
@@ -346,7 +346,7 @@ fn binding_hash(magic: &[u8], nonce: &[u8], spk: &[u8]) -> Vec<u8> {
 const CLIENT_MAGIC: &[u8] = b"CredSSP Client-To-Server Binding Hash\0";
 const SERVER_MAGIC: &[u8] = b"CredSSP Server-To-Client Binding Hash\0";
 
-/// The NTLM Type 2 challenge, with target info and the flags (KEY_EXCH,
+/// The NTLM Type 2 challenge, with target info and the flags (`KEY_EXCH`,
 /// SEAL, SIGN) the CredSSP path needs.
 fn type2() -> Vec<u8> {
     fn av(out: &mut Vec<u8>, id: u16, value: &[u8]) {

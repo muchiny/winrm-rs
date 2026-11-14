@@ -549,7 +549,7 @@ fn channel_bindings_refuse_every_truncated_certificate() {
 }
 
 /// A minimal certificate-shaped DER: empty tbsCertificate, then a
-/// signature AlgorithmIdentifier with `algorithm` as its content.
+/// signature `AlgorithmIdentifier` with `algorithm` as its content.
 fn cert_with_algorithm(algorithm: &[u8]) -> Vec<u8> {
     let mut alg = vec![0x30, u8::try_from(algorithm.len()).unwrap()];
     alg.extend_from_slice(algorithm);

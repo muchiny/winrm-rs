@@ -109,7 +109,7 @@ fn delete_shell_contains_shell_id() {
     assert!(xml.contains(RESOURCE_URI_CMD));
 }
 
-/// A PSRP shell must be deleted under the PowerShell ResourceURI. With the
+/// A PSRP shell must be deleted under the PowerShell `ResourceURI`. With the
 /// `cmd` URI the server answers `InvalidSelectors` and leaves the shell
 /// running until `MaxShellsPerUser` blocks every new Create.
 #[test]
@@ -954,7 +954,7 @@ fn request_action_reads_the_header_action() {
 }
 
 /// A caller-influenced value before the header's action (here the WMI
-/// namespace, spliced into the ResourceURI) cannot fake an action: it is escaped.
+/// namespace, spliced into the `ResourceURI`) cannot fake an action: it is escaped.
 #[test]
 fn request_action_ignores_an_action_tag_in_an_escaped_value() {
     let ns = r#"x"><wsa:Action s:mustUnderstand="true">http://other.invalid/</wsa:Action><y a=""#;

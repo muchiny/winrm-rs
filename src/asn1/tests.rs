@@ -2,7 +2,7 @@ use super::*;
 
 const TAG_OID: u8 = 0x06;
 
-/// Exact size of the DER encoding of the TSCredentials.
+/// Exact size of the DER encoding of the `TSCredentials`.
 fn ts_credentials_len(domain: &str, username: &str, password: &str) -> usize {
     let [_, _, _, outer_content] = ts_credentials_sizes(domain, username, password);
     tlv_len(outer_content)
@@ -309,7 +309,7 @@ fn decode_integer_rejects_empty_payload() {
     assert!(matches!(err, CredSspError::Asn1Decode(_)));
 }
 
-/// Server 2025's final NegTokenResp (pubKeyAuth TSRequest): accept-completed + mechListMIC.
+/// Server 2025's final `NegTokenResp` (pubKeyAuth TSRequest): accept-completed + mechListMIC.
 const SERVER_2025_FINAL_TOKEN: [u8; 29] = [
     0xa1, 0x1b, 0x30, 0x19, 0xa0, 0x03, 0x0a, 0x01, 0x00, 0xa3, 0x12, 0x04, 0x10, 0x01, 0x00, 0x00,
     0x00, 0x7c, 0x04, 0x2c, 0xe7, 0x3e, 0x8f, 0x62, 0x15, 0x00, 0x00, 0x00, 0x00,

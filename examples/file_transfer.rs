@@ -1,6 +1,6 @@
 //! Uploading a file, checking it on the host, and downloading it back.
 //!
-//! Usage: WINRM_HOST=win-server WINRM_USER=admin WINRM_PASS=password cargo run --example file_transfer -- <local-file> <remote-path>
+//! Usage: `WINRM_HOST=win-server WINRM_USER=admin WINRM_PASS=password cargo run --example file_transfer -- <local-file> <remote-path>`
 //!
 //! For example `-- notes.txt 'C:\Windows\Temp\notes.txt'`. The remote path
 //! must be drive-absolute (`C:\...`): UNC, device and relative paths are

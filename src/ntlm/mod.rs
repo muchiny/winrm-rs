@@ -1,7 +1,7 @@
 //! NTLMv2 authentication for WinRM.
 //!
 //! Implements NTLM challenge/response per MS-NLMP. Structured as:
-//! - `crypto` -- hash functions, RC4, AV_PAIR parsing
+//! - `crypto` -- hash functions, RC4, `AV_PAIR` parsing
 //! - `messages` -- Type 1/2/3 message construction and parsing
 
 pub(crate) mod crypto;
@@ -270,7 +270,7 @@ impl SealingSession {
     }
 
     /// Compute an NTLM signature over `data` (no encryption of payload).
-    /// Returns the 16-byte NTLMSSP_MESSAGE_SIGNATURE per MS-NLMP 3.4.4.1
+    /// Returns the 16-byte `NTLMSSP_MESSAGE_SIGNATURE` per MS-NLMP 3.4.4.1
     /// (with extended session security + key exchange). Consumes 8 bytes of
     /// the client RC4 keystream and increments the client sequence number.
     ///
@@ -297,11 +297,11 @@ impl SealingSession {
         Ok(signature(&checksum, seq))
     }
 
-    /// Sign the SPNEGO mech_type_list for the `mechListMIC` of the final
-    /// NegTokenResp, then re-initialise the client RC4 sealing handle when
+    /// Sign the SPNEGO `mech_type_list` for the `mechListMIC` of the final
+    /// `NegTokenResp`, then re-initialise the client RC4 sealing handle when
     /// this was the first client operation.
     ///
-    /// Windows SPNEGO computes the mechListMIC with GSS_GetMIC — which
+    /// Windows SPNEGO computes the mechListMIC with `GSS_GetMIC` — which
     /// consumes 8 bytes of RC4 keystream and one sequence number — and then
     /// resets the NTLM RC4 sealing state while keeping the sequence number.
     /// pyspnego mirrors this (`NegotiateProxy._step_spnego_mic` →
@@ -311,7 +311,7 @@ impl SealingSession {
     ///
     /// CredSSP depends on this: a pubKeyAuth sealed at keystream offset 8
     /// decrypts to garbage on the server, which drops the context and
-    /// answers a bare 401 without any TSRequest.
+    /// answers a bare 401 without any `TSRequest`.
     ///
     /// Call it first and once. Called after another client operation, it
     /// signs without the reset, so the keystream is not rewound over bytes

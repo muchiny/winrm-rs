@@ -22,7 +22,7 @@ use crate::error::NtlmError;
     )
 )]
 pub struct ChallengeMessage {
-    /// 8-byte nonce from the server, used as input to NTProofStr (MS-NLMP 3.3.2).
+    /// 8-byte nonce from the server, used as input to `NTProofStr` (MS-NLMP 3.3.2).
     pub server_challenge: [u8; 8],
     /// Negotiated capability flags (MS-NLMP 2.2.2.5).
     pub negotiate_flags: u32,
@@ -55,9 +55,9 @@ pub(crate) fn create_negotiate_message() -> Vec<u8> {
 
 /// Create a Type 1 message for use inside CredSSP.
 ///
-/// CredSSP requires NEGOTIATE_KEY_EXCH, NEGOTIATE_SEAL, NEGOTIATE_SIGN,
-/// NEGOTIATE_128, NEGOTIATE_56 to enable the sealing of pubKeyAuth and
-/// TSCredentials. Also includes NEGOTIATE_VERSION which adds the 8-byte
+/// CredSSP requires `NEGOTIATE_KEY_EXCH`, `NEGOTIATE_SEAL`, `NEGOTIATE_SIGN`,
+/// `NEGOTIATE_128`, `NEGOTIATE_56` to enable the sealing of pubKeyAuth and
+/// `TSCredentials`. Also includes `NEGOTIATE_VERSION` which adds the 8-byte
 /// OS version field at the end of the message (40 bytes total).
 #[cfg(feature = "credssp")]
 pub(crate) fn create_negotiate_message_credssp() -> Vec<u8> {
@@ -86,7 +86,7 @@ fn create_negotiate_message_with_flags(flags: u32, include_version: bool) -> Vec
 
 /// Parse an NTLM Type 2 (Challenge) message from raw bytes (MS-NLMP 2.2.1.2).
 ///
-/// Extracts the server challenge, negotiate flags, target info AV_PAIRs,
+/// Extracts the server challenge, negotiate flags, target info `AV_PAIRs`,
 /// NetBIOS domain name, and optional server timestamp. Returns
 /// [`NtlmError::InvalidMessage`] if the message is too short, has an invalid
 /// signature, or is not message type 2.
@@ -377,7 +377,7 @@ struct AuthenticateInput<'a> {
     challenge: &'a ChallengeMessage,
     username: &'a str,
     password: &'a str,
-    /// The domain of the NTOWFv2 hash.
+    /// The domain of the `NTOWFv2` hash.
     domain: &'a str,
     /// The domain written in the `DomainName` field; `domain` when `None`
     /// (CredSSP writes an empty one).
@@ -410,9 +410,9 @@ fn client_challenge() -> [u8; 8] {
     rand::random()
 }
 
-/// A random ExportedSessionKey and the `EncryptedRandomSessionKey` field
+/// A random `ExportedSessionKey` and the `EncryptedRandomSessionKey` field
 /// that carries it: the key encrypted with RC4 under `key_exchange_key`
-/// (NEGOTIATE_KEY_EXCH).
+/// (`NEGOTIATE_KEY_EXCH`).
 ///
 /// `CREDSSP_FIXED_RSK` pins the key for deterministic tests. It is honoured
 /// only in debug builds with the internal `__internal` feature; every other
@@ -474,7 +474,7 @@ impl Type3Fields<'_> {
     /// header holds one).
     ///
     /// The header is 64 bytes up to the flags, then 8 for the OS version
-    /// with NEGOTIATE_VERSION, then 16 for the MIC.
+    /// with `NEGOTIATE_VERSION`, then 16 for the MIC.
     fn encode(&self) -> Result<(Vec<u8>, usize), NtlmError> {
         let include_version = self.flags & NEGOTIATE_VERSION != 0;
         let header_size: usize = match (include_version, self.mic) {
@@ -651,7 +651,7 @@ fn create_authenticate_message_full(
 /// Computes the NTLMv2 response using:
 /// - NT Hash: `MD4(UTF-16LE(password))` (MS-NLMP 3.3.1)
 /// - NTLMv2 Hash: `HMAC-MD5(NT_Hash, UTF-16LE(UPPER(username) + domain))` (MS-NLMP 3.3.2)
-/// - NTProofStr: `HMAC-MD5(NTLMv2Hash, ServerChallenge + ClientBlob)` (MS-NLMP 3.3.2)
+/// - `NTProofStr`: `HMAC-MD5(NTLMv2Hash, ServerChallenge + ClientBlob)` (MS-NLMP 3.3.2)
 ///
 /// The client challenge is 8 random bytes. If the server provided a timestamp
 /// in its Type 2 message, that timestamp is reused; otherwise the current
@@ -718,7 +718,7 @@ pub(crate) fn create_authenticate_message_http(
 /// Create an NTLM Type 3 message for use inside CredSSP.
 ///
 /// Mirrors the flags the server returned in the Type 2 challenge.
-/// Generates EncryptedRandomSessionKey (NEGOTIATE_KEY_EXCH) and a MIC
+/// Generates `EncryptedRandomSessionKey` (`NEGOTIATE_KEY_EXCH`) and a MIC
 /// computed over Type1 || Type2 || Type3.
 ///
 /// `type1_bytes` and `type2_bytes` are the raw NTLMSSP messages exchanged

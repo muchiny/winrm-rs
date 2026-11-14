@@ -435,7 +435,7 @@ impl<'a> Shell<'a> {
     /// Like [`start_command`](Self::start_command) but lets the caller
     /// specify the `CommandId` that the server should assign to the
     /// command. Used by PSRP where the pipeline UUID must match the
-    /// CommandId.
+    /// `CommandId`.
     ///
     /// See [`WinrmClient::run_command`](crate::WinrmClient::run_command) (Arguments) for
     /// how `args` reach the host.

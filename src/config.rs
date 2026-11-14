@@ -861,7 +861,7 @@ pub enum AuthMethod {
 pub struct WinrmCredentials {
     /// Windows account name (e.g. `"administrator"`).
     pub username: String,
-    /// Password — stored as SecretString, zeroized on drop, redacted in Debug.
+    /// Password — stored as `SecretString`, zeroized on drop, redacted in Debug.
     pub password: SecretString,
     /// Optional NetBIOS domain. Leave empty to auto-detect from the NTLM
     /// challenge.

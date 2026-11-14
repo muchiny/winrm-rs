@@ -1330,7 +1330,7 @@ fn credssp_type3_av_list_is_canonical() {
     );
 }
 
-/// A Windows-shaped TargetInfo: NB domain, NB computer, EOL.
+/// A Windows-shaped `TargetInfo`: NB domain, NB computer, EOL.
 fn nb_ti() -> Vec<u8> {
     [
         av(0x0002, &to_utf16le("CORP")),

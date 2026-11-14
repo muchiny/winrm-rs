@@ -3,6 +3,22 @@ allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-panic-in-tests = true
 allow-indexing-slicing-in-tests = true
+# Names of products and protocols, which the documentation writes as plain
+# words: `doc_markdown` takes a mixed-case word for an identifier that lacks
+# its backticks. ".." keeps clippy's own list.
+doc-valid-idents = [
+    "CredSSP",
+    "LMv2",
+    "NTLMv1",
+    "NTLMv2",
+    "NetBIOS",
+    "WSMan",
+    "WebDAV",
+    "WebPKI",
+    "WinRM",
+    "WinRS",
+    "..",
+]
 disallowed-methods = [
     { path = "std::process::Command::new", reason = "no subprocess on the authentication path" },
     { path = "rustls::ClientConfig::builder", reason = "reads the process-wide provider; use tls::client_config_builder" },

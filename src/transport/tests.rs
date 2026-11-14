@@ -10,7 +10,7 @@ use secrecy::SecretString;
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-/// Helper to build an HttpTransport with Basic auth pointing at a wiremock server.
+/// Helper to build an `HttpTransport` with Basic auth pointing at a wiremock server.
 fn basic_transport(port: u16) -> HttpTransport {
     let config = WinrmConfig {
         auth_method: AuthMethod::Basic,
@@ -3414,7 +3414,7 @@ fn from_utf16le(bytes: &[u8]) -> String {
     .unwrap()
 }
 
-/// Over TLS the Type 3 now carries a MIC, MsvAvFlags 0x2, the target name,
+/// Over TLS the Type 3 now carries a MIC, `MsvAvFlags` 0x2, the target name,
 /// a zero LM response and the channel binding — as the plain-HTTP path does.
 #[tokio::test]
 async fn ntlm_over_tls_type3_carries_mic_flags_target_name_and_zero_lm() {
@@ -4815,7 +4815,7 @@ async fn ntlm_cbt_through_an_https_proxy_binds_the_target_certificate() {
     assert_eq!(type3_channel_bindings(&seen[0]), Some(cbt_of(EC_CERT_PEM)));
 }
 
-/// An https endpoint reached through an HTTPS_PROXY from the environment:
+/// An https endpoint reached through an `HTTPS_PROXY` from the environment:
 /// reqwest's real proxy selection tunnels it, and the Type 3 still binds
 /// the endpoint's certificate.
 #[tokio::test]

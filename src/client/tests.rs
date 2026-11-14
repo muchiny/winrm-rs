@@ -3430,7 +3430,7 @@ const DONE_HELLO: &str = r#"<s:Envelope><s:Body><rsp:ReceiveResponse>
         </rsp:CommandState>
     </rsp:ReceiveResponse></s:Body></s:Envelope>"#;
 
-/// Mount `n` HTTP 500 TimedOut faults, as a real host answers them.
+/// Mount `n` HTTP 500 `TimedOut` faults, as a real host answers them.
 async fn mount_timed_out_faults(server: &MockServer, prefix: &str, n: u64) {
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(500).set_body_string(timed_out_fault(prefix)))

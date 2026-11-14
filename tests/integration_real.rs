@@ -4308,7 +4308,7 @@ fn test_client_rogue_cert() -> Option<(WinrmClient, String)> {
 /// client certificate during the initial handshake (rustls cannot renegotiate).
 ///
 /// BENCH ONLY: installs a root CA, maps it to an admin account and enables
-/// client-cert negotiation, with no teardown — never point WINRM_TEST_HOST at a
+/// client-cert negotiation, with no teardown — never point `WINRM_TEST_HOST` at a
 /// real machine.
 #[tokio::test]
 #[ignore]

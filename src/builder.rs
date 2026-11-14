@@ -593,7 +593,8 @@ impl WinrmClientBuilder<Ready> {
     pub fn build(self) -> Result<WinrmClient, WinrmError> {
         // The typestate only exposes `build` once the credentials are set
         // (state = Ready), so no caller can reach this refusal. It is an
-        // error and not a panic: this crate has no panic of its own.
+        // error and not a panic: the library holds no `unwrap`, `expect`,
+        // `panic!` or `unreachable!` (`[lints.clippy]` of `Cargo.toml`).
         let Some(credentials) = self.credentials else {
             return Err(WinrmError::AuthFailed(
                 "internal: a ready builder without credentials".into(),

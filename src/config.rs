@@ -872,6 +872,7 @@ impl WinrmCredentials {
     /// Create new credentials.
     ///
     /// Wraps the password in a [`SecretString`] for automatic zeroization.
+    #[must_use]
     pub fn new(
         username: impl Into<String>,
         password: impl Into<String>,

@@ -269,23 +269,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   feature on). No behaviour change.
 - **`clippy::pedantic` is on for the whole crate**, tests included, and CI
   refuses its warnings like the others. What the code does not follow is
-  an `#[expect]` with its reason: four in the library (two of them in the
-  fuzz surface) and one in a test. Test code is exempt from three lints of
-  the group beside `too_many_lines`: `similar_names`,
-  `cast_possible_truncation` and `assert_is_empty`. What a user of the
-  crate can see of it:
-  - `#[must_use]` on `WinrmClientBuilder`, `quote_powershell_string`,
-    `encode_powershell_command`, `StderrDecoder::new` and the accessors of
-    `OutgoingRequest`. Code that drops one of these values now gets the
-    compiler's `unused_must_use` warning; none of them did anything when
-    dropped.
-  - `WinrmClientBuilder::build` holds no `expect` any more: the branch the
-    typestate keeps out of reach is a refusal, not a panic.
+  an `#[expect]` with its reason: four, all in the library, two of them
+  in the fuzz surface. Test code is exempt from three lints of the group
+  beside `too_many_lines`: `similar_names`, `cast_possible_truncation` and
+  `assert_is_empty`. What a user of the crate can see of it:
+  - `#[must_use]` on two types, `WinrmClientBuilder` (it does nothing
+    until `build`) and `Shell` (dropped without `close`, it stays open on
+    the server), and on the functions that only return a value:
+    `WinrmCredentials::new`, `quote_powershell_string`,
+    `encode_powershell_command`, `StderrDecoder::new`, `Shell::shell_id`,
+    `Shell::resource_uri` and the accessors of `OutgoingRequest`. Code
+    that drops one of these values now gets the compiler's
+    `unused_must_use` warning.
+  - The library holds no `unwrap`, `expect`, `panic!` or `unreachable!`
+    any more. Two were left, on branches nothing can reach: an `expect`
+    in `WinrmClientBuilder::build`, now a refusal (`AuthFailed`), and an
+    `unreachable!()` after the retry loop of the transport, which now
+    ends by its `return`s. `clippy::unreachable` joins the lints that
+    keep it so.
   - The proxy route written to the DEBUG log ends with `..`: its `Debug`
     always left the matcher out, and now says so.
-  - Without the `kerberos` feature, asking for Kerberos is refused by a
-    future that is ready at once, not by an `async fn` with nothing to
-    wait for.
 
 ### Fixed
 
@@ -355,9 +358,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   to.
 - The description and the example of `Shell::start_command` were attached
   to `start_command_with_id` by mistake: they are back on their method.
-- Identifiers are in code font throughout the documentation, and the names
-  of products and protocols (`CredSSP`, `NTLMv2`, `WinRM`...) are declared
-  to clippy as words, not identifiers (`doc-valid-idents`).
+- Identifiers are in code font throughout the documentation.
 
 ## [2.1.0] - 2026-11-12
 

@@ -2865,7 +2865,7 @@ async fn socks5_proxy_carries_ntlm() {
 // === HTTPS setup helper (run once to enable HTTPS tests) ===
 
 #[tokio::test]
-#[ignore = "needs the Windows bench: see the head of this file"]
+#[ignore = "BENCH ONLY: changes the host's configuration and does not undo it"]
 async fn setup_https_listener() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let script = r#"
@@ -2951,7 +2951,7 @@ fn test_client_https_ntlm() -> Option<(WinrmClient, String)> {
 }
 
 #[tokio::test]
-#[ignore = "needs the Windows bench: see the head of this file"]
+#[ignore = "BENCH ONLY: changes the host's configuration and does not undo it"]
 async fn enable_credssp_server() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let script = r"
@@ -2969,7 +2969,7 @@ async fn enable_credssp_server() {
 }
 
 #[tokio::test]
-#[ignore = "needs the Windows bench: see the head of this file"]
+#[ignore = "BENCH ONLY: changes the host's configuration and does not undo it"]
 async fn enable_cbt_hardening_strict() {
     let (client, host) = test_client().expect("set WINRM_TEST_HOST and WINRM_TEST_PASS");
     let script = r"
@@ -4314,7 +4314,7 @@ fn test_client_rogue_cert() -> Option<(WinrmClient, String)> {
 /// client-cert negotiation, with no teardown — never point `WINRM_TEST_HOST` at a
 /// real machine.
 #[tokio::test]
-#[ignore = "needs the Windows bench: see the head of this file"]
+#[ignore = "BENCH ONLY: changes the host's configuration and does not undo it"]
 async fn setup_certificate_auth() {
     use base64::Engine as _;
     if is_server_2012_r2().await {
@@ -4583,7 +4583,7 @@ fn krb_bench_ntlm_credentials() -> WinrmCredentials {
 /// command runs as the domain user whose TGT is in the cache.
 #[cfg(feature = "kerberos")]
 #[tokio::test]
-#[ignore = "needs the Windows bench: see the head of this file"]
+#[ignore = "needs the domain controller bench: see the Kerberos section of this file"]
 async fn kerberos_run_command_whoami() {
     let (client, host) = kerberos_client_from_env(|_| {});
     let output = client
@@ -4602,7 +4602,7 @@ async fn kerberos_run_command_whoami() {
 /// fault on a silent Receive is an empty poll, as over the other methods.
 #[cfg(feature = "kerberos")]
 #[tokio::test]
-#[ignore = "needs the Windows bench: see the head of this file"]
+#[ignore = "needs the domain controller bench: see the Kerberos section of this file"]
 async fn silent_command_completes_over_kerberos() {
     let (client, host) = kerberos_client_from_env(|c| c.operation_timeout_secs = SILENT_OP_SECS);
     assert_silent_command_completes(&client, &host).await;
@@ -4616,7 +4616,7 @@ async fn silent_command_completes_over_kerberos() {
 /// fail.
 #[cfg(feature = "kerberos")]
 #[tokio::test]
-#[ignore = "needs the Windows bench: see the head of this file"]
+#[ignore = "needs the domain controller bench: see the Kerberos section of this file"]
 async fn kerberos_two_commands_on_one_client() {
     let (client, host) = kerberos_client_from_env(|_| {});
     for round in 1..=2 {
@@ -4648,7 +4648,7 @@ async fn kerberos_two_commands_on_one_client() {
 /// `check_acceptor_sealed` has to go (the EC check stays).
 #[cfg(feature = "kerberos")]
 #[tokio::test]
-#[ignore = "needs the Windows bench: see the head of this file"]
+#[ignore = "needs the domain controller bench: see the Kerberos section of this file"]
 async fn kerberos_sealed_answer_sizes() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("winrm_rs::kerberos::sealed=trace")
@@ -4677,7 +4677,7 @@ async fn kerberos_sealed_answer_sizes() {
 /// existing HTTPS listener is left as it is. Not undone.
 #[cfg(feature = "kerberos")]
 #[tokio::test]
-#[ignore = "needs the Windows bench: see the head of this file"]
+#[ignore = "BENCH ONLY: changes the domain controller's configuration and does not undo it"]
 async fn setup_dc_https_listener() {
     let (client, host) = kerberos_client_from_env(|_| {});
     let script = r#"
@@ -4730,7 +4730,7 @@ fn kerberos_https_client_from_env(tweak: impl FnOnce(&mut WinrmConfig)) -> (Winr
 /// the messages inside TLS.
 #[cfg(feature = "kerberos")]
 #[tokio::test]
-#[ignore = "needs the Windows bench: see the head of this file"]
+#[ignore = "needs the domain controller bench: see the Kerberos section of this file"]
 async fn kerberos_over_https_whoami() {
     let (client, host) = kerberos_https_client_from_env(|_| {});
     let output = client
@@ -4851,7 +4851,7 @@ where
 /// it with a hint at the cause instead of an opaque `HTTP 500`.
 #[cfg(feature = "kerberos")]
 #[tokio::test]
-#[ignore = "needs the Windows bench: see the head of this file"]
+#[ignore = "needs the domain controller bench: see the Kerberos section of this file"]
 async fn kerberos_unsealed_with_allow_unencrypted_false_is_a_clear_error() {
     with_dc_requiring_encryption(|| async {
         let (client, host) = kerberos_client_from_env(|c| c.encryption = EncryptionMode::Never);
@@ -4928,7 +4928,7 @@ fn kerberos_sealed_traffic(forwarder: &RecordingForwarder) -> usize {
 /// sealed. Every SOAP body crosses sealed, each connection authenticates once.
 #[cfg(feature = "kerberos")]
 #[tokio::test]
-#[ignore = "needs the Windows bench: see the head of this file"]
+#[ignore = "needs the domain controller bench: see the Kerberos section of this file"]
 async fn kerberos_sealed_with_allow_unencrypted_false() {
     with_dc_requiring_encryption(|| async {
         let (client, forwarder, host) = sealed_kerberos_client(|_| {}).await;
@@ -4993,7 +4993,7 @@ async fn kerberos_sealed_with_allow_unencrypted_false() {
 /// server accepting the sealed requests is the evidence; the wire is TLS).
 #[cfg(feature = "kerberos")]
 #[tokio::test]
-#[ignore = "needs the Windows bench: see the head of this file"]
+#[ignore = "needs the domain controller bench: see the Kerberos section of this file"]
 async fn kerberos_encryption_always_over_https() {
     let (client, host) = kerberos_https_client_from_env(|c| c.encryption = EncryptionMode::Always);
     let output = client
@@ -5388,7 +5388,7 @@ fn kerberos_client_through_relay(
 /// the sealed one.
 #[cfg(feature = "kerberos")]
 #[tokio::test]
-#[ignore = "needs the Windows bench: see the head of this file"]
+#[ignore = "needs the domain controller bench and the `openssl` command: see the Kerberos section"]
 async fn kerberos_channel_binding_through_a_tls_relay_is_refused() {
     let https_port: u16 = std::env::var("WINRM_TEST_KRB_HTTPS_PORT")
         .expect("WINRM_TEST_KRB_HTTPS_PORT")
@@ -5459,7 +5459,7 @@ async fn assert_split_relay_fails_at_the_handshake() {
 /// The split case under the DC's default `CbtHardeningLevel = Relaxed`.
 #[cfg(feature = "kerberos")]
 #[tokio::test]
-#[ignore = "needs the Windows bench: see the head of this file"]
+#[ignore = "needs the domain controller bench and the `openssl` command: see the Kerberos section"]
 async fn kerberos_channel_binding_split_relay_fails_at_the_handshake() {
     assert_split_relay_fails_at_the_handshake().await;
 }
@@ -5471,7 +5471,7 @@ async fn kerberos_channel_binding_split_relay_fails_at_the_handshake() {
 /// them as is (TLS only), which shows the relay would see plaintext.
 #[cfg(feature = "kerberos")]
 #[tokio::test]
-#[ignore = "needs the Windows bench: see the head of this file"]
+#[ignore = "needs the domain controller bench and the `openssl` command: see the Kerberos section"]
 async fn always_seals_inside_tls_seen_by_a_relay_with_dc_cbt_none() {
     with_dc_cbt_hardening("None", || async {
         let https_port: u16 = std::env::var("WINRM_TEST_KRB_HTTPS_PORT")
@@ -5543,7 +5543,7 @@ async fn always_seals_inside_tls_seen_by_a_relay_with_dc_cbt_none() {
 /// handshake as under `Relaxed`.
 #[cfg(feature = "kerberos")]
 #[tokio::test]
-#[ignore = "needs the Windows bench: see the head of this file"]
+#[ignore = "needs the domain controller bench and the `openssl` command: see the Kerberos section"]
 async fn kerberos_over_https_with_dc_cbt_strict() {
     with_dc_cbt_hardening("Strict", || async {
         for mode in [
@@ -5589,7 +5589,7 @@ async fn kerberos_over_https_with_dc_cbt_strict() {
 /// must now pass on one connection each.
 #[cfg(feature = "kerberos")]
 #[tokio::test]
-#[ignore = "needs the Windows bench: see the head of this file"]
+#[ignore = "needs the domain controller bench: see the Kerberos section of this file"]
 async fn sealed_download_after_upload_stays_on_its_connection_allow_unencrypted_false() {
     with_dc_requiring_encryption(|| async {
         let dc_port = std::env::var("WINRM_TEST_KRB_PORT").expect("WINRM_TEST_KRB_PORT");
@@ -5915,7 +5915,7 @@ async fn before_send_refusal_leaves_a_credssp_session_usable() {
 /// Kerberos tests.
 #[cfg(feature = "kerberos")]
 #[tokio::test]
-#[ignore = "needs the Windows bench: see the head of this file"]
+#[ignore = "needs the domain controller bench: see the Kerberos section of this file"]
 async fn before_send_refusal_leaves_a_kerberos_session_usable() {
     const HINT: &str = "eval \"$(tests/scripts/vm-connect-dc.sh)\" and kinit vagrant@WINRM.TEST";
     let host = std::env::var("WINRM_TEST_KRB_HOST").expect(HINT);

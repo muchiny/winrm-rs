@@ -67,6 +67,7 @@ enum Polled {
 /// delete it: a warning is logged and the server keeps the shell until its
 /// idle timeout ([`WinrmConfig::idle_timeout_secs`](crate::WinrmConfig::idle_timeout_secs),
 /// or the server's default). Call [`close`](Self::close) when done.
+#[must_use = "a shell stays open on the server until `close` is called"]
 pub struct Shell<'a> {
     client: &'a WinrmClient,
     host: String,
@@ -117,6 +118,7 @@ impl<'a> Shell<'a> {
     }
 
     /// The resource URI this shell was created with.
+    #[must_use]
     pub fn resource_uri(&self) -> &str {
         &self.resource_uri
     }
@@ -615,6 +617,7 @@ impl<'a> Shell<'a> {
     }
 
     /// Get the shell ID.
+    #[must_use]
     pub fn shell_id(&self) -> &str {
         &self.shell_id
     }
@@ -657,8 +660,8 @@ impl<'a> Shell<'a> {
     /// # Errors
     ///
     /// The [errors of a request](crate::WinrmClient#errors-of-a-request),
-    /// those of the Disconnect: the shell is then deleted (above), and a
-    /// failure of that Delete is logged, not returned.
+    /// for the Disconnect request. After such an error the shell is deleted
+    /// (above); a failure of that Delete is logged, not returned.
     pub async fn disconnect(mut self) -> Result<String, WinrmError> {
         self.closed = true;
         let endpoint = self.client.endpoint(&self.host);

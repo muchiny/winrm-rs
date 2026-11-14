@@ -210,7 +210,7 @@ pub(crate) fn create_shell_request(endpoint: &str, config: &crate::config::Winrm
 /// * The body contains `<creationXml>` with base64-encoded PSRP opening
 ///   fragments (`SessionCapability` + `InitRunspacePool`).
 /// * Streams are `stdin stdout stderr` via `pr` (PowerShell Remoting) not
-///   `rsp` (`RemoteShell` Protocol).
+///   `rsp` (Remote Shell Protocol).
 pub(crate) fn create_psrp_shell_request(
     endpoint: &str,
     config: &crate::config::WinrmConfig,

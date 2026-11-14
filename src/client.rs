@@ -59,19 +59,28 @@ use crate::transport::{HttpTransport, TransportOptions};
 ///   authentication fails (credentials rejected, a message of the handshake
 ///   refused, a check of the proxy or of the server's certificate); or the
 ///   server answers an HTTP status that is neither a success nor a SOAP
-///   fault;
+///   fault. One exception: with NTLM message encryption, the default over
+///   plain HTTP, an error status whose answer the server did not seal is
+///   [`WinrmError::Ntlm`];
 /// - [`WinrmError::Http`]: the connection, the TLS handshake or the HTTP
 ///   exchange fails or times out;
-/// - [`WinrmError::Ntlm`] or [`WinrmError::CredSsp`]: a message of that
-///   protocol is malformed or fails its checks;
+/// - [`WinrmError::Ntlm`]: the cases listed on
+///   [`NtlmError::InvalidMessage`](crate::NtlmError::InvalidMessage), a
+///   malformed message of the handshake and a sealed answer that does not
+///   unseal among them. [`WinrmError::CredSsp`]: a message of that protocol
+///   is malformed or fails its checks;
 /// - [`WinrmError::Soap`]: the server answers a fault
 ///   ([`SoapError::Fault`](crate::SoapError::Fault)), or a body that is not
-///   an XML document or is larger than the response limit
+///   an XML document, is larger than the response limit, or is not built
+///   the way the answer to the request must be (an element where a text is
+///   expected, an attribute that does not parse)
 ///   ([`SoapError::ParseError`](crate::SoapError::ParseError));
 /// - [`WinrmError::Timeout`]: the cases listed on that variant (a connection
 ///   slot, a Kerberos ticket, a CredSSP exchange);
 /// - [`WinrmError::Cancelled`]: the hook set with
-///   [`WinrmClientBuilder::before_send`] refuses the request.
+///   [`WinrmClientBuilder::before_send`] or
+///   [`before_send_with`](crate::WinrmClientBuilder::before_send_with)
+///   refuses the request.
 ///
 /// The `Errors` section of a method says what it adds to these.
 ///

@@ -1326,6 +1326,9 @@ impl HttpTransport {
 
     /// One request on `route`, authentication included: the body of the
     /// response to a success status. [`Self::send_soap`] is the only caller.
+    ///
+    /// No span of its own: the one of `send_soap` covers this call, and
+    /// skips `body`, which may hold a script and the secrets written in it.
     async fn exchange(
         &self,
         route: Route,
@@ -2190,7 +2193,10 @@ impl HttpTransport {
         let action = crate::soap::envelope::request_action(&body).unwrap_or("");
         let kind = RequestKind::from_action(action);
         let max = self.config.max_retries;
-        for attempt in 0..=max {
+        // Attempts 0 to `max`. The loop ends by a `return`: only the retry
+        // arm goes round again, and it is not taken at attempt `max`.
+        let mut attempt: u32 = 0;
+        loop {
             // Take the slot first, so that an approval does not go stale
             // during the slot wait. On a retryable error the slot was moved
             // into `send_soap`, so it is released before the backoff sleep.
@@ -2217,6 +2223,7 @@ impl HttpTransport {
                         "retrying after transient HTTP error"
                     );
                     tokio::time::sleep(delay).await;
+                    attempt = attempt.saturating_add(1);
                 }
                 Err(e) => {
                     // Only a connect error can get the hint. Every other
@@ -2233,7 +2240,6 @@ impl HttpTransport {
                 }
             }
         }
-        unreachable!()
     }
 
     /// The `wsmv:SessionId` value this transport stamps on every request.

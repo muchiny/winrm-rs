@@ -304,7 +304,7 @@ fn decode_length(data: &[u8]) -> Result<(usize, &[u8]), CredSspError> {
     }
 }
 
-/// Read a TLV (tag-length-value) at the start of data. Returns (tag, `value_bytes`, bytes after the TLV).
+/// Read a TLV (tag-length-value) at the start of data. Returns (tag, value bytes, bytes after the TLV).
 fn read_tlv(data: &[u8]) -> Result<(u8, &[u8], &[u8]), CredSspError> {
     let Some((&tag, after_tag)) = data.split_first() else {
         return Err(CredSspError::Asn1Decode("unexpected end of data".into()));

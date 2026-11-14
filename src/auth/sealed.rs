@@ -160,13 +160,8 @@ mod tests {
         WinrmError::AuthFailed(what.to_string())
     }
 
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "the signature of the header-length check `parse` takes"
-    )]
-    fn any_len(_: usize) -> Result<(), &'static str> {
-        Ok(())
-    }
+    /// A header-length check that accepts every length.
+    const ANY_LEN: fn(usize) -> Result<(), &'static str> = |_| Ok(());
 
     #[test]
     fn frame_then_parse_round_trips_any_protocol_and_header() {
@@ -180,7 +175,7 @@ mod tests {
                     "multipart/encrypted;protocol=\"{protocol}\";boundary=\"Encrypted Boundary\""
                 )
             );
-            let parsed = parse(&body, protocol, any_len, bad).unwrap();
+            let parsed = parse(&body, protocol, ANY_LEN, bad).unwrap();
             assert_eq!(parsed.length, data.len());
             assert_eq!(&parsed.sealed[..60], &header[..]);
             assert_eq!(&parsed.sealed[60..], &data[..]);
@@ -202,7 +197,7 @@ mod tests {
     #[test]
     fn parse_rejects_another_protocol() {
         let (_, body) = frame(SPNEGO_PROTOCOL, 3, &[0; 16], b"abc");
-        let err = parse(&body, KERBEROS_PROTOCOL, any_len, bad).unwrap_err();
+        let err = parse(&body, KERBEROS_PROTOCOL, ANY_LEN, bad).unwrap_err();
         assert!(err.to_string().contains("first part is not"), "{err}");
     }
 
@@ -231,6 +226,6 @@ mod tests {
         // Overwrite the header length with u32::MAX.
         let at = body.windows(4).position(|w| w == [16, 0, 0, 0]).unwrap();
         body[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
-        assert!(parse(&body, KERBEROS_PROTOCOL, any_len, bad).is_err());
+        assert!(parse(&body, KERBEROS_PROTOCOL, ANY_LEN, bad).is_err());
     }
 }

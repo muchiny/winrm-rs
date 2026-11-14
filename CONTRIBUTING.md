@@ -67,6 +67,12 @@ scripts/fuzz.sh smoke         # replay the committed seed corpora
 scripts/fuzz.sh run           # 60s per target
 scripts/fuzz.sh run fuzz_asn1_ts_request 900
 
+# Mutation testing (needs cargo-mutants): one file at a time. The whole crate
+# is about two thousand mutants, each a build and a run of the unit tests; the
+# `Mutants` workflow runs them all every week, and on request (Actions >
+# Mutants > Run workflow). A mutant that survives is in the summary of its run.
+cargo mutants --features credssp --file src/asn1.rs -- --lib
+
 # Check what will be published to crates.io (fails on any file outside the allowlist)
 scripts/check-package.sh
 

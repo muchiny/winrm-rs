@@ -50,7 +50,7 @@ drives; "invariant" is what it asserts beyond *must not panic*.
 
 | Target | Source | Invariant |
 |---|---|---|
-| `fuzz_soap_parse` | `soap/parser.rs` response parsers | decoded streams fit in the response; a fault is never read as success |
+| `fuzz_soap_parse` | `soap/parser.rs` response parsers, and the reader they share (`soap/xml.rs`, over `quick-xml`) | decoded streams fit in the response; a fault is never read as success |
 | `fuzz_soap_enumerate` | `parse_enumerate_response` | an `EndOfSequence` element after the document clears the context; escaped item text never does and is never a fault; the context cannot add XML elements to the next `Pull` |
 | `fuzz_soap_envelope` | all envelope builders, the five PSRP ones included (shell creation with `creationXml`, command, receive, send, signal) | **no input can add XML markup** — tag counts match an empty-input baseline |
 | `fuzz_xml_escape` | `envelope::xml_escape` | complete (no raw markup survives) and reversible |
@@ -129,8 +129,9 @@ The nightly `long-inputs` job (`fuzz.yml`) fuzzes the three Receive-path
 parsers (`fuzz_soap_parse`, `fuzz_soap_enumerate`, `fuzz_clixml_stderr`) with
 inputs up to 2 MiB (the default `max_response_bytes`) and a 10 s per-input
 timeout, so a superlinear parse shows up as a timeout. Turn every input it
-reports into a time-bounded unit test next to
-`extract_element_text_is_linear_on_unclosed_tags`, then fix the parser.
+reports into a time-bounded unit test next to `many_elements_are_read_once`
+(`src/soap/parser/tests.rs`) or `decode_entities_is_linear_on_ampersand_runs`
+(`src/soap/clixml/tests.rs`), then fix the parser.
 
 To reproduce locally, one target at a time:
 

@@ -1,17 +1,185 @@
+use std::time::{Duration, Instant};
+
 use super::*;
 
-#[test]
-fn fault_reason_control_characters_are_neutralised() {
-    let xml = "<s:Envelope><s:Body><s:Fault><s:Code><s:Value>s:Receiver</s:Value></s:Code>\
-                   <s:Reason><s:Text>Access\x1b]52;c;QUJD\x07 denied\r\nforged</s:Text></s:Reason>\
-                   </s:Fault></s:Body></s:Envelope>";
-    match check_soap_fault(xml).unwrap_err() {
-        SoapError::Fault { code, reason } => {
-            assert_eq!(code, "s:Receiver");
-            assert_eq!(reason, r"Access\u{1b}]52;c;QUJD\u{7} denied forged");
-        }
+/// The code and the reason of the fault `xml` is.
+fn fault_of(xml: &str) -> (String, String) {
+    match check_soap_fault(xml) {
+        Err(SoapError::Fault { code, reason }) => (code, reason),
         other => panic!("expected a fault, got {other:?}"),
     }
+}
+
+/// Why `result` is a [`SoapError::ParseError`].
+fn parse_error<T: std::fmt::Debug>(result: Result<T, SoapError>) -> String {
+    match result {
+        Err(SoapError::ParseError(why)) => why,
+        other => panic!("expected a parse error, got {other:?}"),
+    }
+}
+
+fn envelope(body: &str) -> String {
+    format!("<s:Envelope><s:Header/><s:Body>{body}</s:Body></s:Envelope>")
+}
+
+// --- Real answers, captured on the bench: Windows Server 2012 R2 and 2025 ---
+
+const RECEIVE_2025: &str = include_str!("fixtures/2025-receive.xml");
+
+/// Windows Server 2025: one stream of each kind, then the two empty ones
+/// that end them, then the state of the command with its exit code.
+#[test]
+fn real_receive_answer_of_server_2025_gives_both_streams() {
+    let output = parse_receive_output(RECEIVE_2025).unwrap();
+    assert_eq!(output.stdout, b"out\r\n");
+    assert_eq!(output.stderr, b"err \r\n");
+    assert_eq!(output.exit_code, Some(3));
+    assert!(output.done);
+    assert!(check_soap_fault(RECEIVE_2025).is_ok());
+    assert_eq!(
+        relates_to(RECEIVE_2025).as_deref(),
+        Some("uuid:603D8F3C-C393-40A3-B380-7BF7BE1EDCBB")
+    );
+}
+
+const CREATE: &str = include_str!("fixtures/2012r2-create.xml");
+const COMMAND: &str = include_str!("fixtures/2012r2-command.xml");
+const RECEIVE: &str = include_str!("fixtures/2012r2-receive.xml");
+const DELETE: &str = include_str!("fixtures/2012r2-delete.xml");
+const ENUMERATE: &str = include_str!("fixtures/2012r2-enumerate.xml");
+const FAULT_TIMED_OUT: &str = include_str!("fixtures/2012r2-fault-timed-out.xml");
+const FAULT_NO_SUCH_SHELL: &str = include_str!("fixtures/2012r2-fault-no-such-shell.xml");
+const FAULT_WQL_INVALID_CLASS: &str = include_str!("fixtures/2012r2-fault-wql-invalid-class.xml");
+const FAULT_WQL_SYNTAX: &str = include_str!("fixtures/2012r2-fault-wql-syntax.xml");
+
+/// The Create answer also carries the id as the text of a `Selector` named
+/// `ShellId`, which is not a `ShellId` element.
+#[test]
+fn real_create_answer_gives_the_shell_id() {
+    assert_eq!(
+        parse_shell_id(CREATE).unwrap(),
+        "58F7AF4D-A043-430F-A413-EDB178650682"
+    );
+}
+
+#[test]
+fn real_command_answer_gives_the_command_id() {
+    assert_eq!(
+        parse_command_id(COMMAND).unwrap(),
+        "2343A29B-52F7-4F3A-95AD-1AED87026DE5"
+    );
+}
+
+/// Two stderr streams, two empty streams that end stdout and stderr, and
+/// the exit code inside the command state.
+#[test]
+fn real_receive_answer_gives_the_streams_and_the_exit_code() {
+    let output = parse_receive_output_raw(RECEIVE).unwrap();
+    assert_eq!(output.stdout, b"");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "The syntax of the command is incorrect.\r\nerr  \r\n"
+    );
+    assert_eq!(output.exit_code, Some(3));
+    assert!(output.done);
+}
+
+#[test]
+fn real_enumerate_answer_gives_the_items_and_ends() {
+    let (items, context) = parse_enumerate_response(ENUMERATE).unwrap();
+    assert!(items.starts_with("<w:XmlFragment "), "{items}");
+    assert!(items.ends_with("</Version></w:XmlFragment>"), "{items}");
+    assert!(
+        items.contains("<Caption>Microsoft Windows Server 2012 R2 Standard Evaluation</Caption>")
+    );
+    // An empty EnumerationContext, then EndOfSequence.
+    assert_eq!(context, None);
+}
+
+#[test]
+fn real_answers_that_are_not_faults_have_none() {
+    for xml in [CREATE, COMMAND, RECEIVE, DELETE, ENUMERATE] {
+        assert!(check_soap_fault(xml).is_ok(), "{xml}");
+    }
+    // The Delete answer has an empty Body.
+    assert!(matches!(
+        parse_shell_id(DELETE),
+        Err(SoapError::MissingElement(_))
+    ));
+}
+
+#[test]
+fn real_timed_out_fault_is_the_timed_out_fault() {
+    let (code, reason) = fault_of(FAULT_TIMED_OUT);
+    assert_eq!(code, "w:TimedOut");
+    assert_eq!(
+        reason,
+        "The WS-Management service cannot complete the operation within the time specified \
+         in OperationTimeout."
+    );
+    let err = parse_receive_output_raw(FAULT_TIMED_OUT)
+        .err()
+        .expect("a fault");
+    assert!(is_timed_out_fault(&err));
+}
+
+/// The SOAP reason only says that the selectors are invalid; the message of
+/// the detail says which shell is missing.
+#[test]
+fn real_fault_reason_is_the_message_of_its_detail() {
+    let (code, reason) = fault_of(FAULT_NO_SUCH_SHELL);
+    assert_eq!(code, "w:InvalidSelectors");
+    assert!(
+        reason.starts_with(
+            "The request for the Windows Remote Shell with ShellId \
+             60023D4D-6257-4C14-8934-8578EBCA6C59 failed because the shell was not found"
+        ),
+        "{reason}"
+    );
+}
+
+/// The message of the detail holds a provider fault, which holds the fault
+/// and the message of the WMI plugin.
+#[test]
+fn real_fault_with_a_provider_fault_gives_the_innermost_message() {
+    let (code, reason) = fault_of(FAULT_WQL_SYNTAX);
+    assert_eq!(code, "n:CannotProcessFilter");
+    assert_eq!(
+        reason,
+        "The WS-Management service cannot process the request. The WQL query is invalid."
+    );
+}
+
+/// No `WSManFault` here: the detail is a WMI error, whose `Message` has
+/// attributes and whose `MessageID` is one of its properties.
+#[test]
+fn real_fault_with_a_wmi_error_gives_its_message() {
+    let (code, reason) = fault_of(FAULT_WQL_INVALID_CLASS);
+    assert_eq!(code, "n:CannotProcessFilter");
+    assert_eq!(
+        reason,
+        "The specified class does not exist in the given namespace."
+    );
+    assert!(matches!(
+        parse_enumerate_response(FAULT_WQL_INVALID_CLASS),
+        Err(SoapError::Fault { .. })
+    ));
+    assert_eq!(
+        message_id(FAULT_WQL_INVALID_CLASS).as_deref(),
+        Some("uuid:8A30462E-B684-443E-881F-647A892F6AD0")
+    );
+}
+
+#[test]
+fn real_answers_name_the_request_they_answer() {
+    assert_eq!(
+        relates_to(CREATE).as_deref(),
+        Some("uuid:D61CE4C9-A995-40A8-9541-6CFCE9E54763")
+    );
+    assert_eq!(
+        message_id(CREATE).as_deref(),
+        Some("uuid:DEA8E642-1BB9-4815-A552-60D91B9F6F40")
+    );
 }
 
 // --- RelatesTo binding of a response to its request ---
@@ -48,6 +216,23 @@ fn a_request_without_message_id_binds_nothing_and_is_refused() {
     );
 }
 
+/// Only a child of the header names the request: the same element in the
+/// body, where a server puts data, does not.
+#[test]
+fn relates_to_outside_the_header_is_not_read() {
+    for response in [
+        "<s:Envelope><s:Header/><s:Body><a:RelatesTo>uuid:0a1B2c3D-0000-4000-8000-00000000abcd</a:RelatesTo></s:Body></s:Envelope>",
+        "<s:Envelope><s:Header><x><a:RelatesTo>uuid:0a1B2c3D-0000-4000-8000-00000000abcd</a:RelatesTo></x></s:Header></s:Envelope>",
+        "<a:RelatesTo>uuid:0a1B2c3D-0000-4000-8000-00000000abcd</a:RelatesTo>",
+    ] {
+        assert_eq!(relates_to(response), None, "{response}");
+        assert!(check_relates_to(REQ, response).is_err(), "{response}");
+    }
+    // The first one that has text, when the header has several.
+    let response = "<s:Envelope><s:Header><a:RelatesTo> </a:RelatesTo><a:RelatesTo>one</a:RelatesTo><a:RelatesTo>two</a:RelatesTo></s:Header></s:Envelope>";
+    assert_eq!(relates_to(response).as_deref(), Some("one"));
+}
+
 /// Every request the crate builds carries a `MessageID` (the Kerberos
 /// sealed path refuses one without).
 #[test]
@@ -71,13 +256,14 @@ fn built_requests_carry_a_message_id() {
     }
 }
 
+// --- Shell and command ids ---
+
 #[test]
 fn parse_shell_id_from_response() {
     let xml = r"<s:Envelope><s:Body><rsp:Shell>
             <rsp:ShellId>ABC-DEF-123</rsp:ShellId>
         </rsp:Shell></s:Body></s:Envelope>";
-    let id = parse_shell_id(xml).unwrap();
-    assert_eq!(id, "ABC-DEF-123");
+    assert_eq!(parse_shell_id(xml).unwrap(), "ABC-DEF-123");
 }
 
 #[test]
@@ -85,9 +271,62 @@ fn parse_command_id_from_response() {
     let xml = r"<s:Envelope><s:Body><rsp:CommandResponse>
             <rsp:CommandId>CMD-456</rsp:CommandId>
         </rsp:CommandResponse></s:Body></s:Envelope>";
-    let id = parse_command_id(xml).unwrap();
-    assert_eq!(id, "CMD-456");
+    assert_eq!(parse_command_id(xml).unwrap(), "CMD-456");
 }
+
+/// Whatever the prefix, or none, and with or without attributes.
+#[test]
+fn an_id_is_found_by_its_local_name() {
+    for xml in [
+        "<rsp:CommandId>VAL</rsp:CommandId>",
+        "<CommandId>VAL</CommandId>",
+        "<x:CommandId xmlns:x='urn:x' a=\"1\">VAL</x:CommandId>",
+        "<Root><CommandId>  VAL\n</CommandId></Root>",
+    ] {
+        assert_eq!(parse_command_id(xml).unwrap(), "VAL", "{xml}");
+    }
+    // A name that only ends or starts the same is another element.
+    for xml in [
+        "<rsp:CommandIdx>VAL</rsp:CommandIdx>",
+        "<rsp:xCommandId>VAL</rsp:xCommandId>",
+        "<rsp:commandid>VAL</rsp:commandid>",
+        "<x CommandId=\"VAL\"/>",
+        "<x>CommandId>VAL&lt;/CommandId></x>",
+    ] {
+        assert!(
+            matches!(parse_command_id(xml), Err(SoapError::MissingElement(_))),
+            "{xml}"
+        );
+    }
+}
+
+#[test]
+fn an_id_is_the_first_one_that_has_text() {
+    let xml = "<r><rsp:ShellId></rsp:ShellId><rsp:ShellId/><rsp:ShellId> </rsp:ShellId>\
+               <rsp:ShellId>FOUND</rsp:ShellId><rsp:ShellId>LATER</rsp:ShellId></r>";
+    assert_eq!(parse_shell_id(xml).unwrap(), "FOUND");
+    assert!(matches!(
+        parse_shell_id("<rsp:ShellId></rsp:ShellId>"),
+        Err(SoapError::MissingElement(_))
+    ));
+}
+
+/// The text of an element is what it holds itself, not what the elements
+/// inside it hold.
+#[test]
+fn an_id_is_the_text_of_the_element_itself() {
+    let xml = "<rsp:ShellId>AB<x>no</x>C<!-- no -->D<![CDATA[E]]>&#70;</rsp:ShellId>";
+    assert_eq!(parse_shell_id(xml).unwrap(), "ABCDEF");
+}
+
+#[test]
+fn parse_command_id_missing_returns_missing_element() {
+    let xml = r"<s:Envelope><s:Body><something/></s:Body></s:Envelope>";
+    let err = parse_command_id(xml).unwrap_err();
+    assert!(matches!(err, SoapError::MissingElement(_)));
+}
+
+// --- Receive ---
 
 #[test]
 fn parse_receive_output_with_streams() {
@@ -122,133 +361,6 @@ fn parse_receive_output_not_done() {
 }
 
 #[test]
-fn detect_soap_fault() {
-    let xml = r"<s:Envelope><s:Body><s:Fault>
-            <s:Code><s:Value>s:Receiver</s:Value></s:Code>
-            <s:Reason><s:Text>Access denied</s:Text></s:Reason>
-        </s:Fault></s:Body></s:Envelope>";
-
-    let result = check_soap_fault(xml);
-    assert!(result.is_err());
-    let err = result.unwrap_err();
-    match err {
-        SoapError::Fault { code, reason } => {
-            assert_eq!(code, "s:Receiver");
-            assert_eq!(reason, "Access denied");
-        }
-        _ => panic!("expected SoapFault"),
-    }
-}
-
-#[test]
-fn extract_attribute_works() {
-    let tag = r#"<rsp:Stream Name="stdout" CommandId="C1""#;
-    assert_eq!(extract_attribute(tag, "Name"), Some("stdout".into()));
-    assert_eq!(extract_attribute(tag, "CommandId"), Some("C1".into()));
-    assert_eq!(extract_attribute(tag, "Missing"), None);
-}
-
-#[test]
-fn parse_receive_output_with_soap_fault() {
-    let xml = r"<s:Envelope><s:Body>
-            <s:Fault>
-                <s:Code><s:Value>s:Sender</s:Value></s:Code>
-                <s:Reason><s:Text>Invalid input</s:Text></s:Reason>
-            </s:Fault>
-        </s:Body></s:Envelope>";
-    let result = parse_receive_output(xml);
-    assert!(result.is_err());
-}
-
-#[test]
-fn check_soap_fault_no_fault() {
-    let xml = r"<s:Envelope><s:Body><Data>ok</Data></s:Body></s:Envelope>";
-    assert!(check_soap_fault(xml).is_ok());
-}
-
-#[test]
-fn extract_element_text_closing_tag_first() {
-    // Test where closing tag appears before opening tag
-    let xml = r"</rsp:ShellId><rsp:ShellId>ABC</rsp:ShellId>";
-    let result = parse_shell_id(xml).unwrap();
-    assert_eq!(result, "ABC");
-}
-
-#[test]
-fn extract_element_text_empty_content() {
-    let xml = r"<rsp:ShellId></rsp:ShellId>";
-    assert!(parse_shell_id(xml).is_err());
-}
-
-#[test]
-fn extract_streams_empty_stream() {
-    // Stream with empty content should be skipped
-    let xml = r#"<rsp:Stream Name="stdout" CommandId="C1"></rsp:Stream>"#;
-    let streams = extract_streams(xml);
-    assert!(streams.is_empty());
-}
-
-#[test]
-fn parse_receive_output_non_base64_stream() {
-    let xml = r#"<s:Envelope><s:Body><rsp:ReceiveResponse>
-            <rsp:Stream Name="stdout" CommandId="C1">!!!not-base64!!!</rsp:Stream>
-        </rsp:ReceiveResponse></s:Body></s:Envelope>"#;
-    let result = parse_receive_output(xml);
-    assert!(result.is_err());
-}
-
-#[test]
-fn soap_error_display() {
-    let e = SoapError::MissingElement("ShellId".into());
-    assert_eq!(format!("{e}"), "missing element: ShellId");
-
-    let e = SoapError::ParseError("bad data".into());
-    assert_eq!(format!("{e}"), "parse error: bad data");
-
-    let e = SoapError::Fault {
-        code: "s:Sender".into(),
-        reason: "bad".into(),
-    };
-    assert_eq!(format!("{e}"), "SOAP fault [s:Sender]: bad");
-}
-
-#[test]
-fn extract_streams_bare_tag() {
-    // Test with bare <Stream> (no namespace prefix)
-    let xml = r#"<Stream Name="stdout">aGVsbG8=</Stream>"#;
-    let streams = extract_streams(xml);
-    assert_eq!(streams.len(), 1);
-    assert_eq!(streams[0].0, "stdout");
-}
-
-#[test]
-fn detect_soap_fault_with_legacy_tags() {
-    let xml = r"<Fault><faultcode>s:Client</faultcode><faultstring>oops</faultstring></Fault>";
-    let result = check_soap_fault(xml);
-    assert!(result.is_err());
-}
-
-#[test]
-fn extract_streams_bare_before_namespaced() {
-    // Both <Stream and <rsp:Stream in same XML, bare tag appears first.
-    let xml =
-        r#"<Stream Name="stdout">aGVsbG8=</Stream><rsp:Stream Name="stderr">ZXJy</rsp:Stream>"#;
-    let streams = extract_streams(xml);
-    assert_eq!(streams.len(), 2);
-    assert_eq!(streams[0].0, "stdout");
-    assert_eq!(streams[1].0, "stderr");
-}
-
-#[test]
-fn extract_streams_namespaced_before_bare_close() {
-    // <rsp:Stream> with content closed by </Stream> (bare close appearing before </rsp:Stream>)
-    let xml = r#"<rsp:Stream Name="stdout">dGVzdA==</Stream></rsp:Stream>"#;
-    let streams = extract_streams(xml);
-    assert_eq!(streams.len(), 1);
-    assert_eq!(streams[0].0, "stdout");
-}
-
-#[test]
 fn parse_receive_output_no_exit_code() {
     let xml = r#"<s:Envelope><s:Body><rsp:ReceiveResponse>
             <rsp:CommandState CommandId="C1" State="http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Done"/>
@@ -259,34 +371,8 @@ fn parse_receive_output_no_exit_code() {
     assert!(output.stdout.is_empty());
 }
 
-// --- Mutant-killing tests ---
-
-#[test]
-fn extract_element_text_skips_empty_finds_second() {
-    let xml = r"<rsp:ShellId></rsp:ShellId><rsp:ShellId>FOUND</rsp:ShellId>";
-    assert_eq!(parse_shell_id(xml).unwrap(), "FOUND");
-}
-
-#[test]
-fn extract_element_bare_element() {
-    let xml = r"<ShellId>BARE-ID</ShellId>";
-    assert_eq!(parse_shell_id(xml).unwrap(), "BARE-ID");
-}
-
-#[test]
-fn parse_receive_output_multiple_stdout_chunks() {
-    // "hel" = aGVs, "lo" = bG8=
-    let xml = r#"<s:Envelope><s:Body><rsp:ReceiveResponse>
-            <rsp:Stream Name="stdout" CommandId="C1">aGVs</rsp:Stream>
-            <rsp:Stream Name="stdout" CommandId="C1">bG8=</rsp:Stream>
-            <rsp:CommandState CommandId="C1" State="http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Done">
-                <rsp:ExitCode>0</rsp:ExitCode>
-            </rsp:CommandState>
-        </rsp:ReceiveResponse></s:Body></s:Envelope>"#;
-    let output = parse_receive_output(xml).unwrap();
-    assert_eq!(output.stdout, b"hello");
-}
-
+/// The streams of one answer are joined in document order, each to its own
+/// output.
 #[test]
 fn parse_receive_output_interleaved_streams() {
     // "AB" = QUI=, "err" = ZXJy, "CD" = Q0Q=
@@ -304,44 +390,74 @@ fn parse_receive_output_interleaved_streams() {
     assert_eq!(output.exit_code, Some(1));
 }
 
+/// The name of a stream is its `Name` attribute, wherever it is among the
+/// others and whichever quote it uses.
 #[test]
-fn extract_element_text_multiple_closing_before_opening() {
-    let xml = r"</rsp:CommandId></rsp:CommandId><rsp:CommandId>REAL-CMD</rsp:CommandId>";
-    assert_eq!(parse_command_id(xml).unwrap(), "REAL-CMD");
+fn stream_names_are_read_as_attributes() {
+    // "hi" = aGk=, "!" = IQ==, "err" = ZXJy, "ignored" = aWdub3JlZA==
+    let xml = r#"<rsp:ReceiveResponse>
+            <rsp:Stream CommandId="C1" Name='stdout'>aGk=</rsp:Stream>
+            <rsp:Stream xName="stdout" a:Name="stdout" Name="stderr" End="true">ZXJy</rsp:Stream>
+            <Stream Name="stdout">
+                IQ==
+            </Stream>
+            <rsp:Stream>aWdub3JlZA==</rsp:Stream>
+            <rsp:Stream Name="pr">aWdub3JlZA==</rsp:Stream>
+            <rsp:Stream Name="std&#111;ut">IQ==</rsp:Stream>
+        </rsp:ReceiveResponse>"#;
+    let output = parse_receive_output_raw(xml).unwrap();
+    assert_eq!(output.stdout, b"hi!!");
+    assert_eq!(output.stderr, b"err");
 }
 
 #[test]
-fn extract_streams_three_sequential() {
-    // "A" = QQ==, "B" = Qg==, "C" = Qw==
-    let xml = r#"<s:Envelope><s:Body><rsp:ReceiveResponse>
-            <rsp:Stream Name="stdout" CommandId="C1">QQ==</rsp:Stream>
-            <rsp:Stream Name="stderr" CommandId="C1">Qg==</rsp:Stream>
-            <rsp:Stream Name="stdout" CommandId="C1">Qw==</rsp:Stream>
-            <rsp:CommandState CommandId="C1" State="http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Done">
-                <rsp:ExitCode>0</rsp:ExitCode>
-            </rsp:CommandState>
-        </rsp:ReceiveResponse></s:Body></s:Envelope>"#;
-    let output = parse_receive_output(xml).unwrap();
-    assert_eq!(output.stdout, b"AC");
-    assert_eq!(output.stderr, b"B");
+fn a_stream_without_text_is_skipped() {
+    let xml = r#"<rsp:ReceiveResponse><rsp:Stream Name="stdout" End="true"></rsp:Stream>
+            <rsp:Stream Name="stdout"/><rsp:Stream Name="stderr">
+            </rsp:Stream></rsp:ReceiveResponse>"#;
+    let output = parse_receive_output_raw(xml).unwrap();
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+}
+
+/// A stream that is not base64 fails the answer, whatever its name.
+#[test]
+fn a_stream_that_is_not_base64_is_refused() {
+    for name in ["stdout", "stderr", "pr"] {
+        let xml = format!(
+            r#"<s:Envelope><s:Body><rsp:ReceiveResponse>
+            <rsp:Stream Name="{name}" CommandId="C1">!!!not-base64!!!</rsp:Stream>
+        </rsp:ReceiveResponse></s:Body></s:Envelope>"#
+        );
+        let why = parse_error(parse_receive_output(&xml).map(|output| output.stdout));
+        assert!(why.starts_with("base64 decode"), "{why}");
+    }
+}
+
+/// The command is done when a `CommandState` says so in its `State`: the
+/// same URI anywhere else says nothing.
+#[test]
+fn done_is_read_from_the_state_of_the_command_state() {
+    let running = format!(
+        r#"<rsp:ReceiveResponse><rsp:Note>{COMMAND_STATE_DONE}</rsp:Note>
+        <rsp:Stream Name="stdout" State="{COMMAND_STATE_DONE}">aGk=</rsp:Stream>
+        <rsp:CommandState CommandId="{COMMAND_STATE_DONE}"
+            State="http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Running"/>
+        </rsp:ReceiveResponse>"#
+    );
+    assert!(!parse_receive_output_raw(&running).unwrap().done);
+
+    let done = format!(
+        "<rsp:ReceiveResponse><rsp:CommandState State='{COMMAND_STATE_DONE}'/></rsp:ReceiveResponse>"
+    );
+    assert!(parse_receive_output_raw(&done).unwrap().done);
 }
 
 #[test]
-fn extract_element_text_trims_whitespace() {
-    let xml = r"<rsp:ShellId>  TRIMMED  </rsp:ShellId>";
-    assert_eq!(parse_shell_id(xml).unwrap(), "TRIMMED");
-}
-
-#[test]
-fn parse_receive_output_negative_exit_code() {
-    let xml = r#"<s:Envelope><s:Body><rsp:ReceiveResponse>
-            <rsp:CommandState CommandId="C1" State="http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Done">
-                <rsp:ExitCode>-1</rsp:ExitCode>
-            </rsp:CommandState>
-        </rsp:ReceiveResponse></s:Body></s:Envelope>"#;
-    let output = parse_receive_output(xml).unwrap();
-    assert!(output.done);
-    assert_eq!(output.exit_code, Some(-1));
+fn exit_code_is_the_first_one_that_has_text() {
+    let xml = "<rsp:CommandState><rsp:ExitCode></rsp:ExitCode><rsp:ExitCode> -7 </rsp:ExitCode>\
+               <rsp:ExitCode>9</rsp:ExitCode></rsp:CommandState>";
+    assert_eq!(parse_receive_output_raw(xml).unwrap().exit_code, Some(-7));
 }
 
 #[test]
@@ -374,125 +490,18 @@ fn unparseable_exit_code_is_logged_as_a_bounded_excerpt() {
 }
 
 #[test]
-fn extract_element_text_at_end_of_string() {
-    let xml = "<rsp:CommandId>VAL</rsp:CommandId>";
-    assert_eq!(parse_command_id(xml).unwrap(), "VAL");
-}
-
-#[test]
-fn extract_element_bare_at_start_of_string() {
-    let xml = "<CommandId>START-ID</CommandId>";
-    assert_eq!(parse_command_id(xml).unwrap(), "START-ID");
-}
-
-#[test]
-fn extract_element_bare_with_prefix_text() {
-    let xml = "X<ShellId>OFFSET-ID</ShellId>";
-    assert_eq!(parse_shell_id(xml).unwrap(), "OFFSET-ID");
-}
-
-#[test]
-fn extract_streams_at_end_of_string() {
-    // "ok" = b2s=
-    let xml = r#"<rsp:Stream Name="stdout" CommandId="C1">b2s=</rsp:Stream>"#;
-    let streams = extract_streams(xml);
-    assert_eq!(streams.len(), 1);
-    assert_eq!(streams[0].0, "stdout");
-}
-
-#[test]
-fn extract_streams_rsp_before_bare_picks_first() {
-    // "A" = QQ==, "B" = Qg==
-    let xml = r#"<rsp:Stream Name="stdout">QQ==</rsp:Stream> <Stream Name="stderr">Qg==</Stream>"#;
-    let streams = extract_streams(xml);
-    assert_eq!(streams.len(), 2);
-    assert_eq!(streams[0].0, "stdout");
-    assert_eq!(streams[0].1, "QQ==");
-    assert_eq!(streams[1].0, "stderr");
-    assert_eq!(streams[1].1, "Qg==");
-}
-
-#[test]
-fn extract_streams_close_tag_ordering() {
-    // "X" = WA==
-    let xml = r#"<rsp:Stream Name="stdout">WA==</Stream>extra</rsp:Stream>"#;
-    let streams = extract_streams(xml);
-    assert_eq!(streams.len(), 1);
-    assert_eq!(streams[0].1, "WA==");
-}
-
-#[test]
-fn extract_streams_adjacent_streams_search_from_advance() {
-    // "X" = WA==, "Y" = WQ==
-    let xml =
-        r#"<rsp:Stream Name="stdout">WA==</rsp:Stream><rsp:Stream Name="stderr">WQ==</rsp:Stream>"#;
-    let streams = extract_streams(xml);
-    assert_eq!(streams.len(), 2, "both adjacent streams must be found");
-    assert_eq!(streams[0].0, "stdout");
-    assert_eq!(streams[0].1, "WA==");
-    assert_eq!(streams[1].0, "stderr");
-    assert_eq!(streams[1].1, "WQ==");
-}
-
-#[test]
-fn extract_streams_three_adjacent_with_content() {
-    // "A" = QQ==, "B" = Qg==, "C" = Qw==
-    let xml = r#"<rsp:Stream Name="stdout">QQ==</rsp:Stream><rsp:Stream Name="stderr">Qg==</rsp:Stream><rsp:Stream Name="stdout">Qw==</rsp:Stream>"#;
-    let streams = extract_streams(xml);
-    assert_eq!(streams.len(), 3, "all three adjacent streams must be found");
-    assert_eq!(streams[0].1, "QQ==");
-    assert_eq!(streams[1].1, "Qg==");
-    assert_eq!(streams[2].1, "Qw==");
-}
-
-#[test]
-fn extract_element_text_empty_then_filled_tight() {
-    let xml = "<rsp:ShellId></rsp:ShellId><rsp:ShellId>OK</rsp:ShellId>";
-    assert_eq!(parse_shell_id(xml).unwrap(), "OK");
-}
-
-#[test]
-fn parse_receive_output_stream_at_xml_end() {
-    // "Z" = Wg==
-    let xml = r#"<s:Envelope><s:Body><rsp:ReceiveResponse><rsp:Stream Name="stdout" CommandId="C1">Wg==</rsp:Stream><rsp:CommandState CommandId="C1" State="http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Done"><rsp:ExitCode>0</rsp:ExitCode></rsp:CommandState></rsp:ReceiveResponse></s:Body></s:Envelope>"#;
-    let output = parse_receive_output(xml).unwrap();
-    assert_eq!(output.stdout, b"Z");
-    assert_eq!(output.exit_code, Some(0));
-    assert!(output.done);
-}
-
-// --- Phase 8 tests ---
-
-#[test]
-fn extract_streams_long_content_with_second_stream() {
-    let long_b64 = "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB"; // 40 chars
-    let xml = format!(
-        r#"<rsp:Stream Name="stdout">{long_b64}</rsp:Stream><rsp:Stream Name="stderr">ZXJy</rsp:Stream>"#
-    );
-    let streams = extract_streams(&xml);
-    assert_eq!(streams.len(), 2, "must find both streams with long content");
-    assert_eq!(streams[0].0, "stdout");
-    assert_eq!(streams[0].1, long_b64);
-    assert_eq!(streams[1].0, "stderr");
-    assert_eq!(streams[1].1, "ZXJy");
-}
-
-#[test]
 fn parse_receive_output_long_stdout_with_stderr() {
-    let long_b64 = "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB";
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as B64;
+
+    let long = "x".repeat(100_000);
     let xml = format!(
-        r#"<s:Envelope><s:Body><rsp:ReceiveResponse>
-                <rsp:Stream Name="stdout" CommandId="C1">{long_b64}</rsp:Stream>
-                <rsp:Stream Name="stderr" CommandId="C1">ZXJy</rsp:Stream>
-                <rsp:CommandState CommandId="C1" State="http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Done">
-                    <rsp:ExitCode>0</rsp:ExitCode>
-                </rsp:CommandState>
-            </rsp:ReceiveResponse></s:Body></s:Envelope>"#
+        r#"<rsp:ReceiveResponse><rsp:Stream Name="stdout">{}</rsp:Stream><rsp:Stream Name="stderr">ZXJy</rsp:Stream></rsp:ReceiveResponse>"#,
+        B64.encode(&long)
     );
     let output = parse_receive_output(&xml).unwrap();
-    assert_eq!(output.stdout.len(), 30, "should decode 30 bytes of stdout");
-    assert_eq!(output.stderr, b"err", "should decode stderr correctly");
-    assert_eq!(output.exit_code, Some(0));
+    assert_eq!(output.stdout, long.as_bytes());
+    assert_eq!(output.stderr, b"err");
 }
 
 #[test]
@@ -530,171 +539,53 @@ fn parse_receive_output_clixml_split_across_streams_of_one_response() {
     );
 }
 
-// Kills extract_subcode_value returning None
 #[test]
-fn extract_subcode_from_soap_fault() {
-    let xml = r"<s:Fault>
-            <s:Code><s:Value>s:Sender</s:Value>
-            <s:Subcode><s:Value>wsa:DestinationUnreachable</s:Value></s:Subcode></s:Code>
-            <s:Reason><s:Text>no route</s:Text></s:Reason></s:Fault>";
-    let val = extract_subcode_value(xml);
-    assert_eq!(val.as_deref(), Some("wsa:DestinationUnreachable"));
+fn parse_receive_output_with_soap_fault() {
+    let xml = r"<s:Envelope><s:Body>
+            <s:Fault>
+                <s:Code><s:Value>s:Sender</s:Value></s:Code>
+                <s:Reason><s:Text>Invalid input</s:Text></s:Reason>
+            </s:Fault>
+        </s:Body></s:Envelope>";
+    assert!(matches!(
+        parse_receive_output(xml).map(|output| output.done),
+        Err(SoapError::Fault { .. })
+    ));
 }
 
-// Kills extract_element_text:180 — < → <= on search_from
+/// What a fault holds is the fault's: a stream in its detail is not output,
+/// and is not even checked.
 #[test]
-fn extract_element_text_exact_boundary() {
-    // Element at the very end of the string
-    let xml = "<Root><Name>val</Name></Root>";
-    assert_eq!(extract_element_text(xml, "Name").as_deref(), Some("val"));
+fn a_stream_inside_a_fault_is_not_read() {
+    let xml = envelope(
+        r#"<s:Fault><s:Code><s:Value>s:Sender</s:Value></s:Code><s:Detail>
+           <rsp:Stream Name="stdout">!!!</rsp:Stream><rsp:ExitCode>1</rsp:ExitCode>
+           </s:Detail></s:Fault>"#,
+    );
+    assert!(matches!(
+        parse_receive_output_raw(&xml).map(|output| output.done),
+        Err(SoapError::Fault { .. })
+    ));
 }
 
-// Kills extract_streams:227 — < → <= on search_from
-#[test]
-fn extract_streams_at_string_boundary() {
-    // Streams that extend to the end of the XML
-    let xml = r#"<rsp:Stream Name="stdout">YWJD</rsp:Stream>"#;
-    let streams = extract_streams(xml);
-    assert_eq!(streams.len(), 1);
-    assert_eq!(streams[0].0, "stdout");
-    assert_eq!(streams[0].1, "YWJD");
-}
-
-// Tests parse_enumerate_response with and without continuation context
-#[test]
-fn parse_enumerate_response_with_items_and_end() {
-    let xml = r#"<s:Envelope xmlns:wsen="http://schemas.xmlsoap.org/ws/2004/09/enumeration">
-            <s:Body><wsen:EnumerateResponse>
-                <wsen:Items><data>hello</data></wsen:Items>
-                <wsen:EndOfSequence/>
-            </wsen:EnumerateResponse></s:Body></s:Envelope>"#;
-    let (items, context) = parse_enumerate_response(xml).unwrap();
-    assert!(items.contains("hello"));
-    assert!(context.is_none(), "EndOfSequence means no continuation");
-}
+// --- Faults ---
 
 #[test]
-fn parse_enumerate_response_with_continuation() {
-    let xml = r#"<s:Envelope xmlns:wsen="http://schemas.xmlsoap.org/ws/2004/09/enumeration">
-            <s:Body><wsen:EnumerateResponse>
-                <wsen:Items><data>page1</data></wsen:Items>
-                <wsen:EnumerationContext>ctx-123</wsen:EnumerationContext>
-            </wsen:EnumerateResponse></s:Body></s:Envelope>"#;
-    let (items, context) = parse_enumerate_response(xml).unwrap();
-    assert!(items.contains("page1"));
-    assert_eq!(context.as_deref(), Some("ctx-123"));
-}
-
-#[test]
-fn parse_command_id_missing_returns_missing_element() {
-    let xml = r"<s:Envelope><s:Body><something/></s:Body></s:Envelope>";
-    let err = parse_command_id(xml).unwrap_err();
-    assert!(matches!(err, SoapError::MissingElement(_)));
-}
-
-#[test]
-fn extract_soap_fault_falls_back_to_faultstring() {
-    // Older SOAP 1.1 style fault uses <faultcode>/<faultstring>.
+fn detect_soap_fault() {
     let xml = r"<s:Envelope><s:Body><s:Fault>
-            <faultcode>soap:Server</faultcode>
-            <faultstring>old style</faultstring>
+            <s:Code><s:Value>s:Receiver</s:Value></s:Code>
+            <s:Reason><s:Text>Access denied</s:Text></s:Reason>
         </s:Fault></s:Body></s:Envelope>";
-    let fault = extract_soap_fault(xml).expect("fault parsed");
-    match fault {
-        SoapError::Fault { code, reason } => {
-            assert_eq!(code, "soap:Server");
-            assert_eq!(reason, "old style");
-        }
-        _ => panic!("expected Fault variant"),
-    }
-}
-
-#[test]
-fn extract_soap_fault_returns_none_when_absent() {
-    let xml = "<s:Envelope><s:Body><something/></s:Body></s:Envelope>";
-    assert!(extract_soap_fault(xml).is_none());
-}
-
-#[test]
-fn extract_subcode_value_empty_returns_none() {
-    // Subcode element exists but Value is empty.
-    let xml = r"<s:Subcode><s:Value></s:Value></s:Subcode>";
-    assert!(extract_subcode_value(xml).is_none());
-}
-
-#[test]
-fn parse_enumerate_response_handles_empty_items() {
-    let xml = r#"<s:Envelope xmlns:wsen="http://schemas.xmlsoap.org/ws/2004/09/enumeration">
-            <s:Body><wsen:EnumerateResponse>
-                <wsen:EndOfSequence/>
-            </wsen:EnumerateResponse></s:Body></s:Envelope>"#;
-    let (items, context) = parse_enumerate_response(xml).unwrap();
-    assert!(items.is_empty(), "no <Items> tag should yield empty");
-    assert!(context.is_none());
-}
-
-fn enumerate_page(items: &str, trailer: &str) -> String {
-    format!(
-        "<s:Envelope><s:Body><wsen:EnumerateResponse>\
-             <wsen:EnumerationContext>ctx-1</wsen:EnumerationContext>\
-             <w:Items>{items}</w:Items>{trailer}</wsen:EnumerateResponse></s:Body></s:Envelope>"
-    )
-}
-
-#[test]
-fn enumerate_item_text_mentioning_end_of_sequence_keeps_the_context() {
-    let xml = enumerate_page(
-        "<p:Win32_Process><p:CommandLine>rem EndOfSequence</p:CommandLine></p:Win32_Process>",
-        "",
-    );
-    let (items, context) = parse_enumerate_response(&xml).unwrap();
-    assert!(items.contains("rem EndOfSequence"));
-    assert_eq!(context.as_deref(), Some("ctx-1"));
-}
-
-#[test]
-fn enumerate_end_of_sequence_element_forms_end_the_enumeration() {
-    for trailer in [
-        "<wsen:EndOfSequence/>",
-        "<w:EndOfSequence />",
-        "<wsman:EndOfSequence></wsman:EndOfSequence>",
-        "<EndOfSequence/>",
-        "<n:EndOfSequence\n/>",
-    ] {
-        let (_, context) = parse_enumerate_response(&enumerate_page("<p:X/>", trailer)).unwrap();
-        assert_eq!(context, None, "{trailer}");
-    }
-    // Before the items, too.
-    let xml = "<s:Envelope><s:Body><n:PullResponse><n:EnumerationContext>ctx-1</n:EnumerationContext>\
-                   <n:EndOfSequence/><n:Items><p:X/></n:Items></n:PullResponse></s:Body></s:Envelope>";
-    assert_eq!(parse_enumerate_response(xml).unwrap().1, None);
-}
-
-#[test]
-fn enumerate_end_of_sequence_property_inside_items_is_ignored() {
-    let xml = enumerate_page(
-        "<p:Win32_X><p:EndOfSequence>1</p:EndOfSequence>\
-             <p:EnumerationContext>forged</p:EnumerationContext></p:Win32_X>",
-        "",
-    );
     assert_eq!(
-        parse_enumerate_response(&xml).unwrap().1.as_deref(),
-        Some("ctx-1")
+        fault_of(xml),
+        ("s:Receiver".to_string(), "Access denied".to_string())
     );
 }
 
 #[test]
-fn fault_text_inside_items_is_not_a_fault() {
-    let xml = enumerate_page(
-        "<p:Win32_Process><p:CommandLine>x a:Fault> y s:Fault&gt; &lt;s:Fault&gt;\
-             </p:CommandLine><p:Fault>1</p:Fault></p:Win32_Process>",
-        "",
-    );
-    assert!(check_soap_fault(&xml).is_ok());
-    assert_eq!(
-        parse_enumerate_response(&xml).unwrap().1.as_deref(),
-        Some("ctx-1")
-    );
+fn check_soap_fault_no_fault() {
+    let xml = r"<s:Envelope><s:Body><Data>ok</Data></s:Body></s:Envelope>";
+    assert!(check_soap_fault(xml).is_ok());
 }
 
 #[test]
@@ -705,54 +596,237 @@ fn fault_as_first_child_of_body_is_detected() {
         format!("<s:Envelope><s:Body><s:Fault>{body}</s:Fault></s:Body></s:Envelope>"),
         format!("<s:Envelope><s:Body>\n  <s:Fault>{body}</s:Fault></s:Body></s:Envelope>"),
         format!(
+            "<s:Envelope><s:Header><x/></s:Header><s:Body><s:Fault>{body}</s:Fault></s:Body></s:Envelope>"
+        ),
+        format!(
             "<s:Envelope><s:Body xmlns:s=\"urn:s\"><s:Fault xmlns:f=\"urn:f\">{body}</s:Fault></s:Body></s:Envelope>"
         ),
         format!(
             "<soap:Envelope><soap:Body><soap:Fault>{body}</soap:Fault></soap:Body></soap:Envelope>"
         ),
         format!("<Envelope><Body><Fault>{body}</Fault></Body></Envelope>"),
+        // A document that is the body alone, or the fault alone.
+        format!("<s:Body><s:Fault>{body}</s:Fault></s:Body>"),
+        format!("<s:Fault>{body}</s:Fault>"),
     ] {
-        assert!(check_soap_fault(&xml).is_err(), "{xml}");
+        assert_eq!(
+            fault_of(&xml),
+            ("s:Receiver".to_string(), "x".to_string()),
+            "{xml}"
+        );
     }
-    // Not the first child of Body, or an empty Body: not a fault (SOAP 1.2 Part 1 §5.4).
-    assert!(
-        check_soap_fault(&format!(
-            "<s:Envelope><s:Body><x/><s:Fault>{body}</s:Fault></s:Body></s:Envelope>"
-        ))
-        .is_ok()
-    );
-    assert!(check_soap_fault("<s:Envelope><s:Body/><s:Fault/></s:Envelope>").is_ok());
 }
 
+/// A `Fault` element is the fault only as the first child of the first Body
+/// (SOAP 1.2 Part 1 §5.4). Anywhere else it is data.
 #[test]
-fn items_span_needs_a_closing_tag() {
-    assert_eq!(items_span("a<w:Items>x</w:Items>b"), Some(1..21));
-    assert_eq!(items_span("a<w:Items>x"), None);
-    assert_eq!(items_span("</w:Items><w:Items>x"), None);
-}
-
-/// The span ends at the `>` of the closing tag itself, never at a later one.
-#[test]
-fn items_span_ends_at_the_closing_tags_own_gt() {
-    assert_eq!(items_span("<w:Items>x</w:Items \n>b"), Some(0..22));
-    assert_eq!(items_span("<w:Items>x</w:Items <w:EndOfSequence/>"), None);
-    let xml = "<s:Body><n:EnumerationContext>c</n:EnumerationContext>\
-                   <n:Items>x</n:Items <n:EndOfSequence/>";
-    assert_eq!(parse_enumerate_response(xml).unwrap().1, None);
-}
-
-/// A tag-shaped check that walked back to the nearest `<` would be quadratic here.
-#[test]
-fn element_tags_is_linear() {
-    use std::time::{Duration, Instant};
-    for (shape, xml) in [
-        ("after >", format!("<a {}", "x:Fault>".repeat(130_000))),
-        ("after space", format!("<a {}", "x:Fault ".repeat(130_000))),
+fn a_fault_element_elsewhere_is_not_a_fault() {
+    let fault = "<s:Fault><s:Code><s:Value>s:Receiver</s:Value></s:Code></s:Fault>";
+    for xml in [
+        format!("<s:Envelope><s:Body><x/>{fault}</s:Body></s:Envelope>"),
+        format!("<s:Envelope><s:Body><x>{fault}</x></s:Body></s:Envelope>"),
+        format!("<s:Envelope><s:Body/>{fault}</s:Envelope>"),
+        format!("<s:Envelope><s:Body></s:Body><s:Body>{fault}</s:Body></s:Envelope>"),
+        format!("<s:Envelope><s:Header>{fault}</s:Header><s:Body><x/></s:Body></s:Envelope>"),
+        format!("<s:Envelope><x><s:Body>{fault}</s:Body></x></s:Envelope>"),
+        format!("<s:Envelope></s:Envelope>{fault}"),
+        format!("<html><s:Body>{fault}</s:Body></html>"),
+        format!("<x/>{fault}"),
+        // XML names are case-sensitive.
+        "<s:Envelope><s:Body><s:fault/></s:Body></s:Envelope>".to_string(),
+        // Text that mentions a fault.
+        envelope("<x>a:Fault> s:Fault&gt; &lt;s:Fault&gt; <![CDATA[<s:Fault>]]></x>"),
     ] {
-        let started = Instant::now();
-        assert!(check_soap_fault(&xml).is_ok(), "{shape}");
-        assert!(!has_element(&xml, "Fault"), "{shape}");
-        assert!(started.elapsed() < Duration::from_secs(5), "{shape}");
+        assert!(check_soap_fault(&xml).is_ok(), "{xml}");
+    }
+}
+
+#[test]
+fn fault_code_is_the_subcode_then_the_code() {
+    let fault = |code: &str| envelope(&format!("<s:Fault>{code}</s:Fault>"));
+    assert_eq!(
+        fault_of(&fault(
+            "<s:Code><s:Value>s:Sender</s:Value><s:Subcode><s:Value>wsa:DestinationUnreachable</s:Value>\
+             <s:Subcode><s:Value>x:Deeper</s:Value></s:Subcode></s:Subcode></s:Code>"
+        ))
+        .0,
+        "wsa:DestinationUnreachable"
+    );
+    // The subcode comes first in the document, or has no text.
+    assert_eq!(
+        fault_of(&fault(
+            "<s:Code><s:Subcode><s:Value>w:TimedOut</s:Value></s:Subcode><s:Value>s:Receiver</s:Value></s:Code>"
+        ))
+        .0,
+        "w:TimedOut"
+    );
+    assert_eq!(
+        fault_of(&fault(
+            "<s:Code><s:Value>s:Receiver</s:Value><s:Subcode><s:Value></s:Value></s:Subcode></s:Code>"
+        ))
+        .0,
+        "s:Receiver"
+    );
+    // SOAP 1.1.
+    assert_eq!(
+        fault_of(&fault(
+            "<faultcode>soap:Server</faultcode><faultstring>old style</faultstring>"
+        )),
+        ("soap:Server".to_string(), "old style".to_string())
+    );
+    assert_eq!(
+        fault_of("<Fault><faultcode>s:Client</faultcode><faultstring>oops</faultstring></Fault>"),
+        ("s:Client".to_string(), "oops".to_string())
+    );
+    // Neither.
+    assert_eq!(
+        fault_of(&fault("")),
+        ("unknown".to_string(), "SOAP fault".to_string())
+    );
+}
+
+/// The code and the reason are read at their own places. Elements with the
+/// same names in the detail, where a provider writes what it wants, are not
+/// them.
+#[test]
+fn fault_code_and_reason_are_read_at_their_places() {
+    let xml = envelope(
+        r#"<s:Fault><s:Code><s:Value>s:Sender</s:Value></s:Code>
+        <s:Reason><s:Text xml:lang="">  </s:Text><s:Text xml:lang="en-US">the reason</s:Text>
+        <s:Text xml:lang="fr-FR">la raison</s:Text></s:Reason>
+        <s:Detail><p:Error><p:Value>not the code</p:Value><p:Subcode><p:Value>nor this</p:Value></p:Subcode>
+        <p:Text>not the reason</p:Text><p:faultstring>nor this</p:faultstring></p:Error></s:Detail>
+        <x:Value>stray</x:Value><x:Text>stray</x:Text></s:Fault>"#,
+    );
+    assert_eq!(
+        fault_of(&xml),
+        ("s:Sender".to_string(), "the reason".to_string())
+    );
+}
+
+/// The message of the detail is the reason when there is one: the first
+/// `Message` or `ProviderFault` that holds text itself.
+#[test]
+fn fault_reason_is_the_first_message_of_the_detail_that_has_text() {
+    let fault = |detail: &str| {
+        envelope(&format!(
+            "<s:Fault><s:Reason><s:Text>general</s:Text></s:Reason><s:Detail>{detail}</s:Detail></s:Fault>"
+        ))
+    };
+    for (detail, reason) in [
+        (
+            "<f:WSManFault Code=\"5\"><f:Message>specific</f:Message></f:WSManFault>",
+            "specific",
+        ),
+        // A provider fault that holds its text itself.
+        (
+            "<f:WSManFault><f:Message><f:ProviderFault provider=\"Shell cmd plugin\">\
+             The parameter is incorrect. </f:ProviderFault></f:Message></f:WSManFault>",
+            "The parameter is incorrect.",
+        ),
+        // Text around the provider fault comes first.
+        (
+            "<f:WSManFault><f:Message>outer <f:ProviderFault>inner</f:ProviderFault> tail\
+             </f:Message></f:WSManFault>",
+            "outer",
+        ),
+        (
+            "<f:WSManFault><f:Message> </f:Message><f:Message>second</f:Message></f:WSManFault>",
+            "second",
+        ),
+        // No message that has text: the SOAP reason.
+        (
+            "<f:WSManFault Code=\"5\"><f:Message/></f:WSManFault>",
+            "general",
+        ),
+        (
+            "<w:FaultDetail>http://schemas.dmtf.org/wbem/wsman/1/wsman/faultDetail/Invalid</w:FaultDetail>",
+            "general",
+        ),
+        ("", "general"),
+    ] {
+        assert_eq!(fault_of(&fault(detail)).1, reason, "{detail}");
+    }
+}
+
+#[test]
+fn fault_text_has_its_references_resolved() {
+    let xml = envelope(
+        "<s:Fault><s:Reason><s:Text>a &lt;b&gt; &amp; &quot;c&quot; &apos;d&apos; &#65;&#x42;\
+         <![CDATA[<raw> &amp;]]></s:Text></s:Reason></s:Fault>",
+    );
+    assert_eq!(fault_of(&xml).1, "a <b> & \"c\" 'd' AB<raw> &amp;");
+}
+
+#[test]
+fn fault_reason_control_characters_are_neutralised() {
+    let xml = "<s:Envelope><s:Body><s:Fault><s:Code><s:Value>s:Receiver</s:Value></s:Code>\
+                   <s:Reason><s:Text>Access\x1b]52;c;QUJD\x07 denied\r\nforged&#x1b;[0m</s:Text></s:Reason>\
+                   </s:Fault></s:Body></s:Envelope>";
+    assert_eq!(
+        fault_of(xml),
+        (
+            "s:Receiver".to_string(),
+            r"Access\u{1b}]52;c;QUJD\u{7} denied forged\u{1b}[0m".to_string()
+        )
+    );
+}
+
+/// A server-supplied fault code and reason are bounded before they reach
+/// an error message.
+#[test]
+fn fault_code_and_reason_are_bounded() {
+    let xml = format!(
+        "<s:Envelope><s:Body><s:Fault><s:Code><s:Value>s:Receiver</s:Value>\
+             <s:Subcode><s:Value>w:{}</s:Value></s:Subcode></s:Code>\
+             <s:Reason><s:Text>{}</s:Text></s:Reason></s:Fault></s:Body></s:Envelope>",
+        "C".repeat(1000),
+        "R".repeat(5000)
+    );
+    let (code, reason) = fault_of(&xml);
+    assert!(code.chars().count() < 300, "code: {} chars", code.len());
+    assert!(code.ends_with("[1002 bytes in total]"), "{code}");
+    assert!(
+        reason.chars().count() < 2100,
+        "reason: {} chars",
+        reason.len()
+    );
+    assert!(reason.ends_with("[5000 bytes in total]"));
+}
+
+/// A fault whose end is missing is a fault all the same, with what was read
+/// of it, for every parser.
+#[test]
+fn a_fault_cut_short_is_still_a_fault() {
+    let xml = "<s:Envelope><s:Body><s:Fault><s:Code><s:Value>s:Receiver</s:Value>\
+               <s:Subcode><s:Value>w:TimedOut</s:Value></s:Subcode></s:Code><s:Reason><s:Text>cut";
+    assert_eq!(
+        fault_of(xml),
+        ("w:TimedOut".to_string(), "SOAP fault".to_string())
+    );
+    let err = parse_receive_output_raw(xml).err().expect("a fault");
+    assert!(is_timed_out_fault(&err));
+    assert!(matches!(
+        parse_enumerate_response(xml),
+        Err(SoapError::Fault { .. })
+    ));
+}
+
+/// The body of an HTTP error is often not XML at all: it has no fault, and
+/// looking for one is not an error.
+#[test]
+fn a_body_that_is_not_xml_has_no_fault() {
+    for body in [
+        "",
+        "plain text",
+        "<html><body><h1>502 Bad Gateway</h1><br></body></html>",
+        "<<<>>>",
+        "\u{feff}",
+        "<s:Envelope><s:Body></s:Fault>",
+        "<s:Envelope><s:Body>&nbsp;<s:Fault>",
+        "<!DOCTYPE html><html></html>",
+    ] {
+        assert!(check_soap_fault(body).is_ok(), "{body}");
     }
 }
 
@@ -811,281 +885,590 @@ fn timed_out_fault_is_found_in_a_parsed_server_fault() {
     assert!(!is_timed_out_fault(&err));
 }
 
-/// A server-supplied fault code and reason are bounded before they reach
-/// an error message.
 #[test]
-fn fault_code_and_reason_are_bounded() {
-    let xml = format!(
-        "<s:Envelope><s:Body><s:Fault><s:Code><s:Value>s:Receiver</s:Value>\
-             <s:Subcode><s:Value>w:{}</s:Value></s:Subcode></s:Code>\
-             <s:Reason><s:Text>{}</s:Text></s:Reason></s:Fault></s:Body></s:Envelope>",
-        "C".repeat(1000),
-        "R".repeat(5000)
+fn soap_error_display() {
+    let e = SoapError::MissingElement("ShellId".into());
+    assert_eq!(format!("{e}"), "missing element: ShellId");
+
+    let e = SoapError::ParseError("bad data".into());
+    assert_eq!(format!("{e}"), "parse error: bad data");
+
+    let e = SoapError::Fault {
+        code: "s:Sender".into(),
+        reason: "bad".into(),
+    };
+    assert_eq!(format!("{e}"), "SOAP fault [s:Sender]: bad");
+}
+
+// --- Enumerate and Pull ---
+
+#[test]
+fn parse_enumerate_response_with_items_and_end() {
+    let xml = r#"<s:Envelope xmlns:wsen="http://schemas.xmlsoap.org/ws/2004/09/enumeration">
+            <s:Body><wsen:EnumerateResponse>
+                <wsen:Items><data>hello</data></wsen:Items>
+                <wsen:EndOfSequence/>
+            </wsen:EnumerateResponse></s:Body></s:Envelope>"#;
+    let (items, context) = parse_enumerate_response(xml).unwrap();
+    assert_eq!(items, "<data>hello</data>");
+    assert!(context.is_none(), "EndOfSequence means no continuation");
+}
+
+#[test]
+fn parse_enumerate_response_with_continuation() {
+    let xml = r#"<s:Envelope xmlns:wsen="http://schemas.xmlsoap.org/ws/2004/09/enumeration">
+            <s:Body><wsen:EnumerateResponse>
+                <wsen:Items><data>page1</data></wsen:Items>
+                <wsen:EnumerationContext>ctx-123</wsen:EnumerationContext>
+            </wsen:EnumerateResponse></s:Body></s:Envelope>"#;
+    let (items, context) = parse_enumerate_response(xml).unwrap();
+    assert_eq!(items, "<data>page1</data>");
+    assert_eq!(context.as_deref(), Some("ctx-123"));
+}
+
+#[test]
+fn parse_enumerate_response_handles_empty_items() {
+    let xml = r#"<s:Envelope xmlns:wsen="http://schemas.xmlsoap.org/ws/2004/09/enumeration">
+            <s:Body><wsen:EnumerateResponse>
+                <wsen:EndOfSequence/>
+            </wsen:EnumerateResponse></s:Body></s:Envelope>"#;
+    let (items, context) = parse_enumerate_response(xml).unwrap();
+    assert!(items.is_empty(), "no <Items> tag should yield empty");
+    assert!(context.is_none());
+}
+
+fn enumerate_page(items: &str, trailer: &str) -> String {
+    format!(
+        "<s:Envelope><s:Body><wsen:EnumerateResponse>\
+             <wsen:EnumerationContext>ctx-1</wsen:EnumerationContext>\
+             <w:Items>{items}</w:Items>{trailer}</wsen:EnumerateResponse></s:Body></s:Envelope>"
+    )
+}
+
+/// The items are what the server wrote between the tags: nothing in them is
+/// resolved, and an `Items` element of their own does not end them.
+#[test]
+fn items_are_returned_as_written() {
+    for inner in [
+        "<p:A x='1'>a &amp; b &#65;<![CDATA[<c>]]></p:A><!-- note --><?pi?>",
+        "<w:Items><w:Items>x</w:Items></w:Items><w:Items/>",
+        "<n:Items>other prefix</n:Items>",
+        "text only",
+    ] {
+        let (items, context) = parse_enumerate_response(&enumerate_page(inner, "")).unwrap();
+        assert_eq!(items, inner);
+        assert_eq!(context.as_deref(), Some("ctx-1"));
+    }
+    // Trimmed, and the first that have content.
+    let xml =
+        "<r><w:Items> </w:Items><w:Items/><w:Items>\n <a/> \n</w:Items><w:Items><b/></w:Items></r>";
+    assert_eq!(parse_enumerate_response(xml).unwrap().0, "<a/>");
+}
+
+#[test]
+fn enumerate_item_text_mentioning_end_of_sequence_keeps_the_context() {
+    let xml = enumerate_page(
+        "<p:Win32_Process><p:CommandLine>rem EndOfSequence</p:CommandLine></p:Win32_Process>",
+        "",
     );
-    match check_soap_fault(&xml).unwrap_err() {
-        SoapError::Fault { code, reason } => {
-            assert!(code.chars().count() < 300, "code: {} chars", code.len());
-            assert!(code.ends_with("[1002 bytes in total]"), "{code}");
-            assert!(
-                reason.chars().count() < 2100,
-                "reason: {} chars",
-                reason.len()
-            );
-            assert!(reason.ends_with("[5000 bytes in total]"));
-        }
-        other => panic!("expected a fault, got {other:?}"),
-    }
+    let (items, context) = parse_enumerate_response(&xml).unwrap();
+    assert!(items.contains("rem EndOfSequence"));
+    assert_eq!(context.as_deref(), Some("ctx-1"));
 }
 
-// --- extract_element_text stays linear on unclosed tags ---
-
-/// Pads `unit` repeated `count` times to about 1 MiB with filler text
-/// between the tags.
-fn one_mib_of(count: usize, unit: impl Fn(usize) -> String) -> String {
-    const MIB: usize = 1 << 20;
-    let mut xml = String::with_capacity(MIB + 64);
-    for i in 0..count {
-        let tag = unit(i);
-        xml.push_str(&tag);
-        let pad = (MIB / count).saturating_sub(tag.len());
-        xml.extend(std::iter::repeat_n('x', pad));
-    }
-    xml
-}
-
-/// 20 000 opening tags without a closing tag in 1 MiB: every shape that
-/// used to rescan the rest of the document per tag (distinct prefixes,
-/// one prefix, bare tags, many `:ShellId>` behind a single `<`) finishes
-/// in linear time. The bound is loose on purpose (the quadratic version
-/// took over 20 s in a debug build); a linear scan takes milliseconds.
 #[test]
-fn extract_element_text_is_linear_on_unclosed_tags() {
-    let shapes: [(&str, String); 4] = [
-        (
-            "distinct prefixes",
-            one_mib_of(20_000, |i| format!("<p{i}:ShellId>")),
-        ),
-        (
-            "one prefix",
-            one_mib_of(20_000, |_| "<rsp:ShellId>".to_string()),
-        ),
-        ("bare tags", one_mib_of(20_000, |_| "<ShellId>".to_string())),
-        (
-            "one '<' for every tag",
-            format!("<{}", one_mib_of(20_000, |_| "a:ShellId>".to_string())),
-        ),
-    ];
-    for (shape, xml) in &shapes {
-        let started = std::time::Instant::now();
-        assert_eq!(extract_element_text(xml, "ShellId"), None, "{shape}");
-        let took = started.elapsed();
-        assert!(
-            took < std::time::Duration::from_secs(5),
-            "{shape}: {took:?} for {} bytes",
-            xml.len()
-        );
+fn enumerate_end_of_sequence_element_forms_end_the_enumeration() {
+    for trailer in [
+        "<wsen:EndOfSequence/>",
+        "<w:EndOfSequence />",
+        "<wsman:EndOfSequence></wsman:EndOfSequence>",
+        "<EndOfSequence/>",
+        "<n:EndOfSequence\n/>",
+    ] {
+        let (_, context) = parse_enumerate_response(&enumerate_page("<p:X/>", trailer)).unwrap();
+        assert_eq!(context, None, "{trailer}");
     }
+    // Before the items, too.
+    let xml = "<s:Envelope><s:Body><n:PullResponse><n:EnumerationContext>ctx-1</n:EnumerationContext>\
+                   <n:EndOfSequence/><n:Items><p:X/></n:Items></n:PullResponse></s:Body></s:Envelope>";
+    assert_eq!(parse_enumerate_response(xml).unwrap().1, None);
 }
 
-/// The quadratic implementation this module used before, kept verbatim
-/// as the reference for the differential test below.
-fn reference_extract_element_text(xml: &str, element: &str) -> Option<String> {
-    let suffixed = format!(":{element}>");
-    let bare_open = format!("<{element}>");
-    let mut search_from = 0;
-    while search_from < xml.len() {
-        let region = &xml[search_from..];
-        let (tag_content_start, ns_prefix) = if let Some(pos) = region.find(&suffixed) {
-            let abs_pos = search_from + pos;
-            let before = &xml[..abs_pos];
-            let lt = before.rfind('<')?;
-            if xml[lt..].starts_with("</") {
-                search_from = abs_pos + suffixed.len();
-                continue;
-            }
-            let prefix = &xml[lt + 1..abs_pos];
-            (abs_pos + suffixed.len(), Some(prefix.to_string()))
-        } else {
-            let pos = region.find(&bare_open)?;
-            (search_from + pos + bare_open.len(), None)
-        };
-        let close_tag = match &ns_prefix {
-            Some(p) => format!("</{p}:{element}>"),
-            None => format!("</{element}>"),
-        };
-        if let Some(end) = xml[tag_content_start..].find(&close_tag) {
-            let text = xml[tag_content_start..tag_content_start + end].trim();
-            if !text.is_empty() {
-                return Some(text.to_string());
-            }
-        }
-        search_from = tag_content_start;
-    }
-    None
-}
-
-/// Whether some `:X>` has a `>` between it and the nearest `<` before
-/// it: the one shape where the linear version deliberately differs (it
-/// skips such a match instead of looking for a closing tag that
-/// contains `>` in its prefix).
-fn has_gt_inside_a_prefix(xml: &str) -> bool {
-    let mut from = 0;
-    while let Some(pos) = xml[from..].find(":X>") {
-        let at = from + pos;
-        if let Some(lt) = xml[..at].rfind('<')
-            && xml[lt..at].contains('>')
-        {
-            return true;
-        }
-        from = at + 3;
-    }
-    false
-}
-
-proptest::proptest! {
-    /// The linear version returns what the quadratic one returned on
-    /// every document built from tag-shaped fragments.
-    #[test]
-    fn extract_element_text_matches_the_reference(
-        parts in proptest::collection::vec(
-            proptest::sample::select(vec![
-                "<a:X>", "</a:X>", "<b:X>", "</b:X>", "<:X>", "</:X>", "<X>",
-                "</X>", "<a:Y>", "</a:Y>", "<", "</", "a", "v", " ", "\n",
-                ":X", ">", "x:X>", "é",
-            ]),
-            0..24,
-        )
-    ) {
-        let xml: String = parts.concat();
-        let linear = extract_element_text(&xml, "X");
-        if has_gt_inside_a_prefix(&xml) {
-            return Ok(());
-        }
-        proptest::prop_assert_eq!(
-            linear,
-            reference_extract_element_text(&xml, "X"),
-            "{:?}", xml
-        );
-    }
-}
-
-/// Each element used to rescan the rest of the body for the spelling
-/// (`<rsp:Stream ` / `<Stream `, `</rsp:Stream>` / `</Stream>`) it does not
-/// use. About 2 MiB, the default `max_response_bytes`.
 #[test]
-fn extract_streams_is_linear_when_one_spelling_is_absent() {
-    use std::time::{Duration, Instant};
-    let shapes: [(&str, String, usize); 3] = [
-        ("prefixed", "<rsp:Stream ></rsp:Stream>".repeat(80_660), 0),
-        ("bare", "<Stream ></Stream>".repeat(116_500), 0),
-        (
-            "prefixed open, bare close",
-            "<rsp:Stream >x</Stream>".repeat(80_000),
-            80_000,
-        ),
-    ];
-    for (shape, xml, expected) in &shapes {
-        let started = Instant::now();
-        assert_eq!(extract_streams(xml).len(), *expected, "{shape}");
-        let took = started.elapsed();
-        assert!(took < Duration::from_secs(5), "{shape}: {took:?}");
-    }
-    // The whole Receive path, on the first shape (empty streams decode to nothing).
-    let started = Instant::now();
-    let out = parse_receive_output_raw(&shapes[0].1).unwrap();
-    assert!(out.stdout.is_empty() && out.stderr.is_empty() && !out.done);
-    assert!(started.elapsed() < Duration::from_secs(5));
-}
-
-/// The implementation this module used before, kept verbatim as the
-/// reference for the differential test below.
-fn reference_extract_streams(xml: &str) -> Vec<(String, String)> {
-    let mut streams = Vec::new();
-    let mut search_from = 0;
-
-    let stream_tags = ["<rsp:Stream ", "<Stream "];
-
-    while search_from < xml.len() {
-        let found = stream_tags
-            .iter()
-            .filter_map(|tag| {
-                xml[search_from..]
-                    .find(tag)
-                    .map(|pos| (search_from + pos, *tag))
-            })
-            .min_by_key(|(pos, _)| *pos);
-
-        let Some((tag_start, _)) = found else {
-            break;
-        };
-
-        let tag_region = &xml[tag_start..];
-
-        let Some(tag_end) = tag_region.find('>') else {
-            break;
-        };
-        let opening_tag = &tag_region[..tag_end];
-
-        let name = extract_attribute(opening_tag, "Name").unwrap_or_default();
-
-        let content_start = tag_start + tag_end + 1;
-
-        let close_tags = ["</rsp:Stream>", "</Stream>"];
-        let close_pos = close_tags
-            .iter()
-            .filter_map(|close| xml[content_start..].find(close))
-            .min();
-
-        if let Some(end_offset) = close_pos {
-            let content = &xml[content_start..content_start + end_offset];
-            if !content.trim_ascii().is_empty() {
-                streams.push((name, content.to_string()));
-            }
-            search_from = content_start + end_offset + 1;
-        } else {
-            break;
-        }
-    }
-
-    streams
-}
-
-proptest::proptest! {
-    #[test]
-    fn extract_streams_matches_the_reference(
-        parts in proptest::collection::vec(
-            proptest::sample::select(vec![
-                "<rsp:Stream ", "<Stream ", "</rsp:Stream>", "</Stream>",
-                "Name=\"stdout\"", "Name=\"stderr\"", ">", "QQ==", " ", "<", "é",
-            ]),
-            0..24,
-        )
-    ) {
-        let xml: String = parts.concat();
-        proptest::prop_assert_eq!(
-            extract_streams(&xml),
-            reference_extract_streams(&xml),
-            "{:?}", xml
-        );
-    }
-}
-
-/// The same documents with one real element at the very end still
-/// yield its text.
-#[test]
-fn extract_element_text_finds_the_element_after_many_unclosed_tags() {
-    let mut xml = one_mib_of(20_000, |i| format!("<p{i}:ShellId>"));
-    xml.push_str("<rsp:ShellId>LAST</rsp:ShellId>");
+fn enumerate_end_of_sequence_property_inside_items_is_ignored() {
+    let xml = enumerate_page(
+        "<p:Win32_X><p:EndOfSequence>1</p:EndOfSequence>\
+             <p:EnumerationContext>forged</p:EnumerationContext></p:Win32_X>",
+        "",
+    );
     assert_eq!(
-        extract_element_text(&xml, "ShellId").as_deref(),
-        Some("LAST")
+        parse_enumerate_response(&xml).unwrap().1.as_deref(),
+        Some("ctx-1")
     );
-    let mut bare = one_mib_of(20_000, |_| "<ShellId>".to_string());
-    bare.push_str("</ShellId>");
-    // The last bare opening tag is closed but empty, the previous ones
-    // enclose filler text up to that closing tag.
-    assert!(
-        extract_element_text(&bare, "ShellId").is_some_and(|t| t.starts_with('x')),
-        "bare"
+}
+
+#[test]
+fn fault_text_inside_items_is_not_a_fault() {
+    let xml = enumerate_page(
+        "<p:Win32_Process><p:CommandLine>x a:Fault> y s:Fault&gt; &lt;s:Fault&gt;\
+             </p:CommandLine><p:Fault>1</p:Fault></p:Win32_Process>",
+        "",
     );
+    assert!(check_soap_fault(&xml).is_ok());
+    assert_eq!(
+        parse_enumerate_response(&xml).unwrap().1.as_deref(),
+        Some("ctx-1")
+    );
+}
+
+/// The context is the first one that has text.
+#[test]
+fn enumeration_context_is_the_first_one_that_has_text() {
+    let xml = "<n:PullResponse><n:EnumerationContext></n:EnumerationContext>\
+               <n:EnumerationContext> one </n:EnumerationContext>\
+               <n:EnumerationContext>two</n:EnumerationContext></n:PullResponse>";
+    assert_eq!(
+        parse_enumerate_response(xml).unwrap().1.as_deref(),
+        Some("one")
+    );
+}
+
+// --- What a response may hold ---
+
+/// A response that stops being XML is refused, and not read as far as it
+/// went.
+#[test]
+fn a_response_that_is_not_well_formed_is_refused() {
+    for xml in [
+        "<a><rsp:ShellId>X</a>",
+        "<a>",
+        "<a><b></b>",
+        "</a>",
+        "<a></b>",
+        "<a",
+        "<a><!-- ",
+        "<a><![CDATA[x",
+        "<a>&</a>",
+        "<a>&amp</a>",
+        "<a>&nbsp;</a>",
+        "<s:Body><n:EnumerationContext>c</n:EnumerationContext><n:Items>x</n:Items <n:EndOfSequence/>",
+    ] {
+        parse_error(parse_command_id(xml));
+        parse_error(parse_receive_output_raw(xml).map(|output| output.done));
+        parse_error(parse_enumerate_response(xml));
+        assert_eq!(relates_to(xml), None, "{xml}");
+    }
+}
+
+/// An id read before the response stops being XML stands: the walk ends at
+/// the id.
+#[test]
+fn an_id_before_a_malformed_part_is_kept() {
+    assert_eq!(
+        parse_shell_id("<a><rsp:ShellId>X</rsp:ShellId></oops>").unwrap(),
+        "X"
+    );
+    parse_error(parse_shell_id("<a></oops><rsp:ShellId>X</rsp:ShellId>"));
+}
+
+/// SOAP forbids a DTD, and without one a document cannot declare an entity.
+#[test]
+fn a_dtd_is_refused() {
+    let xml = r#"<!DOCTYPE s:Envelope [<!ENTITY id "FORGED">]><s:Envelope><s:Body>
+        <rsp:ShellId>&id;</rsp:ShellId></s:Body></s:Envelope>"#;
+    let why = parse_error(parse_shell_id(xml));
+    assert!(why.contains("DTD"), "{why}");
+    let why = parse_error(parse_shell_id("<rsp:ShellId>a&nbsp;b</rsp:ShellId>"));
+    assert!(why.contains("entity"), "{why}");
+}
+
+/// A character reference that names no character (0, a surrogate, a number
+/// past the last code point) reads as U+FFFD: a server that writes one does
+/// not lose its whole answer.
+#[test]
+fn a_character_reference_to_no_character_is_replaced() {
+    let xml = "<rsp:ShellId>a&#0;b&#xD800;c&#x110000;d&#x41;</rsp:ShellId>";
+    assert_eq!(
+        parse_shell_id(xml).unwrap(),
+        "a\u{fffd}b\u{fffd}c\u{fffd}dA"
+    );
+}
+
+#[test]
+fn declaration_comments_and_instructions_are_skipped() {
+    let xml = "\u{feff}<?xml version=\"1.0\" encoding=\"utf-8\"?><!-- c --><?pi x?>\n\
+               <s:Envelope><s:Body><!-- <rsp:ShellId>NO</rsp:ShellId> -->\
+               <rsp:ShellId>Y<!-- c -->E<?pi?>S</rsp:ShellId></s:Body></s:Envelope><!-- end -->\n";
+    assert_eq!(parse_shell_id(xml).unwrap(), "YES");
+}
+
+/// The items are cut out of the document by offset: a byte order mark the
+/// reader skips must not shift them.
+#[test]
+fn a_byte_order_mark_does_not_shift_the_items() {
+    let xml = format!("\u{feff}{}", enumerate_page("<p:X>1</p:X>", ""));
+    assert_eq!(
+        parse_enumerate_response(&xml).unwrap(),
+        ("<p:X>1</p:X>".to_string(), Some("ctx-1".to_string()))
+    );
+}
+
+/// The error for a malformed response may quote it: bounded, and without
+/// its control characters.
+#[test]
+fn a_malformed_response_error_is_bounded_and_inert() {
+    let name = format!("a\u{1b}[31m{}", "b".repeat(100_000));
+    let why = parse_error(parse_shell_id(&format!("<x></{name}>")));
+    assert!(why.starts_with("malformed XML: "), "{why}");
+    assert!(why.chars().count() < 2200, "{} chars", why.chars().count());
+    assert!(!why.contains('\u{1b}'), "{why}");
+}
+
+// --- Time ---
+
+/// Run `work` and fail if it takes longer than `limit`: a loose bound, for
+/// inputs on which a quadratic pass takes minutes.
+fn within(limit: Duration, work: impl FnOnce()) {
+    let started = Instant::now();
+    work();
+    assert!(started.elapsed() < limit, "took {:?}", started.elapsed());
+}
+
+/// 300 000 levels of nesting: nothing recurses, and a level costs a byte.
+#[test]
+fn deep_nesting_is_read_without_recursion() {
+    let depth = 300_000;
+    let open = "<a>".repeat(depth);
+    let xml = format!(
+        "{open}<rsp:ShellId>DEEP</rsp:ShellId>{}",
+        "</a>".repeat(depth)
+    );
+    within(Duration::from_secs(10), || {
+        assert_eq!(parse_shell_id(&xml).unwrap(), "DEEP");
+        assert!(check_soap_fault(&xml).is_ok());
+        assert!(parse_receive_output_raw(&xml).is_ok());
+        assert!(parse_enumerate_response(&xml).is_ok());
+        // Left open.
+        parse_error(parse_command_id(&open));
+        parse_error(parse_enumerate_response(&open));
+    });
+}
+
+/// 100 000 attributes on the elements whose attributes are read, without
+/// the one that is looked for.
+#[test]
+fn many_attributes_are_read_once() {
+    use std::fmt::Write as _;
+
+    let mut attributes = String::new();
+    for i in 0..100_000 {
+        write!(attributes, " a{i}=\"v\"").unwrap();
+    }
+    let xml = format!(
+        "<rsp:ReceiveResponse><rsp:Stream{attributes}>aGk=</rsp:Stream>\
+         <rsp:CommandState{attributes}/></rsp:ReceiveResponse>"
+    );
+    within(Duration::from_secs(10), || {
+        let output = parse_receive_output_raw(&xml).unwrap();
+        assert!(output.stdout.is_empty());
+        assert!(!output.done);
+    });
+}
+
+/// Many small elements of each kind a parser keeps something of.
+#[test]
+fn many_elements_are_read_once() {
+    let streams = r#"<rsp:Stream Name="stdout">aGk=</rsp:Stream>"#.repeat(50_000);
+    let contexts =
+        "<n:EnumerationContext></n:EnumerationContext><w:Items></w:Items>".repeat(30_000);
+    let ids = "<rsp:ShellId></rsp:ShellId>".repeat(70_000);
+    let unclosed = "<rsp:ShellId>".repeat(100_000);
+    // Tag-shaped text after an unfinished tag.
+    let mentions = format!("<a {}", "x:Fault>".repeat(130_000));
+    within(Duration::from_secs(20), || {
+        let output = parse_receive_output_raw(&format!("<r>{streams}</r>")).unwrap();
+        assert_eq!(output.stdout.len(), 100_000);
+        assert_eq!(
+            parse_enumerate_response(&format!("<r>{contexts}</r>")).unwrap(),
+            (String::new(), None)
+        );
+        assert!(matches!(
+            parse_shell_id(&format!("<r>{ids}</r>")),
+            Err(SoapError::MissingElement(_))
+        ));
+        parse_error(parse_shell_id(&unclosed));
+        assert!(check_soap_fault(&mentions).is_ok());
+        parse_error(parse_shell_id(&mentions));
+    });
+}
+
+// --- What the fuzz targets assert, on documents made of pieces of real ones ---
+
+/// Markup and text a response is made of, to be joined in any order.
+const PIECES: &[&str] = &[
+    "<s:Envelope>",
+    "</s:Envelope>",
+    "<s:Header>",
+    "</s:Header>",
+    "<s:Body>",
+    "</s:Body>",
+    "<s:Fault>",
+    "</s:Fault>",
+    "<s:Code>",
+    "</s:Code>",
+    "<s:Subcode>",
+    "</s:Subcode>",
+    "<s:Value>",
+    "</s:Value>",
+    "<s:Reason>",
+    "</s:Reason>",
+    "<s:Text xml:lang=\"en-US\">",
+    "</s:Text>",
+    "<s:Detail>",
+    "</s:Detail>",
+    "<f:Message>",
+    "</f:Message>",
+    "<a:RelatesTo>",
+    "</a:RelatesTo>",
+    "<rsp:ShellId>",
+    "</rsp:ShellId>",
+    "<rsp:Stream Name=\"stdout\">",
+    "<rsp:Stream Name='stderr' End=\"true\">",
+    "</rsp:Stream>",
+    "<rsp:CommandState State=\"http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Done\">",
+    "</rsp:CommandState>",
+    "<rsp:ExitCode>",
+    "</rsp:ExitCode>",
+    "<w:Items>",
+    "</w:Items>",
+    "<n:EnumerationContext>",
+    "</n:EnumerationContext>",
+    "<n:EndOfSequence/>",
+    "<x>",
+    "</x>",
+    "<x/>",
+    "aGk=",
+    "7",
+    "text",
+    " ",
+    "&amp;",
+    "&lt;",
+    "&#65;",
+    "&",
+    "<",
+    ">",
+    "/",
+    "\"",
+    "<!--",
+    "-->",
+    "<![CDATA[",
+    "]]>",
+    "<?xml version=\"1.0\"?>",
+    "<!DOCTYPE x>",
+    "\u{feff}",
+];
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(4000))]
+
+    /// The invariants of `fuzz_soap_parse` and `fuzz_soap_enumerate`.
+    #[test]
+    fn the_parsers_agree_on_any_document(
+        pieces in proptest::collection::vec(proptest::sample::select(PIECES), 0..48)
+    ) {
+        let xml = pieces.concat();
+        let _ = parse_shell_id(&xml);
+        let _ = parse_command_id(&xml);
+        let _ = relates_to(&xml);
+
+        // A fault is a fault for every parser.
+        if check_soap_fault(&xml).is_err() {
+            proptest::prop_assert!(parse_receive_output(&xml).is_err());
+            proptest::prop_assert!(parse_enumerate_response(&xml).is_err());
+        }
+        if let Ok(output) = parse_receive_output(&xml) {
+            proptest::prop_assert!(output.stdout.len() <= xml.len());
+            proptest::prop_assert!(output.stderr.len() <= 3 * xml.len());
+        }
+        if let Ok((items, _)) = parse_enumerate_response(&xml) {
+            proptest::prop_assert!(items.len() <= xml.len());
+            // An end marker after the document always ends the enumeration.
+            proptest::prop_assert_eq!(
+                parse_enumerate_response(&format!("{xml}<w:EndOfSequence/>")).ok(),
+                Some((items, None))
+            );
+        }
+    }
+}
+
+/// What `fuzz_soap_enumerate` asserts, on each way a document can end: when
+/// a page is read, the same page followed by an end marker gives the same
+/// items and no context.
+#[test]
+fn an_end_marker_after_any_ending_ends_the_enumeration() {
+    let page = enumerate_page("<p:X>1</p:X>", "");
+    let mut read = 0;
+    for tail in [
+        "",
+        " ",
+        "text",
+        ">",
+        "/>",
+        "]]",
+        "]]>",
+        "\u{feff}",
+        "<a/>",
+        "<a></a>",
+        "<!-- c -->",
+        "<?pi?>",
+        "&amp;",
+        "&#65;",
+        "<",
+        "</",
+        "<a",
+        "<a ",
+        "<a b",
+        "<a b=",
+        "<a b=\"",
+        "<a b='c",
+        "<a/",
+        "<a>",
+        "</a>",
+        "&",
+        "&#",
+        "&#x",
+        "&amp",
+        "<?",
+        "<?x",
+        "<!",
+        "<!-",
+        "<!--",
+        "<!-- x -",
+        "<![",
+        "<![CDATA[",
+        "<![CDATA[x]",
+        "<!DOCTYPE",
+        "<!DOCTYPE x>",
+    ] {
+        let xml = format!("{page}{tail}");
+        if let Ok((items, _)) = parse_enumerate_response(&xml) {
+            read += 1;
+            assert_eq!(items, "<p:X>1</p:X>", "{tail:?}");
+            assert_eq!(
+                parse_enumerate_response(&format!("{xml}<w:EndOfSequence/>")).ok(),
+                Some((items, None)),
+                "{tail:?}"
+            );
+        }
+    }
+    // The endings that leave the document well-formed, at least.
+    assert!(read >= 14, "{read} documents read");
+}
+
+/// The start and the end tag of the elements a well-formed document is made
+/// of.
+const ELEMENTS: &[(&str, &str)] = &[
+    ("<s:Envelope>", "</s:Envelope>"),
+    ("<s:Header>", "</s:Header>"),
+    ("<s:Body>", "</s:Body>"),
+    ("<s:Fault>", "</s:Fault>"),
+    ("<s:Code>", "</s:Code>"),
+    ("<s:Subcode>", "</s:Subcode>"),
+    ("<s:Value>", "</s:Value>"),
+    ("<s:Reason>", "</s:Reason>"),
+    ("<s:Text xml:lang=\"en-US\">", "</s:Text>"),
+    ("<s:Detail>", "</s:Detail>"),
+    ("<f:Message>", "</f:Message>"),
+    ("<a:RelatesTo>", "</a:RelatesTo>"),
+    ("<rsp:ShellId>", "</rsp:ShellId>"),
+    ("<rsp:Stream Name=\"stdout\">", "</rsp:Stream>"),
+    ("<rsp:Stream Name='stderr' End=\"true\">", "</rsp:Stream>"),
+    (
+        "<rsp:CommandState State=\"http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Done\">",
+        "</rsp:CommandState>",
+    ),
+    ("<rsp:ExitCode>", "</rsp:ExitCode>"),
+    ("<w:Items>", "</w:Items>"),
+    ("<n:EnumerationContext>", "</n:EnumerationContext>"),
+    ("<x>", "</x>"),
+];
+
+/// What an element holds beside other elements.
+const LEAVES: &[&str] = &[
+    "",
+    "aGk=",
+    "7",
+    "text",
+    " ",
+    "&amp;",
+    "&lt;",
+    "&#65;",
+    "<![CDATA[<x>]]>",
+    "<!-- c -->",
+    "<?pi?>",
+    "<n:EndOfSequence/>",
+    "<x/>",
+];
+
+/// A well-formed document: the elements the parsers read, nested at random.
+fn well_formed() -> impl proptest::strategy::Strategy<Value = String> {
+    use proptest::strategy::Strategy as _;
+
+    let leaf = proptest::sample::select(LEAVES).prop_map(str::to_owned);
+    leaf.prop_recursive(8, 64, 5, |inner| {
+        (
+            proptest::sample::select(ELEMENTS),
+            proptest::collection::vec(inner, 0..5),
+        )
+            .prop_map(|((open, close), children)| format!("{open}{}{close}", children.concat()))
+    })
+}
+
+fn unexpected(error: &SoapError) -> proptest::test_runner::TestCaseError {
+    proptest::test_runner::TestCaseError::fail(format!("{error:?}"))
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(4000))]
+
+    /// A well-formed document is never refused as XML: it is an answer or a
+    /// fault, and it is the same one for every parser.
+    #[test]
+    fn the_parsers_agree_on_a_well_formed_document(xml in well_formed()) {
+        let is_fault = check_soap_fault(&xml).is_err();
+
+        match parse_enumerate_response(&xml) {
+            Ok((items, _)) => {
+                proptest::prop_assert!(!is_fault);
+                proptest::prop_assert!(items.len() <= xml.len());
+                proptest::prop_assert_eq!(
+                    parse_enumerate_response(&format!("{xml}<w:EndOfSequence/>")).ok(),
+                    Some((items, None))
+                );
+            }
+            Err(SoapError::Fault { .. }) => proptest::prop_assert!(is_fault),
+            Err(other) => return Err(unexpected(&other)),
+        }
+
+        match parse_receive_output_raw(&xml) {
+            Ok(output) => {
+                proptest::prop_assert!(!is_fault);
+                proptest::prop_assert!(output.stdout.len() <= xml.len());
+            }
+            Err(SoapError::Fault { .. }) => proptest::prop_assert!(is_fault),
+            // A stream that is not base64, the one thing left to refuse.
+            Err(SoapError::ParseError(why)) => {
+                proptest::prop_assert!(why.starts_with("base64 decode"), "{}", why);
+            }
+            Err(other) => return Err(unexpected(&other)),
+        }
+
+        for id in [parse_shell_id(&xml), parse_command_id(&xml)] {
+            proptest::prop_assert!(
+                matches!(id, Ok(_) | Err(SoapError::MissingElement(_))),
+                "{:?}",
+                id
+            );
+        }
+    }
 }

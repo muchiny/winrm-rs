@@ -86,6 +86,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **A server's SOAP answers are read with an XML parser (`quick-xml`).**
+  They were searched for tag-shaped substrings. An answer is now read in one
+  forward pass, and an element counts by its name and its place in the
+  document: a fault is the first child of the `Body`, with its code and its
+  reason at their places inside it; `MessageID` and `RelatesTo` are children
+  of the `Header`; the elements of an answer (`ShellId`, `CommandId`,
+  `Stream`, `CommandState`, `ExitCode`, `Items`, `EnumerationContext`,
+  `EndOfSequence`) are read outside a fault and outside the `Items` of an
+  enumeration. Prefixes stay free: namespaces are not resolved. What changes:
+  - an answer that is not well-formed XML is refused with
+    `SoapError::ParseError` (`malformed XML: ...`), where it was read as far
+    as the search went: unbalanced or mismatched tags, an answer cut short,
+    an entity XML does not define. An answer with a DTD is refused too. Two
+    cases stay as they were: a `ShellId` or a `CommandId` read before the
+    malformed part stands, and the body of an HTTP error that is not XML is
+    not an error of its own;
+  - text is decoded: character references, the five predefined entities and
+    CDATA sections are resolved, and comments are skipped, in an id, an
+    enumeration context, an exit code, a fault code and a fault reason. An
+    id or a context is escaped again when it goes into the next request, as
+    before. The items of `run_wql` are still returned as the server wrote
+    them;
+  - attributes are read as attributes. A `Stream` is named by its `Name`
+    wherever it stands among the others and whichever quote it uses, and a
+    command is done when a `CommandState` element says so in its `State`,
+    where the URI of the `Done` state anywhere in the answer was enough;
+  - an element with attributes is read like one without (`ShellId`,
+    `ExitCode`, `EnumerationContext`);
+  - what a fault holds is the fault's: a `Stream` in its detail is not
+    output.
+
+  New dependency: `quick-xml` 0.42 without its default features
+  (`#![forbid(unsafe_code)]`; its one dependency, `memchr`, was in the tree
+  already). In `cargo vet` it is an exemption, not an audit. The CLIXML
+  decoder of stderr does not use it and is unchanged.
 - **MSRV raised to 1.100.0** (from 1.99.0). `clippy.toml` and the MSRV job
   follow. CI and the release workflow pin 1.100.0 as well: 1.100 has no
   point release so far. Twelve `map(..).unwrap_or_default()` chains become
@@ -105,9 +140,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   This lockfile only builds this repository.
 - `cargo vet` imports the audits that Mozilla, Google, the Bytecode
   Alliance, Embark Studios, ISRG and Zcash publish (`[imports]` in
-  `supply-chain/config.toml`). An audit now covers 62 of the 268 crate
-  versions of the dependency tree, where each one was an exemption; 206
-  exemptions remain. CI still reads no network: `cargo vet --locked` checks
+  `supply-chain/config.toml`). An audit now covers 62 of the 269 crate
+  versions of the dependency tree, where each one was an exemption; 207
+  exemptions remain (`quick-xml` is one of them). CI still reads no network: `cargo vet --locked` checks
   against `supply-chain/imports.lock`.
 - `release.toml` (`cargo-release`) and `cliff.toml` (`git-cliff`) are
   removed: the release procedure uses neither tool (CONTRIBUTING.md,
@@ -173,6 +208,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `NEGOTIATE_KEY_EXCH` itself. Its branch without a key exchange, where
   the exported key is the session base key, could not be reached (both
   callers set the flag) and is removed. The messages are unchanged.
+
+### Fixed
+
+- **The reason of a fault is the server's message in two cases where it was
+  not.** Windows writes the reason of a fault as
+  `<s:Text xml:lang="en-US">`, which the search never matched (it looked for
+  a tag without attributes), so the reason came from the `Message` of the
+  fault's detail, cut at the first closing tag. A fault whose detail is a
+  WMI error (`run_wql` on a class that does not exist) had the reason
+  `SOAP fault`: it now has the WMI message. A fault whose message wraps a
+  provider fault (`run_wql` with an invalid query) had a reason that began
+  with the markup of that provider fault
+  (`<f:ProviderFault provider="WMI Provider" ...`): it now has the
+  provider's message. The reason is the first message of the fault's detail
+  that has text, else the fault's `Reason`, else a SOAP 1.1 `faultstring`.
+  The faults that read well keep their text (`w:TimedOut`,
+  `w:InvalidSelectors`). The parser's tests now read answers captured from
+  a Windows Server 2012 R2 (`src/soap/parser/fixtures/`).
 
 ### Documentation
 

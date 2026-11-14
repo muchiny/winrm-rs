@@ -13,8 +13,9 @@
 //!
 //! - **`soap`** (internal) -- builds WS-Management XML envelopes for Create,
 //!   Execute, Receive, Signal, and Delete operations, and parses the
-//!   corresponding responses. Envelope construction uses raw `format!` strings
-//!   rather than a full XML library to keep dependencies minimal.
+//!   corresponding responses. Envelopes are written with `format!` and one
+//!   escaping function; responses are read with `quick-xml`, each element
+//!   taken by its name and its place in the document.
 //!
 //! - **`ntlm`** (internal) -- implements the `NTLMv2` challenge/response handshake
 //!   per MS-NLMP and the NTLM message sealing of HTTP traffic. Only `NTLMv2` is

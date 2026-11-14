@@ -1,5 +1,6 @@
 //! The WS-Management response parsers. Everything they see is the remote
-//! host's XML, parsed by hand with string offsets rather than an XML library.
+//! host's XML: one forward pass with `quick-xml` (`src/soap/xml.rs`), each
+//! parser reading the elements it knows at their place in the document.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
@@ -30,8 +31,8 @@ fuzz_target!(|data: &[u8]| {
         );
     }
 
-    // A fault anywhere in the document must also make `parse_receive_output`
-    // fail: the two must not disagree about whether the response is an error.
+    // A response that is a fault must also make `parse_receive_output` fail:
+    // the two must not disagree about whether the response is an error.
     if check_soap_fault(xml).is_err() {
         assert!(
             parse_receive_output(xml).is_err(),

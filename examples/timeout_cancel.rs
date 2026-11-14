@@ -1,6 +1,6 @@
 //! Bounding a call: a total timeout, and cancellation on Ctrl+C.
 //!
-//! Usage: WINRM_HOST=win-server WINRM_USER=admin WINRM_PASS=password cargo run --example timeout_cancel
+//! Usage: `WINRM_HOST=win-server WINRM_USER=admin WINRM_PASS=password cargo run --example timeout_cancel`
 //!
 //! `run_command` and `run_powershell` wait as long as the command runs.
 //! Wrapping them in `tokio::time::timeout`, or dropping their future, stops

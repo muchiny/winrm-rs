@@ -13,8 +13,9 @@
 //!
 //! - **`soap`** (internal) -- builds WS-Management XML envelopes for Create,
 //!   Execute, Receive, Signal, and Delete operations, and parses the
-//!   corresponding responses. Envelope construction uses raw `format!` strings
-//!   rather than a full XML library to keep dependencies minimal.
+//!   corresponding responses. Envelopes are written with `format!` and one
+//!   escaping function; responses are read with `quick-xml`, each element
+//!   taken by its name and its place in the document.
 //!
 //! - **`ntlm`** (internal) -- implements the `NTLMv2` challenge/response handshake
 //!   per MS-NLMP and the NTLM message sealing of HTTP traffic. Only `NTLMv2` is
@@ -83,12 +84,13 @@
 //! - **`credssp`** -- *Experimental.* Enables `CredSSP` authentication for
 //!   double-hop delegation. Links the host's OpenSSL through `openssl-sys`
 //!   (required because Microsoft's `CredSSP` server has proven incompatible
-//!   with `rustls` in-memory TLS — see `src/auth/credssp.rs`).
+//!   with `rustls` in-memory TLS — see `src/auth/credssp/tls.rs`).
 //!   The inner `CredSSP` TLS client parses server-controlled records before
 //!   authentication, so that library must still receive security fixes
 //!   (README, "`credssp` and the host OpenSSL").
-//!   Validated end-to-end against Windows Server 2025; not yet exercised
-//!   on other host generations.
+//!   Validated end-to-end against Windows Server 2016, 2019, 2022 and
+//!   2025; not against Server 2012 R2, whose HTTPS listener shares no
+//!   cipher suite with `rustls`.
 //!   Delegates your cleartext password to the target: use it only toward
 //!   hosts you trust as much as the account.
 //!
@@ -124,6 +126,12 @@
 // these lints (Cargo.toml). `clippy.toml` exempts `#[test]` functions and
 // `#[cfg(test)]` modules from some of them, not from `as` or arithmetic, and
 // not modules gated on `cfg(all(test, ...))`.
+//
+// Of the pedantic group, test code follows everything but four lints:
+// `too_many_lines`; `cast_possible_truncation`, which goes with `as`;
+// `similar_names`, which refuses the names of the protocols side by side
+// (`ap_req` and `ap_rep`, `port` and `pport`); and `assert_is_empty`, whose
+// `assert_eq!(x, [] as [u8; 0])` reads worse than `assert!(x.is_empty())`.
 #![cfg_attr(
     test,
     allow(
@@ -133,6 +141,10 @@
         clippy::indexing_slicing,
         clippy::arithmetic_side_effects,
         clippy::as_conversions,
+        clippy::cast_possible_truncation,
+        clippy::too_many_lines,
+        clippy::similar_names,
+        clippy::assert_is_empty,
         reason = "test code"
     )
 )]

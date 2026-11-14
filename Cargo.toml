@@ -2,7 +2,7 @@
 name = "winrm-rs"
 version = "2.1.0"
 edition = "2024"
-rust-version = "1.99.0"
+rust-version = "1.100.0"
 description = "Async WinRM (WS-Management) client for Rust with NTLMv2, Basic, Kerberos, and Certificate authentication"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/muchiny/winrm-rs"
@@ -10,7 +10,6 @@ keywords = ["winrm", "windows", "remote-management", "ntlm", "kerberos"]
 categories = ["network-programming", "os::windows-apis"]
 readme = "README.md"
 documentation = "https://docs.rs/winrm-rs"
-homepage = "https://github.com/muchiny/winrm-rs"
 include = [
     "/src/**/*.rs",
     "/examples/**/*.rs",

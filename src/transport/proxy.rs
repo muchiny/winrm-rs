@@ -139,9 +139,7 @@ impl ProxyRoute {
         let https = first(HTTPS_PROXY)
             .and_then(|(name, raw)| usable(name, &raw))
             .or(all);
-        let no = first(NO_PROXY)
-            .map(|(_, value)| value.to_string())
-            .unwrap_or_default();
+        let no = first(NO_PROXY).map_or_default(|(_, value)| value.to_string());
         Ok(Self {
             explicit: None,
             http,

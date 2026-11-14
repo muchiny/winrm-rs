@@ -9,12 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **MSRV raised to 1.100.0** (from 1.99.0). `clippy.toml` and the MSRV job
+  follow. CI and the release workflow pin 1.100.0 as well: 1.100 has no
+  point release so far. Twelve `map(..).unwrap_or_default()` chains become
+  `map_or_default(..)`, which Clippy 1.100 asks for now that the MSRV has
+  it; no behaviour change.
 - **The `credssp` feature no longer declares `hyper`, `http-body-util` and
   `bytes`.** Nothing in the library has used them since the CredSSP
   transport was rewritten over a raw `tokio-rustls` stream. The three
   crates stay in the dependency tree through `reqwest`, so a build with
   `credssp` compiles the same crates as before. `bytes` stays a
   dev-dependency (`tests/kerberos_kdc.rs`).
+- `Cargo.toml` no longer sets `homepage`: it repeated `repository`, which
+  Cargo 1.100 warns about.
 - `cc` 1.11.1, `smallvec` 1.16.5, `uuid` 1.29.1, `toml_datetime` 1.1.3,
   `toml_edit` 0.25.19 and `winnow` 1.0.5 in the lockfile, with their
   `cargo vet` exemptions; `fuzz/Cargo.lock` follows for the three it has.

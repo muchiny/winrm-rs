@@ -18,7 +18,7 @@ body:
     attributes:
       label: Rust version
       description: Output of `rustc --version`
-      placeholder: "rustc 1.99.1"
+      placeholder: "rustc 1.100.0"
     validations:
       required: true
   - type: dropdown

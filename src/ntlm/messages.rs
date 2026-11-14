@@ -759,26 +759,22 @@ pub(crate) fn sanitize_workstation(raw: &str) -> Vec<u8> {
 pub(crate) fn workstation() -> &'static [u8] {
     static WORKSTATION: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     WORKSTATION.get_or_init(|| {
-        let from_env = std::env::var("HOSTNAME")
-            .map(|h| sanitize_workstation(&h))
-            .unwrap_or_default();
+        let from_env = std::env::var("HOSTNAME").map_or_default(|h| sanitize_workstation(&h));
         if !from_env.is_empty() {
             return from_env;
         }
         #[cfg(target_os = "linux")]
         {
             let from_kernel = std::fs::read_to_string("/proc/sys/kernel/hostname")
-                .map(|h| sanitize_workstation(&h))
-                .unwrap_or_default();
+                .map_or_default(|h| sanitize_workstation(&h));
             if !from_kernel.is_empty() {
                 return from_kernel;
             }
         }
         #[cfg(windows)]
         {
-            let from_computer = std::env::var("COMPUTERNAME")
-                .map(|h| sanitize_workstation(&h))
-                .unwrap_or_default();
+            let from_computer =
+                std::env::var("COMPUTERNAME").map_or_default(|h| sanitize_workstation(&h));
             if !from_computer.is_empty() {
                 return from_computer;
             }
@@ -1582,9 +1578,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn workstation_on_linux_is_hostname_env_else_kernel_hostname() {
-        let from_env = std::env::var("HOSTNAME")
-            .map(|h| sanitize_workstation(&h))
-            .unwrap_or_default();
+        let from_env = std::env::var("HOSTNAME").map_or_default(|h| sanitize_workstation(&h));
         let expected = if from_env.is_empty() {
             sanitize_workstation(&std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap())
         } else {

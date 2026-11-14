@@ -1879,7 +1879,7 @@ impl RecordingForwarder {
                 all.iter()
                     .map(|(up, down)| {
                         let log = if to_server { up } else { down };
-                        log.lock().map(|b| b.clone()).unwrap_or_default()
+                        log.lock().map_or_default(|b| b.clone())
                     })
                     .collect()
             },
@@ -5154,7 +5154,7 @@ impl TlsRecordingRelay {
     }
 
     fn requests(&self) -> Vec<RelayedRequest> {
-        self.requests.lock().map(|r| r.clone()).unwrap_or_default()
+        self.requests.lock().map_or_default(|r| r.clone())
     }
 
     /// (requests with a body, of which sealed `multipart/encrypted`).

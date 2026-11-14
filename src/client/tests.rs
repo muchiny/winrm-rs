@@ -1773,7 +1773,7 @@ fn certificate_auth_reads_valid_pem_files() {
     assert!(
         result.is_ok(),
         "valid PEM should construct client: {}",
-        result.err().map(|e| format!("{e}")).unwrap_or_default()
+        result.err().map_or_default(|e| format!("{e}"))
     );
 
     std::fs::remove_dir_all(&dir).ok();

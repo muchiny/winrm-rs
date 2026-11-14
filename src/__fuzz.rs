@@ -199,9 +199,7 @@ pub fn unseal_body(key: &[u8; 16], data: &[u8]) -> Result<String, WinrmError> {
 /// fail every unseal of it.
 pub fn seal_body_as_server(key: &[u8; 16], plaintext: &str) -> Vec<u8> {
     let mut server = crate::ntlm::SealingSession::server_side(key);
-    crate::auth::ntlm::seal_body(&mut server, plaintext)
-        .map(|(_, body)| body)
-        .unwrap_or_default()
+    crate::auth::ntlm::seal_body(&mut server, plaintext).map_or_default(|(_, body)| body)
 }
 
 /// The crate's NTLM sealing session (`ntlm::SealingSession`), client side.

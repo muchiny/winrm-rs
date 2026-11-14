@@ -27,7 +27,7 @@ def unhex(s: str) -> bytes:
 
 
 # --- NTLM ------------------------------------------------------------------
-# Captured from the pywinrm oracle vectors used in `src/ntlm/mod.rs` tests.
+# Captured from the pywinrm oracle vectors used in `src/ntlm/tests.rs`.
 
 TYPE1 = unhex(
     "4e544c4d5353500001000000378208e200000000280000000000000028000000"

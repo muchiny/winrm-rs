@@ -295,6 +295,32 @@ async fn signal_terminate_success() {
     assert!(result.is_ok());
 }
 
+/// A Delete and a Signal read nothing from their answer: a success status
+/// is not enough for them to succeed, the body has to be an answer.
+#[tokio::test]
+async fn a_delete_or_a_signal_answered_by_what_is_no_answer_fails() {
+    for body in ["", "OK", "<html><body>Welcome</body>", "x<s:Envelope/>"] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        for result in [
+            client.delete_shell("127.0.0.1", "SHELL-1").await,
+            client.signal_terminate("127.0.0.1", "S1", "C1").await,
+        ] {
+            assert!(
+                matches!(
+                    result,
+                    Err(WinrmError::Soap(crate::error::SoapError::ParseError(_)))
+                ),
+                "{body:?}: {result:?}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn ntlm_handshake_success() {
     let server = MockServer::start().await;
@@ -2374,9 +2400,11 @@ fn refusing_port() -> (tokio::net::TcpSocket, u16) {
 /// refuses connections until a listener appears on it, then the request
 /// goes through.
 #[tokio::test]
-// Windows answers a refused loopback connect only after ~2 s of SYN
-// retries, which makes this slow and timing-sensitive there.
-#[cfg_attr(windows, ignore)]
+#[cfg_attr(
+    windows,
+    ignore = "Windows answers a refused loopback connect only after ~2 s of SYN retries: \
+              slow and timing-sensitive there"
+)]
 async fn retry_backoff_on_http_error() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -2423,7 +2451,8 @@ async fn upload_file_multi_chunk_with_append() {
     let dir = unique_temp_path("winrm-rs-test-upload-multi-chunk");
     std::fs::create_dir_all(&dir).unwrap();
     let local_file = dir.join("multi.bin");
-    // 4001 bytes = 3 chunks with CHUNK_SIZE=2000 (2000 + 2000 + 1)
+    // 4001 bytes = 3 chunks: a chunk holds at most 2000 bytes, and a little
+    // less under the default policy, whose check takes room in the script.
     let data = vec![0xABu8; 4001];
     std::fs::write(&local_file, &data).unwrap();
 
@@ -2996,9 +3025,11 @@ async fn upload_file_launches_powershell_by_full_path() {
 /// Retries of refused connections back off exponentially (100 ms, then
 /// 200 ms) rather than additively.
 #[tokio::test]
-// Windows answers a refused loopback connect only after ~2 s of SYN
-// retries, so three attempts would take seconds there.
-#[cfg_attr(windows, ignore)]
+#[cfg_attr(
+    windows,
+    ignore = "Windows answers a refused loopback connect only after ~2 s of SYN retries: \
+              three attempts would take seconds there"
+)]
 async fn retry_backoff_is_exponential_not_additive() {
     let (_held, port) = refusing_port();
     let config = WinrmConfig {
@@ -3161,28 +3192,35 @@ async fn psrp_shell_with_a_mixed_case_uri_signals_as_psrp() {
     assert!(!signal.contains("windows/shell/signal/ctrl_c"), "{signal}");
 }
 
+/// The cap counts what the Pulls add: a small Enumerate answer passes, the
+/// Pull that takes the items over the cap is refused, and no other follows.
 #[tokio::test]
 async fn run_wql_caps_items_at_max_output_bytes() {
     let server = MockServer::start().await;
     let port = server.address().port();
 
-    // Big enumerate response with EnumerationContext so the Pull loop iterates,
-    // padded so each iteration adds > 1 KiB to the items string.
-    let big = "X".repeat(2048);
-    let chunk = format!(
-        r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
-              xmlns:wsen="http://schemas.xmlsoap.org/ws/2004/09/enumeration">
-              <s:Body>
-                <wsen:EnumerateResponse>
-                  <wsen:EnumerationContext>CTX-1</wsen:EnumerationContext>
-                  <wsen:Items><p:Win32_OS><p:Name>{big}</p:Name></p:Win32_OS></wsen:Items>
-                </wsen:EnumerateResponse>
-              </s:Body>
-            </s:Envelope>"#
-    );
-
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(chunk))
+        .and(body_string_contains("enumeration/Enumerate"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<s:Envelope><s:Body><wsen:EnumerateResponse>\
+             <wsen:EnumerationContext>CTX-1</wsen:EnumerationContext>\
+             <wsen:Items><p:Win32_OS><p:Name>small</p:Name></p:Win32_OS></wsen:Items>\
+             </wsen:EnumerateResponse></s:Body></s:Envelope>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // Each Pull adds more than 1 KiB and keeps the enumeration open.
+    let big = "X".repeat(2048);
+    Mock::given(method("POST"))
+        .and(body_string_contains("enumeration/Pull"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            "<s:Envelope><s:Body><n:PullResponse>\
+             <n:EnumerationContext>CTX-1</n:EnumerationContext>\
+             <n:Items><p:Win32_OS><p:Name>{big}</p:Name></p:Win32_OS></n:Items>\
+             </n:PullResponse></s:Body></s:Envelope>"
+        )))
+        .expect(1)
         .mount(&server)
         .await;
 
@@ -3194,9 +3232,109 @@ async fn run_wql_caps_items_at_max_output_bytes() {
         .await
         .unwrap_err();
     assert!(
-        matches!(err, WinrmError::Transfer(_)),
+        matches!(&err, WinrmError::Transfer(msg) if msg.contains("max_output_bytes (1024)")),
         "expected Transfer cap error, got: {err}"
     );
+}
+
+/// An Enumerate answer over the cap is refused before any Pull is sent,
+/// even when it leaves the enumeration open.
+#[tokio::test]
+async fn run_wql_refuses_an_oversized_enumerate_answer_before_any_pull() {
+    let server = MockServer::start().await;
+    let big = "X".repeat(2048);
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            "<s:Envelope><s:Body><wsen:EnumerateResponse>\
+             <wsen:EnumerationContext>CTX-1</wsen:EnumerationContext>\
+             <wsen:Items><p:Win32_OS><p:Name>{big}</p:Name></p:Win32_OS></wsen:Items>\
+             </wsen:EnumerateResponse></s:Body></s:Envelope>"
+        )))
+        .mount(&server)
+        .await;
+
+    let mut config = basic_config(server.address().port());
+    config.max_output_bytes = Some(1024);
+    let client = WinrmClient::new(config, test_creds()).unwrap();
+    let err = client
+        .run_wql("127.0.0.1", "SELECT * FROM Win32_OS", None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, WinrmError::Transfer(msg) if msg.contains("max_output_bytes (1024)")),
+        "expected Transfer cap error, got: {err}"
+    );
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1, "a Pull was sent after the refusal");
+}
+
+/// The cap is the largest size accepted: items of exactly that many bytes
+/// pass, one more byte does not, and `None` accepts anything.
+#[test]
+fn check_wql_cap_accepts_items_up_to_the_cap() {
+    assert!(check_wql_cap("", Some(0)).is_ok());
+    assert!(check_wql_cap("12345678", Some(8)).is_ok());
+    assert!(matches!(
+        check_wql_cap("123456789", Some(8)),
+        Err(WinrmError::Transfer(msg)) if msg.contains("max_output_bytes (8)")
+    ));
+    assert!(matches!(
+        check_wql_cap("x", Some(0)),
+        Err(WinrmError::Transfer(_))
+    ));
+    assert!(check_wql_cap(&"x".repeat(4096), None).is_ok());
+}
+
+/// With `OptimizeEnumeration` the server may put every item in the Enumerate
+/// answer and end the sequence there: no Pull follows, and the cap must still
+/// apply.
+#[tokio::test]
+async fn run_wql_caps_items_of_the_enumerate_answer() {
+    let server = MockServer::start().await;
+    let port = server.address().port();
+
+    let big = "X".repeat(2048);
+    let single_page = format!(
+        r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+              xmlns:wsen="http://schemas.xmlsoap.org/ws/2004/09/enumeration">
+              <s:Body>
+                <wsen:EnumerateResponse>
+                  <wsen:Items><p:Win32_OS><p:Name>{big}</p:Name></p:Win32_OS></wsen:Items>
+                  <wsen:EndOfSequence/>
+                </wsen:EnumerateResponse>
+              </s:Body>
+            </s:Envelope>"#
+    );
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(single_page))
+        .mount(&server)
+        .await;
+
+    let mut config = basic_config(port);
+    config.max_output_bytes = Some(1024);
+    let client = WinrmClient::new(config, test_creds()).unwrap();
+    let err = client
+        .run_wql("127.0.0.1", "SELECT * FROM Win32_OS", None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, WinrmError::Transfer(msg) if msg.contains("max_output_bytes (1024)")),
+        "expected Transfer cap error, got: {err}"
+    );
+
+    // Without a cap the same answer is returned whole.
+    let mut config = basic_config(port);
+    config.max_output_bytes = None;
+    let client = WinrmClient::new(config, test_creds()).unwrap();
+    let items = client
+        .run_wql("127.0.0.1", "SELECT * FROM Win32_OS", None)
+        .await
+        .unwrap();
+    assert!(items.contains(&big));
+
+    // One Enumerate per call and no Pull: the cap was not left to a Pull.
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -3297,7 +3435,7 @@ const DONE_HELLO: &str = r#"<s:Envelope><s:Body><rsp:ReceiveResponse>
         </rsp:CommandState>
     </rsp:ReceiveResponse></s:Body></s:Envelope>"#;
 
-/// Mount `n` HTTP 500 TimedOut faults, as a real host answers them.
+/// Mount `n` HTTP 500 `TimedOut` faults, as a real host answers them.
 async fn mount_timed_out_faults(server: &MockServer, prefix: &str, n: u64) {
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(500).set_body_string(timed_out_fault(prefix)))
@@ -3575,12 +3713,12 @@ async fn upload_file_of_an_empty_file_truncates_the_remote_file() {
     let scripts = powershell_scripts(&bodies);
     assert_eq!(scripts.len(), 1, "{scripts:?}");
     assert!(
-        scripts[0].contains("FromBase64String('')"),
+        scripts[0].contains("$p = 'C:\\dest.txt'; $t = "),
         "{}",
         scripts[0]
     );
     assert!(
-        scripts[0].contains("WriteAllBytes('C:\\dest.txt'"),
+        scripts[0].contains("WriteAllBytes($p, [Convert]::FromBase64String(''))"),
         "{}",
         scripts[0]
     );
@@ -3594,6 +3732,53 @@ async fn upload_file_of_an_empty_file_truncates_the_remote_file() {
         bodies.last().is_some_and(|b| b.contains("transfer/Delete")),
         "{bodies:?}"
     );
+    std::fs::remove_file(&local).ok();
+}
+
+/// The scripts of the three transfer entry points carry the host's check
+/// under `LocalDrive` and not under `Any`.
+#[tokio::test]
+async fn the_remote_path_policy_decides_what_the_transfer_scripts_check() {
+    use std::time::Duration;
+    let local = unique_temp_path("winrm-rs-test-policy-scripts");
+    for (policy, checked) in [
+        (crate::RemotePathPolicy::LocalDrive, true),
+        (crate::RemotePathPolicy::Any, false),
+    ] {
+        let mut scripts = Vec::new();
+        for entry_point in 0..3 {
+            let server = MockServer::start().await;
+            let done = ResponseTemplate::new(200).set_body_string(receive_done(b"", b"", 0));
+            mount_hanging_command(&server, done).await;
+            let client = WinrmClient::builder(basic_config(server.address().port()))
+                .credentials(test_creds())
+                .remote_path_policy(policy)
+                .build()
+                .unwrap();
+            std::fs::write(&local, b"abc").unwrap();
+            let (host, remote) = ("127.0.0.1", "C:\\dest.txt");
+            match entry_point {
+                0 => client.upload_file(host, &local, remote).await,
+                1 => client.download_file(host, remote, &local).await,
+                _ => {
+                    client
+                        .download_file_with_timeout(host, remote, &local, Duration::from_secs(5))
+                        .await
+                }
+            }
+            .unwrap();
+            scripts.extend(powershell_scripts(&received_bodies(&server).await));
+        }
+        assert_eq!(scripts.len(), 3, "{policy:?}: {scripts:?}");
+        for script in &scripts {
+            let names_the_path = script.contains("$p = 'C:\\dest.txt'; ");
+            assert!(names_the_path, "{policy:?}: {script}");
+            let reads_the_drive = script.contains("-ccontains $t");
+            assert_eq!(reads_the_drive, checked, "{policy:?}: {script}");
+            let resolves = script.contains("$p = [IO.Path]::GetFullPath($p)");
+            assert_eq!(resolves, checked, "{policy:?}: {script}");
+        }
+    }
     std::fs::remove_file(&local).ok();
 }
 

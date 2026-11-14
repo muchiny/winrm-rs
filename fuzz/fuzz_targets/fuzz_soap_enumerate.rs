@@ -4,7 +4,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use winrm_rs::__fuzz::{parse_enumerate_response, pull_request};
+use winrm_rs::__fuzz::{check_answer, check_soap_fault, parse_enumerate_response, pull_request};
 
 fuzz_target!(|data: &[u8]| {
     let Ok(xml) = std::str::from_utf8(data) else {
@@ -27,6 +27,15 @@ fuzz_target!(|data: &[u8]| {
         "item text ended the enumeration or read as a fault"
     );
 
+    // A response that is a fault is that fault here too, never a page.
+    if let Err(fault) = check_soap_fault(xml) {
+        assert_eq!(
+            parse_enumerate_response(xml).map_err(|e| e.to_string()),
+            Err(fault.to_string()),
+            "a fault read as a page, or as another error"
+        );
+    }
+
     let Ok((items, context)) = parse_enumerate_response(xml) else {
         return;
     };
@@ -35,10 +44,16 @@ fuzz_target!(|data: &[u8]| {
         items.len() <= xml.len(),
         "items text longer than the response"
     );
+    assert!(
+        check_answer(xml).is_ok(),
+        "a page read from a response the transport refuses"
+    );
 
-    // An end marker after the document always ends the enumeration.
+    // A response that is read is a document, so it can be the content of an
+    // element. An end marker after it in that element ends the enumeration,
+    // with the same items: nothing in a page can hide what follows it.
     assert_eq!(
-        parse_enumerate_response(&format!("{xml}<w:EndOfSequence/>")).ok(),
+        parse_enumerate_response(&format!("<r>{xml}<w:EndOfSequence/></r>")).ok(),
         Some((items.clone(), None)),
         "an EndOfSequence element did not end the enumeration"
     );

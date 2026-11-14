@@ -128,7 +128,7 @@ pub enum CredSspError {
     /// ASN.1 DER encoding or decoding error.
     #[error("ASN.1 decode error: {0}")]
     Asn1Decode(String),
-    /// Server public key verification failed (possible MiTM).
+    /// Server public key verification failed (possible man-in-the-middle).
     #[error("server public key mismatch")]
     PublicKeyMismatch,
     /// Server returned an NTSTATUS error code.
@@ -179,7 +179,9 @@ pub enum NtlmError {
     /// - NTLM over HTTPS cannot compute the channel binding: no server
     ///   certificate reported, several certificates seen, or a certificate
     ///   whose signature algorithm defines no binding hash (Ed25519, unknown
-    ///   algorithms).
+    ///   algorithms);
+    /// - the operating system's random source fails while the session key is
+    ///   drawn.
     #[error("NTLM error: {0}")]
     InvalidMessage(String),
 }

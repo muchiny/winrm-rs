@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `SysRng`, which keeps no state. This covers NTLM over HTTP and HTTPS and
   the NTLM exchange inside CredSSP. If the operating system's random source
   fails, the handshake fails with `NtlmError::InvalidMessage`.
+- **`run_wql` applies `max_output_bytes` to the first answer too.** The cap
+  was only checked after each Pull. The Enumerate request asks for optimized
+  enumeration, so a server can return every item in the Enumerate answer and
+  end the sequence there: those items were returned whatever the cap, up to
+  the size limit of one response (4 × max(`max_envelope_size`, 512 KiB)).
 
 ### Changed
 

@@ -1073,6 +1073,36 @@ fn proxy_io(e: &std::io::Error) -> WinrmError {
     }
 }
 
+/// The CONNECT request head for `authority`, with the proxy credentials
+/// (`authorization`, the `Proxy-Authorization` value) when there are any.
+///
+/// The buffer gets its final size before anything is written to it, so it
+/// never grows: growing frees the old buffer, which could already hold the
+/// credentials, without wiping it.
+fn connect_request(authority: &str, authorization: Option<&str>) -> Zeroizing<String> {
+    let [name, value, end] = match authorization {
+        Some(value) => ["Proxy-Authorization: ", value, "\r\n"],
+        None => [""; 3],
+    };
+    let parts = [
+        "CONNECT ",
+        authority,
+        " HTTP/1.1\r\nHost: ",
+        authority,
+        "\r\n",
+        name,
+        value,
+        end,
+        "\r\n",
+    ];
+    let len = parts.iter().map(|part| part.len()).sum();
+    let mut request = Zeroizing::new(String::with_capacity(len));
+    for part in parts {
+        request.push_str(part);
+    }
+    request
+}
+
 /// Ask the HTTP proxy on `tcp` to open a tunnel to `authority`. Only a 2xx
 /// answer with nothing after its head opens it.
 async fn http_connect(
@@ -1082,22 +1112,7 @@ async fn http_connect(
 ) -> Result<(), WinrmError> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let mut request = Zeroizing::new(String::with_capacity(256));
-    for part in [
-        "CONNECT ",
-        authority,
-        " HTTP/1.1\r\nHost: ",
-        authority,
-        "\r\n",
-    ] {
-        request.push_str(part);
-    }
-    if let Some(value) = authorization {
-        for part in ["Proxy-Authorization: ", value, "\r\n"] {
-            request.push_str(part);
-        }
-    }
-    request.push_str("\r\n");
+    let request = connect_request(authority, authorization);
     tcp.write_all(request.as_bytes())
         .await
         .map_err(|e| proxy_io(&e))?;
@@ -1155,11 +1170,22 @@ async fn socks5_connect(
     user_pass: Option<(&str, &str)>,
     remote_dns: bool,
 ) -> Result<(), WinrmError> {
-    use std::net::IpAddr;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
 
-    let invalid =
-        || WinrmError::AuthFailed("CredSSP: the SOCKS5 proxy sent an invalid reply".into());
+    socks5_negotiate(tcp, user_pass).await?;
+    let request = socks5_request(host, port, remote_dns).await?;
+    tcp.write_all(&request).await.map_err(|e| proxy_io(&e))?;
+    socks5_read_reply(tcp).await
+}
+
+/// The method negotiation of SOCKS5: "no authentication", plus "user name
+/// and password" when `user_pass` is set, which is then sent if the proxy
+/// picks it (RFC 1929).
+async fn socks5_negotiate(
+    tcp: &mut tokio::net::TcpStream,
+    user_pass: Option<(&str, &str)>,
+) -> Result<(), WinrmError> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let greeting: &[u8] = if user_pass.is_some() {
         &[5, 2, 0, 2]
@@ -1172,7 +1198,7 @@ async fn socks5_connect(
         .await
         .map_err(|e| proxy_io(&e))?;
     match (choice, user_pass) {
-        ([5, 0], _) => {}
+        ([5, 0], _) => Ok(()),
         ([5, 2], Some((user, pass))) => {
             let too_long = || {
                 WinrmError::AuthFailed(crate::transport::proxy::SOCKS5_CREDENTIALS_TOO_LONG.into())
@@ -1190,18 +1216,25 @@ async fn socks5_connect(
             tcp.read_exact(&mut status)
                 .await
                 .map_err(|e| proxy_io(&e))?;
-            if status != [1, 0] {
-                return Err(WinrmError::AuthFailed(
+            if status == [1, 0] {
+                Ok(())
+            } else {
+                Err(WinrmError::AuthFailed(
                     "CredSSP: the SOCKS5 proxy refused the credentials".into(),
-                ));
+                ))
             }
         }
-        _ => {
-            return Err(WinrmError::AuthFailed(
-                "CredSSP: the SOCKS5 proxy accepted no offered authentication method".into(),
-            ));
-        }
+        _ => Err(WinrmError::AuthFailed(
+            "CredSSP: the SOCKS5 proxy accepted no offered authentication method".into(),
+        )),
     }
+}
+
+/// The SOCKS5 CONNECT request for `host:port`: an address when `host` is
+/// one, the host name as is with `remote_dns`, else the first address it
+/// resolves to here.
+async fn socks5_request(host: &str, port: u16, remote_dns: bool) -> Result<Vec<u8>, WinrmError> {
+    use std::net::IpAddr;
 
     let mut request = vec![5, 1, 0];
     let address = match host.parse::<IpAddr>() {
@@ -1238,10 +1271,18 @@ async fn socks5_connect(
         }
     }
     request.extend_from_slice(&port.to_be_bytes());
-    tcp.write_all(&request).await.map_err(|e| proxy_io(&e))?;
+    Ok(request)
+}
 
-    // `05 REP 00 ATYP BND.ADDR BND.PORT`, read to its last byte so that
-    // nothing of it is left for the TLS handshake.
+/// Read the SOCKS5 answer to a CONNECT request,
+/// `05 REP 00 ATYP BND.ADDR BND.PORT`, to its last byte, so that nothing of
+/// it is left for the TLS handshake. Only a reply of 0 opens the tunnel.
+async fn socks5_read_reply(tcp: &mut tokio::net::TcpStream) -> Result<(), WinrmError> {
+    use tokio::io::AsyncReadExt;
+
+    let invalid =
+        || WinrmError::AuthFailed("CredSSP: the SOCKS5 proxy sent an invalid reply".into());
+
     let mut reply = [0u8; 4];
     tcp.read_exact(&mut reply).await.map_err(|e| proxy_io(&e))?;
     let [version, rep, _, atyp] = reply;
@@ -1337,287 +1378,306 @@ impl AuthTransport for CredSspAuth {
     }
 }
 
-/// Run the CredSSP handshake on `conn` up to the delegation: the inner TLS
-/// handshake, NTLM negotiate, then NTLM authenticate with `pubKeyAuth`, whose
-/// answer must carry the server's final SPNEGO token and `pubKeyAuth`. Each
-/// round posts `body_for_auth`. Returns the `Authorization` value of the
-/// delegation round (the TSRequest with the sealed TSCredentials in
-/// `authInfo`), which the caller posts with the request body.
-async fn authenticate(
-    conn: &mut CredSspConnection,
-    auth: &CredSspAuth,
-    endpoint: &CredSspEndpoint,
-    body_for_auth: &str,
-) -> Result<String, WinrmError> {
-    let encode_auth = |bytes: &[u8]| format!("CredSSP {}", B64.encode(bytes));
+/// A round of the handshake that the server answers with a `401` carrying a
+/// CredSSP token. Each one words its errors in its own way.
+#[derive(Clone, Copy)]
+enum Round {
+    /// A round of the inner TLS handshake, numbered from 1.
+    Tls(u32),
+    /// The NTLM Type 1, answered by the Type 2 challenge.
+    Negotiate,
+    /// The NTLM Type 3 with the client `pubKeyAuth`, answered by the
+    /// server's.
+    Authenticate,
+}
 
-    // === Step 1: Initialize the INNER TLS connection (memory-only) ===
-    // Use OpenSSL via in-memory BIO — pyspnego does the same and rustls
-    // produces a TLS state Microsoft's CredSSP server silently rejects.
-    let mut inner_tls = build_inner_openssl_tls(&auth.tls.inner)?;
-    // Drive the TLS handshake one step to produce ClientHello.
-    inner_tls.handshake_step()?;
-
-    // === Step 3: Drive the TLS handshake through HTTP rounds ===
-    // Each round:
-    //   1. Drain outgoing TLS bytes (ClientHello, then key exchange...)
-    //   2. POST to server with these bytes in Authorization header
-    //   3. Receive server response (ServerHello, etc.) in WWW-Authenticate
-    //   4. Feed back into rustls
-    //   5. Repeat until !is_handshaking()
-    let mut round: u32 = 0;
-    loop {
-        round = round.saturating_add(1);
-        if round > 10 {
-            return Err(WinrmError::AuthFailed(
-                "CredSSP: TLS handshake did not complete in 10 rounds".into(),
-            ));
+impl Round {
+    /// The round as the errors about its status or its connection name it.
+    fn name(self) -> String {
+        match self {
+            Self::Tls(n) => format!("TLS handshake round {n}"),
+            Self::Negotiate => "NTLM negotiate".into(),
+            Self::Authenticate => "NTLM authenticate".into(),
         }
+    }
 
-        let outgoing = inner_tls.drain_outgoing();
-        if outgoing.is_empty() {
-            if inner_tls.handshake_step()? {
-                break;
+    /// Error for a `401` that carries no CredSSP token.
+    fn no_token(self) -> WinrmError {
+        WinrmError::AuthFailed(match self {
+            Self::Tls(n) => {
+                format!("CredSSP: TLS handshake round {n}: no CredSSP token in response")
             }
-            continue;
-        }
-
-        let resp = conn
-            .post(Some(&encode_auth(&outgoing)), body_for_auth)
-            .await?;
-        if resp.status != 401 {
-            return Err(WinrmError::AuthFailed(format!(
-                "CredSSP: TLS handshake round {round}: expected 401, got {}",
-                resp.status
-            )));
-        }
-        let server_token = resp
-            .head
-            .header("www-authenticate")
-            .as_deref()
-            .and_then(extract_credssp_token_str)
-            .ok_or_else(|| {
-                WinrmError::AuthFailed(format!(
-                    "CredSSP: TLS handshake round {round}: no CredSSP token in response"
-                ))
-            })?;
-        handshake_round_ok(&resp, &format!("TLS handshake round {round}"))?;
-        let server_bytes = B64.decode(server_token.trim_ascii()).map_err(|e| {
-            WinrmError::AuthFailed(format!("CredSSP: bad base64 in handshake: {e}"))
-        })?;
-        inner_tls.feed_incoming(&server_bytes);
-        if inner_tls.handshake_step()? {
-            break;
-        }
+            Self::Negotiate => "CredSSP: NTLM nego: no CredSSP token".into(),
+            Self::Authenticate => {
+                "CredSSP: server dropped the context after NTLM AUTHENTICATE + pubKeyAuth \
+                 (401 without a CredSSP token is how Windows reports a rejected pubKeyAuth)"
+                    .into()
+            }
+        })
     }
 
-    // === Extract SubjectPublicKey from the INNER TLS server cert ===
-    let inner_cert_der = inner_tls.peer_cert_der()?;
-    let inner_cert_der: &[u8] = &inner_cert_der;
-    let subject_public_key = {
-        use x509_cert::der::Decode;
-        let cert = x509_cert::Certificate::from_der(inner_cert_der)
-            .map_err(|e| WinrmError::AuthFailed(format!("CredSSP cert parse: {e}")))?;
-        // Per MS-CSSP 2.2.2.5, pubKeyAuth is computed over the bit string
-        // contents of subjectPublicKey (PKCS#1 RSAPublicKey for RSA certs).
-        cert.tbs_certificate()
-            .subject_public_key_info()
-            .subject_public_key
-            .raw_bytes()
-            .to_vec()
-    };
+    /// Error for a CredSSP token that is not base64.
+    fn bad_base64(self, e: &base64::DecodeError) -> WinrmError {
+        WinrmError::AuthFailed(match self {
+            Self::Tls(_) => format!("CredSSP: bad base64 in handshake: {e}"),
+            Self::Negotiate => format!("CredSSP: bad b64 NTLM nego: {e}"),
+            Self::Authenticate => format!("CredSSP: bad b64 auth: {e}"),
+        })
+    }
+}
 
-    // === Step 4: Inner TLS established. Build NTLM Type 1 in TSRequest ===
-    // Use the CredSSP-specific Type 1 with KEY_EXCH/SEAL/SIGN flags required
-    // for the sealing of pubKeyAuth and TSCredentials.
-    let type1 = ntlm::create_negotiate_message_credssp();
-    let spnego_init = asn1::encode_spnego_init(&type1);
-    let ts_req1 = asn1::encode_ts_request(CREDSSP_VERSION, Some(&spnego_init), None, None, None);
-    inner_tls.write_plaintext(&ts_req1)?;
-    let outgoing = Ok::<_, WinrmError>(inner_tls.drain_outgoing())?;
+/// The `Authorization` value that carries `token`.
+fn authorization(token: &[u8]) -> String {
+    format!("CredSSP {}", B64.encode(token))
+}
 
-    // Send through HTTP
-    let resp = conn
-        .post(Some(&encode_auth(&outgoing)), body_for_auth)
-        .await?;
+/// One round of the handshake: post `body` with `token` in `Authorization`
+/// and return the token of the `401` that answers.
+async fn exchange(
+    conn: &mut CredSspConnection,
+    token: &[u8],
+    body: &str,
+    round: Round,
+) -> Result<Vec<u8>, WinrmError> {
+    let resp = conn.post(Some(&authorization(token)), body).await?;
     if resp.status != 401 {
         return Err(WinrmError::AuthFailed(format!(
-            "CredSSP: NTLM negotiate: expected 401, got {}",
-            resp.status
-        )));
-    }
-    let server_token = resp
-        .head
-        .header("www-authenticate")
-        .as_deref()
-        .and_then(extract_credssp_token_str)
-        .ok_or_else(|| WinrmError::AuthFailed("CredSSP: NTLM nego: no CredSSP token".into()))?;
-    handshake_round_ok(&resp, "NTLM negotiate")?;
-    let server_bytes = B64
-        .decode(server_token.trim_ascii())
-        .map_err(|e| WinrmError::AuthFailed(format!("CredSSP: bad b64 NTLM nego: {e}")))?;
-    {
-        inner_tls.feed_incoming(&server_bytes);
-        Ok::<_, WinrmError>(())
-    }?;
-    let plaintext = inner_tls.read_plaintext()?;
-
-    // === Step 5: Decode TSRequest containing NTLM Type 2 ===
-    let ts_resp = asn1::decode_ts_request(&plaintext).map_err(WinrmError::CredSsp)?;
-    let negotiated_version = std::cmp::min(ts_resp.version, CREDSSP_VERSION);
-    tracing::debug!(
-        server_version = ts_resp.version,
-        negotiated = negotiated_version,
-        "CredSSP version negotiation"
-    );
-    if let Some(code) = ts_resp.error_code {
-        return Err(WinrmError::CredSsp(CredSspError::ServerError(code)));
-    }
-    let spnego_resp = ts_resp
-        .nego_token
-        .ok_or_else(|| WinrmError::AuthFailed("CredSSP: no negoToken from server".into()))?;
-    let type2 = asn1::decode_spnego_token(&spnego_resp).map_err(WinrmError::CredSsp)?;
-    let challenge = ntlm::parse_challenge(&type2).map_err(WinrmError::Ntlm)?;
-    ntlm::log_challenge(&challenge);
-    ntlm::check_challenge(&challenge, true).map_err(WinrmError::Ntlm)?;
-
-    // === Step 6: Build NTLM Type 3 + pubKeyAuth + clientNonce ===
-    // CONFIRMED via forensic hash analysis: pywinrm uses username.upper()+empty
-    // for NTOWFv2 (NTProofStr matches when computed this way). Empty domain.
-    let domain = auth.domain.clone();
-    // SPN from the endpoint host (punycode, lowercase, IPv6 without brackets).
-    let spn = endpoint.spn();
-
-    // No `.await` inside this block: the exported session key never becomes
-    // part of the future's state, and `Zeroizing` wipes it when the block
-    // ends. Keep awaits out of it.
-    let (type3, mut ntlm_session) = {
-        let (type3, session_key) = ntlm::create_authenticate_message_credssp(
-            &challenge,
-            &auth.username,
-            &auth.password,
-            &domain,
-            &spn,
-            &type1,
-            &type2,
-        )
-        .map_err(WinrmError::Ntlm)?;
-        (type3, SealingSession::boxed_from_auth(&session_key))
-    };
-    // Compute mechListMIC over the SPNEGO mech_type_list. This MUST happen
-    // before sealing pubKeyAuth so that the latter uses seq=1 (matches
-    // pyspnego/Windows expectations). Without mechListMIC the server
-    // returns STATUS_LOGON_FAILURE. `sign_mech_list_mic` also resets the
-    // RC4 sealing handle afterwards, as Windows SPNEGO does — the
-    // pubKeyAuth below must be sealed at keystream offset 0.
-    let mech_list_mic = ntlm_session
-        .sign_mech_list_mic(asn1::MECH_TYPE_LIST_NTLM)
-        .map_err(WinrmError::Ntlm)?;
-
-    // Compute pubKeyAuth (v6): SHA256(magic + nonce + SubjectPublicKey).
-    //
-    // CREDSSP_FIXED_NONCE pins the v6 nonce for deterministic tests. It is
-    // honoured only in debug builds with the internal `__internal` feature;
-    // every other build draws from the CSPRNG.
-    #[cfg(all(debug_assertions, feature = "__internal"))]
-    let nonce: [u8; 32] = std::env::var("CREDSSP_FIXED_NONCE")
-        .ok()
-        .and_then(|s| crate::ntlm::crypto::parse_fixed_hex::<32>(&s))
-        .unwrap_or_else(rand::random);
-    #[cfg(not(all(debug_assertions, feature = "__internal")))]
-    let nonce: [u8; 32] = rand::random();
-    let client_hash = {
-        let mut hasher = Sha256::new();
-        hasher.update(b"CredSSP Client-To-Server Binding Hash\0");
-        hasher.update(nonce);
-        hasher.update(&subject_public_key);
-        hasher.finalize().to_vec()
-    };
-    let encrypted_pub_key_auth = ntlm_session.seal(&client_hash).map_err(WinrmError::Ntlm)?;
-
-    let spnego_authenticate = asn1::encode_spnego_response(&type3, Some(&mech_list_mic));
-    let ts_req3 = asn1::encode_ts_request(
-        CREDSSP_VERSION,
-        Some(&spnego_authenticate),
-        Some(&encrypted_pub_key_auth),
-        None,
-        Some(&nonce),
-    );
-    // CREDSSP_DUMP dumps every secret (nonce, public key bind, sealed
-    // pubKeyAuth) to stderr. It is compiled in only for debug builds with
-    // the internal `__internal` feature.
-    #[cfg(all(debug_assertions, feature = "__internal"))]
-    if std::env::var("CREDSSP_DUMP").is_ok() {
-        let h = |b: &[u8]| b.iter().map(|x| format!("{:02x}", x)).collect::<String>();
-        eprintln!(
-            "[CREDSSP_DUMP] ts_req3 ({}B): {}",
-            ts_req3.len(),
-            h(&ts_req3)
-        );
-        eprintln!("[CREDSSP_DUMP] nonce: {}", h(&nonce));
-        eprintln!("[CREDSSP_DUMP] inner_cert_der: {}", h(inner_cert_der));
-        eprintln!("[CREDSSP_DUMP] type1: {}", h(&type1));
-        eprintln!("[CREDSSP_DUMP] spnego_init: {}", h(&spnego_init));
-        eprintln!("[CREDSSP_DUMP] type2: {}", h(&type2));
-        eprintln!("[CREDSSP_DUMP] type3: {}", h(&type3));
-        eprintln!("[CREDSSP_DUMP] mech_list_mic: {}", h(&mech_list_mic));
-        eprintln!("[CREDSSP_DUMP] spn: {spn}");
-        eprintln!(
-            "[CREDSSP_DUMP] subject_public_key: {}",
-            h(&subject_public_key)
-        );
-        eprintln!("[CREDSSP_DUMP] client_hash: {}", h(&client_hash));
-        eprintln!(
-            "[CREDSSP_DUMP] sealed_pub_key_auth: {}",
-            h(&encrypted_pub_key_auth)
-        );
-    }
-    inner_tls.write_plaintext(&ts_req3)?;
-    let outgoing = Ok::<_, WinrmError>(inner_tls.drain_outgoing())?;
-
-    let resp = conn
-        .post(Some(&encode_auth(&outgoing)), body_for_auth)
-        .await?;
-    if resp.status != 401 {
-        return Err(WinrmError::AuthFailed(format!(
-            "CredSSP: NTLM authenticate: expected 401, got {}",
+            "CredSSP: {}: expected 401, got {}",
+            round.name(),
             resp.status
         )));
     }
     #[cfg(all(debug_assertions, feature = "__internal"))]
-    if std::env::var("CREDSSP_DUMP").is_ok() {
+    if matches!(round, Round::Authenticate) && std::env::var("CREDSSP_DUMP").is_ok() {
         eprintln!(
             "[CREDSSP_DUMP] step6 response status={} headers={:?}",
             resp.status, resp.head.headers
         );
     }
-    let server_token = resp
+    let answer = resp
         .head
         .header("www-authenticate")
         .as_deref()
         .and_then(extract_credssp_token_str)
-        .ok_or_else(|| {
-            WinrmError::AuthFailed(
-                "CredSSP: server dropped the context after NTLM AUTHENTICATE + pubKeyAuth \
-                     (401 without a CredSSP token is how Windows reports a rejected pubKeyAuth)"
-                    .into(),
-            )
-        })?;
-    handshake_round_ok(&resp, "NTLM authenticate")?;
-    let server_bytes = B64
-        .decode(server_token.trim_ascii())
-        .map_err(|e| WinrmError::AuthFailed(format!("CredSSP: bad b64 auth: {e}")))?;
-    {
-        inner_tls.feed_incoming(&server_bytes);
-        Ok::<_, WinrmError>(())
-    }?;
-    let plaintext = inner_tls.read_plaintext()?;
+        .ok_or_else(|| round.no_token())?;
+    handshake_round_ok(&resp, &round.name())?;
+    B64.decode(answer.trim_ascii())
+        .map_err(|e| round.bad_base64(&e))
+}
 
-    // === Step 7: Verify server pubKeyAuth ===
-    let ts_resp = asn1::decode_ts_request(&plaintext).map_err(WinrmError::CredSsp)?;
-    if let Some(code) = ts_resp.error_code {
-        return Err(WinrmError::CredSsp(CredSspError::ServerError(code)));
+/// Rounds the inner TLS handshake may take.
+const MAX_TLS_ROUNDS: u32 = 10;
+
+/// Run the handshake of the inner TLS session: each flight of the client
+/// goes out in the `Authorization` header of a round, and the server's comes
+/// back in the `WWW-Authenticate` header of its `401`.
+async fn inner_tls_handshake(
+    conn: &mut CredSspConnection,
+    inner: &mut OpenSslMemTls,
+    body: &str,
+) -> Result<(), WinrmError> {
+    // The first step produces the ClientHello.
+    inner.handshake_step()?;
+    for round in 1..=MAX_TLS_ROUNDS {
+        let flight = inner.drain_outgoing();
+        if !flight.is_empty() {
+            let answer = exchange(conn, &flight, body, Round::Tls(round)).await?;
+            inner.feed_incoming(&answer);
+        }
+        if inner.handshake_step()? {
+            return Ok(());
+        }
     }
+    Err(WinrmError::AuthFailed(format!(
+        "CredSSP: TLS handshake did not complete in {MAX_TLS_ROUNDS} rounds"
+    )))
+}
+
+/// One round carrying a TSRequest: send `request` in the inner TLS session,
+/// with `body`, and decode the TSRequest of the answer.
+async fn ts_round(
+    conn: &mut CredSspConnection,
+    inner: &mut OpenSslMemTls,
+    request: &[u8],
+    body: &str,
+    round: Round,
+) -> Result<asn1::TsRequest, WinrmError> {
+    inner.write_plaintext(request)?;
+    let answer = exchange(conn, &inner.drain_outgoing(), body, round).await?;
+    inner.feed_incoming(&answer);
+    asn1::decode_ts_request(&inner.read_plaintext()?).map_err(WinrmError::CredSsp)
+}
+
+/// Refuse a TSRequest in which the server reports an error (an NTSTATUS in
+/// `errorCode`).
+fn refuse_error_code(answer: &asn1::TsRequest) -> Result<(), WinrmError> {
+    match answer.error_code {
+        Some(code) => Err(WinrmError::CredSsp(CredSspError::ServerError(code))),
+        None => Ok(()),
+    }
+}
+
+/// The NTLM challenge in the server's answer to the negotiate round: the raw
+/// Type 2, which the MIC of the Type 3 covers, and its fields, checked.
+fn server_challenge(
+    answer: asn1::TsRequest,
+) -> Result<(Vec<u8>, ntlm::messages::ChallengeMessage), WinrmError> {
+    tracing::debug!(
+        server_version = answer.version,
+        negotiated = std::cmp::min(answer.version, CREDSSP_VERSION),
+        "CredSSP version negotiation"
+    );
+    refuse_error_code(&answer)?;
+    let spnego = answer
+        .nego_token
+        .ok_or_else(|| WinrmError::AuthFailed("CredSSP: no negoToken from server".into()))?;
+    let type2 = asn1::decode_spnego_token(&spnego).map_err(WinrmError::CredSsp)?;
+    let challenge = ntlm::parse_challenge(&type2).map_err(WinrmError::Ntlm)?;
+    ntlm::log_challenge(&challenge);
+    ntlm::check_challenge(&challenge, true).map_err(WinrmError::Ntlm)?;
+    Ok((type2, challenge))
+}
+
+/// The SubjectPublicKey of the certificate `cert_der`: the contents of its
+/// bit string (a PKCS#1 `RSAPublicKey` for an RSA certificate), which is what
+/// `pubKeyAuth` is computed over (MS-CSSP 2.2.2.5).
+fn subject_public_key(cert_der: &[u8]) -> Result<Vec<u8>, WinrmError> {
+    use x509_cert::der::Decode;
+    let cert = x509_cert::Certificate::from_der(cert_der)
+        .map_err(|e| WinrmError::AuthFailed(format!("CredSSP cert parse: {e}")))?;
+    Ok(cert
+        .tbs_certificate()
+        .subject_public_key_info()
+        .subject_public_key
+        .raw_bytes()
+        .to_vec())
+}
+
+/// The nonce of `pubKeyAuth`, from the CSPRNG.
+///
+/// `CREDSSP_FIXED_NONCE` pins it for deterministic tests. It is honoured
+/// only in debug builds with the internal `__internal` feature.
+fn client_nonce() -> [u8; 32] {
+    #[cfg(all(debug_assertions, feature = "__internal"))]
+    if let Some(fixed) = std::env::var("CREDSSP_FIXED_NONCE")
+        .ok()
+        .and_then(|s| crate::ntlm::crypto::parse_fixed_hex::<32>(&s))
+    {
+        return fixed;
+    }
+    rand::random()
+}
+
+/// Prefix of the hash the client seals in its `pubKeyAuth`.
+const CLIENT_TO_SERVER: &[u8] = b"CredSSP Client-To-Server Binding Hash\0";
+/// Prefix of the hash the server seals in return.
+const SERVER_TO_CLIENT: &[u8] = b"CredSSP Server-To-Client Binding Hash\0";
+
+/// What `pubKeyAuth` binds since version 5 of the protocol: the nonce the
+/// client draws and the public key of the server's inner TLS certificate.
+struct KeyBinding {
+    nonce: [u8; 32],
+    subject_public_key: Vec<u8>,
+}
+
+impl KeyBinding {
+    /// `SHA256(magic || nonce || SubjectPublicKey)`.
+    fn hash(&self, magic: &[u8]) -> Vec<u8> {
+        let mut hasher = Sha256::new();
+        hasher.update(magic);
+        hasher.update(self.nonce);
+        hasher.update(&self.subject_public_key);
+        hasher.finalize().to_vec()
+    }
+}
+
+/// The client's answer to the challenge: the TSRequest of the authenticate
+/// round (the NTLM Type 3 with its mechListMIC, `pubKeyAuth`, the nonce) and
+/// the NTLM session it opens.
+///
+/// Not `async`: the exported session key never becomes part of a future's
+/// state, and `Zeroizing` wipes it as soon as the session is built.
+fn client_proof(
+    auth: &CredSspAuth,
+    spn: &str,
+    type1: &[u8],
+    type2: &[u8],
+    challenge: &ntlm::messages::ChallengeMessage,
+    binding: &KeyBinding,
+) -> Result<(Vec<u8>, Box<SealingSession>), WinrmError> {
+    let (type3, mut session) = {
+        let (type3, session_key) = ntlm::create_authenticate_message_credssp(
+            challenge,
+            &auth.username,
+            &auth.password,
+            &auth.domain,
+            spn,
+            type1,
+            type2,
+        )
+        .map_err(WinrmError::Ntlm)?;
+        (type3, SealingSession::boxed_from_auth(&session_key))
+    };
+    // The mechListMIC over the SPNEGO mech_type_list MUST come before the
+    // sealing of pubKeyAuth, so that the latter uses seq=1 (what pyspnego
+    // and Windows expect). Without a mechListMIC the server answers
+    // STATUS_LOGON_FAILURE. `sign_mech_list_mic` also resets the RC4 sealing
+    // handle afterwards, as Windows SPNEGO does: the pubKeyAuth below must
+    // be sealed at keystream offset 0.
+    let mech_list_mic = session
+        .sign_mech_list_mic(asn1::MECH_TYPE_LIST_NTLM)
+        .map_err(WinrmError::Ntlm)?;
+    let client_hash = binding.hash(CLIENT_TO_SERVER);
+    let pub_key_auth = session.seal(&client_hash).map_err(WinrmError::Ntlm)?;
+
+    let spnego = asn1::encode_spnego_response(&type3, Some(&mech_list_mic));
+    let request = asn1::encode_ts_request(
+        CREDSSP_VERSION,
+        Some(&spnego),
+        Some(&pub_key_auth),
+        None,
+        Some(&binding.nonce),
+    );
+    // CREDSSP_DUMP dumps every value of the proof (nonce, public key, hash,
+    // sealed pubKeyAuth) to stderr. It is compiled in only for debug builds
+    // with the internal `__internal` feature.
+    #[cfg(all(debug_assertions, feature = "__internal"))]
+    if std::env::var("CREDSSP_DUMP").is_ok() {
+        use crate::ntlm::crypto::hex;
+        eprintln!(
+            "[CREDSSP_DUMP] ts_req3 ({}B): {}",
+            request.len(),
+            hex(&request)
+        );
+        eprintln!("[CREDSSP_DUMP] nonce: {}", hex(&binding.nonce));
+        eprintln!("[CREDSSP_DUMP] type1: {}", hex(type1));
+        eprintln!(
+            "[CREDSSP_DUMP] spnego_init: {}",
+            hex(&asn1::encode_spnego_init(type1))
+        );
+        eprintln!("[CREDSSP_DUMP] type2: {}", hex(type2));
+        eprintln!("[CREDSSP_DUMP] type3: {}", hex(&type3));
+        eprintln!("[CREDSSP_DUMP] mech_list_mic: {}", hex(&mech_list_mic));
+        eprintln!("[CREDSSP_DUMP] spn: {spn}");
+        eprintln!(
+            "[CREDSSP_DUMP] subject_public_key: {}",
+            hex(&binding.subject_public_key)
+        );
+        eprintln!("[CREDSSP_DUMP] client_hash: {}", hex(&client_hash));
+        eprintln!("[CREDSSP_DUMP] sealed_pub_key_auth: {}", hex(&pub_key_auth));
+    }
+    Ok((request, session))
+}
+
+/// Check the server's answer to the authenticate round: its final SPNEGO
+/// token, its mechListMIC and its `pubKeyAuth`, which proves it holds the
+/// private key of the inner TLS certificate and the NTLM session key.
+fn verify_server_proof(
+    answer: asn1::TsRequest,
+    session: &mut SealingSession,
+    binding: &KeyBinding,
+) -> Result<(), WinrmError> {
+    refuse_error_code(&answer)?;
     // The client sent a mechListMIC with its last SPNEGO token, so RFC 4178
     // §5 c) case I requires the server's final token to answer with its own
     // and with accept-completed. MS-SPNG <8> makes the mechListMIC
@@ -1627,7 +1687,7 @@ async fn authenticate(
     // Verifying the MIC (GSS_VerifyMIC at server seq 0) also re-initialises
     // the server RC4 handle, so the pubKeyAuth below unseals at seq 1,
     // keystream offset 0 — the same reset Windows applies on its side.
-    let nego = ts_resp.nego_token.as_deref().ok_or_else(|| {
+    let nego = answer.nego_token.as_deref().ok_or_else(|| {
         WinrmError::AuthFailed("CredSSP: server sent no final SPNEGO token".into())
     })?;
     let (state, mic) = asn1::decode_spnego_final(nego).map_err(WinrmError::CredSsp)?;
@@ -1641,40 +1701,99 @@ async fn authenticate(
     let mic = mic.ok_or_else(|| {
         WinrmError::AuthFailed("CredSSP: server omitted mechListMIC (RFC 4178 §5)".into())
     })?;
-    ntlm_session
+    session
         .verify_mech_list_mic(asn1::MECH_TYPE_LIST_NTLM, &mic)
         .map_err(WinrmError::Ntlm)?;
-    let server_pub_key_auth = ts_resp
+    let sealed = answer
         .pub_key_auth
         .ok_or_else(|| WinrmError::AuthFailed("CredSSP: no pubKeyAuth from server".into()))?;
-    let decrypted_server_hash = ntlm_session
-        .unseal(&server_pub_key_auth)
-        .map_err(WinrmError::Ntlm)?;
-    let expected_server_hash = {
-        let mut hasher = Sha256::new();
-        hasher.update(b"CredSSP Server-To-Client Binding Hash\0");
-        hasher.update(nonce);
-        hasher.update(&subject_public_key);
-        hasher.finalize().to_vec()
-    };
-    if decrypted_server_hash != expected_server_hash {
+    let server_hash = session.unseal(&sealed).map_err(WinrmError::Ntlm)?;
+    if server_hash != binding.hash(SERVER_TO_CLIENT) {
         return Err(WinrmError::CredSsp(CredSspError::PublicKeyMismatch));
     }
+    Ok(())
+}
 
-    // === Step 8: Send encrypted TSCredentials ===
-    // Same rule: the cleartext TSCredentials are wiped before the final
-    // POST, which can last as long as the WS-Man operation
-    // (`operation_timeout_secs`). No `.await` inside this block.
-    let encrypted_creds = {
-        let ts_creds = asn1::encode_ts_credentials(&domain, &auth.username, &auth.password);
-        ntlm_session.seal(&ts_creds).map_err(WinrmError::Ntlm)?
+/// The TSRequest of the delegation round: the TSCredentials, sealed, in
+/// `authInfo`.
+///
+/// Not `async`: the cleartext TSCredentials are wiped before the round that
+/// carries them is posted, which can last as long as the WS-Man operation
+/// (`operation_timeout_secs`).
+fn delegation(auth: &CredSspAuth, session: &mut SealingSession) -> Result<Vec<u8>, WinrmError> {
+    let ts_creds = asn1::encode_ts_credentials(&auth.domain, &auth.username, &auth.password);
+    let sealed = session.seal(&ts_creds).map_err(WinrmError::Ntlm)?;
+    Ok(asn1::encode_ts_request(
+        CREDSSP_VERSION,
+        None,
+        None,
+        Some(&sealed),
+        None,
+    ))
+}
+
+/// Run the CredSSP handshake on `conn` up to the delegation: the inner TLS
+/// handshake, NTLM negotiate, then NTLM authenticate with `pubKeyAuth`, whose
+/// answer must carry the server's final SPNEGO token and `pubKeyAuth`. Each
+/// round posts `body_for_auth`. Returns the `Authorization` value of the
+/// delegation round (the TSRequest with the sealed TSCredentials in
+/// `authInfo`), which the caller posts with the request body.
+async fn authenticate(
+    conn: &mut CredSspConnection,
+    auth: &CredSspAuth,
+    endpoint: &CredSspEndpoint,
+    body_for_auth: &str,
+) -> Result<String, WinrmError> {
+    // The inner TLS session is OpenSSL over an in-memory BIO, as pyspnego
+    // does: the session rustls builds is one Microsoft's CredSSP server
+    // silently rejects.
+    let mut inner = build_inner_openssl_tls(&auth.tls.inner)?;
+    inner_tls_handshake(conn, &mut inner, body_for_auth).await?;
+    let inner_cert_der = inner.peer_cert_der()?;
+    #[cfg(all(debug_assertions, feature = "__internal"))]
+    if std::env::var("CREDSSP_DUMP").is_ok() {
+        eprintln!(
+            "[CREDSSP_DUMP] inner_cert_der: {}",
+            crate::ntlm::crypto::hex(&inner_cert_der)
+        );
+    }
+    let subject_public_key = subject_public_key(&inner_cert_der)?;
+
+    // NTLM negotiate: the CredSSP Type 1 carries the KEY_EXCH, SEAL and SIGN
+    // flags that the sealing of pubKeyAuth and TSCredentials needs.
+    let type1 = ntlm::create_negotiate_message_credssp();
+    let negotiate = asn1::encode_ts_request(
+        CREDSSP_VERSION,
+        Some(&asn1::encode_spnego_init(&type1)),
+        None,
+        None,
+        None,
+    );
+    let answer = ts_round(
+        conn,
+        &mut inner,
+        &negotiate,
+        body_for_auth,
+        Round::Negotiate,
+    )
+    .await?;
+    let (type2, challenge) = server_challenge(answer)?;
+
+    // NTLM authenticate, with the proof of each side. The SPN is the one of
+    // the endpoint host (punycode, lowercase, IPv6 without brackets).
+    let binding = KeyBinding {
+        nonce: client_nonce(),
+        subject_public_key,
     };
-    let ts_req5 =
-        asn1::encode_ts_request(CREDSSP_VERSION, None, None, Some(&encrypted_creds), None);
-    inner_tls.write_plaintext(&ts_req5)?;
-    let outgoing = Ok::<_, WinrmError>(inner_tls.drain_outgoing())?;
+    let (proof, mut session) =
+        client_proof(auth, &endpoint.spn(), &type1, &type2, &challenge, &binding)?;
+    let answer = ts_round(conn, &mut inner, &proof, body_for_auth, Round::Authenticate).await?;
+    verify_server_proof(answer, &mut session, &binding)?;
 
-    Ok(encode_auth(&outgoing))
+    // The delegation: the caller posts it with the request body.
+    let credentials = delegation(auth, &mut session)?;
+    inner.write_plaintext(&credentials)?;
+    Ok(authorization(&inner.drain_outgoing()))
 }
 
 #[cfg(not(feature = "credssp"))]
@@ -1696,1699 +1815,4 @@ impl AuthTransport for CredSspAuth {
 // `auth/mod.rs` already gates this module on `credssp`. A plain `cfg(test)`
 // is also what Clippy's `allow-*-in-tests` (clippy.toml) recognises.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::WinrmConfig;
-
-    use rustls::pki_types::ServerName;
-
-    #[test]
-    fn credssp_endpoint_strips_ipv6_brackets_for_connect_sni_and_spn() {
-        let e = CredSspEndpoint::parse("https://[::1]:5986/wsman").unwrap();
-        assert_eq!(
-            (e.host.as_str(), e.port, e.path.as_str()),
-            ("::1", 5986, "/wsman")
-        );
-        assert_eq!(e.host_header, "[::1]:5986");
-        assert_eq!(e.server_name, ServerName::try_from("::1").unwrap());
-        assert_eq!(e.spn(), "HTTP/::1");
-    }
-
-    #[test]
-    fn credssp_endpoint_punycodes_an_idn_host() {
-        let e = CredSspEndpoint::parse("https://bücher.example:5986/wsman").unwrap();
-        assert_eq!(e.host, "xn--bcher-kva.example");
-        assert_eq!(e.host_header, "xn--bcher-kva.example:5986");
-        assert_eq!(
-            e.server_name,
-            ServerName::try_from("xn--bcher-kva.example").unwrap()
-        );
-        assert_eq!(e.spn(), "HTTP/xn--bcher-kva.example");
-    }
-
-    #[test]
-    fn credssp_endpoint_keeps_todays_results_for_plain_hosts() {
-        let e = CredSspEndpoint::parse("https://host.example:5986/wsman").unwrap();
-        assert_eq!(
-            (e.host.as_str(), e.port, e.path.as_str()),
-            ("host.example", 5986, "/wsman")
-        );
-        assert_eq!(e.host_header, "host.example:5986");
-        assert_eq!(
-            CredSspEndpoint::parse("https://10.0.0.5:5986/wsman")
-                .unwrap()
-                .spn(),
-            "HTTP/10.0.0.5"
-        );
-        assert_eq!(
-            CredSspEndpoint::parse("https://host:5986").unwrap().path,
-            "/"
-        );
-        assert_eq!(CredSspEndpoint::parse("http://h:80/x").unwrap().port, 80);
-        // The URL parser drops a default port; the transport always writes one.
-        assert_eq!(
-            CredSspEndpoint::parse("https://host:443/wsman")
-                .unwrap()
-                .port,
-            443
-        );
-        // Without a port the scheme's default is used.
-        let https = CredSspEndpoint::parse("https://host.example/wsman").unwrap();
-        assert_eq!(https.port, 443);
-        assert_eq!(https.host_header, "host.example:443");
-        let http = CredSspEndpoint::parse("http://host.example/wsman").unwrap();
-        assert_eq!(http.port, 80);
-        assert_eq!(http.host_header, "host.example:80");
-    }
-
-    #[test]
-    fn credssp_endpoint_spn_host_is_lowercase_like_pyspnego() {
-        assert_eq!(
-            CredSspEndpoint::parse("https://WIN01.Corp:5986/wsman")
-                .unwrap()
-                .spn(),
-            "HTTP/win01.corp"
-        );
-    }
-
-    #[test]
-    fn credssp_endpoint_rejects_bad_scheme_and_port() {
-        assert!(CredSspEndpoint::parse("ftp://host/path").is_err());
-        assert!(CredSspEndpoint::parse("https://host:notaport/x").is_err());
-        assert!(CredSspEndpoint::parse("https://host:99999/x").is_err());
-    }
-
-    #[test]
-    fn extract_credssp_token_str_simple() {
-        assert_eq!(
-            extract_credssp_token_str("CredSSP YWJjZGVm"),
-            Some("YWJjZGVm".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_credssp_token_str_case_insensitive_and_mixed() {
-        assert_eq!(
-            extract_credssp_token_str("Negotiate, credssp ABCDEF, Basic"),
-            Some("ABCDEF".to_string())
-        );
-    }
-
-    /// A non-ASCII character whose uppercase form is longer in UTF-8
-    /// (`ɐ` → `Ɐ`) before the scheme must neither panic nor shift the cut.
-    #[test]
-    fn extract_credssp_token_str_survives_non_ascii_before_the_scheme() {
-        assert_eq!(
-            extract_credssp_token_str("ɐ CredSSP éé"),
-            Some("éé".to_string())
-        );
-        assert_eq!(
-            extract_credssp_token_str("ɐɐɐɐ, CredSSP QUJD, Basic"),
-            Some("QUJD".to_string())
-        );
-        assert_eq!(extract_credssp_token_str("ɐ ẞ ſ"), None);
-    }
-
-    #[test]
-    fn extract_credssp_token_str_returns_none_when_no_token() {
-        assert_eq!(extract_credssp_token_str("Negotiate, Basic"), None);
-        assert_eq!(extract_credssp_token_str("CredSSP "), None);
-    }
-
-    fn read_all(chunks: &[&[u8]]) -> Result<Option<HttpResponse>, WinrmError> {
-        let mut r = ResponseReader::new(1024, 64);
-        for c in chunks {
-            if let Some(resp) = r.feed(c)? {
-                return Ok(Some(resp));
-            }
-        }
-        Ok(None)
-    }
-
-    fn err_text(input: &[u8]) -> String {
-        match read_all(&[input]) {
-            Err(WinrmError::AuthFailed(m)) => m,
-            other => panic!(
-                "expected AuthFailed for {:?}, got {other:?}",
-                String::from_utf8_lossy(input)
-            ),
-        }
-    }
-
-    #[test]
-    fn find_head_end_resumes_where_it_stopped() {
-        let buf = b"HTTP/1.1 200 OK\r\nA: b\r\n\r\nrest";
-        assert_eq!(find_head_end(buf, 0), Some(25));
-        assert_eq!(find_head_end(buf, 21), Some(25));
-        assert_eq!(find_head_end(buf, 22), None);
-    }
-
-    #[test]
-    fn head_scan_is_linear_in_the_bytes_fed() {
-        let mut r = ResponseReader::new(1024 * 1024, 64);
-        for _ in 0..65_536 {
-            assert!(r.feed(b"a").unwrap().is_none());
-        }
-        assert!(
-            r.scanned <= 4 * 65_536,
-            "scanned {} bytes for 65536 fed",
-            r.scanned
-        );
-        let mut small = ResponseReader::new(64, 64);
-        assert!(
-            matches!(small.feed(&[b'a'; 65]), Err(WinrmError::AuthFailed(m)) if m == "CredSSP: response head too large")
-        );
-    }
-
-    #[test]
-    fn reader_frames_by_content_length() {
-        let resp = read_all(&[b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"])
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            (
-                resp.status,
-                resp.body.as_slice(),
-                resp.closing,
-                resp.leftover
-            ),
-            (200, &b"hello"[..], false, false)
-        );
-        for dup in [
-            &b"Content-Length: 5\r\nContent-Length: 5"[..],
-            b"Content-Length: 5, 5",
-        ] {
-            let input = [&b"HTTP/1.1 200 OK\r\n"[..], dup, b"\r\n\r\nhello"].concat();
-            assert_eq!(read_all(&[&input]).unwrap().unwrap().body, b"hello");
-        }
-        for bad in ["5\r\nContent-Length: 6", "5, 6", "+5", "5 5", "", "0x5"] {
-            let input = format!("HTTP/1.1 200 OK\r\nContent-Length: {bad}\r\n\r\nhello");
-            assert_eq!(
-                err_text(input.as_bytes()),
-                "CredSSP: invalid Content-Length",
-                "{bad:?}"
-            );
-        }
-        let too_large = crate::auth::body_too_large(64).to_string();
-        for big in ["65", "99999999999999999999999"] {
-            let input = format!("HTTP/1.1 200 OK\r\nContent-Length: {big}\r\n\r\n");
-            assert_eq!(
-                read_all(&[input.as_bytes()]).unwrap_err().to_string(),
-                too_large,
-                "{big}"
-            );
-        }
-    }
-
-    #[test]
-    fn reader_refuses_transfer_and_content_codings() {
-        assert_eq!(
-            err_text(
-                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"
-            ),
-            "CredSSP: Transfer-Encoding is not supported"
-        );
-        assert_eq!(
-            err_text(b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 0\r\n\r\n"),
-            "CredSSP: Content-Encoding is not supported: gzip"
-        );
-        assert!(
-            read_all(&[
-                b"HTTP/1.1 200 OK\r\nContent-Encoding: Identity\r\nContent-Length: 0\r\n\r\n"
-            ])
-            .unwrap()
-            .is_some()
-        );
-    }
-
-    #[test]
-    fn reader_requires_a_length_on_success() {
-        assert_eq!(
-            err_text(b"HTTP/1.1 200 OK\r\n\r\nbody"),
-            "CredSSP: response 200 without Content-Length"
-        );
-        let no_content = read_all(&[b"HTTP/1.1 204 No Content\r\n\r\n"])
-            .unwrap()
-            .unwrap();
-        assert!(no_content.body.is_empty() && !no_content.closing);
-        let challenge = read_all(&[b"HTTP/1.1 401 \r\nWWW-Authenticate: CredSSP AAA\r\n\r\n"])
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            (challenge.status, challenge.body.len(), challenge.closing),
-            (401, 0, true)
-        );
-    }
-
-    #[test]
-    fn reader_skips_interim_responses() {
-        let resp = read_all(&[
-            b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
-        ])
-        .unwrap()
-        .unwrap();
-        assert_eq!((resp.status, resp.body.as_slice()), (200, &b"ok"[..]));
-        let nine = "HTTP/1.1 100 Continue\r\n\r\n".repeat(9);
-        assert_eq!(
-            err_text(nine.as_bytes()),
-            "CredSSP: too many interim responses"
-        );
-        assert_eq!(
-            err_text(b"HTTP/1.1 101 Switching Protocols\r\n\r\n"),
-            "CredSSP: unexpected 101 Switching Protocols"
-        );
-    }
-
-    #[test]
-    fn reader_reports_a_short_body_at_eof() {
-        let mut r = ResponseReader::new(1024, 64);
-        assert!(
-            r.feed(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc")
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(
-            r.eof_error().to_string(),
-            WinrmError::AuthFailed("CredSSP: connection closed after 3 of 10 body bytes".into())
-                .to_string()
-        );
-        let mut early = ResponseReader::new(1024, 64);
-        assert!(early.feed(b"HTTP/1.1 200").unwrap().is_none());
-        assert!(
-            matches!(early.eof_error(), WinrmError::AuthFailed(m) if m == "CredSSP: server closed connection mid-response")
-        );
-    }
-
-    #[test]
-    fn reader_flags_leftover_bytes() {
-        let resp = read_all(&[b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nokEXTRA"])
-            .unwrap()
-            .unwrap();
-        assert_eq!((resp.body.as_slice(), resp.leftover), (&b"ok"[..], true));
-    }
-
-    #[test]
-    fn reader_reads_connection_close_and_http_1_0() {
-        let close = read_all(&[
-            b"HTTP/1.1 200 OK\r\nConnection: keep-alive, Close\r\nContent-Length: 0\r\n\r\n",
-        ])
-        .unwrap()
-        .unwrap();
-        assert!(close.closing);
-        assert!(
-            read_all(&[b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n"])
-                .unwrap()
-                .unwrap()
-                .closing
-        );
-        assert!(
-            !read_all(&[b"HTTP/1.0 200 OK\r\nConnection: Keep-Alive\r\nContent-Length: 0\r\n\r\n"])
-                .unwrap()
-                .unwrap()
-                .closing
-        );
-    }
-
-    #[test]
-    fn reader_refuses_bad_lines() {
-        assert_eq!(
-            err_text(b"HTTP/1.1 200 OK\r\nA: b\r\n c\r\nContent-Length: 0\r\n\r\n"),
-            "CredSSP: folded header line"
-        );
-        assert!(
-            err_text(b"HTTP/1.1 200 OK\r\nBad Name: x\r\nContent-Length: 0\r\n\r\n")
-                .starts_with("CredSSP: bad header line: ")
-        );
-        assert!(
-            err_text(b"HTTP/1.1 200 OK\r\nNoColon\r\nContent-Length: 0\r\n\r\n")
-                .starts_with("CredSSP: bad header line: ")
-        );
-        for line in [
-            "HTTP/2 200 OK",
-            "HTTP/1.1 600 X",
-            "HTTP/1.1 20 X",
-            "HTTP/1.1 abc OK",
-            "HTTP/1.1  200 OK",
-        ] {
-            let input = format!("{line}\r\nContent-Length: 0\r\n\r\n");
-            assert!(
-                err_text(input.as_bytes()).starts_with("CredSSP: bad status line: "),
-                "{line}"
-            );
-        }
-        assert_eq!(
-            err_text(b"HTTP/1.1 200 OK\r\nX: \xff\r\n\r\n"),
-            "CredSSP: non-UTF8 response head"
-        );
-    }
-
-    #[test]
-    fn reader_joins_repeated_headers() {
-        let resp = read_all(&[b"HTTP/1.1 401 \r\nWWW-Authenticate: CredSSP AAA\r\nwww-authenticate: Negotiate\r\nContent-Length: 0\r\n\r\n"])
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            resp.head.header("WWW-Authenticate").as_deref(),
-            Some("CredSSP AAA, Negotiate")
-        );
-        assert_eq!(
-            resp.head
-                .header_values("www-authenticate")
-                .collect::<Vec<_>>(),
-            ["CredSSP AAA", "Negotiate"]
-        );
-    }
-
-    #[test]
-    fn missing_header_is_absent() {
-        let resp = read_all(&[b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"])
-            .unwrap()
-            .unwrap();
-        assert_eq!(resp.head.header("missing"), None);
-        assert_eq!(resp.head.header_values("missing").count(), 0);
-    }
-
-    /// Feed `input` in one read, then byte by byte, to a reader whose head
-    /// cap is `max_head`; both must give the same `AuthFailed` text.
-    fn capped_err_text(input: &[u8], max_head: usize) -> String {
-        let mut texts = Vec::new();
-        for chunk_len in [input.len(), 1] {
-            let mut r = ResponseReader::new(max_head, 64);
-            let mut out = Ok(None);
-            for c in input.chunks(chunk_len) {
-                out = r.feed(c);
-                if !matches!(out, Ok(None)) {
-                    break;
-                }
-            }
-            match out {
-                Err(WinrmError::AuthFailed(m)) => texts.push(m),
-                other => panic!("chunk {chunk_len}: expected AuthFailed, got {other:?}"),
-            }
-        }
-        assert_eq!(texts[0], texts[1]);
-        texts.remove(0)
-    }
-
-    #[test]
-    fn head_ending_past_the_cap_in_one_read_is_refused() {
-        let input = b"HTTP/1.1 200 OK\r\nX-Pad: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\nContent-Length: 0\r\n\r\n";
-        assert!(input.len() > 64);
-        let mut r = ResponseReader::new(64, 64);
-        assert!(
-            matches!(r.feed(input), Err(WinrmError::AuthFailed(m)) if m == "CredSSP: response head too large")
-        );
-        assert_eq!(
-            capped_err_text(input, 64),
-            "CredSSP: response head too large"
-        );
-        // The same head fits a cap of its own length.
-        assert!(
-            ResponseReader::new(input.len(), 64)
-                .feed(input)
-                .unwrap()
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn interim_heads_count_against_the_head_cap() {
-        let interim = "HTTP/1.1 100 Continue\r\n\r\n".repeat(2);
-        let input = format!("{interim}HTTP/1.1 204 No Content\r\n\r\n");
-        // Each head alone fits in 64 bytes; together they do not.
-        assert!(input.len() > 64 && interim.len() < 64);
-        assert_eq!(
-            capped_err_text(input.as_bytes(), 64),
-            "CredSSP: response head too large"
-        );
-        assert!(
-            ResponseReader::new(input.len(), 64)
-                .feed(input.as_bytes())
-                .unwrap()
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn bare_cr_or_lf_in_a_head_line_is_refused() {
-        assert_eq!(
-            err_text(b"HTTP/1.1 200 OK\r\nX: a\rb\r\nContent-Length: 0\r\n\r\n"),
-            "CredSSP: bad header line: X: a b"
-        );
-        assert_eq!(
-            err_text(b"HTTP/1.1 200 OK\r\nX: a\nb\r\nContent-Length: 0\r\n\r\n"),
-            "CredSSP: bad header line: X: a b"
-        );
-        assert_eq!(
-            err_text(b"HTTP/1.1 200 O\rK\r\nContent-Length: 0\r\n\r\n"),
-            "CredSSP: bad status line: HTTP/1.1 200 O K"
-        );
-        assert_eq!(
-            err_text(b"HTTP/1.1 200 O\nK\r\nContent-Length: 0\r\n\r\n"),
-            "CredSSP: bad status line: HTTP/1.1 200 O K"
-        );
-    }
-
-    #[tokio::test]
-    async fn post_applies_the_connection_head_cap() {
-        let (conn, peer) = duplex_conn();
-        let mut conn = CredSspConnection {
-            max_head_bytes: 64,
-            ..conn
-        };
-        tokio::spawn(answer_then_hang(
-            peer,
-            b"HTTP/1.1 200 OK\r\nX-Pad: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\nContent-Length: 0\r\n\r\n",
-        ));
-        let res = conn.post(None, "<a/>").await;
-        assert!(
-            matches!(&res, Err(WinrmError::AuthFailed(m)) if m == "CredSSP: response head too large"),
-            "{res:?}"
-        );
-    }
-
-    #[test]
-    fn reader_result_does_not_depend_on_chunking() {
-        let input: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 401 \r\nWWW-Authenticate: CredSSP QUJD\r\nContent-Length: 3\r\n\r\nabc";
-        let one = read_all(&[input]).unwrap().unwrap();
-        let key = |r: &HttpResponse| {
-            (
-                r.status,
-                r.body.clone(),
-                r.closing,
-                r.leftover,
-                r.head.header("www-authenticate"),
-            )
-        };
-        for i in 0..=input.len() {
-            assert_eq!(
-                key(&read_all(&[&input[..i], &input[i..]]).unwrap().unwrap()),
-                key(&one),
-                "split at {i}"
-            );
-        }
-        let bytes: Vec<&[u8]> = input.chunks(1).collect();
-        assert_eq!(key(&read_all(&bytes).unwrap().unwrap()), key(&one));
-    }
-
-    #[test]
-    fn handshake_round_ok_refuses_closing_and_leftover() {
-        let resp = |closing, leftover| HttpResponse {
-            status: 401,
-            head: ResponseHead {
-                minor_version: 1,
-                status: 401,
-                headers: Vec::new(),
-            },
-            body: Vec::new(),
-            closing,
-            leftover,
-        };
-        assert!(handshake_round_ok(&resp(false, false), "NTLM negotiate").is_ok());
-        assert!(
-            matches!(handshake_round_ok(&resp(true, false), "NTLM negotiate"),
-            Err(WinrmError::AuthFailed(m)) if m == "CredSSP: server closed the connection during NTLM negotiate")
-        );
-        assert!(
-            matches!(handshake_round_ok(&resp(false, true), "NTLM negotiate"),
-            Err(WinrmError::AuthFailed(m)) if m == "CredSSP: unexpected bytes after the response during NTLM negotiate")
-        );
-    }
-
-    #[tokio::test]
-    async fn post_sends_identity_and_the_configured_user_agent() {
-        let (conn, mut peer) = duplex_conn();
-        let mut conn = CredSspConnection {
-            opts: CredSspConnOptions {
-                user_agent: "probe-agent/1".into(),
-                ..test_opts()
-            },
-            ..conn
-        };
-        let server = tokio::spawn(async move {
-            let req = read_request(&mut peer).await;
-            tokio::io::AsyncWriteExt::write_all(
-                &mut peer,
-                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
-            )
-            .await
-            .unwrap();
-            req
-        });
-        let resp = conn.post(None, "<s:Envelope/>").await.unwrap();
-        assert_eq!(resp.body, b"ok");
-        let req = server.await.unwrap();
-        assert!(req.contains("\r\nUser-Agent: probe-agent/1\r\n"), "{req}");
-        assert!(req.contains("\r\nAccept-Encoding: identity\r\n"), "{req}");
-        assert!(
-            !req.contains("Python WinRM client") && !req.contains("gzip"),
-            "{req}"
-        );
-    }
-
-    #[test]
-    fn credssp_options_default_user_agent_is_the_crate_name() {
-        let config = WinrmConfig::default();
-        assert_eq!(
-            CredSspConnOptions::from_config(&config).user_agent,
-            concat!("winrm-rs/", env!("CARGO_PKG_VERSION"))
-        );
-        let config = WinrmConfig {
-            user_agent: Some("ops-tool/2".into()),
-            ..WinrmConfig::default()
-        };
-        assert_eq!(
-            CredSspConnOptions::from_config(&config).user_agent,
-            "ops-tool/2"
-        );
-    }
-
-    #[tokio::test]
-    async fn post_fails_on_a_short_body() {
-        let (mut conn, mut peer) = duplex_conn();
-        tokio::spawn(async move {
-            read_request(&mut peer).await;
-            tokio::io::AsyncWriteExt::write_all(
-                &mut peer,
-                b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc",
-            )
-            .await
-            .unwrap();
-            drop(peer);
-        });
-        let err = conn.post(None, "<s:Envelope/>").await.unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("connection closed after 3 of 10 body bytes"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn membio_write_appends_to_outgoing_and_read_drains_incoming() {
-        use std::io::{Read, Write};
-        let mut bio = MemBio {
-            incoming: std::collections::VecDeque::new(),
-            outgoing: Vec::new(),
-        };
-        // Write extends outgoing
-        assert_eq!(bio.write(b"hello").unwrap(), 5);
-        bio.flush().unwrap();
-        assert_eq!(bio.outgoing, b"hello");
-
-        // Read on empty incoming returns WouldBlock
-        let mut buf = [0u8; 4];
-        let err = bio.read(&mut buf).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
-
-        // Feed incoming and read it back
-        bio.incoming.extend(b"abcdef".iter().copied());
-        let n = bio.read(&mut buf).unwrap();
-        assert_eq!(n, 4);
-        assert_eq!(&buf, b"abcd");
-        // Remaining 2 bytes still queued
-        assert_eq!(bio.incoming.len(), 2);
-    }
-
-    #[test]
-    fn openssl_inner_tls_peer_cert_before_handshake_errors() {
-        let tls = build_inner_openssl_tls(&no_verify().inner).expect("build inner tls");
-        // No handshake completed → no peer cert available
-        assert!(tls.peer_cert_der().is_err());
-    }
-
-    #[test]
-    fn openssl_inner_tls_feed_incoming_then_drain_clears_outgoing() {
-        let mut tls = build_inner_openssl_tls(&no_verify().inner).expect("build inner tls");
-        let _ = tls.handshake_step();
-        let first = tls.drain_outgoing();
-        assert!(!first.is_empty());
-        // After draining, outgoing buffer should be empty
-        assert!(tls.drain_outgoing().is_empty());
-        // feed_incoming with garbage doesn't panic
-        tls.feed_incoming(&[0u8; 8]);
-    }
-
-    #[test]
-    fn openssl_inner_tls_handshake_starts() {
-        let mut tls = build_inner_openssl_tls(&no_verify().inner).expect("build inner tls");
-        let _ = tls.handshake_step();
-        let bytes = tls.drain_outgoing();
-        assert!(!bytes.is_empty(), "should produce ClientHello bytes");
-        // First byte of TLS record is 0x16 (Handshake)
-        assert_eq!(bytes[0], 0x16);
-    }
-
-    #[tokio::test]
-    async fn credssp_outer_tls_refuses_an_impostor() {
-        for (label, versions) in [
-            ("TLS 1.3", &[&rustls::version::TLS13][..]),
-            ("TLS 1.2", &[&rustls::version::TLS12][..]),
-        ] {
-            let (port, _read) =
-                crate::test_pki::spawn_tls_sink(crate::test_pki::impostor_server_config(versions));
-            let endpoint =
-                CredSspEndpoint::parse(&format!("https://127.0.0.1:{port}/wsman")).unwrap();
-            match CredSspConnection::connect(
-                &endpoint,
-                &no_verify(),
-                &CredSspDial::Direct,
-                test_opts(),
-            )
-            .await
-            {
-                Err(WinrmError::AuthFailed(m)) => {
-                    assert!(m.starts_with("CredSSP outer TLS:"), "{label}: {m}");
-                }
-                Err(e) => panic!("{label}: {e:?}"),
-                Ok(_) => panic!("{label}: impostor accepted on the CredSSP outer TLS"),
-            }
-        }
-    }
-
-    // --- Full exchanges against the in-process acceptor (`test_server`) ---
-
-    use super::test_server::{self, Event, Fault, delegations, rounds};
-    use crate::test_ntlm_server::{PASS, USER};
-    use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
-    use std::time::Duration;
-
-    const BODY: &str = "<s:Envelope>mock request</s:Envelope>";
-
-    /// The TLS contexts of a client on a private `ring` provider, whose
-    /// outer TLS uses `verifier`.
-    fn test_tls_with(
-        verifier: impl FnOnce(
-            &Arc<rustls::crypto::CryptoProvider>,
-        ) -> Arc<dyn rustls::client::danger::ServerCertVerifier>,
-    ) -> CredSspTls {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let base = crate::tls::client_config_builder(&provider)
-            .unwrap()
-            .dangerous()
-            .with_custom_certificate_verifier(verifier(&provider))
-            .with_no_client_auth();
-        CredSspTls::new(&base).unwrap()
-    }
-
-    /// TLS contexts with no outer certificate verification (handshake
-    /// signatures are still checked). The transport refuses CredSSP under
-    /// `accept_invalid_certs`; these tests build `CredSspAuth` directly.
-    fn no_verify() -> CredSspTls {
-        test_tls_with(|provider| Arc::new(crate::tls::NoVerifier::new(provider)))
-    }
-
-    /// The TLS contexts of a verifying client: the `webpki_roots` verifier.
-    fn webpki() -> CredSspTls {
-        test_tls_with(|provider| {
-            let roots =
-                rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            rustls::client::WebPkiServerVerifier::builder_with_provider(
-                Arc::new(roots),
-                Arc::clone(provider),
-            )
-            .build()
-            .unwrap()
-        })
-    }
-
-    #[test]
-    #[tracing_test::traced_test]
-    fn inner_tls_logs_the_runtime_openssl_version() {
-        let _tls = build_inner_openssl_tls(&no_verify().inner).expect("inner TLS builds");
-        assert!(logs_contain("CredSSP inner TLS backend"));
-        assert!(logs_contain(openssl::version::version()));
-        assert!(logs_contain(&format!(
-            "openssl_num={:#x}",
-            openssl::version::number()
-        )));
-    }
-
-    static TLS13_ONLY: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS13];
-    static TLS12_ONLY: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS12];
-
-    /// A std-thread TLS server (EC test certificate, tickets on) that answers
-    /// every request with an empty `401` and keeps connections alive.
-    fn spawn_tls_401_server(versions: &'static [&'static rustls::SupportedProtocolVersion]) -> u16 {
-        use rustls::pki_types::pem::PemObject;
-        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-        use std::io::{Read, Write};
-
-        crate::test_pki::install_test_provider();
-        let chain = vec![CertificateDer::from_pem_slice(EC_CERT_PEM.as_bytes()).unwrap()];
-        let key = PrivateKeyDer::from_pem_slice(EC_KEY_PKCS8_PEM.as_bytes()).unwrap();
-        let mut config = rustls::ServerConfig::builder_with_protocol_versions(versions)
-            .with_no_client_auth()
-            .with_single_cert(chain, key)
-            .unwrap();
-        config.ticketer = rustls::crypto::ring::Ticketer::new().unwrap();
-        let config = Arc::new(config);
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            for tcp in listener.incoming().flatten() {
-                let config = Arc::clone(&config);
-                std::thread::spawn(move || {
-                    let _ = tcp.set_read_timeout(Some(Duration::from_secs(10)));
-                    let Ok(conn) = rustls::ServerConnection::new(config) else {
-                        return;
-                    };
-                    let mut tls = rustls::StreamOwned::new(conn, tcp);
-                    let mut pending: Vec<u8> = Vec::new();
-                    let mut buf = [0u8; 4096];
-                    loop {
-                        // One request: the head up to CRLFCRLF, then its body.
-                        let head_end = loop {
-                            if let Some(end) = find_head_end(&pending, 0) {
-                                break end - 4;
-                            }
-                            match tls.read(&mut buf) {
-                                Ok(0) | Err(_) => return,
-                                Ok(n) => pending.extend_from_slice(&buf[..n]),
-                            }
-                        };
-                        let head =
-                            String::from_utf8_lossy(&pending[..head_end]).to_ascii_lowercase();
-                        let len = head
-                            .lines()
-                            .find_map(|l| l.strip_prefix("content-length:"))
-                            .and_then(|v| v.trim().parse::<usize>().ok())
-                            .unwrap_or(0);
-                        while pending.len() < head_end + 4 + len {
-                            match tls.read(&mut buf) {
-                                Ok(0) | Err(_) => return,
-                                Ok(n) => pending.extend_from_slice(&buf[..n]),
-                            }
-                        }
-                        pending.drain(..head_end + 4 + len);
-                        let reply = b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n";
-                        if tls.write_all(reply).and_then(|()| tls.flush()).is_err() {
-                            return;
-                        }
-                    }
-                });
-            }
-        });
-        port
-    }
-
-    /// The first TLS record a client with `config` sends to a listener that
-    /// never answers: its ClientHello.
-    async fn captured_client_hello(config: Arc<rustls::ClientConfig>) -> Vec<u8> {
-        use std::io::Read;
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let reader = std::thread::spawn(move || {
-            let (mut tcp, _) = listener.accept().unwrap();
-            tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            let mut record = vec![0u8; 5];
-            tcp.read_exact(&mut record).unwrap();
-            let len = usize::from(u16::from_be_bytes([record[3], record[4]]));
-            record.resize(5 + len, 0);
-            tcp.read_exact(&mut record[5..]).unwrap();
-            record
-        });
-        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .unwrap();
-        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
-        let _ = tokio::time::timeout(
-            Duration::from_secs(2),
-            tokio_rustls::TlsConnector::from(config).connect(name, tcp),
-        )
-        .await;
-        reader.join().unwrap()
-    }
-
-    /// Every extension type of a ClientHello record, sorted: rustls shuffles
-    /// the extension order on every hello.
-    fn client_hello_extension_types(record: &[u8]) -> Vec<u16> {
-        // Record header 5, handshake header 4, version 2, random 32.
-        let mut at = 5 + 4 + 2 + 32;
-        let session_id = usize::from(record[at]);
-        at += 1 + session_id;
-        let suites = usize::from(u16::from_be_bytes([record[at], record[at + 1]]));
-        at += 2 + suites;
-        let compression = usize::from(record[at]);
-        at += 1 + compression;
-        let total = usize::from(u16::from_be_bytes([record[at], record[at + 1]]));
-        at += 2;
-        let end = at + total;
-        let mut types = Vec::new();
-        while at < end {
-            types.push(u16::from_be_bytes([record[at], record[at + 1]]));
-            let len = usize::from(u16::from_be_bytes([record[at + 2], record[at + 3]]));
-            at += 4 + len;
-        }
-        types.sort_unstable();
-        types
-    }
-
-    #[test]
-    fn inner_ssl_comes_from_the_cached_context() {
-        let tls = no_verify();
-        let a = build_inner_openssl_tls(&tls.inner).unwrap();
-        let b = build_inner_openssl_tls(&tls.inner).unwrap();
-        assert!(std::ptr::eq(a.ssl.ssl().ssl_context(), tls.inner.context()));
-        assert!(std::ptr::eq(b.ssl.ssl().ssl_context(), tls.inner.context()));
-    }
-
-    #[tokio::test]
-    async fn credssp_outer_tls_never_resumes() {
-        for (label, versions) in [("TLS 1.3", TLS13_ONLY), ("TLS 1.2", TLS12_ONLY)] {
-            let port = spawn_tls_401_server(versions);
-            let tls = no_verify();
-            let endpoint =
-                CredSspEndpoint::parse(&format!("https://127.0.0.1:{port}/wsman")).unwrap();
-            let mut first =
-                CredSspConnection::connect(&endpoint, &tls, &CredSspDial::Direct, test_opts())
-                    .await
-                    .unwrap();
-            // Reading a response makes the client process any NewSessionTicket.
-            assert_eq!(first.post(None, "<a/>").await.unwrap().status, 401);
-            drop(first);
-            let second =
-                CredSspConnection::connect(&endpoint, &tls, &CredSspDial::Direct, test_opts())
-                    .await
-                    .unwrap();
-            assert_eq!(
-                second.stream.get_ref().1.handshake_kind(),
-                Some(rustls::HandshakeKind::Full),
-                "{label}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn credssp_outer_client_hello_extensions_unchanged() {
-        // What `connect` built for every request before the contexts were cached.
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let today = Arc::new(
-            crate::tls::client_config_builder(&provider)
-                .unwrap()
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(crate::tls::NoVerifier::new(&provider)))
-                .with_no_client_auth(),
-        );
-        let want = client_hello_extension_types(&captured_client_hello(today).await);
-        let got = client_hello_extension_types(
-            &captured_client_hello(Arc::clone(&no_verify().outer)).await,
-        );
-        assert_eq!(got, want);
-        assert!(
-            got.contains(&35),
-            "the empty SessionTicket extension is still sent"
-        );
-    }
-
-    /// The client the acceptor knows: `USER` / `PASS`, empty domain.
-    fn mock_auth(tls: CredSspTls, max_response_bytes: usize) -> CredSspAuth {
-        CredSspAuth {
-            username: USER.into(),
-            password: Zeroizing::new(PASS.into()),
-            domain: String::new(),
-            tls: Arc::new(tls),
-            opts: CredSspConnOptions {
-                max_response_bytes,
-                connect_timeout: Duration::from_secs(20),
-                exchange_timeout: Duration::from_secs(20),
-                user_agent: "winrm-rs/test".into(),
-            },
-            dial: Arc::new(CredSspDial::Direct),
-        }
-    }
-
-    fn test_opts() -> CredSspConnOptions {
-        CredSspConnOptions {
-            max_response_bytes: 512 * 1024,
-            connect_timeout: Duration::from_secs(30),
-            exchange_timeout: Duration::from_secs(70),
-            user_agent: "winrm-rs/test".into(),
-        }
-    }
-
-    /// A connection over an in-memory pipe, and the server end of the pipe.
-    fn duplex_conn() -> (
-        CredSspConnection<tokio::io::DuplexStream>,
-        tokio::io::DuplexStream,
-    ) {
-        let (client, server) = tokio::io::duplex(64 * 1024);
-        let conn = CredSspConnection::from_stream(
-            client,
-            "127.0.0.1:5986".into(),
-            "/wsman".into(),
-            test_opts(),
-        );
-        (conn, server)
-    }
-
-    /// Read one request from `peer`: the head up to CRLFCRLF plus its
-    /// Content-Length body.
-    async fn read_request(peer: &mut tokio::io::DuplexStream) -> String {
-        use tokio::io::AsyncReadExt;
-        let mut buf = Vec::new();
-        let head_end = loop {
-            let mut chunk = [0u8; 1024];
-            let n = peer.read(&mut chunk).await.unwrap();
-            assert!(n > 0, "client closed before finishing the request");
-            buf.extend_from_slice(&chunk[..n]);
-            if let Some(end) = find_head_end(&buf, 0) {
-                break end;
-            }
-        };
-        let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
-        let len: usize = head
-            .lines()
-            .find_map(|l| {
-                let (k, v) = l.split_once(':')?;
-                k.eq_ignore_ascii_case("content-length")
-                    .then(|| v.trim().parse().ok())
-                    .flatten()
-            })
-            .unwrap_or(0);
-        while buf.len() < head_end + len {
-            let mut chunk = [0u8; 1024];
-            let n = peer.read(&mut chunk).await.unwrap();
-            assert!(n > 0, "client closed before finishing the body");
-            buf.extend_from_slice(&chunk[..n]);
-        }
-        String::from_utf8_lossy(&buf).into_owned()
-    }
-
-    /// Read one request, write `reply`, then keep the pipe open and silent.
-    async fn answer_then_hang(mut peer: tokio::io::DuplexStream, reply: &'static [u8]) {
-        use tokio::io::AsyncWriteExt;
-        read_request(&mut peer).await;
-        peer.write_all(reply).await.unwrap();
-        std::future::pending::<()>().await;
-    }
-
-    #[test]
-    fn conn_options_derive_from_the_config() {
-        let config = |connect: u64, operation: u64| crate::config::WinrmConfig {
-            connect_timeout_secs: connect,
-            operation_timeout_secs: operation,
-            ..Default::default()
-        };
-        let opts = CredSspConnOptions::from_config(&config(7, 60));
-        assert_eq!(opts.connect_timeout, Duration::from_secs(7));
-        assert_eq!(opts.exchange_timeout, Duration::from_secs(70));
-        assert_eq!(
-            opts.max_response_bytes,
-            crate::transport::max_response_bytes(&config(7, 60))
-        );
-        let opts = CredSspConnOptions::from_config(&config(u64::MAX, u64::MAX));
-        assert_eq!(opts.connect_timeout, Duration::from_secs(u64::MAX));
-        assert_eq!(opts.exchange_timeout, Duration::from_secs(u64::MAX));
-        let opts = CredSspConnOptions::from_config(&config(0, 60));
-        assert_eq!(opts.connect_timeout, Duration::from_secs(1));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn credssp_post_times_out_on_an_unfinished_response_head() {
-        let (mut conn, peer) = duplex_conn();
-        tokio::spawn(answer_then_hang(peer, b"HTTP/1.1 401 Unauthorized\r\n"));
-        let res = tokio::time::timeout(
-            Duration::from_secs(600),
-            conn.post(Some("CredSSP AAAA"), "<a/>"),
-        )
-        .await
-        .expect("post is not bounded");
-        assert!(matches!(res, Err(WinrmError::Timeout(70))), "{res:?}");
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn credssp_post_times_out_on_a_trickled_body() {
-        let (mut conn, peer) = duplex_conn();
-        tokio::spawn(answer_then_hang(
-            peer,
-            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nx",
-        ));
-        let res = tokio::time::timeout(Duration::from_secs(600), conn.post(None, "<a/>"))
-            .await
-            .expect("post is not bounded");
-        assert!(matches!(res, Err(WinrmError::Timeout(70))), "{res:?}");
-    }
-
-    #[tokio::test]
-    async fn credssp_connect_times_out_when_the_server_never_sends_server_hello() {
-        crate::test_pki::install_test_provider();
-        // Never accepted: the kernel completes the TCP handshake and nobody
-        // answers the ClientHello.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let endpoint = CredSspEndpoint::parse(&format!("https://127.0.0.1:{port}/wsman")).unwrap();
-        let opts = CredSspConnOptions {
-            connect_timeout: Duration::from_secs(1),
-            ..test_opts()
-        };
-        let start = std::time::Instant::now();
-        let res = tokio::time::timeout(
-            Duration::from_secs(10),
-            CredSspConnection::connect(&endpoint, &no_verify(), &CredSspDial::Direct, opts),
-        )
-        .await
-        .expect("connect is not bounded");
-        let err = res.err().expect("connected to a silent listener");
-        assert!(matches!(err, WinrmError::Timeout(1)), "{err:?}");
-        assert!(start.elapsed() < Duration::from_secs(5));
-        drop(listener);
-    }
-
-    // --- The tunnel through WinrmConfig::proxy ---
-
-    use crate::test_proxy;
-
-    /// A target that accepts connections and writes `hi` on each.
-    async fn spawn_hi_target() -> u16 {
-        use tokio::io::AsyncWriteExt;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            while let Ok((mut s, _)) = listener.accept().await {
-                let _ = s.write_all(b"hi").await;
-                // Keep the socket open until the peer is done.
-                tokio::spawn(async move {
-                    let mut sink = [0u8; 64];
-                    use tokio::io::AsyncReadExt;
-                    while matches!(s.read(&mut sink).await, Ok(n) if n > 0) {}
-                });
-            }
-        });
-        port
-    }
-
-    async fn read_two(stream: &mut tokio::net::TcpStream) -> [u8; 2] {
-        use tokio::io::AsyncReadExt;
-        let mut got = [0u8; 2];
-        stream.read_exact(&mut got).await.unwrap();
-        got
-    }
-
-    fn http_dial(pport: u16, authorization: Option<&str>) -> CredSspDial {
-        CredSspDial::HttpConnect {
-            proxy: format!("127.0.0.1:{pport}"),
-            authorization: authorization.map(|a| Zeroizing::new(a.to_string())),
-        }
-    }
-
-    fn auth_failed(res: Result<tokio::net::TcpStream, WinrmError>) -> String {
-        match res {
-            Err(WinrmError::AuthFailed(m)) => m,
-            Err(e) => panic!("{e:?}"),
-            Ok(_) => panic!("the tunnel opened"),
-        }
-    }
-
-    #[tokio::test]
-    async fn dial_tunnel_runs_http_connect() {
-        let port = spawn_hi_target().await;
-        for authorization in [Some("Basic dXNlcjpwdw=="), None] {
-            let (pport, heads) = test_proxy::spawn_connect_proxy_answering(
-                "HTTP/1.1 200 Connection established\r\n\r\n",
-            )
-            .await;
-            let mut stream = dial_tunnel(&http_dial(pport, authorization), "127.0.0.1", port)
-                .await
-                .unwrap();
-            assert_eq!(&read_two(&mut stream).await, b"hi");
-            let heads = heads.lock().unwrap().clone();
-            assert_eq!(heads.len(), 1);
-            let expected =
-                format!("CONNECT 127.0.0.1:{port} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n");
-            assert!(heads[0].starts_with(&expected), "{:?}", heads[0]);
-            assert_eq!(
-                heads[0].contains("Proxy-Authorization: Basic dXNlcjpwdw==\r\n"),
-                authorization.is_some(),
-                "{:?}",
-                heads[0]
-            );
-        }
-    }
-
-    /// The `CONNECT` target of an IPv6 host is its bracketed authority.
-    #[tokio::test]
-    async fn dial_tunnel_brackets_an_ipv6_target() {
-        let (pport, heads) =
-            test_proxy::spawn_connect_proxy_answering("HTTP/1.1 403 Forbidden\r\n\r\n").await;
-        let err = auth_failed(dial_tunnel(&http_dial(pport, None), "::1", 5986).await);
-        assert_eq!(err, "CredSSP: proxy CONNECT failed with status 403");
-        assert!(
-            heads.lock().unwrap()[0]
-                .starts_with("CONNECT [::1]:5986 HTTP/1.1\r\nHost: [::1]:5986\r\n")
-        );
-    }
-
-    #[tokio::test]
-    async fn dial_tunnel_reports_407_and_other_statuses() {
-        for (answer, expected) in [
-            (
-                "HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n",
-                "CredSSP: the proxy refused the credentials (407)",
-            ),
-            (
-                "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n",
-                "CredSSP: proxy CONNECT failed with status 502",
-            ),
-            (
-                "HTTP/1.1 200 OK\r\n\r\nEARLY",
-                "CredSSP: the proxy sent data before the tunnel opened",
-            ),
-        ] {
-            let (pport, _) = test_proxy::spawn_connect_proxy_answering(answer).await;
-            // The target port is never reached: nothing listens on port 9.
-            let err = auth_failed(dial_tunnel(&http_dial(pport, None), "127.0.0.1", 9).await);
-            assert_eq!(err, expected, "{answer:?}");
-        }
-    }
-
-    /// A proxy that closes, or whose answer head never ends within 64 KiB,
-    /// is refused.
-    #[tokio::test]
-    async fn dial_tunnel_bounds_the_proxy_answer() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        async fn scripted(answer: Vec<u8>) -> u16 {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let port = listener.local_addr().unwrap().port();
-            tokio::spawn(async move {
-                let (mut s, _) = listener.accept().await.unwrap();
-                let mut head = [0u8; 1024];
-                let _ = s.read(&mut head).await;
-                let _ = s.write_all(&answer).await;
-                // Hold the connection open: only the cap ends the read.
-                let _ = s.read(&mut head).await;
-            });
-            port
-        }
-        let mut endless = b"HTTP/1.1 200 OK\r\n".to_vec();
-        while endless.len() <= MAX_PROXY_HEAD_BYTES {
-            endless
-                .extend_from_slice(b"X-Pad: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n");
-        }
-        let port = scripted(endless).await;
-        let err = auth_failed(dial_tunnel(&http_dial(port, None), "127.0.0.1", 9).await);
-        assert_eq!(err, "CredSSP: proxy response head too large");
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            let (mut s, _) = listener.accept().await.unwrap();
-            let mut head = [0u8; 1024];
-            let _ = s.read(&mut head).await;
-        });
-        let err = auth_failed(dial_tunnel(&http_dial(port, None), "127.0.0.1", 9).await);
-        assert_eq!(err, "CredSSP: the proxy closed the connection");
-    }
-
-    /// The connect timeout covers the proxy handshake: a proxy that never
-    /// answers the `CONNECT` ends at `connect_timeout`.
-    #[tokio::test]
-    async fn connect_timeout_covers_the_proxy_handshake() {
-        crate::test_pki::install_test_provider();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); // never accepted
-        let pport = listener.local_addr().unwrap().port();
-        let endpoint = CredSspEndpoint::parse("https://127.0.0.1:5986/wsman").unwrap();
-        let opts = CredSspConnOptions {
-            connect_timeout: Duration::from_secs(1),
-            ..test_opts()
-        };
-        let res = tokio::time::timeout(
-            Duration::from_secs(10),
-            CredSspConnection::connect(&endpoint, &no_verify(), &http_dial(pport, None), opts),
-        )
-        .await
-        .expect("connect is not bounded");
-        assert!(
-            matches!(res, Err(WinrmError::Timeout(1))),
-            "{:?}",
-            res.err()
-        );
-        drop(listener);
-    }
-
-    #[tokio::test]
-    async fn dial_tunnel_runs_socks5() {
-        let port = spawn_hi_target().await;
-        let [hi, lo] = port.to_be_bytes();
-
-        let (pport, records) = test_proxy::spawn_socks5_proxy(true).await;
-        let dial = CredSspDial::Socks5 {
-            proxy: format!("127.0.0.1:{pport}"),
-            user_pass: Some((Zeroizing::new("u".into()), Zeroizing::new("p".into()))),
-            remote_dns: false,
-        };
-        let mut stream = dial_tunnel(&dial, "127.0.0.1", port).await.unwrap();
-        assert_eq!(&read_two(&mut stream).await, b"hi");
-        assert_eq!(
-            *records.lock().unwrap(),
-            vec![
-                vec![5, 2, 0, 2],
-                vec![1, 1, b'u', 1, b'p'],
-                vec![5, 1, 0, 1, 127, 0, 0, 1, hi, lo],
-            ]
-        );
-
-        let (pport, records) = test_proxy::spawn_socks5_proxy(false).await;
-        let dial = CredSspDial::Socks5 {
-            proxy: format!("127.0.0.1:{pport}"),
-            user_pass: None,
-            remote_dns: true,
-        };
-        let mut stream = dial_tunnel(&dial, "localhost", port).await.unwrap();
-        assert_eq!(&read_two(&mut stream).await, b"hi");
-        let mut connect = vec![5, 1, 0, 3, 9];
-        connect.extend_from_slice(b"localhost");
-        connect.extend_from_slice(&[hi, lo]);
-        assert_eq!(*records.lock().unwrap(), vec![vec![5, 1, 0], connect]);
-    }
-
-    #[tokio::test]
-    async fn dial_tunnel_refuses_a_socks5_without_a_common_method() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let pport = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            let (mut s, _) = listener.accept().await.unwrap();
-            let mut greeting = [0u8; 3];
-            let _ = s.read_exact(&mut greeting).await;
-            let _ = s.write_all(&[5, 0xFF]).await;
-        });
-        let dial = CredSspDial::Socks5 {
-            proxy: format!("127.0.0.1:{pport}"),
-            user_pass: None,
-            remote_dns: false,
-        };
-        let err = auth_failed(dial_tunnel(&dial, "127.0.0.1", 9).await);
-        assert_eq!(
-            err,
-            "CredSSP: the SOCKS5 proxy accepted no offered authentication method"
-        );
-    }
-
-    /// A SOCKS5 proxy that refuses the credentials, or the connection, is
-    /// reported as such.
-    #[tokio::test]
-    async fn dial_tunnel_reports_socks5_refusals() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        async fn scripted(replies: &'static [&'static [u8]]) -> u16 {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let port = listener.local_addr().unwrap().port();
-            tokio::spawn(async move {
-                let (mut s, _) = listener.accept().await.unwrap();
-                for reply in replies {
-                    let mut msg = [0u8; 512];
-                    let _ = s.read(&mut msg).await;
-                    let _ = s.write_all(reply).await;
-                }
-            });
-            port
-        }
-        let dial = |pport: u16, user_pass: bool| CredSspDial::Socks5 {
-            proxy: format!("127.0.0.1:{pport}"),
-            user_pass: user_pass.then(|| (Zeroizing::new("u".into()), Zeroizing::new("p".into()))),
-            remote_dns: false,
-        };
-        let port = scripted(&[&[5, 2], &[1, 1]]).await;
-        assert_eq!(
-            auth_failed(dial_tunnel(&dial(port, true), "127.0.0.1", 9).await),
-            "CredSSP: the SOCKS5 proxy refused the credentials"
-        );
-        // Offered no credentials, so user name and password is no choice.
-        let port = scripted(&[&[5, 2]]).await;
-        assert_eq!(
-            auth_failed(dial_tunnel(&dial(port, false), "127.0.0.1", 9).await),
-            "CredSSP: the SOCKS5 proxy accepted no offered authentication method"
-        );
-        let port = scripted(&[&[5, 0], &[5, 5, 0, 1, 0, 0, 0, 0, 0, 0]]).await;
-        assert_eq!(
-            auth_failed(dial_tunnel(&dial(port, false), "127.0.0.1", 9).await),
-            "CredSSP: SOCKS5 connect failed (reply 5)"
-        );
-    }
-
-    /// One CredSSP exchange posting `body` to the acceptor on `port`.
-    async fn run(auth: &CredSspAuth, port: u16, body: &str) -> Result<String, WinrmError> {
-        crate::test_pki::install_test_provider();
-        let http = reqwest::Client::builder().build().unwrap();
-        let url = format!("https://127.0.0.1:{port}/wsman");
-        tokio::time::timeout(
-            Duration::from_secs(20),
-            auth.send_authenticated(&http, &url, body.to_string()),
-        )
-        .await
-        .expect("CredSSP exchange did not finish in 20 s")
-    }
-
-    /// Run an exchange against `fault`, which must fail before any password
-    /// is delegated. Returns the error and the acceptor's log.
-    async fn refused(fault: Fault, max: usize) -> (WinrmError, Vec<Event>) {
-        let (port, log) = test_server::spawn(fault, EC_CERT_PEM, EC_KEY_PKCS8_PEM);
-        let err = run(&mock_auth(no_verify(), max), port, BODY)
-            .await
-            .unwrap_err();
-        let log = log.lock().unwrap().clone();
-        assert_eq!(delegations(&log), 0, "password delegated despite {err:?}");
-        (err, log)
-    }
-
-    #[tokio::test]
-    async fn mock_happy_path_delegates_once() {
-        let (port, log) = test_server::spawn(Fault::Honest, EC_CERT_PEM, EC_KEY_PKCS8_PEM);
-        let out = run(&mock_auth(no_verify(), 1 << 20), port, BODY)
-            .await
-            .unwrap();
-        assert_eq!(out, test_server::MOCK_REPLY);
-        let log = log.lock().unwrap().clone();
-        assert_eq!(
-            log.iter()
-                .filter(|e| **e == Event::Delegated { user: USER.into() })
-                .count(),
-            1
-        );
-        assert!(log.contains(&Event::Executed { body: BODY.into() }));
-    }
-
-    /// Each request runs its own session on its own connection: the inner TLS
-    /// handshake, NTLM negotiate, NTLM authenticate, then the delegation that
-    /// carries the request. Every round posts the request body.
-    #[tokio::test]
-    async fn send_authenticated_is_one_session_per_request() {
-        let auth = mock_auth(no_verify(), 1 << 20);
-        let mut want = vec![(BODY.len(), false); 4];
-        want.push((BODY.len(), true));
-        for _ in 0..2 {
-            let (port, log) = test_server::spawn(Fault::Honest, EC_CERT_PEM, EC_KEY_PKCS8_PEM);
-            let out = run(&auth, port, BODY).await.unwrap();
-            assert_eq!(out, test_server::MOCK_REPLY);
-            let log = log.lock().unwrap().clone();
-            assert_eq!(rounds(&log), want);
-            assert_eq!(delegations(&log), 1);
-            assert_eq!(
-                log.iter()
-                    .filter(|e| **e == Event::Executed { body: BODY.into() })
-                    .count(),
-                1
-            );
-        }
-    }
-
-    /// Whether a live host keeps the CredSSP context of a connection after
-    /// the delegation: a shell is created with the delegation round, then
-    /// deleted on the same connection with no `Authorization` header. Run on
-    /// an HTTPS listener without message encryption, its certificate pinned,
-    /// with the variables of `tests/integration_real.rs`:
-    /// `cargo test --lib --features credssp -- --ignored --nocapture credssp_live_connection_keeps_the_context`
-    #[tokio::test]
-    #[ignore = "needs a live host: WINRM_TEST_HOST, WINRM_TEST_USER, WINRM_TEST_PASS, WINRM_TEST_HTTPS_CERT_SHA256"]
-    async fn credssp_live_connection_keeps_the_context() {
-        use crate::config::{AuthMethod, WinrmCredentials};
-        use crate::soap::namespaces::RESOURCE_URI_CMD;
-        use crate::tls::TlsOptions;
-        use crate::transport::{HttpTransport, TransportOptions};
-
-        let (Ok(host), Ok(user), Ok(pass)) = (
-            std::env::var("WINRM_TEST_HOST"),
-            std::env::var("WINRM_TEST_USER"),
-            std::env::var("WINRM_TEST_PASS"),
-        ) else {
-            eprintln!(
-                "SKIP credssp_live_connection_keeps_the_context: set WINRM_TEST_HOST, \
-                 WINRM_TEST_USER and WINRM_TEST_PASS"
-            );
-            return;
-        };
-        let port: u16 = std::env::var("WINRM_TEST_HTTPS_PORT")
-            .ok()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(55986);
-        let Some(pin) = std::env::var("WINRM_TEST_HTTPS_CERT_SHA256")
-            .ok()
-            .filter(|pin| !pin.trim().is_empty())
-        else {
-            eprintln!(
-                "SKIP credssp_live_connection_keeps_the_context: set WINRM_TEST_HTTPS_CERT_SHA256"
-            );
-            return;
-        };
-
-        let config = WinrmConfig {
-            auth_method: AuthMethod::CredSsp,
-            use_tls: true,
-            accept_invalid_certs: false,
-            port: Some(port),
-            ..Default::default()
-        };
-        let t = HttpTransport::new_with(
-            config.clone(),
-            WinrmCredentials::new(user.clone(), pass.clone(), ""),
-            TransportOptions {
-                tls: TlsOptions {
-                    pins: vec![pin],
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        let (tls, dial) = t.credssp_tls_and_dial();
-        let tls = tls.unwrap();
-        let url = t.endpoint(&host);
-        let endpoint = CredSspEndpoint::parse(&url).unwrap();
-        let opts = CredSspConnOptions::from_config(&config);
-        let auth = CredSspAuth {
-            username: user,
-            password: Zeroizing::new(pass),
-            domain: String::new(),
-            tls: Arc::clone(tls),
-            opts: opts.clone(),
-            dial: Arc::clone(dial),
-        };
-
-        let mut conn = CredSspConnection::connect(&endpoint, tls, dial, opts)
-            .await
-            .unwrap();
-        let create = crate::soap::create_shell_request(&url, &config);
-        let round5 = authenticate(&mut conn, &auth, &endpoint, &create)
-            .await
-            .unwrap();
-        let resp = conn.post(Some(&round5), &create).await.unwrap();
-        let body = String::from_utf8_lossy(&resp.body).into_owned();
-        assert_eq!(resp.status, 200, "create: {body}");
-        eprintln!(
-            "create: status {}, closing {}, leftover {}",
-            resp.status, resp.closing, resp.leftover
-        );
-        let shell_id = crate::soap::parse_shell_id(&body).unwrap();
-
-        let delete =
-            crate::soap::delete_shell_request_for(&url, &shell_id, RESOURCE_URI_CMD, 60, 153_600);
-        let outcome = conn.post(None, &delete).await;
-        let deleted = matches!(&outcome, Ok(resp)
-            if resp.status == 200 && !String::from_utf8_lossy(&resp.body).contains("s:Fault"));
-        if !deleted {
-            // Best effort, before the assertions fail: delete the shell
-            // through a fresh session, so a failed run does not leave it on
-            // the host until its idle timeout.
-            let cleanup = async {
-                let mut fresh =
-                    CredSspConnection::connect(&endpoint, tls, dial, auth.opts.clone()).await?;
-                let token = authenticate(&mut fresh, &auth, &endpoint, &delete).await?;
-                fresh.post(Some(&token), &delete).await
-            };
-            match cleanup.await {
-                Ok(resp) => eprintln!("clean-up through a fresh session: status {}", resp.status),
-                Err(e) => eprintln!(
-                    "clean-up through a fresh session failed ({e}): delete shell {shell_id} by hand"
-                ),
-            }
-        }
-        let resp = match outcome {
-            Ok(resp) => resp,
-            Err(e) => panic!("delete without Authorization on the same connection: {e}"),
-        };
-        let body = String::from_utf8_lossy(&resp.body).into_owned();
-        eprintln!(
-            "delete without Authorization: status {}, closing {}, leftover {}",
-            resp.status, resp.closing, resp.leftover
-        );
-        assert_eq!(resp.status, 200, "delete: {body}");
-        assert!(!body.contains("s:Fault"), "delete: {body}");
-    }
-
-    #[tokio::test]
-    async fn server_pubkeyauth_mismatch_is_refused_before_delegation() {
-        let (err, _) = refused(Fault::WrongServerHash, 1 << 20).await;
-        assert!(
-            matches!(err, WinrmError::CredSsp(CredSspError::PublicKeyMismatch)),
-            "{err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn missing_server_pubkeyauth_is_refused_before_delegation() {
-        let (err, _) = refused(Fault::NoPubKeyAuth, 1 << 20).await;
-        assert!(
-            matches!(&err, WinrmError::AuthFailed(m) if m.contains("no pubKeyAuth")),
-            "{err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn error_code_in_challenge_round_is_server_error() {
-        let (err, _) = refused(Fault::ErrorCodeAtChallenge(0xC000_006D), 1 << 20).await;
-        assert!(
-            matches!(
-                err,
-                WinrmError::CredSsp(CredSspError::ServerError(0xC000_006D))
-            ),
-            "{err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn error_code_in_pubkey_round_is_server_error() {
-        let (err, _) = refused(Fault::ErrorCodeAtPubKey(0x8009_030C), 1 << 20).await;
-        assert!(
-            matches!(
-                err,
-                WinrmError::CredSsp(CredSspError::ServerError(0x8009_030C))
-            ),
-            "{err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn final_token_without_mech_list_mic_is_refused_before_delegation() {
-        let (err, _) = refused(Fault::NoMechListMic, 1 << 20).await;
-        assert!(
-            matches!(&err, WinrmError::AuthFailed(m)
-                if m == "CredSSP: server omitted mechListMIC (RFC 4178 §5)"),
-            "{err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn reject_neg_state_is_refused_before_delegation() {
-        let (err, _) = refused(Fault::NegStateReject, 1 << 20).await;
-        assert!(
-            matches!(&err, WinrmError::AuthFailed(m)
-                if m == "CredSSP: server final SPNEGO state 2 is not accept-completed"),
-            "{err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn final_ts_request_without_nego_token_is_refused_before_delegation() {
-        let (err, _) = refused(Fault::NoFinalNegoToken, 1 << 20).await;
-        assert!(
-            matches!(&err, WinrmError::AuthFailed(m)
-                if m == "CredSSP: server sent no final SPNEGO token"),
-            "{err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn tampered_mech_list_mic_is_refused_before_delegation() {
-        let (err, _) = refused(Fault::TamperedMechListMic, 1 << 20).await;
-        assert!(
-            matches!(
-                &err,
-                WinrmError::Ntlm(crate::error::NtlmError::InvalidMessage(m))
-                    if m == "mechListMIC checksum mismatch"
-            ),
-            "{err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn oversized_content_length_is_refused() {
-        let (err, _) = refused(Fault::OversizedContentLength(4097), 4096).await;
-        assert!(
-            matches!(
-                &err,
-                WinrmError::Soap(crate::error::SoapError::ParseError(m))
-                    if m == "response body exceeds 4096 bytes"
-            ),
-            "{err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn body_of_exactly_the_cap_is_accepted() {
-        let (port, _) = test_server::spawn(Fault::Honest, EC_CERT_PEM, EC_KEY_PKCS8_PEM);
-        let max = test_server::MOCK_REPLY.len();
-        let out = run(&mock_auth(no_verify(), max), port, BODY).await.unwrap();
-        assert_eq!(out, test_server::MOCK_REPLY);
-    }
-
-    #[tokio::test]
-    async fn oversized_head_is_refused() {
-        let (err, _) = refused(Fault::OversizedHead, 1 << 20).await;
-        assert!(
-            matches!(&err, WinrmError::AuthFailed(m) if m == "CredSSP: response head too large"),
-            "{err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn untrusted_outer_cert_is_refused_by_default() {
-        let (port, log) = test_server::spawn(Fault::Honest, EC_CERT_PEM, EC_KEY_PKCS8_PEM);
-        let err = run(&mock_auth(webpki(), 1 << 20), port, BODY)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(&err, WinrmError::AuthFailed(m) if m.starts_with("CredSSP outer TLS")),
-            "{err:?}"
-        );
-        assert!(log.lock().unwrap().is_empty());
-    }
-
-    async fn impostor_outer_cert_is_refused(
-        versions: &[&'static rustls::SupportedProtocolVersion],
-    ) {
-        let (port, log) = test_server::spawn_with(
-            Fault::Honest,
-            crate::test_pki::impostor_server_config(versions),
-        );
-        let err = run(&mock_auth(no_verify(), 1 << 20), port, BODY)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(&err, WinrmError::AuthFailed(m) if m.starts_with("CredSSP outer TLS")),
-            "{err:?}"
-        );
-        assert!(log.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn impostor_outer_cert_is_refused_tls13() {
-        impostor_outer_cert_is_refused(&[&rustls::version::TLS13]).await;
-    }
-
-    #[tokio::test]
-    async fn impostor_outer_cert_is_refused_tls12() {
-        impostor_outer_cert_is_refused(&[&rustls::version::TLS12]).await;
-    }
-
-    /// The inner-TLS loop never awaits, so a tokio timeout cannot stop it:
-    /// the exchange runs on its own thread, watched from this one.
-    #[test]
-    fn stalled_inner_tls_hits_the_round_bound() {
-        let (port, log) = test_server::spawn(Fault::StalledInnerTls, EC_CERT_PEM, EC_KEY_PKCS8_PEM);
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            let _ = tx.send(rt.block_on(run(&mock_auth(no_verify(), 1 << 20), port, BODY)));
-        });
-        let out = rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("handshake loop did not stop: round bound missing");
-        assert!(matches!(out, Err(WinrmError::AuthFailed(_))), "{out:?}");
-        assert_eq!(rounds(&log.lock().unwrap()).len(), 1);
-    }
-}
+mod tests;

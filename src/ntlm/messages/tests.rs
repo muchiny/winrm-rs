@@ -851,6 +851,30 @@ fn type3_carries_the_given_workstation() {
     assert_eq!(&type3[off..off + len], to_utf16le("SEATTLE").as_slice());
 }
 
+/// The Type 3 asks for a key exchange and carries the encrypted session
+/// key even when the challenge does not offer one.
+#[test]
+fn type3_exchanges_a_session_key_the_challenge_did_not_offer() {
+    let mut challenge = challenge_with(Vec::new());
+    challenge.negotiate_flags &= !NEGOTIATE_KEY_EXCH;
+    let (type3, _) = create_authenticate_message_http(
+        &challenge,
+        "user",
+        "pass",
+        "",
+        &create_negotiate_message(),
+        &[0u8; 32],
+        "HTTP/win01",
+        None,
+        &[],
+    )
+    .unwrap();
+    let flags = u32::from_le_bytes(type3[60..64].try_into().unwrap());
+    assert_ne!(flags & NEGOTIATE_KEY_EXCH, 0);
+    // EncryptedRandomSessionKeyFields: a 16-byte key.
+    assert_eq!(u16::from_le_bytes([type3[52], type3[53]]), 16);
+}
+
 #[test]
 fn type3_with_oversized_target_info_is_an_error() {
     // One AV pair of 65500 bytes (its own length still fits in 16 bits)

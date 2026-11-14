@@ -171,8 +171,8 @@ impl NtlmAuth {
         Ok((text, session_key, closing))
     }
 
-    /// Steps 1 and 2: send the Type 1 with an empty body and read the `401`
-    /// that carries the challenge.
+    /// Send the Type 1 with an empty body and read the `401` that carries
+    /// the challenge.
     async fn negotiate(
         &self,
         http: &reqwest::Client,
@@ -323,9 +323,8 @@ impl NtlmAuth {
         Ok((type3, boxed_key))
     }
 
-    /// Step 3: send the Type 3, with the SOAP `body` or an empty one, and
-    /// read the answer. Returns its body and whether it announced
-    /// `Connection: close`.
+    /// Send the Type 3, with the SOAP `body` or an empty one, and read the
+    /// answer. Returns its body and whether it announced `Connection: close`.
     async fn send_type3(
         &self,
         http: &reqwest::Client,

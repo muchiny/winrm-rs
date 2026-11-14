@@ -362,11 +362,9 @@ pub(crate) fn create_authenticate_message_internal(
         password,
         domain,
         display_domain: None,
-        // The server's negotiated flags (from the Type 2), augmented with
-        // KEY_EXCH and VERSION to enable message sealing.
-        flags: (challenge.negotiate_flags & !TYPE3_NEVER_ECHO)
-            | NEGOTIATE_KEY_EXCH
-            | NEGOTIATE_VERSION,
+        // The flags the server negotiated (from the Type 2), with VERSION.
+        // The builder adds KEY_EXCH, which sealing needs.
+        flags: (challenge.negotiate_flags & !TYPE3_NEVER_ECHO) | NEGOTIATE_VERSION,
         channel_bindings,
         mic_input,
         target_name,
@@ -381,12 +379,12 @@ struct AuthenticateInput<'a> {
     password: &'a str,
     /// The domain of the NTOWFv2 hash.
     domain: &'a str,
-    /// The domain written in the `DomainName` field when it is not `domain`
+    /// The domain written in the `DomainName` field; `domain` when `None`
     /// (CredSSP writes an empty one).
     display_domain: Option<&'a str>,
-    /// The `NegotiateFlags` of the message. With `NEGOTIATE_KEY_EXCH` the
-    /// session key is random and travels encrypted; with `NEGOTIATE_VERSION`
-    /// the header carries a version.
+    /// The `NegotiateFlags` of the message, to which the builder adds
+    /// `NEGOTIATE_KEY_EXCH`. With `NEGOTIATE_VERSION` the header carries a
+    /// version.
     flags: u32,
     channel_bindings: Option<[u8; 16]>,
     /// The raw Type 1 and Type 2. With them the message carries a MIC over
@@ -540,8 +538,12 @@ impl Type3Fields<'_> {
     }
 }
 
-/// Build an NTLM Type 3 with full control over flags, key exchange and MIC.
-/// Returns the message and the exported session key.
+/// Build an NTLM Type 3 from `input`. Returns the message and the exported
+/// session key.
+///
+/// The session key is always exchanged (`NEGOTIATE_KEY_EXCH`), whatever the
+/// flags of `input` and of the challenge: the exported key is random, never
+/// the session base key that the password and the challenge determine.
 fn create_authenticate_message_full(
     input: &AuthenticateInput<'_>,
 ) -> Result<(Vec<u8>, Zeroizing<[u8; 16]>), NtlmError> {
@@ -568,14 +570,11 @@ fn create_authenticate_message_full(
     // For NTLMv2 with EXTENDED_SESSIONSECURITY it is the KeyExchangeKey too.
     let session_base_key = hmac_md5_secret(ntlmv2_hash.as_slice(), &nt_proof_str);
 
-    // With NEGOTIATE_KEY_EXCH the ExportedSessionKey is random and travels
-    // encrypted; otherwise it is the KeyExchangeKey.
+    // The ExportedSessionKey is random and travels encrypted under the
+    // KeyExchangeKey, which the flags announce.
+    let flags = input.flags | NEGOTIATE_KEY_EXCH;
     let (exported_session_key, encrypted_random_session_key) =
-        if input.flags & NEGOTIATE_KEY_EXCH != 0 {
-            exchanged_session_key(&session_base_key)?
-        } else {
-            (Zeroizing::new(*session_base_key), Vec::new())
-        };
+        exchanged_session_key(&session_base_key)?;
 
     // NT response = NTProofStr + blob
     let nt_response = [nt_proof_str.as_slice(), &blob].concat();
@@ -586,7 +585,7 @@ fn create_authenticate_message_full(
         input.mic_input.is_some(),
     );
     let fields = Type3Fields {
-        flags: input.flags,
+        flags,
         mic: input.mic_input.is_some(),
         lm_response: &lm_response,
         nt_response: &nt_response,
@@ -741,8 +740,8 @@ pub(crate) fn create_authenticate_message_credssp(
         domain,
         // An empty domain in the field, as for a local account.
         display_domain: Some(""),
+        // The builder adds KEY_EXCH.
         flags: (challenge.negotiate_flags & !TYPE3_NEVER_ECHO)
-            | NEGOTIATE_KEY_EXCH
             | NEGOTIATE_SEAL
             | NEGOTIATE_SIGN
             | NEGOTIATE_VERSION,

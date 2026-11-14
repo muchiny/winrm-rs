@@ -212,8 +212,8 @@ impl ClixmlDecoder {
     }
 
     /// A step in plain text: release it up to the next marker, or up to the
-    /// document a held marker announced. `Break` when the bytes at hand do
-    /// not tell what comes next.
+    /// document a held marker announced. `Break` when neither starts in the
+    /// bytes at hand, or when they do not tell what follows a marker.
     fn drain_text(&mut self, out: &mut Vec<u8>, start: &mut usize, eof: bool) -> ControlFlow<()> {
         let view = self.pending.get(*start..).unwrap_or_default();
         let documents = self.held_marker.is_some();

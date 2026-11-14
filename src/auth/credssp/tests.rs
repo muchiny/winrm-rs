@@ -1096,10 +1096,14 @@ async fn dial_tunnel_runs_http_connect() {
             "HTTP/1.1 200 Connection established\r\n\r\n",
         )
         .await;
-        let mut stream = dial_tunnel(&http_dial(pport, authorization), "127.0.0.1", port)
-            .await
-            .unwrap();
-        assert_eq!(&read_two(&mut stream).await, b"hi");
+        let mut stream = bounded(dial_tunnel(
+            &http_dial(pport, authorization),
+            "127.0.0.1",
+            port,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(&bounded(read_two(&mut stream)).await, b"hi");
         let heads = heads.lock().unwrap().clone();
         assert_eq!(heads.len(), 1);
         let expected = format!("CONNECT 127.0.0.1:{port} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n");
@@ -1139,7 +1143,7 @@ fn connect_request_never_grows_its_buffer() {
 async fn dial_tunnel_brackets_an_ipv6_target() {
     let (pport, heads) =
         test_proxy::spawn_connect_proxy_answering("HTTP/1.1 403 Forbidden\r\n\r\n").await;
-    let err = auth_failed(dial_tunnel(&http_dial(pport, None), "::1", 5986).await);
+    let err = auth_failed(bounded(dial_tunnel(&http_dial(pport, None), "::1", 5986)).await);
     assert_eq!(err, "CredSSP: proxy CONNECT failed with status 403");
     assert!(
         heads.lock().unwrap()[0].starts_with("CONNECT [::1]:5986 HTTP/1.1\r\nHost: [::1]:5986\r\n")
@@ -1164,7 +1168,7 @@ async fn dial_tunnel_reports_407_and_other_statuses() {
     ] {
         let (pport, _) = test_proxy::spawn_connect_proxy_answering(answer).await;
         // The target port is never reached: nothing listens on port 9.
-        let err = auth_failed(dial_tunnel(&http_dial(pport, None), "127.0.0.1", 9).await);
+        let err = auth_failed(bounded(dial_tunnel(&http_dial(pport, None), "127.0.0.1", 9)).await);
         assert_eq!(err, expected, "{answer:?}");
     }
 }
@@ -1192,7 +1196,7 @@ async fn dial_tunnel_bounds_the_proxy_answer() {
         endless.extend_from_slice(b"X-Pad: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n");
     }
     let port = scripted(endless).await;
-    let err = auth_failed(dial_tunnel(&http_dial(port, None), "127.0.0.1", 9).await);
+    let err = auth_failed(bounded(dial_tunnel(&http_dial(port, None), "127.0.0.1", 9)).await);
     assert_eq!(err, "CredSSP: proxy response head too large");
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1202,7 +1206,7 @@ async fn dial_tunnel_bounds_the_proxy_answer() {
         let mut head = [0u8; 1024];
         let _ = s.read(&mut head).await;
     });
-    let err = auth_failed(dial_tunnel(&http_dial(port, None), "127.0.0.1", 9).await);
+    let err = auth_failed(bounded(dial_tunnel(&http_dial(port, None), "127.0.0.1", 9)).await);
     assert_eq!(err, "CredSSP: the proxy closed the connection");
 }
 
@@ -1243,8 +1247,10 @@ async fn dial_tunnel_runs_socks5() {
         user_pass: Some((Zeroizing::new("u".into()), Zeroizing::new("p".into()))),
         remote_dns: false,
     };
-    let mut stream = dial_tunnel(&dial, "127.0.0.1", port).await.unwrap();
-    assert_eq!(&read_two(&mut stream).await, b"hi");
+    let mut stream = bounded(dial_tunnel(&dial, "127.0.0.1", port))
+        .await
+        .unwrap();
+    assert_eq!(&bounded(read_two(&mut stream)).await, b"hi");
     assert_eq!(
         *records.lock().unwrap(),
         vec![
@@ -1260,8 +1266,10 @@ async fn dial_tunnel_runs_socks5() {
         user_pass: None,
         remote_dns: true,
     };
-    let mut stream = dial_tunnel(&dial, "localhost", port).await.unwrap();
-    assert_eq!(&read_two(&mut stream).await, b"hi");
+    let mut stream = bounded(dial_tunnel(&dial, "localhost", port))
+        .await
+        .unwrap();
+    assert_eq!(&bounded(read_two(&mut stream)).await, b"hi");
     let mut connect = vec![5, 1, 0, 3, 9];
     connect.extend_from_slice(b"localhost");
     connect.extend_from_slice(&[hi, lo]);
@@ -1284,7 +1292,7 @@ async fn dial_tunnel_refuses_a_socks5_without_a_common_method() {
         user_pass: None,
         remote_dns: false,
     };
-    let err = auth_failed(dial_tunnel(&dial, "127.0.0.1", 9).await);
+    let err = auth_failed(bounded(dial_tunnel(&dial, "127.0.0.1", 9)).await);
     assert_eq!(
         err,
         "CredSSP: the SOCKS5 proxy accepted no offered authentication method"
@@ -1316,18 +1324,18 @@ async fn dial_tunnel_reports_socks5_refusals() {
     };
     let port = scripted(&[&[5, 2], &[1, 1]]).await;
     assert_eq!(
-        auth_failed(dial_tunnel(&dial(port, true), "127.0.0.1", 9).await),
+        auth_failed(bounded(dial_tunnel(&dial(port, true), "127.0.0.1", 9)).await),
         "CredSSP: the SOCKS5 proxy refused the credentials"
     );
     // Offered no credentials, so user name and password is no choice.
     let port = scripted(&[&[5, 2]]).await;
     assert_eq!(
-        auth_failed(dial_tunnel(&dial(port, false), "127.0.0.1", 9).await),
+        auth_failed(bounded(dial_tunnel(&dial(port, false), "127.0.0.1", 9)).await),
         "CredSSP: the SOCKS5 proxy accepted no offered authentication method"
     );
     let port = scripted(&[&[5, 0], &[5, 5, 0, 1, 0, 0, 0, 0, 0, 0]]).await;
     assert_eq!(
-        auth_failed(dial_tunnel(&dial(port, false), "127.0.0.1", 9).await),
+        auth_failed(bounded(dial_tunnel(&dial(port, false), "127.0.0.1", 9)).await),
         "CredSSP: SOCKS5 connect failed (reply 5)"
     );
 }
@@ -1670,6 +1678,16 @@ async fn a_round_without_a_usable_token_is_refused() {
             "CredSSP: TLS handshake round 1: no CredSSP token in response",
         ),
         (1, NOT_BASE64, "CredSSP: bad base64 in handshake: "),
+        (
+            2,
+            OK,
+            "CredSSP: TLS handshake round 2: expected 401, got 200",
+        ),
+        (
+            2,
+            NO_TOKEN,
+            "CredSSP: TLS handshake round 2: no CredSSP token in response",
+        ),
         (3, OK, "CredSSP: NTLM negotiate: expected 401, got 200"),
         (3, NO_TOKEN, "CredSSP: NTLM nego: no CredSSP token"),
         (3, NOT_BASE64, "CredSSP: bad b64 NTLM nego: "),
@@ -1688,6 +1706,26 @@ async fn a_round_without_a_usable_token_is_refused() {
         assert!(message.starts_with(expected), "request {rank}: {message}");
         assert_eq!(rounds(&log).len(), rank, "{message}");
     }
+}
+
+/// A server that never ends its flight does not hold the client: the inner
+/// TLS handshake stops after its ten rounds. The flight here is the start
+/// of a record header, so the client has nothing to answer and sends no
+/// other request.
+#[tokio::test]
+async fn an_inner_tls_handshake_that_never_ends_is_refused() {
+    // `FgMD` is 16 03 03: a handshake record of TLS 1.2, cut before its length.
+    const CUT_RECORD: &[u8] =
+        b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: CredSSP FgMD\r\nContent-Length: 0\r\n\r\n";
+    let (err, log) = refused(Fault::RawAnswer(1, CUT_RECORD), 1 << 20).await;
+    let WinrmError::AuthFailed(message) = &err else {
+        panic!("{err:?}");
+    };
+    assert_eq!(
+        message,
+        "CredSSP: TLS handshake did not complete in 10 rounds"
+    );
+    assert_eq!(rounds(&log).len(), 1);
 }
 
 /// The answer to the delegation round is the answer to the request: a `401`

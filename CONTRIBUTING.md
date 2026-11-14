@@ -101,6 +101,7 @@ We follow [Conventional Commits](https://www.conventionalcommits.org/):
 - Follow existing patterns in the codebase
 - Use `tracing` for logging, not `println!`
 - No `unwrap`, `expect`, `panic!`, unchecked indexing, unchecked arithmetic or `as` casts in library code: Cargo.toml sets these Clippy lints and CI denies warnings. Tests are exempt. A justified exception is an `#[expect(clippy::..., reason = "...")]` on the smallest item that needs it, never an `#[allow]` (Clippy refuses it). When the lint only fires without a feature, the `#[expect]` goes in a `cfg_attr` with that condition; code that only the tests and the fuzz targets call is gated on `cfg(any(test, feature = "__internal"))` instead
+- A function of the library is at most 100 lines (`clippy::too_many_lines`): split a longer one into named steps. Tests are exempt.
 - Wrap secrets with `secrecy::SecretString` and zeroize sensitive data
 
 ## CredSSP differential against pyspnego

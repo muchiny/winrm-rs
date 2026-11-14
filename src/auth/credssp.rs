@@ -1172,7 +1172,7 @@ async fn socks5_connect(
 ) -> Result<(), WinrmError> {
     use tokio::io::AsyncWriteExt;
 
-    socks5_authenticate(tcp, user_pass).await?;
+    socks5_negotiate(tcp, user_pass).await?;
     let request = socks5_request(host, port, remote_dns).await?;
     tcp.write_all(&request).await.map_err(|e| proxy_io(&e))?;
     socks5_read_reply(tcp).await
@@ -1181,7 +1181,7 @@ async fn socks5_connect(
 /// The method negotiation of SOCKS5: "no authentication", plus "user name
 /// and password" when `user_pass` is set, which is then sent if the proxy
 /// picks it (RFC 1929).
-async fn socks5_authenticate(
+async fn socks5_negotiate(
     tcp: &mut tokio::net::TcpStream,
     user_pass: Option<(&str, &str)>,
 ) -> Result<(), WinrmError> {

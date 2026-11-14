@@ -141,6 +141,14 @@ impl<'a> Shell<'a> {
     ///
     /// See [`WinrmClient::run_command`](crate::WinrmClient::run_command) (Arguments) for
     /// how `args` reach the host.
+    ///
+    /// # Errors
+    ///
+    /// The [errors of a request](crate::WinrmClient#errors-of-a-request),
+    /// from the Execute or a Receive; [`WinrmError::Timeout`] when the
+    /// deadline passes; [`WinrmError::Transfer`] when the output exceeds
+    /// `max_output_bytes`. An exit code other than zero is not an error: it
+    /// is in the [`CommandOutput`].
     pub async fn run_command(
         &self,
         command: &str,
@@ -258,6 +266,11 @@ impl<'a> Shell<'a> {
     ///
     /// See [`WinrmClient::run_command`](crate::WinrmClient::run_command) (Arguments) for
     /// how `args` reach the host.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`run_command`](Self::run_command), and
+    /// [`WinrmError::Cancelled`] when `cancel` is cancelled first.
     pub async fn run_command_with_cancel(
         &self,
         command: &str,
@@ -303,6 +316,12 @@ impl<'a> Shell<'a> {
     /// [`upload_file`](crate::WinrmClient::upload_file) and
     /// [`download_file`](crate::WinrmClient::download_file) always use the
     /// flags.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`run_command`](Self::run_command). A script that fails is
+    /// not an error of the call: PowerShell reports it on stderr and in the
+    /// exit code of the [`CommandOutput`].
     pub async fn run_powershell(&self, script: &str) -> Result<CommandOutput, WinrmError> {
         let encoded = crate::command::encode_powershell_command(script);
         self.run_command(
@@ -318,6 +337,11 @@ impl<'a> Shell<'a> {
     /// [`CancellationToken`](crate::CancellationToken). It starts PowerShell by
     /// the same full path as [`run_powershell`](Self::run_powershell) (never
     /// the 32-bit one).
+    ///
+    /// # Errors
+    ///
+    /// Those of [`run_powershell`](Self::run_powershell), and
+    /// [`WinrmError::Cancelled`] when `cancel` is cancelled first.
     pub async fn run_powershell_with_cancel(
         &self,
         script: &str,
@@ -336,6 +360,11 @@ impl<'a> Shell<'a> {
     ///
     /// The `command_id` identifies which command receives the input.
     /// Set `end_of_stream` to `true` to signal EOF on stdin.
+    ///
+    /// # Errors
+    ///
+    /// The [errors of a request](crate::WinrmClient#errors-of-a-request):
+    /// among them the fault of a server that no longer knows the command.
     pub async fn send_input(
         &self,
         command_id: &str,
@@ -388,6 +417,11 @@ impl<'a> Shell<'a> {
     /// Like every request, it goes through the client's [`before_send`](crate::WinrmClientBuilder::before_send) hook: a refusal fails with [`WinrmError::Cancelled`](crate::WinrmError::Cancelled) and the command keeps running.
     /// A [`before_send_with`](crate::WinrmClientBuilder::before_send_with) hook
     /// can let it through by its kind, [`RequestKind::Signal`](crate::RequestKind::Signal).
+    ///
+    /// # Errors
+    ///
+    /// The [errors of a request](crate::WinrmClient#errors-of-a-request):
+    /// among them the fault of a server that no longer knows the command.
     pub async fn signal_ctrl_c(&self, command_id: &str) -> Result<(), WinrmError> {
         let endpoint = self.client.endpoint(&self.host);
         let config = self.client.config();
@@ -413,25 +447,6 @@ impl<'a> Shell<'a> {
         Ok(())
     }
 
-    /// Start a command and return the command ID for manual polling.
-    ///
-    /// Use with [`receive_next`](Self::receive_next) and
-    /// [`signal_ctrl_c`](Self::signal_ctrl_c) for fine-grained control over
-    /// long-running commands.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # async fn example(shell: &winrm_rs::Shell<'_>) -> Result<(), winrm_rs::WinrmError> {
-    /// let cmd_id = shell.start_command("ping", &["-t", "10.0.0.1"]).await?;
-    /// loop {
-    ///     let chunk = shell.receive_next(&cmd_id).await?;
-    ///     print!("{}", String::from_utf8_lossy(&chunk.stdout));
-    ///     if chunk.done { break; }
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
     /// Like [`start_command`](Self::start_command) but lets the caller
     /// specify the `CommandId` that the server should assign to the
     /// command. Used by PSRP where the pipeline UUID must match the
@@ -439,6 +454,10 @@ impl<'a> Shell<'a> {
     ///
     /// See [`WinrmClient::run_command`](crate::WinrmClient::run_command) (Arguments) for
     /// how `args` reach the host.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`start_command`](Self::start_command).
     pub async fn start_command_with_id(
         &self,
         command: &str,
@@ -463,8 +482,34 @@ impl<'a> Shell<'a> {
         Ok(returned_id)
     }
 
+    /// Start a command and return the command ID for manual polling.
+    ///
+    /// Use with [`receive_next`](Self::receive_next) and
+    /// [`signal_ctrl_c`](Self::signal_ctrl_c) for fine-grained control over
+    /// long-running commands.
+    ///
     /// See [`WinrmClient::run_command`](crate::WinrmClient::run_command) (Arguments) for
     /// how `args` reach the host.
+    ///
+    /// # Errors
+    ///
+    /// The [errors of a request](crate::WinrmClient#errors-of-a-request), and
+    /// [`SoapError::MissingElement`](crate::SoapError::MissingElement) for
+    /// an answer without a `CommandId`.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # async fn example(shell: &winrm_rs::Shell<'_>) -> Result<(), winrm_rs::WinrmError> {
+    /// let cmd_id = shell.start_command("ping", &["-t", "10.0.0.1"]).await?;
+    /// loop {
+    ///     let chunk = shell.receive_next(&cmd_id).await?;
+    ///     print!("{}", String::from_utf8_lossy(&chunk.stdout));
+    ///     if chunk.done { break; }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn start_command(&self, command: &str, args: &[&str]) -> Result<String, WinrmError> {
         let endpoint = self.client.endpoint(&self.host);
         let config = self.client.config();
@@ -515,6 +560,13 @@ impl<'a> Shell<'a> {
     /// spin, so back off after a few empty polls in a row, as
     /// [`run_command`](Self::run_command) does (50 ms after the third poll
     /// that brought nothing in under 250 ms, doubling up to 1 s).
+    ///
+    /// # Errors
+    ///
+    /// The [errors of a request](crate::WinrmClient#errors-of-a-request),
+    /// the `TimedOut` fault excepted (above), and
+    /// [`SoapError::ParseError`](crate::SoapError::ParseError) for a stream
+    /// that is not valid base64.
     pub async fn receive_next(&self, command_id: &str) -> Result<ReceiveOutput, WinrmError> {
         let endpoint = self.client.endpoint(&self.host);
         let config = self.client.config();
@@ -564,6 +616,12 @@ impl<'a> Shell<'a> {
     }
 
     /// Explicitly close the shell, releasing server-side resources.
+    ///
+    /// # Errors
+    ///
+    /// The [errors of a request](crate::WinrmClient#errors-of-a-request).
+    /// The shell value is consumed either way: after an error, a shell the
+    /// server still has stays there until its idle timeout.
     pub async fn close(mut self) -> Result<(), WinrmError> {
         self.closed = true;
         self.client
@@ -591,6 +649,12 @@ impl<'a> Shell<'a> {
     /// A hook that refuses [`RequestKind::Disconnect`](crate::RequestKind::Disconnect)
     /// but lets [`RequestKind::Delete`](crate::RequestKind::Delete) through
     /// therefore deletes the shell.
+    ///
+    /// # Errors
+    ///
+    /// The [errors of a request](crate::WinrmClient#errors-of-a-request),
+    /// those of the Disconnect: the shell is then deleted (above), and a
+    /// failure of that Delete is logged, not returned.
     pub async fn disconnect(mut self) -> Result<String, WinrmError> {
         self.closed = true;
         let endpoint = self.client.endpoint(&self.host);

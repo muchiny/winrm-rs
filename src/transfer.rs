@@ -298,6 +298,16 @@ impl WinrmClient {
     /// - `local_path` is opened with this process's privileges and follows
     ///   symbolic links. Check an untrusted local path yourself before passing
     ///   it.
+    ///
+    /// # Errors
+    ///
+    /// [`WinrmError::Transfer`] when `remote_path` is refused before anything
+    /// is sent (the policy above, a control character, a path too long for
+    /// one command line), when `local_path` cannot be read, or when the
+    /// script of a chunk fails on the host (the error quotes its stderr).
+    /// Otherwise the errors of [`open_shell`](Self::open_shell) and, for each
+    /// chunk, of [`Shell::run_command`](crate::Shell::run_command), its
+    /// deadline included.
     pub async fn upload_file(
         &self,
         host: &str,
@@ -424,6 +434,15 @@ impl WinrmClient {
     ///   `local_path`); the limit of
     ///   [`download_file_with_timeout`](Self::download_file_with_timeout)
     ///   does not cover the local write.
+    ///
+    /// # Errors
+    ///
+    /// [`WinrmError::Transfer`] when `remote_path` is refused before anything
+    /// is sent (the policy above, a control character, a path too long),
+    /// when the script fails on the host (the error quotes its stderr), when
+    /// what it printed is not base64, or when `local_path` is refused or
+    /// cannot be written. Otherwise the errors of
+    /// [`run_command`](Self::run_command).
     pub async fn download_file(
         &self,
         host: &str,
@@ -474,6 +493,12 @@ impl WinrmClient {
     /// println!("{bytes} bytes");
     /// # Ok(()) }
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Those of [`download_file`](Self::download_file), and
+    /// [`WinrmError::Timeout`] when `timeout` passes before the remote read
+    /// ends.
     #[tracing::instrument(
         level = "debug",
         skip(self, host),

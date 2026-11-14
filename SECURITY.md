@@ -4,15 +4,16 @@
 
 Security fixes ship as a new patch release of the latest minor version only;
 older minor versions get no backports. Within a major version every release
-is semver-compatible with the latest one, so moving up within 2.x needs no
-code change. Moving from 1.x to 2.0 does: see *Upgrading from 1.x* in the
-[CHANGELOG](CHANGELOG.md). From 2.1 on, the crate needs Rust 1.99.0 or later
-(2.0.x built with 1.98.0).
+is semver-compatible with the latest one, so moving up within 3.x needs no
+code change. Moving from 2.x to 3.0 does (the error types changed), and so
+does moving from 1.x to 2.0: see *Upgrading from 2.x* and *Upgrading from
+1.x* in the [CHANGELOG](CHANGELOG.md). From 3.0 on, the crate needs Rust
+1.100.0 or later (2.1.x built with 1.99.0, 2.0.x with 1.98.0).
 
 | Version              | Supported |
 |----------------------|-----------|
-| 2.1.x (latest patch) | Yes       |
-| < 2.1                | No        |
+| 3.0.x (latest patch) | Yes       |
+| < 3.0                | No        |
 
 ## Reporting a vulnerability
 

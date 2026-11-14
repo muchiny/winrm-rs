@@ -7,8 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-`WinrmError` says what failed by its variant. That breaks the programs that
-match on it, so the next release is 3.0.0: read *Upgrading from 2.x* first.
+## [3.0.0] - 2026-11-14
+
+**This release breaks the API of 2.x.** `WinrmError` says what failed by
+its variant: `AuthFailed` and `NtlmError::InvalidMessage` are gone,
+`Transfer` holds a `TransferError`, and the error enums, `AuthMethod` and
+`EncryptionMode` are `#[non_exhaustive]`. A program that matches on these
+types has to be adapted; one that only shows an error or passes it on with
+`?` compiles as it is. Read *Upgrading from 2.x* first.
+
+The rest of the release hardens what 2.1 did and breaks no other API: a
+server's answers are read with an XML parser, the host checks the remote
+path of a transfer too, the five low-severity findings of an audit are
+fixed, and the MSRV is 1.100.0.
 
 ### Upgrading from 2.x
 
@@ -2388,7 +2399,8 @@ published to crates.io, where 1.0.0 is the first release.
 - Raw command execution (`cmd.exe` or any executable)
 - Full shell lifecycle: create, execute, receive, signal, delete
 
-[Unreleased]: https://github.com/muchiny/winrm-rs/compare/v2.1.0...HEAD
+[Unreleased]: https://github.com/muchiny/winrm-rs/compare/v3.0.0...HEAD
+[3.0.0]: https://github.com/muchiny/winrm-rs/compare/v2.1.0...v3.0.0
 [2.1.0]: https://github.com/muchiny/winrm-rs/compare/v2.0.1...v2.1.0
 [2.0.1]: https://github.com/muchiny/winrm-rs/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/muchiny/winrm-rs/compare/v1.4.1...v2.0.0

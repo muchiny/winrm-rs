@@ -1582,10 +1582,7 @@ name = "winrm-rs"
 version = "2.1.0"
 dependencies = [
  "base64",
- "bytes",
  "http",
- "http-body-util",
- "hyper",
  "hyper-util",
  "idna",
  "md-5",

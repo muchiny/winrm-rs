@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **The `credssp` feature no longer declares `hyper`, `http-body-util` and
+  `bytes`.** Nothing in the library has used them since the CredSSP
+  transport was rewritten over a raw `tokio-rustls` stream. The three
+  crates stay in the dependency tree through `reqwest`, so a build with
+  `credssp` compiles the same crates as before. `bytes` stays a
+  dev-dependency (`tests/kerberos_kdc.rs`).
 - `release.toml` (`cargo-release`) and `cliff.toml` (`git-cliff`) are
   removed: the release procedure uses neither tool (CONTRIBUTING.md,
   "Releasing"), and `release.toml` asked for a publish and a push from the

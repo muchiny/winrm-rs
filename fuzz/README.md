@@ -54,14 +54,14 @@ drives; "invariant" is what it asserts beyond *must not panic*.
 | `fuzz_soap_enumerate` | `parse_enumerate_response` | an `EndOfSequence` element after the document clears the context; escaped item text never does and is never a fault; the context cannot add XML elements to the next `Pull` |
 | `fuzz_soap_envelope` | all envelope builders, the five PSRP ones included (shell creation with `creationXml`, command, receive, send, signal) | **no input can add XML markup** — tag counts match an empty-input baseline |
 | `fuzz_xml_escape` | `envelope::xml_escape` | complete (no raw markup survives) and reversible |
-| `fuzz_clixml_stderr` | `soap/clixml.rs::ClixmlDecoder` | output does not depend on how stderr is sliced; plain stderr passes through; output ≤ 3× input |
+| `fuzz_clixml_stderr` | `soap/clixml.rs::ClixmlDecoder` | output does not depend on how stderr is sliced; plain stderr passes through, and so does raw text between the records of an open document, even when it looks like the start of a record; a document inside another one is decoded; output ≤ 3× input |
 
 ### Input validation
 
 | Target | Source | Invariant |
 |---|---|---|
 | `fuzz_transport_host` | `transport::sanitize_host`, `transport::validate_host` | no `/` or `@` survives; the rebuilt URL has one authority; an accepted host has no `?`, `#`, `\`, whitespace or control character, and its endpoint URL (when the URL parser takes it) reads back with that host, the port, `/wsman`, and no userinfo, query or fragment |
-| `fuzz_transfer_path` | `validate_remote_path`, `validate_remote_path_for`, `escape_ps_single_quoted`, `quote_powershell_string` | accepted paths are bounded and control-free; LocalDrive accepts only drive-absolute paths and refuses DOS device names (last component after resolving `.` and `..`); every PowerShell single quote (U+0027, U+2018, U+2019, U+201A, U+201B) is doubled with itself and collapses back to the input; `quote_powershell_string` wraps that escape in one pair of ASCII single quotes and its inner part collapses back to the input |
+| `fuzz_transfer_path` | `validate_remote_path`, `validate_remote_path_for`, `escape_ps_single_quoted`, `quote_powershell_string` | accepted paths are bounded and control-free; LocalDrive accepts only drive-absolute paths and refuses DOS device names (last component after resolving `.` and `..`) and components made only of dots and blanks; every PowerShell single quote (U+0027, U+2018, U+2019, U+201A, U+201B) is doubled with itself and collapses back to the input; `quote_powershell_string` wraps that escape in one pair of ASCII single quotes and its inner part collapses back to the input |
 | `fuzz_powershell_encode` | `command::encode_powershell_command` | output is ASCII base64 and roundtrips |
 
 ### CredSSP ASN.1 / DER — pre-authentication attack surface

@@ -340,7 +340,10 @@ device paths, `\\?\` long paths and relative paths before anything is sent
 (`RemotePathPolicy::LocalDrive`, the default). It also refuses a path whose
 last component, after resolving `.` and `..`, is a DOS device name (`CON`,
 `NUL`, `COM1`, `LPT1`, ...): Windows opens the device instead of a file, and
-a printer port may be redirected to a network printer. With the `Any`
+a printer port may be redirected to a network printer. A path with a
+component made only of dots and blanks, other than `.` and `..`, is refused
+as well (`C:\x\LPT1\. `): Windows does not read such a component the same
+way everywhere. With the `Any`
 policy, a path may name a UNC share or a device path, and under CredSSP or
 Basic a UNC path is reached with your credentials: never pass an untrusted
 path. On the host, blocking outbound SMB (445) and WebDAV, the "Network

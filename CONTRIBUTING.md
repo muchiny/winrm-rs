@@ -52,8 +52,9 @@ scripts/test-release-ci-status.sh
 
 # Lint
 cargo clippy --all-targets -- -D warnings
-cargo clippy --all-targets --features kerberos -- -D warnings
 cargo clippy --all-targets --all-features -- -D warnings
+# What CI runs: the same under every feature combination (needs cargo-hack)
+cargo hack clippy --feature-powerset --exclude-features default --all-targets -- -D warnings
 
 # Format (requires nightly). fuzz/ is a crate of its own: check it too.
 cargo +nightly fmt --check
@@ -99,7 +100,8 @@ We follow [Conventional Commits](https://www.conventionalcommits.org/):
 - Run `cargo +nightly fmt` before committing
 - Follow existing patterns in the codebase
 - Use `tracing` for logging, not `println!`
-- No `unwrap`, `expect`, `panic!`, unchecked indexing, unchecked arithmetic or `as` casts in library code: Cargo.toml sets these Clippy lints and CI denies warnings. Tests are exempt. A justified exception is an `#[expect(clippy::..., reason = "...")]` on the smallest item that needs it
+- No `unwrap`, `expect`, `panic!`, unchecked indexing, unchecked arithmetic or `as` casts in library code: Cargo.toml sets these Clippy lints and CI denies warnings. Tests are exempt. A justified exception is an `#[expect(clippy::..., reason = "...")]` on the smallest item that needs it, never an `#[allow]` (Clippy refuses it). When the lint only fires without a feature, the `#[expect]` goes in a `cfg_attr` with that condition; code that only the tests and the fuzz targets call is gated on `cfg(any(test, feature = "__internal"))` instead
+- A function of the library is at most 100 lines (`clippy::too_many_lines`): split a longer one into named steps. Tests are exempt.
 - Wrap secrets with `secrecy::SecretString` and zeroize sensitive data
 
 ## CredSSP differential against pyspnego

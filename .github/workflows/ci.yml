@@ -224,6 +224,13 @@ jobs:
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
+    env:
+      # The `#[cfg(test)]` helper modules (in-process servers, test PKI):
+      # `src/test_*.rs` and `src/auth/credssp/test_server.rs`. Test code, like
+      # the `tests.rs` files and `tests/`, which cargo-llvm-cov leaves out of
+      # the report by itself. The short test modules written in a source file
+      # still count.
+      TEST_HELPERS: '(^|/)src/(.*/)?test_[a-z_]+\.rs$'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -242,12 +249,16 @@ jobs:
       # gated too. Coverage runs without --features kerberos: the Kerberos
       # FFI glue is exercised by the kerberos-kdc job, not counted here.
       - name: Generate coverage
-        run: cargo llvm-cov --locked --features credssp --summary-only --fail-under-lines 95
+        run: >-
+          cargo llvm-cov --locked --features credssp --summary-only
+          --fail-under-lines 95 --ignore-filename-regex "$TEST_HELPERS"
       # Reuses the profile data and the objects of the run above (built with
       # `credssp`): no rebuild. `cargo llvm-cov report` takes no feature
       # flags; it reads whatever that run left in the target directory.
       - name: Cobertura report for SonarQube Cloud
-        run: cargo llvm-cov report --cobertura --output-path cobertura.xml
+        run: >-
+          cargo llvm-cov report --cobertura --output-path cobertura.xml
+          --ignore-filename-regex "$TEST_HELPERS"
       - name: Keep cobertura.xml for the sonar job
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+
+- **The NTLM session key comes straight from the operating system.** It was
+  drawn from `rand`'s thread-local generator, whose state is never wiped and
+  can produce its past output again until it reseeds (every 64 KiB). A copy
+  of the key therefore outlived the sealing session, which is wiped when it
+  ends: someone able to read the process memory afterwards could recompute
+  the key and decrypt a recorded sealed exchange. The key is now read with
+  `SysRng`, which keeps no state. This covers NTLM over HTTP and HTTPS and
+  the NTLM exchange inside CredSSP. If the operating system's random source
+  fails, the handshake fails with `NtlmError::InvalidMessage`.
+- **`run_wql` applies `max_output_bytes` to the first answer too.** The cap
+  was only checked after each Pull. The Enumerate request asks for optimized
+  enumeration, so a server can return every item in the Enumerate answer and
+  end the sequence there: those items were returned whatever the cap, up to
+  the size limit of one response (4 × max(`max_envelope_size`, 512 KiB)).
+- **`RemotePathPolicy::LocalDrive` refuses a path with a component made only
+  of dots and blanks**, other than `.` and `..` (`C:\x\LPT1\. `,
+  `C:\x\LPT1\a\...`, a component that is a lone space). Windows reads such a
+  component as nothing, as `.` or as `..` depending on the code that opens
+  the path, so these paths could name a DOS device the policy refuses in its
+  plain form. A TAB or a no-break space at the end of the last component is
+  now dropped before the device check, like a trailing dot or space
+  (`C:\x\LPT1<TAB>`). The rules come from the .NET Framework reference
+  source; they were not exercised against a live Windows PowerShell 5.1.
+  One real name is refused with the others: a directory named with
+  no-break spaces alone, which `RemotePathPolicy::Any` still reaches.
+  `RemotePathPolicy::Any` is unchanged.
+- **The CredSSP proxy `CONNECT` request is built in a buffer of its final
+  size.** With a long proxy password or host name the buffer grew while it
+  was written, which freed its first copy, `Proxy-Authorization` value
+  included, without wiping it.
+- **Raw stderr written while a CLIXML document is open is no longer lost.**
+  `powershell.exe` keeps its `<Objs>` document open until it exits, and a
+  native command can write to stderr in the meantime. The decoder behind
+  `CommandOutput::stderr`, `Shell::receive_next` and `StderrDecoder` skipped
+  any text between two records, and read any `<` as the start of a record,
+  which it then dropped: after `a < b`, `<stdin>:1: error` or the
+  `#< CLIXML` line of a nested `powershell.exe`, the rest of stderr was held
+  back and dropped when the command ended (past 16 MiB it was released raw).
+  Text reaching stderr could thus hide the errors that followed it.
+  Inside a document, CLIXML is now recognised by the bytes `powershell.exe`
+  writes: `<S S="` starts a string record, `<Obj S="` an object record,
+  `<Objs` the root tag of a document inside this one, and `</Objs>` closes
+  the innermost open document. A record must also be well-formed: a `<`
+  inside a tag, or a tag other than `</S>` inside a string record, makes its
+  bytes text. Everything else passes through. The documents
+  `powershell.exe` writes decode as before. What changes for other input:
+  - a tag that is none of those (another name, an `<S>` or `<Obj>` that
+    names no stream, a lone end tag, a comment) comes out as text instead of
+    being dropped, and so does a `<` left unfinished at the end of the
+    stream;
+  - a record that is not well-formed comes out as text, instead of being
+    decoded up to its first `<` or of taking in the records after it;
+  - a document inside an open one (nested `powershell.exe`) has its records
+    decoded instead of being dropped whole, and its `#< CLIXML` line comes
+    out as text;
+  - the blank bytes between a record or a root tag and the raw text after
+    it are dropped, as they are between two records.
+
+  Raw text that holds a whole well-formed record is still read as that
+  record, and an `<Obj S="` that nothing closes still holds what follows
+  it.
+
 ### Changed
 
 - **MSRV raised to 1.100.0** (from 1.99.0). `clippy.toml` and the MSRV job
@@ -31,6 +95,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   "Releasing"), and `release.toml` asked for a publish and a push from the
   maintainer's machine, which that procedure forbids. Neither file was in
   the published crate.
+- The unit tests of eighteen more modules move to a file of their own, as
+  those of `src/transport.rs` and `src/client.rs` did in 2.1.0
+  (`src/soap/parser.rs` to `src/soap/parser/tests.rs`, `src/ntlm/mod.rs` to
+  `src/ntlm/tests.rs`, the `layout_tests` of `src/auth/kerberos.rs` to
+  `src/auth/kerberos/layout_tests.rs`, and so on): every test module of
+  more than 150 lines. Same tests, same names, no API change.
+  `sonar-project.properties` leaves these files, and
+  `src/auth/credssp/test_server.rs`, out of main-code analysis.
+- The coverage gate of CI (95 % of lines) counts less test code. The test
+  modules written in a source file counted in that figure, and they are
+  covered at nearly 100 %: once the long ones were moved out, the gate read
+  94.48 %. The `#[cfg(test)]` helper modules (`src/test_*.rs`,
+  `src/auth/credssp/test_server.rs`) now leave the report as well; the
+  short test modules that stay in their source file still count.
+  Eighteen tests cover library code that no test ran, which brings the
+  figure to 96.23 %: the SOCKS5 and `CONNECT` tunnel of CredSSP (each form
+  of target and of reply, what SOCKS5 cannot carry, a proxy that closes or
+  is absent, an answer that ends past its size cap), a CredSSP round
+  answered without a usable token, the answer to the delegation round, the
+  query and the server name of the CredSSP endpoint, a Receive on a PSRP
+  shell, a refused Disconnect, and malformed `TSRequest`, SPNEGO and
+  certificate fields.
 
 ### Documentation
 

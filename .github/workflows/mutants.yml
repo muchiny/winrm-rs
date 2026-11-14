@@ -65,6 +65,10 @@ jobs:
       # tests). Neither is library code.
       #
       # `--lib`: the unit tests are the ones that have to catch a mutant.
+      #
+      # `.cargo/mutants.toml` caps the memory of the test binary at 8 GiB: a
+      # mutant that loops for ever while it allocates is then caught, where
+      # it used to take the runner down with its shard.
       - name: Mutants
         env:
           SHARD: ${{ matrix.shard }}

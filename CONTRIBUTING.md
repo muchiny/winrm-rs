@@ -71,6 +71,9 @@ scripts/fuzz.sh run fuzz_asn1_ts_request 900
 # is about two thousand mutants, each a build and a run of the unit tests; the
 # `Mutants` workflow runs them all every week, and on request (Actions >
 # Mutants > Run workflow). A mutant that survives is in the summary of its run.
+# On Linux the tests of a mutant get at most 8 GiB of memory
+# (.cargo/mutants.toml, needs `prlimit`): some mutants loop for ever while
+# they allocate, and would take the machine down before their timeout.
 cargo mutants --features credssp --file src/asn1.rs -- --lib
 
 # Check what will be published to crates.io (fails on any file outside the allowlist)

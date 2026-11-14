@@ -802,7 +802,7 @@ version = "1.0.5"
 criteria = "safe-to-run"
 
 [[exemptions.winrm-rs]]
-version = "2.1.0"
+version = "3.0.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.wiremock]]

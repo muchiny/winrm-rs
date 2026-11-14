@@ -62,9 +62,10 @@ pub(crate) enum Fault {
     /// Answer the first round with a response head that never ends.
     OversizedHead,
     /// Answer the request of this rank (the first is 1) with these bytes,
-    /// without reading what it carries, and close. The requests before it
-    /// are answered honestly: 1 and 2 are the inner TLS handshake, 3 the
-    /// NTLM negotiate, 4 the NTLM authenticate, 5 the delegation.
+    /// without decoding what it carries, and close. It is logged as a round
+    /// without `authInfo`, whatever it carried. The requests before it are
+    /// answered honestly: 1 and 2 are the inner TLS handshake, 3 the NTLM
+    /// negotiate, 4 the NTLM authenticate, 5 the delegation.
     RawAnswer(usize, &'static [u8]),
 }
 

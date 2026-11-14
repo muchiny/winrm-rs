@@ -5,7 +5,7 @@ use crate::test_proxy;
 
 /// A target that accepts connections and writes `hi` on each.
 async fn spawn_hi_target() -> u16 {
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
@@ -14,7 +14,6 @@ async fn spawn_hi_target() -> u16 {
             // Keep the socket open until the peer is done.
             tokio::spawn(async move {
                 let mut sink = [0u8; 64];
-                use tokio::io::AsyncReadExt;
                 while matches!(s.read(&mut sink).await, Ok(n) if n > 0) {}
             });
         }

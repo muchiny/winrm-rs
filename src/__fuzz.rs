@@ -158,7 +158,7 @@ pub fn build_ntlmv2_blob(
     client_challenge: &[u8; 8],
     target_info: &[u8],
 ) -> Vec<u8> {
-    crate::ntlm::crypto::build_ntlmv2_blob(timestamp, client_challenge, target_info)
+    crate::ntlm::crypto::build_ntlmv2_blob(*timestamp, *client_challenge, target_info)
 }
 
 /// Compute the `tls-server-end-point` channel binding token from a DER cert

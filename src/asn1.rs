@@ -413,11 +413,11 @@ pub(crate) fn decode_ts_request(data: &[u8]) -> Result<TsRequest, CredSspError> 
         .transpose()?;
 
     let auth_info = find_context_tag(seq_data, 2)
-        .map(|d| decode_octet_string(d).map(|v| v.to_vec()))
+        .map(|d| decode_octet_string(d).map(<[u8]>::to_vec))
         .transpose()?;
 
     let pub_key_auth = find_context_tag(seq_data, 3)
-        .map(|d| decode_octet_string(d).map(|v| v.to_vec()))
+        .map(|d| decode_octet_string(d).map(<[u8]>::to_vec))
         .transpose()?;
 
     let error_code = find_context_tag(seq_data, 4)
@@ -425,7 +425,7 @@ pub(crate) fn decode_ts_request(data: &[u8]) -> Result<TsRequest, CredSspError> 
         .transpose()?;
 
     let client_nonce = find_context_tag(seq_data, 5)
-        .map(|d| decode_octet_string(d).map(|v| v.to_vec()))
+        .map(|d| decode_octet_string(d).map(<[u8]>::to_vec))
         .transpose()?;
 
     Ok(TsRequest {

@@ -4,7 +4,12 @@ use std::fmt::Write;
 
 use uuid::Uuid;
 
-use super::namespaces::*;
+use super::namespaces::{
+    ACTION_COMMAND, ACTION_CREATE, ACTION_DELETE, ACTION_DISCONNECT, ACTION_ENUMERATE, ACTION_PULL,
+    ACTION_RECEIVE, ACTION_RECONNECT, ACTION_SEND, ACTION_SIGNAL, REPLY_TO_ANONYMOUS,
+    RESOURCE_URI_CMD, RESOURCE_URI_WMI, SIGNAL_CTRL_C, SIGNAL_PSRP_CTRL_C, SIGNAL_TERMINATE,
+    WQL_DIALECT,
+};
 
 /// Escape special XML characters to prevent injection in SOAP envelopes.
 pub(crate) fn xml_escape(s: &str) -> String {

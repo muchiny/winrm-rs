@@ -1,3 +1,5 @@
+use std::fmt::Write as _;
+
 use super::*;
 
 #[test]
@@ -196,7 +198,12 @@ fn ntlm_session_keys_match_pywinrm_vector() {
         &key,
         b"session key to server-to-client signing key magic constant\0",
     );
-    let h = |b: &[u8]| b.iter().map(|x| format!("{:02x}", x)).collect::<String>();
+    let h = |b: &[u8]| {
+        b.iter().fold(String::new(), |mut hex, byte| {
+            write!(hex, "{byte:02x}").unwrap();
+            hex
+        })
+    };
     assert_eq!(
         h(&cli_seal),
         "af22a2127a4b090cccdfa26c427969c7",

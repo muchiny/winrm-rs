@@ -782,15 +782,12 @@ fn decode_entities(s: &str) -> String {
                 end.saturating_add(1),
             ))
         });
-        match decoded {
-            Some((c, after)) => {
-                out.push(c);
-                pos = after;
-            }
-            None => {
-                out.push('&');
-                pos = name_start;
-            }
+        if let Some((c, after)) = decoded {
+            out.push(c);
+            pos = after;
+        } else {
+            out.push('&');
+            pos = name_start;
         }
     }
     out.push_str(s.get(pos..).unwrap_or_default());

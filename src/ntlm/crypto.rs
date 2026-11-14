@@ -190,8 +190,8 @@ fn hmac_md5_wiping(key: &[u8], parts: &[&[u8]]) -> Zeroizing<[u8; 16]> {
 
 /// Build the NTLMv2 client blob (MS-NLMP 3.3.2).
 pub(crate) fn build_ntlmv2_blob(
-    timestamp: &[u8; 8],
-    client_challenge: &[u8; 8],
+    timestamp: [u8; 8],
+    client_challenge: [u8; 8],
     target_info: &[u8],
 ) -> Vec<u8> {
     // 28 bytes of fixed fields, the AV pairs, then the 4-byte terminator.
@@ -199,8 +199,8 @@ pub(crate) fn build_ntlmv2_blob(
     blob.push(0x01); // RespType
     blob.push(0x01); // HiRespType
     blob.extend_from_slice(&[0u8; 6]); // Reserved
-    blob.extend_from_slice(timestamp); // TimeStamp (8 bytes)
-    blob.extend_from_slice(client_challenge); // ChallengeFromClient (8 bytes)
+    blob.extend_from_slice(&timestamp); // TimeStamp (8 bytes)
+    blob.extend_from_slice(&client_challenge); // ChallengeFromClient (8 bytes)
     blob.extend_from_slice(&[0u8; 4]); // Reserved
     blob.extend_from_slice(target_info); // AvPairs
     blob.extend_from_slice(&[0u8; 4]); // Reserved (terminator)
@@ -254,7 +254,7 @@ pub(crate) fn write_security_buffer(buf: &mut Vec<u8>, len: u16, offset: u32) {
 }
 
 pub(crate) fn to_utf16le(s: &str) -> Vec<u8> {
-    s.encode_utf16().flat_map(|c| c.to_le_bytes()).collect()
+    s.encode_utf16().flat_map(u16::to_le_bytes).collect()
 }
 
 /// [`to_utf16le`] into a buffer that is wiped on drop, for secrets.
@@ -504,11 +504,10 @@ fn channel_bindings_with(hash: CbtHash, cert_der: &[u8]) -> [u8; 16] {
     bindings.extend_from_slice(&0u32.to_le_bytes()); // initiator length = 0
     bindings.extend_from_slice(&0u32.to_le_bytes()); // acceptor addrtype = 0
     bindings.extend_from_slice(&0u32.to_le_bytes()); // acceptor length = 0
-    #[expect(
-        clippy::as_conversions,
-        reason = "app data is a 21-byte prefix and a hash of at most 64 bytes"
-    )]
-    bindings.extend_from_slice(&(app_data.len() as u32).to_le_bytes()); // app_data length
+    // The app data is a 21-byte prefix and a hash of at most 64 bytes: its
+    // length always fits.
+    let app_data_len = u32::try_from(app_data.len()).unwrap_or(u32::MAX);
+    bindings.extend_from_slice(&app_data_len.to_le_bytes()); // app_data length
     bindings.extend_from_slice(&app_data);
 
     // Step 4: MD5 of the entire gss_channel_bindings_struct

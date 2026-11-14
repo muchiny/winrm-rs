@@ -24,6 +24,7 @@ pub(crate) use messages::{
 // The sealing session uses crypto internals
 use crate::error::NtlmError;
 use crypto::{Rc4State, hmac_md5_parts};
+use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Length of an NTLM message signature (MS-NLMP 2.2.2.9.1).
@@ -52,12 +53,12 @@ fn checksum_head(mac: &[u8; 16]) -> [u8; 8] {
 }
 
 /// `Version(4) || Checksum(8) || SeqNum(4)`, all little-endian.
-fn signature(checksum: &[u8; 8], seq: u32) -> [u8; SIGNATURE_LEN] {
+fn signature(checksum: [u8; 8], seq: u32) -> [u8; SIGNATURE_LEN] {
     let mut sig = [0u8; SIGNATURE_LEN];
     let fields = SIGNATURE_VERSION
         .to_le_bytes()
         .into_iter()
-        .chain(checksum.iter().copied())
+        .chain(checksum)
         .chain(seq.to_le_bytes());
     for (slot, byte) in sig.iter_mut().zip(fields) {
         *slot = byte;
@@ -262,7 +263,7 @@ impl SealingSession {
 
             // 4. Signature, then ciphertext.
             let mut result = Vec::with_capacity(SIGNATURE_LEN.saturating_add(ciphertext.len()));
-            result.extend_from_slice(&signature(&checksum, seq));
+            result.extend_from_slice(&signature(checksum, seq));
             result.extend_from_slice(&ciphertext);
             s.client_seq_num = seq.checked_add(1);
             Ok(result)
@@ -294,7 +295,7 @@ impl SealingSession {
         // KEY_EXCH path: encrypt the checksum with the client RC4 stream.
         self.client_seal_handle.process(&mut checksum);
         self.client_seq_num = seq.checked_add(1);
-        Ok(signature(&checksum, seq))
+        Ok(signature(checksum, seq))
     }
 
     /// Sign the SPNEGO `mech_type_list` for the `mechListMIC` of the final
@@ -377,7 +378,6 @@ impl SealingSession {
             let mut expected = checksum_head(&mac);
             s.server_seal_handle.process(&mut expected);
 
-            use subtle::ConstantTimeEq;
             if expected.ct_eq(&received).unwrap_u8() == 0 {
                 return Err(invalid("mechListMIC checksum mismatch"));
             }
@@ -435,7 +435,6 @@ impl SealingSession {
             // Use a constant-time comparison so the time taken to detect a
             // mismatch does not leak how many leading bytes of the checksum
             // are correct. Defence-in-depth against timing oracles.
-            use subtle::ConstantTimeEq;
             let mac = hmac_md5_parts(&s.server_sign_key, &[&seq.to_le_bytes(), &plaintext]);
             if sig_checksum.ct_eq(&checksum_head(&mac)).unwrap_u8() == 0 {
                 return Err(invalid("checksum mismatch"));

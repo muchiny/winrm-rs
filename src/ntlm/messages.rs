@@ -444,16 +444,16 @@ fn exchanged_session_key(
 /// LMv2 response.
 fn lm_response(
     ntlmv2_hash: &[u8],
-    server_challenge: &[u8; 8],
-    client_challenge: &[u8; 8],
+    server_challenge: [u8; 8],
+    client_challenge: [u8; 8],
     mic: bool,
 ) -> Vec<u8> {
     if mic {
         return vec![0u8; 24];
     }
-    let lm_input = [server_challenge.as_slice(), client_challenge].concat();
+    let lm_input = [server_challenge, client_challenge].concat();
     let lm_hash = *hmac_md5_secret(ntlmv2_hash, &lm_input);
-    [lm_hash.as_slice(), client_challenge].concat()
+    [lm_hash.as_slice(), &client_challenge].concat()
 }
 
 /// The fields of a Type 3, ready to be laid out.
@@ -561,7 +561,7 @@ fn create_authenticate_message_full(
         input.mic_input.is_some(),
     )?;
 
-    let blob = build_ntlmv2_blob(&timestamp, &client_challenge, &target_info);
+    let blob = build_ntlmv2_blob(timestamp, client_challenge, &target_info);
 
     let proof_input = [challenge.server_challenge.as_slice(), &blob].concat();
     let nt_proof_str = *hmac_md5_secret(ntlmv2_hash.as_slice(), &proof_input);
@@ -580,8 +580,8 @@ fn create_authenticate_message_full(
     let nt_response = [nt_proof_str.as_slice(), &blob].concat();
     let lm_response = lm_response(
         ntlmv2_hash.as_slice(),
-        &challenge.server_challenge,
-        &client_challenge,
+        challenge.server_challenge,
+        client_challenge,
         input.mic_input.is_some(),
     );
     let fields = Type3Fields {

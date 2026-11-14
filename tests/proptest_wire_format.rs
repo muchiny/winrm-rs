@@ -35,6 +35,8 @@
     reason = "test code"
 )]
 
+use std::fmt::Write as _;
+
 use proptest::prelude::*;
 
 // P-PS-1 — powershell encode is decodable as base64 of UTF-16-LE bytes.
@@ -202,7 +204,7 @@ fn clixml_escape(text: &str) -> String {
             '"' => out.push_str("&quot;"),
             c if c.is_control() => {
                 for unit in c.encode_utf16(&mut [0; 2]) {
-                    out.push_str(&format!("_x{unit:04X}_"));
+                    write!(out, "_x{unit:04X}_").unwrap();
                 }
             }
             c => out.push(c),
@@ -247,7 +249,7 @@ proptest! {
                         continue;
                     }
                 };
-                stream.push_str(&format!("<S S=\"{tag}\">{}</S>", clixml_escape(text)));
+                write!(stream, "<S S=\"{tag}\">{}</S>", clixml_escape(text)).unwrap();
                 expected.push_str(prefix);
                 expected.push_str(text);
                 if !prefix.is_empty() {

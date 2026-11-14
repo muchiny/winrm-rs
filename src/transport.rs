@@ -1019,7 +1019,7 @@ impl HttpTransport {
         var: impl Fn(&str) -> Option<String>,
     ) -> Result<Self, WinrmError> {
         let provider = crate::tls::crypto_provider(opts.tls.provider)?;
-        Self::with_provider(config, credentials, opts, provider, var)
+        Self::with_provider(config, credentials, opts, &provider, var)
     }
 
     /// Create a new HTTP transport whose every TLS configuration (the shared
@@ -1042,7 +1042,7 @@ impl HttpTransport {
         config: WinrmConfig,
         credentials: WinrmCredentials,
         opts: TransportOptions,
-        provider: Arc<CryptoProvider>,
+        provider: &Arc<CryptoProvider>,
         var: impl Fn(&str) -> Option<String>,
     ) -> Result<Self, WinrmError> {
         debug!(tls_provider = ?opts.tls.provider, "TLS crypto provider choice");
@@ -1081,7 +1081,7 @@ impl HttpTransport {
             config.use_tls,
             config.accept_invalid_certs,
             &proxy_names,
-            &provider,
+            provider,
         )?;
         // CredSSP has no channel binding on the outer TLS (MS-CSSP), so it
         // runs only behind a verifier that authenticates the server.
@@ -1110,12 +1110,12 @@ impl HttpTransport {
             };
         let (client_tls, server_verifier) = if config.use_tls {
             (
-                origin_client_tls(&provider, Arc::clone(&origin), client_auth)?,
+                origin_client_tls(provider, Arc::clone(&origin), client_auth)?,
                 Some(origin),
             )
         } else {
             // Plain HTTP: TLS only on the leg to an `https://` proxy.
-            (crate::tls::plain_http_config(proxy, &provider)?, None)
+            (crate::tls::plain_http_config(proxy, provider)?, None)
         };
 
         #[cfg(feature = "credssp")]

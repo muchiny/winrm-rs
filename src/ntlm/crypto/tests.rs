@@ -186,7 +186,7 @@ fn build_blob_correct_structure() {
     let ts = [0u8; 8];
     let cc = [1u8; 8];
     let ti = vec![0, 0, 0, 0]; // MsvAvEOL
-    let blob = build_ntlmv2_blob(&ts, &cc, &ti);
+    let blob = build_ntlmv2_blob(ts, cc, &ti);
     assert_eq!(blob[0], 0x01); // RespType
     assert_eq!(blob[1], 0x01); // HiRespType
     assert_eq!(&blob[2..8], &[0u8; 6]); // Reserved

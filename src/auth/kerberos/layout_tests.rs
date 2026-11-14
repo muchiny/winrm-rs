@@ -75,8 +75,8 @@ fn windows_layout_keeps_an_sspi_header_without_trailer() {
 
 #[test]
 fn windows_layout_refuses_what_is_not_a_sealed_initiator_wrap_token() {
-    let (h, d, p, t) = mit_parts();
     type Mutation = fn(&mut Vec<u8>);
+    let (intact, data, padding, trailer) = mit_parts();
     let cases: [(&str, Mutation); 5] = [
         ("rc4 token id", |h| h[..2].copy_from_slice(&[0x02, 0x01])),
         ("not sealed", |h| h[2] &= !FLAG_SEALED),
@@ -85,9 +85,9 @@ fn windows_layout_refuses_what_is_not_a_sealed_initiator_wrap_token() {
         ("too short", |h| h.truncate(15)),
     ];
     for (name, mutate) in cases {
-        let mut header = h.clone();
+        let mut header = intact.clone();
         mutate(&mut header);
-        let err = windows_layout(&header, &d, &p, &t).unwrap_err();
+        let err = windows_layout(&header, &data, &padding, &trailer).unwrap_err();
         assert!(
             matches!(err, WinrmError::AuthFailed(ref m) if m.contains("Kerberos message encryption")),
             "{name}: {err:?}"

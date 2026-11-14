@@ -86,7 +86,7 @@ impl std::fmt::Debug for ProxyRoute {
             .field("http", &shown(&self.http))
             .field("https", &shown(&self.https))
             .field("no", &self.no)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

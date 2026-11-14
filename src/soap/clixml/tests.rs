@@ -569,7 +569,9 @@ fn document_larger_than_the_record_bound_decodes_fully() {
     out.extend(d.finish());
     let line = format!("{}\r\n", "y".repeat(1000));
     assert_eq!(out.len(), line.len() * count);
-    assert!(String::from_utf8(out).unwrap() == line.repeat(count));
+    // Not `assert_eq!`: a failure would print both texts, 16 MiB each.
+    let decoded = String::from_utf8(out).unwrap() == line.repeat(count);
+    assert!(decoded, "the output is not {count} times the line");
 }
 
 #[test]
@@ -666,15 +668,12 @@ fn reference_decode_entities(s: &str) -> String {
             }?;
             Some((c, after))
         });
-        match decoded {
-            Some((c, after)) => {
-                out.push(c);
-                rest = after;
-            }
-            None => {
-                out.push('&');
-                rest = after_amp;
-            }
+        if let Some((c, after)) = decoded {
+            out.push(c);
+            rest = after;
+        } else {
+            out.push('&');
+            rest = after_amp;
         }
     }
     out.push_str(rest);

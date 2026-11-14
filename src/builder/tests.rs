@@ -16,8 +16,8 @@ fn builder_stays_unwind_safe() {
 /// trait either.
 #[test]
 fn builder_keeps_its_auto_traits() {
-    builder_stays_unwind_safe();
     fn assert_send_sync<T: Send + Sync>() {}
+    builder_stays_unwind_safe();
     assert_send_sync::<WinrmClientBuilder<NeedsCredentials>>();
     assert_send_sync::<WinrmClientBuilder<Ready>>();
     assert_send_sync::<WinrmClient>();

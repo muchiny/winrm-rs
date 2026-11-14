@@ -53,7 +53,7 @@ fn header_lines(header: &[u8]) -> impl Iterator<Item = &[u8]> {
     header
         .split(|&b| b == b'\n')
         .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
-        .map(|line| line.trim_ascii_start())
+        .map(<[u8]>::trim_ascii_start)
         .filter(|line| !line.is_empty())
 }
 

@@ -1378,7 +1378,7 @@ fn every_tls_config_uses_the_chosen_provider() {
             },
             WinrmCredentials::new(USER, PASS, ""),
             TransportOptions::default(),
-            Arc::clone(&p),
+            &p,
             proxy::env_var,
         )
         .unwrap();
@@ -1399,7 +1399,7 @@ fn every_tls_config_uses_the_chosen_provider() {
             },
             WinrmCredentials::new(USER, PASS, ""),
             TransportOptions::default(),
-            Arc::clone(&p),
+            &p,
             proxy::env_var,
         )
         .unwrap();
@@ -3836,9 +3836,9 @@ fn seals_follows_mode_and_scheme_for_ntlm_and_kerberos() {
     let seals = |auth_method: AuthMethod, encryption: EncryptionMode, use_tls: bool| {
         HttpTransport::new(
             WinrmConfig {
+                use_tls,
                 auth_method,
                 encryption,
-                use_tls,
                 ..Default::default()
             },
             WinrmCredentials::new("u", "p", ""),
@@ -3886,10 +3886,10 @@ fn seals_follows_mode_and_scheme_for_ntlm_and_kerberos() {
 #[test]
 fn auto_seals_over_https_when_the_certificate_is_not_verified() {
     let config = |auth_method, encryption, use_tls, accept_invalid_certs| WinrmConfig {
-        auth_method,
-        encryption,
         use_tls,
         accept_invalid_certs,
+        auth_method,
+        encryption,
         ..Default::default()
     };
     let seals = |auth_method, encryption, use_tls, accept_invalid_certs| {
@@ -4076,7 +4076,9 @@ async fn waiters_for_a_full_host_take_no_client_slot() {
         128,
         "queued waiters hold client slots"
     );
-    waiters.iter().for_each(|w| w.abort());
+    for waiter in &waiters {
+        waiter.abort();
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -4381,9 +4383,9 @@ fn route_follows_method_mode_and_scheme() {
     use EncryptionMode::{Always, Auto, Never};
     let route = |auth_method, encryption, use_tls| {
         Route::for_config(&WinrmConfig {
+            use_tls,
             auth_method,
             encryption,
-            use_tls,
             ..Default::default()
         })
     };
@@ -4615,7 +4617,7 @@ async fn explicit_provider_is_used_for_every_handshake() {
                 },
                 ..Default::default()
             },
-            only(suite),
+            &only(suite),
             proxy::env_var,
         )
         .unwrap()

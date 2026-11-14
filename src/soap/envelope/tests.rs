@@ -1,5 +1,6 @@
 use super::*;
 use crate::request::RequestKind;
+use crate::soap::namespaces::RESOURCE_URI_PSRP;
 
 #[test]
 fn enumerate_wql_request_default_namespace() {

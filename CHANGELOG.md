@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   crates stay in the dependency tree through `reqwest`, so a build with
   `credssp` compiles the same crates as before. `bytes` stays a
   dev-dependency (`tests/kerberos_kdc.rs`).
+- `cc` 1.11.1, `smallvec` 1.16.5, `uuid` 1.29.1, `toml_datetime` 1.1.3,
+  `toml_edit` 0.25.19 and `winnow` 1.0.5 in the lockfile, with their
+  `cargo vet` exemptions; `fuzz/Cargo.lock` follows for the three it has.
+  This lockfile only builds this repository.
 - `release.toml` (`cargo-release`) and `cliff.toml` (`git-cliff`) are
   removed: the release procedure uses neither tool (CONTRIBUTING.md,
   "Releasing"), and `release.toml` asked for a publish and a push from the

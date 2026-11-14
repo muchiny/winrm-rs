@@ -23,6 +23,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   enumeration, so a server can return every item in the Enumerate answer and
   end the sequence there: those items were returned whatever the cap, up to
   the size limit of one response (4 × max(`max_envelope_size`, 512 KiB)).
+- **`RemotePathPolicy::LocalDrive` refuses a path with a component made only
+  of dots and blanks**, other than `.` and `..` (`C:\x\LPT1\. `,
+  `C:\x\LPT1\a\...`, a component that is a lone space). Windows reads such a
+  component as nothing, as `.` or as `..` depending on the code that opens
+  the path, so these paths could name a DOS device the policy refuses in its
+  plain form. A TAB or a no-break space at the end of the last component is
+  now dropped before the device check, like a trailing dot or space
+  (`C:\x\LPT1<TAB>`). The rules come from the .NET Framework reference
+  source; they were not exercised against a live Windows PowerShell 5.1.
+  One real name is refused with the others: a directory named with
+  no-break spaces alone, which `RemotePathPolicy::Any` still reaches.
+  `RemotePathPolicy::Any` is unchanged.
 
 ### Changed
 

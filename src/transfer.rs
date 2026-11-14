@@ -81,6 +81,14 @@ pub(crate) fn validate_remote_path(path: &str) -> Result<(), WinrmError> {
 /// `C:\x\LPT1`, `C:\x\nul.txt` and `C:\x\LPT1\.` are refused;
 /// `C:\con\file.txt`, `C:\x\LPT1\..\file.txt` and `C:\x\com10` are not.
 ///
+/// It refuses as well a path with a component, other than `.` and `..`,
+/// made only of dots, spaces, TABs and no-break spaces (`C:\x\LPT1\. `,
+/// `C:\x\LPT1\a\...`): Windows reads such a component as nothing, as `.` or
+/// as `..` depending on the code that opens the path, so what it names
+/// cannot be told from the text. A TAB or a no-break space at the end of
+/// the last component is dropped like a trailing dot or space before the
+/// device check.
+///
 /// This is a lexical check. A symbolic link, junction, `subst` drive or
 /// mapped network drive on the host can still lead a drive-absolute path to
 /// a share.
@@ -96,13 +104,15 @@ pub enum RemotePathPolicy {
     Any,
     /// Accept only drive-absolute remote paths: a letter, `:`, then `\` or
     /// `/`, whose last component, after resolving `.` and `..`, is not a DOS
-    /// device name. The default since 2.0.
+    /// device name, and with no component made only of dots and blanks
+    /// other than `.` and `..`. The default since 2.0.
     #[default]
     LocalDrive,
 }
 
 /// [`validate_remote_path`], then the restriction `policy` adds: under
-/// [`RemotePathPolicy::LocalDrive`], a drive-absolute path whose last
+/// [`RemotePathPolicy::LocalDrive`], a drive-absolute path with no component
+/// made only of dots and blanks ([`has_blank_component`]) and whose last
 /// component, after resolving `.` and `..`, is not a DOS device name
 /// ([`names_dos_device`]).
 pub(crate) fn validate_remote_path_for(
@@ -118,6 +128,12 @@ pub(crate) fn validate_remote_path_for(
                     "remote path {path:?} is not a drive-absolute path (RemotePathPolicy::LocalDrive)"
                 )));
             }
+            if has_blank_component(path) {
+                return Err(WinrmError::Transfer(format!(
+                    "remote path {path:?} has a component made only of dots and blanks \
+                     (RemotePathPolicy::LocalDrive)"
+                )));
+            }
             if names_dos_device(path) {
                 return Err(WinrmError::Transfer(format!(
                     "remote path {path:?} ends in a DOS device name (RemotePathPolicy::LocalDrive)"
@@ -126,6 +142,38 @@ pub(crate) fn validate_remote_path_for(
             Ok(())
         }
     }
+}
+
+/// Characters Windows path handling drops from the end of a path or of one
+/// of its components: the space and the dot (Win32 and .NET), and the TAB
+/// and the no-break space, which the .NET Framework path code under Windows
+/// PowerShell trims from the end of a path. The other characters it trims
+/// there are control characters, which [`validate_remote_path`] refuses.
+const DROPPED_AT_END: [char; 4] = [' ', '.', '\t', '\u{A0}'];
+
+/// Whether a component of the drive-absolute `path`, other than `.` and
+/// `..`, holds nothing but [`DROPPED_AT_END`] characters: `. `, `.. `, `...`
+/// or a lone space, for instance.
+///
+/// Windows does not read such a component one way. Win32 drops trailing
+/// dots and spaces from the end of a path; the .NET Framework path code
+/// (`Path.LegacyNormalizePath`) reads a component of dots then spaces as `.`
+/// when it has one dot and as `..` when it has more. Under one reading or
+/// the other, `C:\x\LPT1\. `, `C:\x\LPT1\a\.. ` and `C:\x\LPT1\a\...` name
+/// `LPT1`. An ordinary Windows path cannot create a file or a directory
+/// named with dots and spaces alone, so the path is refused instead of
+/// guessing which rule the host applies. A name made of no-break spaces
+/// alone can exist; it is refused with the others, and
+/// [`RemotePathPolicy::Any`] reaches it.
+fn has_blank_component(path: &str) -> bool {
+    // The caller checked the `C:` prefix; the components start after it.
+    path.get(2..)
+        .unwrap_or(path)
+        .split(['\\', '/'])
+        .any(|component| {
+            !matches!(component, "" | "." | "..")
+                && component.chars().all(|c| DROPPED_AT_END.contains(&c))
+        })
 }
 
 /// Whether the last component of the drive-absolute `path`, once `.` and
@@ -141,9 +189,12 @@ pub(crate) fn validate_remote_path_for(
 /// separator is skipped too, which also refuses `C:\x\LPT1\` (a directory
 /// path, so nothing is lost).
 ///
-/// Trailing dots and spaces are then dropped from that component, and the
+/// Trailing dots and spaces (and TABs and no-break spaces, see
+/// [`DROPPED_AT_END`]) are then dropped from that component, and the
 /// name is cut at its first `.` or `:` with the spaces before that cut
 /// dropped too, so `nul.`, `COM1.txt`, `con .txt` and `LPT1:` all count.
+/// The caller has already refused the components [`has_blank_component`]
+/// describes, so every component left here is `.`, `..` or a real name.
 /// Earlier components are not checked: a directory named `con` is not
 /// opened as a device.
 fn names_dos_device(path: &str) -> bool {
@@ -159,7 +210,7 @@ fn names_dos_device(path: &str) -> bool {
         }
     }
     let last = resolved.last().copied().unwrap_or_default();
-    let trimmed = last.trim_end_matches([' ', '.']);
+    let trimmed = last.trim_end_matches(DROPPED_AT_END);
     let stem = trimmed
         .split(['.', ':'])
         .next()
@@ -232,9 +283,11 @@ impl WinrmClient {
     ///   then only to the targets that delegation allows. It is not a sandbox:
     ///   never pass an untrusted `remote_path`.
     ///   By default ([`RemotePathPolicy::LocalDrive`](crate::RemotePathPolicy::LocalDrive),
-    ///   since 2.0) UNC, WebDAV and device paths, and a last component that
-    ///   is a DOS device name (`NUL`, `COM1`, `LPT1`, ...), are refused before
-    ///   anything is sent; it does not limit which local files a path names.
+    ///   since 2.0) UNC, WebDAV and device paths, a last component that
+    ///   is a DOS device name (`NUL`, `COM1`, `LPT1`, ...) and a component
+    ///   made only of dots and blanks (other than `.` and `..`) are refused
+    ///   before anything is sent; it does not limit which local files a path
+    ///   names.
     ///   A client built with `.remote_path_policy(RemotePathPolicy::Any)`
     ///   lets them through.
     /// - Each chunk of the file, up to 2000 bytes, travels as base64 inside the
@@ -354,9 +407,11 @@ impl WinrmClient {
     ///   then only to the targets that delegation allows. It is not a sandbox:
     ///   never pass an untrusted `remote_path`.
     ///   By default ([`RemotePathPolicy::LocalDrive`](crate::RemotePathPolicy::LocalDrive),
-    ///   since 2.0) UNC, WebDAV and device paths, and a last component that
-    ///   is a DOS device name (`NUL`, `COM1`, `LPT1`, ...), are refused before
-    ///   anything is sent; it does not limit which local files a path names.
+    ///   since 2.0) UNC, WebDAV and device paths, a last component that
+    ///   is a DOS device name (`NUL`, `COM1`, `LPT1`, ...) and a component
+    ///   made only of dots and blanks (other than `.` and `..`) are refused
+    ///   before anything is sent; it does not limit which local files a path
+    ///   names.
     ///   A client built with `.remote_path_policy(RemotePathPolicy::Any)`
     ///   lets them through.
     /// - The file comes back as base64 on the command's stdout. PowerShell
@@ -1138,13 +1193,86 @@ mod tests {
             r"C:\x\..\ok.txt",
             r"C:\x\.\console.txt",
             r"C:\CON\..",
-            r"C:\x\NUL\...",
         ] {
             assert!(
                 validate_remote_path_for(p, RemotePathPolicy::LocalDrive).is_ok(),
                 "{p:?}"
             );
         }
+    }
+
+    /// A component made only of dots and blanks, other than `.` and `..`, is
+    /// read as nothing, as `.` or as `..` depending on the Windows code that
+    /// opens the path (`C:\x\LPT1\. ` and `C:\x\LPT1\a\...` can both name
+    /// `LPT1`), so `LocalDrive` refuses the path wherever the component is.
+    #[test]
+    fn local_drive_policy_refuses_components_of_dots_and_blanks() {
+        for p in [
+            "C:\\x\\LPT1\\. ",
+            "C:\\x\\LPT1\\a\\.. ",
+            "C:\\x\\LPT1\\a\\...",
+            "C:\\x\\COM1\\a\\.. \\.",
+            "C:\\x\\nul\\a\\....",
+            "C:\\x\\NUL\\...",
+            "C:\\x\\LPT1\\ ",
+            "C:\\x\\LPT1\\\t",
+            "C:\\x\\LPT1\\\u{a0}",
+            "C:\\x\\LPT1\\a\\..\u{a0}",
+            "C:\\x\\ . .\\LPT1\\file.txt",
+            "C:/x/ /file.txt",
+            "C:\\... \\file.txt",
+            "C:\\x\\ \\",
+            "C:\\x\\LPT1\\. \\",
+            "C:\\ ",
+            "C:\\...",
+        ] {
+            match validate_remote_path_for(p, RemotePathPolicy::LocalDrive) {
+                Err(WinrmError::Transfer(m)) => {
+                    assert!(m.contains("only of dots and blanks"), "{p:?}: {m}");
+                }
+                other => panic!("{p:?}: expected Transfer, got {other:?}"),
+            }
+            assert!(
+                validate_remote_path_for(p, RemotePathPolicy::Any).is_ok(),
+                "{p:?} refused under Any"
+            );
+        }
+        // Dots and blanks inside a real name are not such a component.
+        for p in [
+            "C:\\x\\.config\\file.txt",
+            "C:\\x\\a..b\\file .txt",
+            "C:\\x\\...a\\file",
+            "C:\\x\\a ...\\file",
+            "C:\\x\\file\u{a0}",
+            "C:\\x\\LPT1\\..\\file.txt",
+        ] {
+            assert!(
+                validate_remote_path_for(p, RemotePathPolicy::LocalDrive).is_ok(),
+                "{p:?}"
+            );
+        }
+    }
+
+    /// The .NET Framework path code trims a TAB or a no-break space from
+    /// the end of a path, like a space: a device name followed by one is
+    /// still the device.
+    #[test]
+    fn local_drive_policy_drops_a_trailing_tab_or_no_break_space_before_the_device_check() {
+        for p in [
+            "C:\\x\\LPT1\t",
+            "C:\\x\\LPT1\u{a0}",
+            "C:\\x\\nul.\u{a0} \t",
+            "C:\\x\\COM1 \u{a0}.",
+        ] {
+            match validate_remote_path_for(p, RemotePathPolicy::LocalDrive) {
+                Err(WinrmError::Transfer(m)) => assert!(m.contains("DOS device"), "{p:?}: {m}"),
+                other => panic!("{p:?}: expected Transfer, got {other:?}"),
+            }
+        }
+        // In the middle of the name they are part of it.
+        assert!(
+            validate_remote_path_for("C:\\x\\LPT1\u{a0}x", RemotePathPolicy::LocalDrive).is_ok()
+        );
     }
 
     /// Only a last component that is exactly a device name counts: longer

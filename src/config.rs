@@ -98,7 +98,7 @@ pub struct WinrmConfig {
     /// turns that off.
     ///
     /// With [`AuthMethod::CredSsp`], building the client fails with
-    /// `AuthFailed`: CredSSP refuses `accept_invalid_certs = true`. Set it to
+    /// [`WinrmError::Config`](crate::WinrmError::Config): CredSSP refuses `accept_invalid_certs = true`. Set it to
     /// false and either pin the listener certificate with
     /// [`pin_server_certificate_sha256`](crate::WinrmClientBuilder::pin_server_certificate_sha256)
     /// or trust its CA with
@@ -107,7 +107,7 @@ pub struct WinrmConfig {
     /// connection.
     ///
     /// With [`AuthMethod::Basic`] over HTTPS, building the client fails with
-    /// `AuthFailed`: Basic sends the password to a server whose certificate
+    /// [`WinrmError::Config`](crate::WinrmError::Config): Basic sends the password to a server whose certificate
     /// is not verified. Pin the certificate or add a root instead, as for
     /// CredSSP. Since 2.0; 1.x only logged a WARN.
     pub accept_invalid_certs: bool,
@@ -152,7 +152,7 @@ pub struct WinrmConfig {
     /// chunk), so a timeout, a reset or a dropped connection after sending is
     /// returned, as are authentication errors and SOAP faults. A CredSSP
     /// connection error is
-    /// [`WinrmError::AuthFailed`](crate::WinrmError::AuthFailed) or
+    /// [`WinrmError::Connection`](crate::WinrmError::Connection) or
     /// [`WinrmError::Timeout`](crate::WinrmError::Timeout), never
     /// `WinrmError::Http`, so it is not retried.
     pub max_retries: u32,
@@ -309,7 +309,7 @@ pub struct WinrmConfig {
     ///
     /// Prevents a malicious or runaway server from exhausting client memory
     /// by streaming an unbounded base64 chunk sequence. When the cap is
-    /// reached the call returns [`crate::error::WinrmError::Transfer`]:
+    /// reached the call returns [`crate::error::WinrmError::OutputLimit`]:
     /// - [`WinrmClient::run_command`](crate::WinrmClient::run_command),
     ///   [`run_powershell`](crate::WinrmClient::run_powershell) and their
     ///   `_with_timeout` / `_with_cancel` variants (so `download_file` too)
@@ -585,6 +585,7 @@ impl std::fmt::Debug for EnvVarNames<'_> {
 /// `accept_invalid_certs`, and [`Self::Never`] is the way back if that
 /// fails.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
 pub enum EncryptionMode {
     /// Seal every SOAP body over HTTP (NTLM and Kerberos), and over HTTPS
     /// when [`WinrmConfig::accept_invalid_certs`] is set; over HTTPS with a
@@ -603,7 +604,7 @@ pub enum EncryptionMode {
     ///
     /// NTLM and Kerberos only: with Basic, Certificate or CredSSP, which
     /// winrm-rs cannot seal, building the client fails with
-    /// [`WinrmError::AuthFailed`](crate::WinrmError::AuthFailed). For those
+    /// [`WinrmError::Config`](crate::WinrmError::Config). For those
     /// methods the protection is TLS (HTTPS): use [`Self::Auto`].
     Always,
     /// Never seal: over HTTP, SOAP bodies (commands, their output, file
@@ -643,7 +644,7 @@ pub enum EncryptionMode {
 pub enum ProxySessionAuth {
     /// Refuse to authenticate with [`EncryptionMode::Never`] through a proxy
     /// that does not announce the header: the authentication fails with
-    /// [`WinrmError::AuthFailed`](crate::WinrmError::AuthFailed) and nothing
+    /// [`WinrmError::Connection`](crate::WinrmError::Connection) and nothing
     /// more is sent. Sealed requests only log a WARN, once per endpoint:
     /// they stay protected, but the server must keep `AllowUnencrypted =
     /// false`. `Never` is refused because it needs `AllowUnencrypted = true`
@@ -672,13 +673,14 @@ pub enum TlsProvider {
     /// The provider the application installed with
     /// `rustls::crypto::CryptoProvider::install_default` (for example
     /// aws-lc-rs in FIPS mode). Building fails with
-    /// [`WinrmError::AuthFailed`](crate::WinrmError::AuthFailed) when none is
+    /// [`WinrmError::Config`](crate::WinrmError::Config) when none is
     /// installed.
     ProcessDefault,
 }
 
 /// Authentication method for the WinRM HTTP transport.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum AuthMethod {
     /// HTTP Basic authentication. Credentials are sent as a base64-encoded
     /// `Authorization` header on every request. Only safe over HTTPS. Over
@@ -687,7 +689,7 @@ pub enum AuthMethod {
     /// through an SSH or port-forward tunnel, which the client cannot see.
     ///
     /// Over HTTPS with [`WinrmConfig::accept_invalid_certs`], building the
-    /// client fails with `AuthFailed`: the password would go to a server
+    /// client fails with [`WinrmError::Config`](crate::WinrmError::Config): the password would go to a server
     /// whose certificate is not verified. Pin the certificate
     /// ([`pin_server_certificate_sha256`](crate::WinrmClientBuilder::pin_server_certificate_sha256))
     /// or add a root
@@ -770,7 +772,7 @@ pub enum AuthMethod {
     /// (MS-WSMV), which tells WinRM to authenticate with that certificate. The
     /// server must trust the issuing CA and map the certificate to a local
     /// account (`WSMan:\localhost\ClientCertificate`). Building the client
-    /// fails with [`WinrmError::AuthFailed`](crate::WinrmError::AuthFailed)
+    /// fails with [`WinrmError::Config`](crate::WinrmError::Config)
     /// when `use_tls` is `false` (no TLS handshake to present the certificate
     /// in), and when a file is missing, not a regular file, over 1 MiB, holds
     /// no certificate or no key, holds an encrypted key (unencrypted keys
@@ -793,7 +795,7 @@ pub enum AuthMethod {
     /// `credssp` cargo feature and HTTPS (`use_tls = true`): building the
     /// client with `use_tls = false`, or sending a request without the
     /// feature, fails with
-    /// [`WinrmError::AuthFailed`](crate::WinrmError::AuthFailed).
+    /// [`WinrmError::Config`](crate::WinrmError::Config).
     ///
     /// # Security
     ///
@@ -802,7 +804,7 @@ pub enum AuthMethod {
     /// domain-joined computer can complete the NTLM exchange inside CredSSP
     /// through a domain controller. CredSSP refuses `accept_invalid_certs =
     /// true`: building the client fails with
-    /// [`WinrmError::AuthFailed`](crate::WinrmError::AuthFailed). Set it to
+    /// [`WinrmError::Config`](crate::WinrmError::Config). Set it to
     /// false and either pin the listener certificate with
     /// `pin_server_certificate_sha256` or trust its CA with
     /// `add_root_certificates_pem`. The CredSSP connection uses the same
@@ -826,12 +828,12 @@ pub enum AuthMethod {
     /// configured in Active Directory, avoids sending the password; it works
     /// with [`AuthMethod::Kerberos`] to the first hop.
     ///
-    /// Validated live against Windows Server 2025 (`credssp_run_command_whoami`
-    /// in `tests/integration_real.rs`). Not validated on Windows Server 2012 R2:
-    /// its SCHANNEL pairs AES-GCM only with static-RSA key exchange, which
-    /// `rustls` does not support, so the HTTPS leg shares no cipher suite with
-    /// a default 2012 R2 listener and the live test skips there (it was not
-    /// measured on 2012 R2 in the latest validation round either).
+    /// Validated live against Windows Server 2016, 2019, 2022 and 2025 (the
+    /// `credssp` tests of `tests/integration_real.rs`). Not validated on
+    /// Windows Server 2012 R2: its SCHANNEL pairs AES-GCM only with static-RSA
+    /// key exchange, which `rustls` does not support, so the HTTPS leg shares
+    /// no cipher suite with a default 2012 R2 listener and the live tests skip
+    /// there.
     ///
     /// # Limitations in this release
     ///
@@ -844,7 +846,7 @@ pub enum AuthMethod {
     /// apply these
     /// [`WinrmConfig`] fields:
     /// - `max_retries`: a CredSSP connection error is
-    ///   [`WinrmError::AuthFailed`](crate::WinrmError::AuthFailed) or
+    ///   [`WinrmError::Connection`](crate::WinrmError::Connection) or
     ///   [`WinrmError::Timeout`](crate::WinrmError::Timeout), never
     ///   `WinrmError::Http`, so it is not retried.
     CredSsp,
@@ -861,7 +863,7 @@ pub enum AuthMethod {
 pub struct WinrmCredentials {
     /// Windows account name (e.g. `"administrator"`).
     pub username: String,
-    /// Password — stored as SecretString, zeroized on drop, redacted in Debug.
+    /// Password — stored as `SecretString`, zeroized on drop, redacted in Debug.
     pub password: SecretString,
     /// Optional NetBIOS domain. Leave empty to auto-detect from the NTLM
     /// challenge.
@@ -872,6 +874,7 @@ impl WinrmCredentials {
     /// Create new credentials.
     ///
     /// Wraps the password in a [`SecretString`] for automatic zeroization.
+    #[must_use]
     pub fn new(
         username: impl Into<String>,
         password: impl Into<String>,
@@ -896,241 +899,4 @@ impl std::fmt::Debug for WinrmCredentials {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn https_preset_is_tls_on_5986() {
-        let c = WinrmConfig::https();
-        assert!(c.use_tls);
-        assert_eq!(c.port, Some(5986));
-        assert!(!c.accept_invalid_certs);
-        assert!(matches!(c.auth_method, AuthMethod::Ntlm));
-        assert_eq!(c.encryption, EncryptionMode::Auto);
-        assert_eq!(
-            crate::transport::endpoint_url(c.use_tls, "h", c.effective_port()),
-            "https://h:5986/wsman"
-        );
-        // `WinrmConfig` has no `PartialEq`; its `Debug` lists every field.
-        assert_eq!(
-            format!("{:?}", WinrmConfig { port: None, ..c }),
-            format!("{:?}", WinrmConfig::default())
-        );
-    }
-
-    #[test]
-    fn default_config_is_https_on_5986() {
-        let c = WinrmConfig::default();
-        assert!(c.use_tls);
-        assert_eq!(c.port, None);
-        assert_eq!(c.effective_port(), 5986);
-        assert!(matches!(c.auth_method, AuthMethod::Ntlm));
-        assert_eq!(
-            crate::transport::endpoint_url(c.use_tls, "h", c.effective_port()),
-            "https://h:5986/wsman"
-        );
-    }
-
-    #[test]
-    fn port_none_follows_use_tls() {
-        assert_eq!(
-            WinrmConfig {
-                use_tls: false,
-                ..Default::default()
-            }
-            .effective_port(),
-            5985
-        );
-        assert_eq!(
-            WinrmConfig {
-                port: Some(6000),
-                ..Default::default()
-            }
-            .effective_port(),
-            6000
-        );
-        assert_eq!(WinrmConfig::http().port, Some(5985));
-        assert!(!WinrmConfig::http().use_tls);
-        assert_eq!(WinrmConfig::https().port, Some(5986));
-    }
-
-    #[test]
-    fn default_config_max_envelope_size() {
-        let config = WinrmConfig::default();
-        assert_eq!(config.max_envelope_size, 153_600);
-    }
-
-    #[test]
-    fn custom_max_envelope_size() {
-        let config = WinrmConfig {
-            max_envelope_size: 512_000,
-            ..Default::default()
-        };
-        assert_eq!(config.max_envelope_size, 512_000);
-    }
-
-    #[test]
-    fn default_config_max_retries_is_zero() {
-        let config = WinrmConfig::default();
-        assert_eq!(config.max_retries, 0);
-    }
-
-    #[test]
-    fn default_config_has_no_proxy() {
-        let config = WinrmConfig::default();
-        assert!(config.proxy.is_none());
-    }
-
-    #[test]
-    fn default_config_has_no_cert_paths() {
-        let config = WinrmConfig::default();
-        assert!(config.client_cert_pem.is_none());
-        assert!(config.client_key_pem.is_none());
-    }
-
-    #[test]
-    fn credentials_new_constructor() {
-        let creds = WinrmCredentials::new("admin", "s3cret", "DOMAIN");
-        assert_eq!(creds.username, "admin");
-        assert_eq!(creds.password.expose_secret(), "s3cret");
-        assert_eq!(creds.domain, "DOMAIN");
-    }
-
-    /// `Debug` keeps every field visible but not the proxy password nor the
-    /// environment variable values.
-    #[test]
-    fn config_debug_redacts_proxy_userinfo_and_env_values() {
-        let config = WinrmConfig {
-            proxy: Some(SecretString::from(
-                "http://proxyuser:proxy-secret@proxy.corp:8080",
-            )),
-            env_vars: vec![("API_TOKEN".into(), "env-secret".into())],
-            ..Default::default()
-        };
-        let debug = format!("{config:?}");
-        assert!(!debug.contains("proxy-secret"), "{debug}");
-        assert!(!debug.contains("proxyuser"), "{debug}");
-        assert!(!debug.contains("env-secret"), "{debug}");
-        assert!(
-            debug.contains("http://<redacted>@proxy.corp:8080"),
-            "{debug}"
-        );
-        assert!(debug.contains("\"API_TOKEN\": <redacted>"), "{debug}");
-        for field in [
-            "port",
-            "use_tls",
-            "accept_invalid_certs",
-            "connect_timeout_secs",
-            "operation_timeout_secs",
-            "auth_method",
-            "max_envelope_size",
-            "max_retries",
-            "client_cert_pem",
-            "client_key_pem",
-            "proxy",
-            "codepage",
-            "working_directory",
-            "env_vars",
-            "encryption",
-            "user_agent",
-            "idle_timeout_secs",
-            "max_output_bytes",
-        ] {
-            assert!(debug.contains(&format!("{field}: ")), "{field} in {debug}");
-        }
-        let plain = format!("{:?}", WinrmConfig::default());
-        assert!(plain.contains("proxy: None"), "{plain}");
-    }
-
-    #[test]
-    fn proxy_is_a_secret_string() {
-        let c = WinrmConfig {
-            proxy: Some(SecretString::from("http://u:pw@p:3128")),
-            ..Default::default()
-        };
-        assert_eq!(
-            c.proxy.as_ref().map(|p| p.expose_secret().to_string()),
-            Some("http://u:pw@p:3128".to_string())
-        );
-        assert!(!format!("{c:?}").contains("pw"));
-    }
-
-    #[test]
-    fn credentials_debug_redacts_password() {
-        let creds = WinrmCredentials::new("admin", "super-secret-password", "DOM");
-        let debug_output = format!("{creds:?}");
-        assert!(debug_output.contains("admin"));
-        assert!(debug_output.contains("DOM"));
-        assert!(debug_output.contains("[REDACTED]"));
-        assert!(!debug_output.contains("super-secret-password"));
-    }
-
-    #[test]
-    fn credentials_expose_secret_works() {
-        let creds = WinrmCredentials::new("user", "my-password", "");
-        let exposed: &str = creds.password.expose_secret();
-        assert_eq!(exposed, "my-password");
-    }
-
-    #[test]
-    fn auth_method_kerberos_variant_exists() {
-        let method = AuthMethod::Kerberos;
-        let debug = format!("{method:?}");
-        assert!(debug.contains("Kerberos"));
-    }
-
-    #[test]
-    fn auth_method_certificate_variant_exists() {
-        let method = AuthMethod::Certificate;
-        let debug = format!("{method:?}");
-        assert!(debug.contains("Certificate"));
-    }
-
-    #[test]
-    fn debug_redacts_key_material_in_cert_and_key_fields() {
-        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
-        let config = WinrmConfig {
-            client_cert_pem: Some(format!("{EC_CERT_PEM}{EC_KEY_PKCS8_PEM}")),
-            client_key_pem: Some(EC_KEY_PKCS8_PEM.to_string()),
-            ..Default::default()
-        };
-        let debug = format!("{config:?}");
-        assert!(!debug.contains("BEGIN"), "{debug}");
-        assert!(!debug.contains("IvSE2eFVFQPSvWUFhXFxIaP6"), "{debug}");
-        assert_eq!(debug.matches(crate::tls::KEY_MATERIAL_NOT_SHOWN).count(), 2);
-        let paths = WinrmConfig {
-            client_cert_pem: Some("/etc/winrm/client.pem".into()),
-            client_key_pem: Some(r"C:\certs\client.key".into()),
-            ..Default::default()
-        };
-        let debug = format!("{paths:?}");
-        assert!(
-            debug.contains(r#"client_cert_pem: Some("/etc/winrm/client.pem")"#),
-            "{debug}"
-        );
-        assert!(
-            debug.contains(r#"client_key_pem: Some("C:\\certs\\client.key")"#),
-            "{debug}"
-        );
-    }
-
-    #[test]
-    fn debug_redacts_a_one_line_base64_key() {
-        use crate::test_pki::EC_KEY_PKCS8_PEM;
-        use base64::Engine as _;
-        let body: String = EC_KEY_PKCS8_PEM
-            .lines()
-            .filter(|l| !l.starts_with("-----"))
-            .collect();
-        let whole = base64::engine::general_purpose::STANDARD.encode(EC_KEY_PKCS8_PEM);
-        for value in [body, whole] {
-            let config = WinrmConfig {
-                client_key_pem: Some(value.clone()),
-                ..Default::default()
-            };
-            let debug = format!("{config:?}");
-            assert!(!debug.contains(&value[..24]), "{debug}");
-            assert!(debug.contains(crate::tls::KEY_MATERIAL_NOT_SHOWN));
-        }
-    }
-}
+mod tests;

@@ -10,7 +10,7 @@ use secrecy::SecretString;
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-/// Helper to build an HttpTransport with Basic auth pointing at a wiremock server.
+/// Helper to build an `HttpTransport` with Basic auth pointing at a wiremock server.
 fn basic_transport(port: u16) -> HttpTransport {
     let config = WinrmConfig {
         auth_method: AuthMethod::Basic,
@@ -210,7 +210,7 @@ fn validate_host_refuses_ipv6_literals_that_stand_for_an_ipv4_address() {
     ] {
         let err = validate_host(host).unwrap_err();
         assert!(
-            matches!(&err, WinrmError::AuthFailed(m)
+            matches!(&err, WinrmError::Config(m)
                 if m.contains("invalid host") && m.contains(&format!("pass \"{v4}\""))),
             "{host:?}: {err:?}"
         );
@@ -287,7 +287,7 @@ fn validate_host_rejects_what_would_mis_route_the_endpoint() {
     ] {
         let err = validate_host(host).unwrap_err();
         assert!(
-            matches!(&err, WinrmError::AuthFailed(m) if m.contains("invalid host")),
+            matches!(&err, WinrmError::Config(m) if m.contains("invalid host")),
             "{host:?}: {err:?}"
         );
     }
@@ -317,7 +317,7 @@ async fn a_host_that_is_not_a_host_name_is_refused_before_anything_is_sent() {
             .await
             .unwrap_err();
         assert!(
-            matches!(&err, WinrmError::AuthFailed(m) if m.contains("invalid host")),
+            matches!(&err, WinrmError::Config(m) if m.contains("invalid host")),
             "{host:?}: {err:?}"
         );
     }
@@ -331,7 +331,7 @@ async fn a_host_that_is_not_a_host_name_is_refused_before_anything_is_sent() {
         .await
         .unwrap_err();
     assert!(
-        matches!(&err, WinrmError::AuthFailed(m) if m.contains("WinrmConfig::port")),
+        matches!(&err, WinrmError::Config(m) if m.contains("WinrmConfig::port")),
         "{err:?}"
     );
     let requests = server.received_requests().await.unwrap_or_default();
@@ -370,8 +370,8 @@ fn credssp_without_tls_returns_error() {
     };
     let creds = WinrmCredentials::new("admin", "pass", "");
     match HttpTransport::new(config, creds) {
-        Err(WinrmError::AuthFailed(_)) => {} // expected
-        Err(e) => panic!("expected AuthFailed, got: {e}"),
+        Err(WinrmError::Config(_)) => {} // expected
+        Err(e) => panic!("expected Config, got: {e}"),
         Ok(_) => panic!("expected error, got Ok"),
     }
 }
@@ -386,8 +386,8 @@ fn certificate_auth_without_cert_path_returns_error() {
     };
     let creds = WinrmCredentials::new("admin", "pass", "");
     match HttpTransport::new(config, creds) {
-        Err(WinrmError::AuthFailed(_)) => {}
-        Err(e) => panic!("expected AuthFailed, got: {e}"),
+        Err(WinrmError::Config(_)) => {}
+        Err(e) => panic!("expected Config, got: {e}"),
         Ok(_) => panic!("expected error, got Ok"),
     }
 }
@@ -403,8 +403,8 @@ fn certificate_auth_without_key_path_returns_error() {
     };
     let creds = WinrmCredentials::new("admin", "pass", "");
     match HttpTransport::new(config, creds) {
-        Err(WinrmError::AuthFailed(_)) => {}
-        Err(e) => panic!("expected AuthFailed, got: {e}"),
+        Err(WinrmError::Config(_)) => {}
+        Err(e) => panic!("expected Config, got: {e}"),
         Ok(_) => panic!("expected error, got Ok"),
     }
 }
@@ -435,8 +435,14 @@ fn user_agent_with_a_line_break_is_refused() {
             HttpTransport::new(config, WinrmCredentials::new("u", "p", ""))
         };
         for bad in ["agent\r\nX-Extra: 1", "agent\rx", "agent\nx"] {
+            // An option the HTTP client refuses, and nothing was sent:
+            // `Config`, not the `Http` of a failure on the network.
             assert!(
-                matches!(build(bad), Err(WinrmError::Http(_))),
+                matches!(
+                    build(bad),
+                    Err(WinrmError::Config(m))
+                        if m.starts_with("the HTTP client cannot be set up as configured: ")
+                ),
                 "{auth_method:?} accepted {bad:?}"
             );
         }
@@ -455,8 +461,8 @@ fn certificate_auth_nonexistent_cert_file_returns_error() {
     };
     let creds = WinrmCredentials::new("admin", "pass", "");
     match HttpTransport::new(config, creds) {
-        Err(WinrmError::AuthFailed(_)) => {}
-        Err(e) => panic!("expected AuthFailed, got: {e}"),
+        Err(WinrmError::Config(_)) => {}
+        Err(e) => panic!("expected Config, got: {e}"),
         Ok(_) => panic!("expected error, got Ok"),
     }
 }
@@ -522,12 +528,12 @@ fn cert_tls_config(files: &PemFiles) -> WinrmConfig {
     }
 }
 
-/// Build the transport and return the `AuthFailed` message, or panic.
-fn cert_auth_failed(config: WinrmConfig) -> String {
+/// Build the transport and return the `Config` message, or panic.
+fn cert_config_error(config: WinrmConfig) -> String {
     match HttpTransport::new(config, WinrmCredentials::new("u", "p", "")) {
-        Err(WinrmError::AuthFailed(msg)) => msg,
-        Err(e) => panic!("expected AuthFailed, got: {e:?}"),
-        Ok(_) => panic!("expected AuthFailed, got Ok"),
+        Err(WinrmError::Config(msg)) => msg,
+        Err(e) => panic!("expected Config, got: {e:?}"),
+        Ok(_) => panic!("expected Config, got Ok"),
     }
 }
 
@@ -561,7 +567,7 @@ fn certificate_auth_over_tls_accepts_pkcs1_key() {
 #[test]
 fn certificate_auth_empty_cert_file_is_a_clear_error() {
     let files = pem_files("emptycert", "", crate::test_pki::EC_KEY_PKCS8_PEM);
-    let msg = cert_auth_failed(cert_tls_config(&files));
+    let msg = cert_config_error(cert_tls_config(&files));
     assert!(msg.contains("no certificate"), "{msg}");
     assert!(msg.contains(&files.cert), "names the file: {msg}");
 }
@@ -570,7 +576,7 @@ fn certificate_auth_empty_cert_file_is_a_clear_error() {
 fn certificate_auth_key_file_without_key_is_a_clear_error() {
     use crate::test_pki::EC_CERT_PEM;
     let files = pem_files("nokey", EC_CERT_PEM, EC_CERT_PEM);
-    let msg = cert_auth_failed(cert_tls_config(&files));
+    let msg = cert_config_error(cert_tls_config(&files));
     assert!(msg.contains("no private key"), "{msg}");
     assert!(msg.contains(&files.key), "names the file: {msg}");
 }
@@ -595,7 +601,7 @@ fn certificate_auth_key_material_in_key_path_is_never_echoed() {
     use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
     let files = pem_files("redactkey", EC_CERT_PEM, EC_KEY_PKCS8_PEM);
     for value in [EC_KEY_PKCS8_PEM.to_string(), one_line_key_body()] {
-        let msg = cert_auth_failed(WinrmConfig {
+        let msg = cert_config_error(WinrmConfig {
             client_key_pem: Some(value.clone()),
             ..cert_tls_config(&files)
         });
@@ -612,7 +618,7 @@ fn certificate_auth_key_material_in_cert_path_is_never_echoed() {
         one_line_key_body(),
     ] {
         // The cert file is read first, so that read fails.
-        let msg = cert_auth_failed(WinrmConfig {
+        let msg = cert_config_error(WinrmConfig {
             client_cert_pem: Some(value.clone()),
             ..cert_tls_config(&files)
         });
@@ -624,7 +630,7 @@ fn certificate_auth_key_material_in_cert_path_is_never_echoed() {
 fn certificate_auth_missing_path_is_still_named() {
     use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
     let files = pem_files("namedpath", EC_CERT_PEM, EC_KEY_PKCS8_PEM);
-    let msg = cert_auth_failed(WinrmConfig {
+    let msg = cert_config_error(WinrmConfig {
         client_key_pem: Some("/nonexistent/winrm-rs/client.key".into()),
         ..cert_tls_config(&files)
     });
@@ -635,7 +641,7 @@ fn certificate_auth_missing_path_is_still_named() {
 fn certificate_auth_garbled_key_pem_is_rejected_without_echoing_it() {
     let garbled = "-----BEGIN PRIVATE KEY-----\nTOPSECRET*&^%$#\n-----END PRIVATE KEY-----\n";
     let files = pem_files("garbled", crate::test_pki::EC_CERT_PEM, garbled);
-    let msg = cert_auth_failed(cert_tls_config(&files));
+    let msg = cert_config_error(cert_tls_config(&files));
     assert!(msg.contains("invalid PEM"), "{msg}");
     assert!(!msg.contains("TOPSECRET"), "key material echoed: {msg}");
 }
@@ -645,7 +651,7 @@ fn certificate_auth_unsupported_key_type_is_rejected() {
     // Valid PEM framing and base64, but not a key rustls can load.
     let bogus = "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n";
     let files = pem_files("bogus", crate::test_pki::EC_CERT_PEM, bogus);
-    let msg = cert_auth_failed(cert_tls_config(&files));
+    let msg = cert_config_error(cert_tls_config(&files));
     assert!(msg.contains("rejected"), "{msg}");
 }
 
@@ -653,7 +659,7 @@ fn certificate_auth_unsupported_key_type_is_rejected() {
 fn certificate_auth_key_not_matching_certificate_is_rejected() {
     use crate::test_pki::{EC_CERT_PEM, RSA_KEY_PKCS1_PEM};
     let files = pem_files("mismatch", EC_CERT_PEM, RSA_KEY_PKCS1_PEM);
-    let msg = cert_auth_failed(cert_tls_config(&files));
+    let msg = cert_config_error(cert_tls_config(&files));
     assert!(msg.contains("rejected"), "{msg}");
 }
 
@@ -666,7 +672,7 @@ fn certificate_auth_over_http_is_rejected_before_reading_pem() {
         client_key_pem: Some("/nonexistent/key.pem".into()),
         ..Default::default()
     };
-    let msg = cert_auth_failed(config);
+    let msg = cert_config_error(config);
     assert_eq!(msg, "Certificate auth requires HTTPS (set use_tls = true)");
 }
 
@@ -681,7 +687,7 @@ fn certificate_auth_cert_path_that_is_a_directory_is_rejected() {
         client_cert_pem: Some(files.dir.to_string_lossy().into()),
         ..cert_tls_config(&files)
     };
-    let msg = cert_auth_failed(config);
+    let msg = cert_config_error(config);
     assert!(msg.contains("not a regular file"), "{msg}");
 }
 
@@ -714,7 +720,7 @@ fn certificate_auth_key_file_over_the_size_limit_is_rejected() {
     use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
     let key = padded_pem(&format!("\n{EC_KEY_PKCS8_PEM}"), 1024 * 1024 + 1);
     let files = pem_files("keyhuge", EC_CERT_PEM, &key);
-    let msg = cert_auth_failed(cert_tls_config(&files));
+    let msg = cert_config_error(cert_tls_config(&files));
     assert!(msg.contains("larger than"), "{msg}");
     assert!(msg.contains(&files.key), "names the file: {msg}");
     assert!(!msg.contains("MIG"), "key material echoed: {msg}");
@@ -725,7 +731,7 @@ fn certificate_auth_cert_file_over_the_size_limit_is_rejected() {
     use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM};
     let cert = padded_pem(&format!("\n{EC_CERT_PEM}"), 1024 * 1024 + 1);
     let files = pem_files("certhuge", &cert, EC_KEY_PKCS8_PEM);
-    let msg = cert_auth_failed(cert_tls_config(&files));
+    let msg = cert_config_error(cert_tls_config(&files));
     assert!(msg.contains("larger than"), "{msg}");
     assert!(msg.contains(&files.cert), "names the file: {msg}");
 }
@@ -734,7 +740,7 @@ fn certificate_auth_cert_file_over_the_size_limit_is_rejected() {
 fn certificate_auth_encrypted_pkcs8_key_is_rejected_as_encrypted() {
     use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_ENCRYPTED_PEM};
     let files = pem_files("encpkcs8", EC_CERT_PEM, EC_KEY_PKCS8_ENCRYPTED_PEM);
-    let msg = cert_auth_failed(cert_tls_config(&files));
+    let msg = cert_config_error(cert_tls_config(&files));
     assert!(
         msg.contains("encrypted private keys are not supported"),
         "{msg}"
@@ -746,7 +752,7 @@ fn certificate_auth_encrypted_pkcs8_key_is_rejected_as_encrypted() {
 fn certificate_auth_legacy_encrypted_key_is_rejected_as_encrypted() {
     use crate::test_pki::{EC_CERT_PEM, EC_KEY_SEC1_LEGACY_ENCRYPTED_PEM};
     let files = pem_files("enclegacy", EC_CERT_PEM, EC_KEY_SEC1_LEGACY_ENCRYPTED_PEM);
-    let msg = cert_auth_failed(cert_tls_config(&files));
+    let msg = cert_config_error(cert_tls_config(&files));
     assert!(
         msg.contains("encrypted private keys are not supported"),
         "{msg}"
@@ -1042,13 +1048,64 @@ async fn send_basic_soap_fault_returns_soap_error() {
         .await
         .unwrap_err();
     assert!(
-        matches!(err, WinrmError::Soap(_)),
-        "expected Soap error, got: {err}"
+        matches!(&err, WinrmError::Soap(crate::error::SoapError::Fault { code, .. }) if code == "s:Receiver"),
+        "expected the fault, got: {err}"
     );
 }
 
+/// A body that comes with a success status is an answer, or the exchange
+/// fails: the operations that read nothing from their answer (Delete,
+/// Signal, Send) have this check alone between a server and a success.
 #[tokio::test]
-async fn send_basic_auth_failed_returns_error() {
+async fn a_success_status_with_a_body_that_is_no_answer_is_an_error() {
+    let fault = "<s:Envelope><s:Body><s:Fault><s:Code><s:Value>s:Receiver</s:Value></s:Code>\
+                 </s:Fault></s:Body></s:Envelope>";
+    for (body, is_fault) in [
+        (String::new(), false),
+        ("OK".to_owned(), false),
+        ("<s:Envelope><s:Body>".to_owned(), false),
+        ("<s:Envelope/><s:Envelope/>".to_owned(), false),
+        ("<!DOCTYPE x><s:Envelope/>".to_owned(), false),
+        // Read as far as it is XML, this one holds no fault.
+        (format!("x{fault}"), false),
+        (fault.to_owned(), true),
+        (format!("{fault}<!-- end -->\n"), true),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body.clone()))
+            .mount(&server)
+            .await;
+        let addr = server.address();
+        let err = basic_transport(addr.port())
+            .send_soap_with_retry(&addr.ip().to_string(), "<soap/>".into())
+            .await
+            .unwrap_err();
+        let expected = match &err {
+            WinrmError::Soap(crate::error::SoapError::Fault { .. }) => is_fault,
+            WinrmError::Soap(crate::error::SoapError::ParseError(_)) => !is_fault,
+            _ => false,
+        };
+        assert!(expected, "{body:?}: {err:?}");
+    }
+
+    // An answer with nothing in it, as a Delete has.
+    let server = MockServer::start().await;
+    let answer = "<?xml version=\"1.0\"?>\n<s:Envelope><s:Header/><s:Body/></s:Envelope>\n";
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(answer))
+        .mount(&server)
+        .await;
+    let addr = server.address();
+    let reply = basic_transport(addr.port())
+        .send_soap_with_retry(&addr.ip().to_string(), "<soap/>".into())
+        .await
+        .unwrap();
+    assert_eq!(reply, answer);
+}
+
+#[tokio::test]
+async fn send_basic_403_is_an_http_status() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(403).set_body_string("Forbidden"))
@@ -1062,8 +1119,8 @@ async fn send_basic_auth_failed_returns_error() {
         .await
         .unwrap_err();
     assert!(
-        matches!(err, WinrmError::AuthFailed(_)),
-        "expected AuthFailed, got: {err}"
+        matches!(err, WinrmError::HttpStatus { status: 403, .. }),
+        "expected HttpStatus, got: {err}"
     );
 }
 
@@ -1327,7 +1384,7 @@ fn every_tls_config_uses_the_chosen_provider() {
             },
             WinrmCredentials::new(USER, PASS, ""),
             TransportOptions::default(),
-            Arc::clone(&p),
+            &p,
             proxy::env_var,
         )
         .unwrap();
@@ -1348,7 +1405,7 @@ fn every_tls_config_uses_the_chosen_provider() {
             },
             WinrmCredentials::new(USER, PASS, ""),
             TransportOptions::default(),
-            Arc::clone(&p),
+            &p,
             proxy::env_var,
         )
         .unwrap();
@@ -1370,7 +1427,7 @@ fn proxy_named_after_its_scheme_is_refused_at_construction() {
             .err()
             .expect("refused");
         assert!(
-            matches!(&err, WinrmError::AuthFailed(m) if m.contains("invalid proxy URL")),
+            matches!(&err, WinrmError::Config(m) if m.contains("invalid proxy URL")),
             "{proxy}: {err:?}"
         );
     }
@@ -1406,7 +1463,7 @@ fn basic_over_http_is_refused_unless_encryption_is_never() {
     for mode in [EncryptionMode::Auto, EncryptionMode::Always] {
         let err = basic(false, mode.clone()).err().expect("refused");
         assert!(
-            matches!(&err, WinrmError::AuthFailed(m) if m.contains("EncryptionMode::Never") && m.contains("use_tls")),
+            matches!(&err, WinrmError::Config(m) if m.contains("EncryptionMode::Never") && m.contains("use_tls")),
             "{mode:?}: {err:?}"
         );
     }
@@ -1434,7 +1491,7 @@ fn always_with_a_method_that_never_seals_is_refused() {
         };
         let err = HttpTransport::new(config, creds()).err().expect("refused");
         assert!(
-            matches!(&err, WinrmError::AuthFailed(m) if m.contains("EncryptionMode::Always") && m.contains(&format!("does not seal {name}"))),
+            matches!(&err, WinrmError::Config(m) if m.contains("EncryptionMode::Always") && m.contains(&format!("does not seal {name}"))),
             "{err:?}"
         );
     }
@@ -1531,7 +1588,7 @@ async fn logs_of_a_host_with_userinfo_do_not_carry_the_password() {
         .send_soap(host, "<s:Envelope/>".into(), None)
         .await;
     assert!(
-        matches!(&sent, Err(WinrmError::AuthFailed(m)) if m.contains("invalid host")),
+        matches!(&sent, Err(WinrmError::Config(m)) if m.contains("invalid host")),
         "{sent:?}"
     );
     assert!(logs_contain("<redacted>@127.0.0.1"));
@@ -1713,6 +1770,41 @@ async fn connect_hint_only_for_a_connect_failure_on_the_default_https_port() {
     assert!(connect_hint(&WinrmConfig::default(), false, &WinrmError::Timeout(1)).is_none());
 }
 
+/// `reqwest` says which step failed and for which URL, and leaves the
+/// reason to the causes of its error: the message gives them, down to the
+/// last one. What that reason is depends on the system: Linux and Windows
+/// refuse the connection to a port that is bound and does not listen, and
+/// the macOS runner of CI lets it run into the connect timeout.
+#[tokio::test]
+async fn a_failed_connection_gives_its_reason_in_the_message() {
+    let (_socket, closed) = refused_port();
+    let err = basic_transport(closed)
+        .send_soap_with_retry("127.0.0.1", "<s:Envelope/>".into())
+        .await
+        .unwrap_err();
+    let WinrmError::Http(inner) = &err else {
+        panic!("{err:?}");
+    };
+    assert!(inner.is_connect(), "{err:?}");
+    let reason = std::iter::successors(std::error::Error::source(inner), |cause| cause.source())
+        .last()
+        .expect("reqwest gives the reason as a cause")
+        .to_string();
+    let shown = err.to_string();
+    assert!(
+        shown.starts_with("WinRM HTTP error: error sending request for url ("),
+        "{shown}"
+    );
+    assert!(!reason.is_empty() && shown.ends_with(&reason), "{shown}");
+    #[cfg(target_os = "linux")]
+    assert!(
+        shown.ends_with("Connection refused (os error 111)"),
+        "{shown}"
+    );
+    // In the message, so not behind `source()` as well.
+    assert!(std::error::Error::source(&err).is_none());
+}
+
 /// With a proxy set, a connect failure is the proxy's (unreachable, or
 /// a DNS failure through it): `WinrmConfig::http()` would not fix it.
 #[tokio::test]
@@ -1856,7 +1948,7 @@ async fn host_log_fields_escape_control_characters() {
         .await
         .unwrap_err();
     assert!(
-        matches!(&err, WinrmError::AuthFailed(m) if m.contains("invalid host")),
+        matches!(&err, WinrmError::Config(m) if m.contains("invalid host")),
         "{err:?}"
     );
     let text = logs.text();
@@ -1881,7 +1973,7 @@ async fn bidi_characters_in_a_host_are_refused_and_logged_escaped() {
         .await
         .unwrap_err();
     assert!(
-        matches!(&err, WinrmError::AuthFailed(m) if m.contains("invalid host")),
+        matches!(&err, WinrmError::Config(m) if m.contains("invalid host")),
         "{err:?}"
     );
     let text = logs.text();
@@ -2033,7 +2125,7 @@ async fn before_send_with_is_not_called_for_a_decorated_host() {
         .await
         .unwrap_err();
     assert!(
-        matches!(&err, WinrmError::AuthFailed(m) if m.contains("invalid host")),
+        matches!(&err, WinrmError::Config(m) if m.contains("invalid host")),
         "{err:?}"
     );
     assert!(
@@ -2139,7 +2231,7 @@ async fn unauthorized_on_a_reused_connection_is_not_resent() {
         .await
         .unwrap_err();
     assert!(
-        matches!(&err, WinrmError::Ntlm(e) if e.to_string().contains("NOT resent")),
+        matches!(&err, WinrmError::Connection(m) if m.contains("NOT resent")),
         "got: {err:?}"
     );
     assert_eq!(
@@ -2157,7 +2249,8 @@ async fn unauthorized_on_a_reused_connection_is_not_resent() {
     assert_eq!(fake.handshakes(), 2, "log: {:?}", fake.log());
 }
 
-/// A 401 right after a fresh handshake is an authentication failure, not
+/// A 401 right after a fresh handshake is a connection that lost its
+/// session (`Connection`: bad credentials fail the handshake itself), not
 /// a reason to loop.
 #[tokio::test]
 async fn unauthorized_on_a_fresh_session_is_not_retried() {
@@ -2169,8 +2262,9 @@ async fn unauthorized_on_a_fresh_session_is_not_retried() {
         .send_soap_with_retry(&host, "<a/>".into())
         .await
         .unwrap_err();
-    // Not a credentials problem (bad credentials fail the handshake).
-    assert!(matches!(err, WinrmError::Ntlm(_)), "got: {err:?}");
+    // Not a credentials problem (bad credentials fail the handshake): the
+    // connection lost its session.
+    assert!(matches!(err, WinrmError::Connection(_)), "got: {err:?}");
     assert_eq!(fake.sealed().len(), 1, "log: {:?}", fake.log());
     assert_eq!(fake.plaintext_bodies(), 0, "log: {:?}", fake.log());
 }
@@ -2201,6 +2295,13 @@ async fn failed_sealed_request_is_never_resent() {
             content_type: "multipart/encrypted;protocol=\"application/HTTP-SPNEGO-session-encrypted\";boundary=\"Encrypted Boundary\"",
             body: b"--Encrypted Boundary\r\ngarbage".to_vec(),
         },
+        // What HTTP.sys answers while the WinRM service restarts: it holds
+        // no session and cannot seal.
+        Reply::Raw {
+            status: 503,
+            content_type: "text/html",
+            body: b"<h1>Service Unavailable</h1>".to_vec(),
+        },
     ];
     for (i, failure) in failures.into_iter().enumerate() {
         let (_server, fake, transport, host) = sealed_setup_with(|c| c.max_retries = 2).await;
@@ -2214,10 +2315,27 @@ async fn failed_sealed_request_is_never_resent() {
             .send_soap_with_retry(&host, "<b/>".into())
             .await
             .unwrap_err();
-        assert!(
-            !matches!(err, WinrmError::Soap(_) | WinrmError::Http(_)),
-            "case {i}: got {err:?}"
-        );
+        // A sealed answer is trusted and keeps its status. An error status
+        // that is not sealed keeps its status too, and its body is not
+        // quoted. A success that does not unseal is not what the protocol
+        // allows.
+        let unsealed = |status: u16, body: &str| {
+            matches!(
+                &err,
+                WinrmError::HttpStatus { status: got, message }
+                    if *got == status
+                        && message.contains("without sealing")
+                        && !message.contains(body)
+            )
+        };
+        let expected = match i {
+            0 => matches!(err, WinrmError::HttpStatus { status: 500, .. }),
+            1 => matches!(err, WinrmError::HttpStatus { status: 400, .. }),
+            2 => unsealed(500, "TimedOut"),
+            3 => matches!(&err, WinrmError::Protocol(m) if m.starts_with("NTLM sealed response: ")),
+            _ => unsealed(503, "Service Unavailable</h1>"),
+        };
+        assert!(expected, "case {i}: got {err:?}");
         assert_eq!(
             fake.sealed().iter().filter(|p| p.contains("<b/>")).count(),
             1,
@@ -2259,7 +2377,10 @@ async fn sealed_label_on_a_plaintext_fault_is_an_error() {
         .send_soap_with_retry(&host, "<b/>".into())
         .await
         .unwrap_err();
-    assert!(matches!(err, WinrmError::Ntlm(_)), "got: {err:?}");
+    assert!(
+        matches!(&err, WinrmError::Protocol(m) if m.starts_with("NTLM sealed response: ")),
+        "got: {err:?}"
+    );
 }
 
 /// Windows seals the HTTP 500 fault of a sealed request: it surfaces as
@@ -2285,6 +2406,53 @@ async fn sealed_fault_is_a_soap_error_and_keeps_the_session() {
         .unwrap();
     assert_eq!(reply, "<after/>");
     assert_eq!(fake.handshakes(), 1, "log: {:?}", fake.log());
+}
+
+/// A sealed answer with a success status that is no answer is refused on
+/// this route as on the others, once it is unsealed. The request is not
+/// sent again, and the session stays usable (no new handshake).
+#[tokio::test]
+async fn sealed_body_that_is_no_answer_is_an_error_and_keeps_the_session() {
+    let (_server, fake, transport, host) = sealed_setup().await;
+    let fault = "<s:Envelope><s:Body><s:Fault><s:Code><s:Value>s:Receiver</s:Value></s:Code>\
+                 </s:Fault></s:Body></s:Envelope>";
+    fake.push(Reply::ok("<first/>"));
+    fake.push(Reply::ok("OK"));
+    fake.push(Reply::ok(""));
+    fake.push(Reply::ok(fault));
+    fake.push(Reply::ok("<after/>"));
+    transport
+        .send_soap_with_retry(&host, "<a/>".into())
+        .await
+        .unwrap();
+    for request in ["<b/>", "<c/>"] {
+        let err = transport
+            .send_soap_with_retry(&host, request.into())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                WinrmError::Soap(crate::error::SoapError::ParseError(_))
+            ),
+            "{request}: {err:?}"
+        );
+    }
+    let err = transport
+        .send_soap_with_retry(&host, "<d/>".into())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, WinrmError::Soap(crate::error::SoapError::Fault { code, .. }) if code == "s:Receiver"),
+        "{err:?}"
+    );
+    let reply = transport
+        .send_soap_with_retry(&host, "<e/>".into())
+        .await
+        .unwrap();
+    assert_eq!(reply, "<after/>");
+    assert_eq!(fake.handshakes(), 1, "log: {:?}", fake.log());
+    assert_eq!(fake.sealed().len(), 5, "log: {:?}", fake.log());
 }
 
 /// An answer larger than the response cap is refused before unsealing.
@@ -2412,7 +2580,7 @@ async fn requests_are_retried_only_on_connection_errors() {
 
     assert!(HttpTransport::is_retryable(&WinrmError::Http(refused)));
     assert!(!HttpTransport::is_retryable(&WinrmError::Http(timed_out)));
-    assert!(!HttpTransport::is_retryable(&WinrmError::AuthFailed(
+    assert!(!HttpTransport::is_retryable(&WinrmError::Config(
         "x".into()
     )));
 }
@@ -2725,7 +2893,7 @@ fn credssp_with_accept_invalid_certs_is_refused() {
         .err()
         .expect("must refuse");
     assert!(
-        matches!(&err, WinrmError::AuthFailed(m) if m == CREDSSP_UNAUTHENTICATED_TLS),
+        matches!(&err, WinrmError::Config(m) if m == CREDSSP_UNAUTHENTICATED_TLS),
         "{err}"
     );
 }
@@ -2767,7 +2935,7 @@ fn basic_with_accept_invalid_certs_is_refused() {
         .err()
         .expect("must refuse");
     assert!(
-        matches!(&err, WinrmError::AuthFailed(m) if m == BASIC_UNVERIFIED_TLS),
+        matches!(&err, WinrmError::Config(m) if m == BASIC_UNVERIFIED_TLS),
         "{err}"
     );
 }
@@ -2807,7 +2975,7 @@ fn a_refused_credssp_build_logs_no_verification_warn() {
         .err()
         .expect("must refuse");
     assert!(
-        matches!(&err, WinrmError::AuthFailed(m) if m == CREDSSP_UNAUTHENTICATED_TLS),
+        matches!(&err, WinrmError::Config(m) if m == CREDSSP_UNAUTHENTICATED_TLS),
         "{err}"
     );
     assert!(!logs_contain(UNVERIFIED_SERVER_WARN));
@@ -2937,8 +3105,10 @@ async fn credssp_pin_refuses_a_listener_with_another_certificate() {
     let relay = test_server::spawn_tls_relay(port, RSA_CERT_PEM, RSA_KEY_PKCS1_PEM);
     let t = credssp_test_transport(relay);
     let err = send_bounded(&t).await.unwrap_err();
+    // The pin's refusal is the variant the other methods give it
+    // (`kerberos_probe_reports_a_wrong_pin_as_such`), not a network failure.
     assert!(
-        matches!(&err, WinrmError::AuthFailed(m) if m.starts_with("CredSSP outer TLS")),
+        matches!(&err, WinrmError::Authentication(m) if m.starts_with("CredSSP outer TLS")),
         "{err}"
     );
     assert!(
@@ -3054,7 +3224,7 @@ async fn credssp_through_a_proxy_keeps_the_pin() {
     let t = credssp_proxied_transport(relay, format!("http://127.0.0.1:{pport}")).unwrap();
     let err = send_bounded(&t).await.unwrap_err();
     assert!(
-        matches!(&err, WinrmError::AuthFailed(m) if m.starts_with("CredSSP outer TLS")
+        matches!(&err, WinrmError::Authentication(m) if m.starts_with("CredSSP outer TLS")
             && m.contains("matches no pin_server_certificate_sha256 fingerprint")),
         "{err}"
     );
@@ -3118,7 +3288,7 @@ async fn credssp_request_refuses_an_https_env_proxy_when_opted_in() {
     let t = credssp_env_proxy_transport(5986, true, "https://proxy.test:3128".into());
     let err = send_bounded(&t).await.unwrap_err();
     assert!(
-        matches!(&err, WinrmError::AuthFailed(m)
+        matches!(&err, WinrmError::Config(m)
             if m.starts_with("CredSSP: an https:// proxy is not supported")),
         "{err}"
     );
@@ -3155,7 +3325,7 @@ fn credssp_refuses_an_https_proxy_at_construction() {
     assert!(
         matches!(
             &err,
-            WinrmError::AuthFailed(m) if m == "CredSSP: an https:// proxy is not supported; \
+            WinrmError::Config(m) if m == "CredSSP: an https:// proxy is not supported; \
                 use an http:// or socks5:// proxy, or connect directly"
         ),
         "{err}"
@@ -3184,7 +3354,7 @@ async fn credssp_default_verifier_refuses_untrusted_listener() {
     let t = HttpTransport::new(credssp_test_config(port), creds()).unwrap();
     let err = send_bounded(&t).await.unwrap_err();
     assert!(
-        matches!(&err, WinrmError::AuthFailed(m) if m.starts_with("CredSSP outer TLS")),
+        matches!(&err, WinrmError::Connection(m) if m.starts_with("CredSSP outer TLS")),
         "{err}"
     );
     assert!(log.lock().unwrap().is_empty(), "the server saw a request");
@@ -3316,7 +3486,7 @@ fn from_utf16le(bytes: &[u8]) -> String {
     .unwrap()
 }
 
-/// Over TLS the Type 3 now carries a MIC, MsvAvFlags 0x2, the target name,
+/// Over TLS the Type 3 now carries a MIC, `MsvAvFlags` 0x2, the target name,
 /// a zero LM response and the channel binding — as the plain-HTTP path does.
 #[tokio::test]
 async fn ntlm_over_tls_type3_carries_mic_flags_target_name_and_zero_lm() {
@@ -3419,7 +3589,10 @@ async fn ntlm_over_tls_without_a_peer_certificate_fails_closed() {
     .await
     .expect("did not finish in 20 s");
     assert!(
-        matches!(&result, Err(WinrmError::Ntlm(e)) if e.to_string().contains("certificate")),
+        matches!(
+            &result,
+            Err(WinrmError::Authentication(m)) if m.contains("reported no server certificate")
+        ),
         "got: {result:?}"
     );
     assert!(seen.lock().unwrap().is_empty(), "no Type 3 may be sent");
@@ -3602,7 +3775,7 @@ async fn kerberos_without_the_feature_sends_nothing_in_any_mode() {
             WinrmCredentials::new("u", "p", ""),
         )
         .unwrap();
-        assert!(transport.seals() == (encryption != EncryptionMode::Never));
+        assert_eq!(transport.seals(), encryption != EncryptionMode::Never);
         let err = transport
             .send_soap_raw("127.0.0.1", "<s:Envelope/>".into())
             .await
@@ -3738,9 +3911,9 @@ fn seals_follows_mode_and_scheme_for_ntlm_and_kerberos() {
     let seals = |auth_method: AuthMethod, encryption: EncryptionMode, use_tls: bool| {
         HttpTransport::new(
             WinrmConfig {
+                use_tls,
                 auth_method,
                 encryption,
-                use_tls,
                 ..Default::default()
             },
             WinrmCredentials::new("u", "p", ""),
@@ -3788,10 +3961,10 @@ fn seals_follows_mode_and_scheme_for_ntlm_and_kerberos() {
 #[test]
 fn auto_seals_over_https_when_the_certificate_is_not_verified() {
     let config = |auth_method, encryption, use_tls, accept_invalid_certs| WinrmConfig {
-        auth_method,
-        encryption,
         use_tls,
         accept_invalid_certs,
+        auth_method,
+        encryption,
         ..Default::default()
     };
     let seals = |auth_method, encryption, use_tls, accept_invalid_certs| {
@@ -3978,7 +4151,9 @@ async fn waiters_for_a_full_host_take_no_client_slot() {
         128,
         "queued waiters hold client slots"
     );
-    waiters.iter().for_each(|w| w.abort());
+    for waiter in &waiters {
+        waiter.abort();
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -4271,7 +4446,7 @@ async fn the_hook_is_not_called_for_an_invalid_host() {
         .await
         .unwrap_err();
     assert!(
-        matches!(&err, WinrmError::AuthFailed(m) if m.contains("invalid host")),
+        matches!(&err, WinrmError::Config(m) if m.contains("invalid host")),
         "{err:?}"
     );
     assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -4283,9 +4458,9 @@ fn route_follows_method_mode_and_scheme() {
     use EncryptionMode::{Always, Auto, Never};
     let route = |auth_method, encryption, use_tls| {
         Route::for_config(&WinrmConfig {
+            use_tls,
             auth_method,
             encryption,
-            use_tls,
             ..Default::default()
         })
     };
@@ -4371,7 +4546,10 @@ async fn ntlm_handshake_fails_closed_when_the_client_saw_two_certificates() {
     assert_eq!(send(port_a).await.unwrap(), "<ok/>");
     let second = send(port_b).await;
     assert!(
-        matches!(&second, Err(WinrmError::Ntlm(e)) if e.to_string().contains("several")),
+        matches!(
+            &second,
+            Err(WinrmError::Authentication(m)) if m.contains("several server certificates")
+        ),
         "got: {second:?}"
     );
     assert_eq!(seen_a.lock().unwrap().len(), 1);
@@ -4517,7 +4695,7 @@ async fn explicit_provider_is_used_for_every_handshake() {
                 },
                 ..Default::default()
             },
-            only(suite),
+            &only(suite),
             proxy::env_var,
         )
         .unwrap()
@@ -4558,7 +4736,7 @@ async fn explicit_provider_is_used_for_every_handshake() {
                 assert_eq!(result.unwrap(), "<ok/>");
             }
             assert!(
-                matches!(&shared, Err(WinrmError::AuthFailed(m)) if m.starts_with("HTTP 400")),
+                matches!(&shared, Err(WinrmError::HttpStatus { status: 400, .. })),
                 "shared client: {shared:?}"
             );
         } else {
@@ -4717,7 +4895,7 @@ async fn ntlm_cbt_through_an_https_proxy_binds_the_target_certificate() {
     assert_eq!(type3_channel_bindings(&seen[0]), Some(cbt_of(EC_CERT_PEM)));
 }
 
-/// An https endpoint reached through an HTTPS_PROXY from the environment:
+/// An https endpoint reached through an `HTTPS_PROXY` from the environment:
 /// reqwest's real proxy selection tunnels it, and the Type 3 still binds
 /// the endpoint's certificate.
 #[tokio::test]
@@ -4915,13 +5093,13 @@ fn credssp_follows_env_proxies_when_opted_in() {
     // it applies to, not when the client is built.
     let t = build(true, "https://10.0.0.1:3128");
     match t.credssp_dial_for(h) {
-        Err(WinrmError::AuthFailed(m)) => {
+        Err(WinrmError::Config(m)) => {
             assert!(
                 m.starts_with("CredSSP: an https:// proxy is not supported"),
                 "{m}"
             );
         }
-        other => panic!("expected AuthFailed, got {other:?}"),
+        other => panic!("expected Config, got {other:?}"),
     }
     assert!(matches!(
         *t.credssp_dial_for(excluded).unwrap(),
@@ -5125,7 +5303,7 @@ async fn never_through_a_proxy_without_session_auth_is_refused_before_type3() {
         .await
         .unwrap_err();
     assert!(
-        matches!(&err, WinrmError::AuthFailed(m) if m.contains("Session-Based-Authentication") && m.contains("proxy_session_auth")),
+        matches!(&err, WinrmError::Connection(m) if m.contains("Session-Based-Authentication") && m.contains("proxy_session_auth")),
         "{err:?}"
     );
     assert_eq!(fake.log(), vec![Event::Negotiate], "no Type 3 may follow");
@@ -5410,7 +5588,7 @@ async fn kerberos_probe_answered_407_is_refused_and_not_kept() {
         let err = t.send_soap_raw(&host, "<a/>".into()).await.unwrap_err();
         assert!(
             is_proxy_refusal(&err)
-                && err.to_string().contains("407")
+                && matches!(err, WinrmError::HttpStatus { status: 407, .. })
                 && !err.to_string().contains("with the server's 401"),
             "{err}"
         );
@@ -5607,12 +5785,12 @@ async fn accepting_invalid_proxy_certs_refuses_a_host_named_like_the_proxy() {
     };
     let t = transport_with(config, &opts).unwrap();
     match send_basic(&t, "localhost").await {
-        Err(WinrmError::AuthFailed(m)) => assert_eq!(
+        Err(WinrmError::Config(m)) => assert_eq!(
             m,
             "danger_accept_invalid_proxy_certs: host localhost has the name of an https:// \
              proxy; it would not be verified, refusing"
         ),
-        other => panic!("expected AuthFailed, got {other:?}"),
+        other => panic!("expected Config, got {other:?}"),
     }
     assert_eq!(read.load(Ordering::SeqCst), 0);
 }
@@ -5737,7 +5915,7 @@ async fn sealing_handshake_always_closed_is_an_error() {
         .await
         .unwrap_err();
     assert!(
-        matches!(&err, WinrmError::Ntlm(e) if e.to_string().contains("closes the connection")),
+        matches!(&err, WinrmError::Connection(m) if m.contains("closes the connection")),
         "{err:?}"
     );
     assert!(fake.sealed().is_empty(), "log: {:?}", fake.log());
@@ -5892,7 +6070,7 @@ async fn dedicated_client_never_opens_a_second_connection() {
     let fake = FakeNtlmServer::mount(&server).await;
     let (relay, accepts) = spawn_counting_relay(server.address().port());
     let transport = relayed_transport(relay);
-    let big = "x".repeat(200_000);
+    let big = format!("<r>{}</r>", "x".repeat(200_000));
     for _ in 0..20 {
         fake.push(Reply::ok(&big));
     }
@@ -5901,7 +6079,7 @@ async fn dedicated_client_never_opens_a_second_connection() {
             .send_soap_with_retry("127.0.0.1", format!("<r{i}/>"))
             .await
             .unwrap();
-        assert_eq!(reply.len(), 200_000, "exchange {i}");
+        assert_eq!(reply.len(), big.len(), "exchange {i}");
     }
     assert_eq!(accepts.load(Ordering::SeqCst), 1, "log: {:?}", fake.log());
     assert_eq!(fake.handshakes(), 1);
@@ -6063,9 +6241,26 @@ async fn basic_against_sink(
     (result, read.load(Ordering::SeqCst))
 }
 
+/// The causes of the `reqwest` error of `result`, as [`error_chain`] gives
+/// them. The message of the `WinrmError` must give the reason too, which
+/// `reqwest` leaves to `source()`: the deepest cause (what `rustls` or the
+/// operating system reported) is in it.
 fn http_error_chain(result: Result<String, WinrmError>) -> String {
     match result {
-        Err(WinrmError::Http(e)) => error_chain(&e),
+        Err(WinrmError::Http(e)) => {
+            let chain = error_chain(&e);
+            let mut deepest: &(dyn std::error::Error + 'static) = &e;
+            while let Some(cause) = deepest.source() {
+                deepest = cause;
+            }
+            let reason = crate::error::quote_server_text(&deepest.to_string(), 256);
+            let message = WinrmError::Http(e).to_string();
+            assert!(
+                message.starts_with("WinRM HTTP error: ") && message.contains(&reason),
+                "{message:?} does not give {reason:?}"
+            );
+            chain
+        }
         other => panic!("expected WinrmError::Http, got {other:?}"),
     }
 }
@@ -6270,10 +6465,10 @@ async fn credssp_tls_outer_uses_the_extra_root() {
     )
     .unwrap();
     match send_basic(&t, "localhost").await {
-        Err(WinrmError::AuthFailed(m)) => {
+        Err(WinrmError::Connection(m)) => {
             assert!(m.starts_with("CredSSP outer TLS:"), "{m}");
         }
-        other => panic!("expected AuthFailed, got {other:?}"),
+        other => panic!("expected Connection, got {other:?}"),
     }
     assert_eq!(read.load(Ordering::SeqCst), 0);
 }
@@ -6283,21 +6478,21 @@ fn root_file_without_a_certificate_is_a_clear_error() {
     use crate::test_pki::EC_KEY_PKCS8_PEM;
     let keys = root_file("no-cert", EC_KEY_PKCS8_PEM);
     match transport_with(tls_config(AuthMethod::Basic, 5986), &roots(&[&keys])) {
-        Err(WinrmError::AuthFailed(m)) => {
+        Err(WinrmError::Config(m)) => {
             assert!(m.contains(&keys.cert), "{m}");
             assert!(m.contains("no certificate"), "{m}");
             assert!(!m.contains("IvSE2eFVFQPSvWUFhXFxIaP6"), "{m}");
         }
-        other => panic!("expected AuthFailed, got {:?}", other.map(|_| ())),
+        other => panic!("expected Config, got {:?}", other.map(|_| ())),
     }
 }
 
-/// The `AuthFailed` message of building a transport that trusts `pem`.
+/// The `Config` message of building a transport that trusts `pem`.
 fn root_file_error(tag: &str, pem: &str) -> (PemFiles, String) {
     let file = root_file(tag, pem);
     match transport_with(tls_config(AuthMethod::Basic, 5986), &roots(&[&file])) {
-        Err(WinrmError::AuthFailed(m)) => (file, m),
-        other => panic!("expected AuthFailed, got {:?}", other.map(|_| ())),
+        Err(WinrmError::Config(m)) => (file, m),
+        other => panic!("expected Config, got {:?}", other.map(|_| ())),
     }
 }
 
@@ -6335,10 +6530,10 @@ fn missing_root_file_is_a_clear_error() {
         ..Default::default()
     };
     match transport_with(tls_config(AuthMethod::Basic, 5986), &opts) {
-        Err(WinrmError::AuthFailed(m)) => {
+        Err(WinrmError::Config(m)) => {
             assert!(m.contains("/nonexistent/winrm-rs/ca.pem"), "{m}");
         }
-        other => panic!("expected AuthFailed, got {:?}", other.map(|_| ())),
+        other => panic!("expected Config, got {:?}", other.map(|_| ())),
     }
 }
 
@@ -6411,19 +6606,38 @@ async fn pin_accepts_a_matching_self_signed_listener_by_ip() {
     }
 }
 
+/// A listener that presents another certificate than the pinned one is
+/// refused before any byte is sent, with the methods that send through the
+/// shared client as with the others. It is the server failing to prove who
+/// it is, not a connection that could not be opened: `Authentication`,
+/// which `max_retries` does not retry.
 #[tokio::test]
 async fn pin_refuses_another_certificate() {
     use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM, RSA_CERT_PEM};
-    let (result, read) = basic_against_sink(
-        &pinned(&[&sha256_hex(RSA_CERT_PEM)]),
-        EC_CERT_PEM,
-        EC_KEY_PKCS8_PEM,
-        "127.0.0.1",
-    )
-    .await;
-    let chain = http_error_chain(result);
-    assert!(chain.contains("pin_server_certificate_sha256"), "{chain}");
-    assert_eq!(read, 0);
+    let client_files = pem_files("pin-client", EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+    for auth_method in [AuthMethod::Basic, AuthMethod::Certificate] {
+        let (port, read) = crate::test_pki::spawn_tls_sink(crate::test_pki::server_config(
+            EC_CERT_PEM,
+            EC_KEY_PKCS8_PEM,
+        ));
+        let mut config = tls_config(auth_method.clone(), port);
+        config.max_retries = 2;
+        if matches!(auth_method, AuthMethod::Certificate) {
+            config.client_cert_pem = Some(client_files.cert.clone());
+            config.client_key_pem = Some(client_files.key.clone());
+        }
+        let t = transport_with(config, &pinned(&[&sha256_hex(RSA_CERT_PEM)])).unwrap();
+        let err = send_basic(&t, "127.0.0.1").await.unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                WinrmError::Authentication(m) if m.contains("pin_server_certificate_sha256")
+            ),
+            "{auth_method:?}: {err:?}"
+        );
+        assert!(!HttpTransport::is_retryable(&err), "{auth_method:?}");
+        assert_eq!(read.load(Ordering::SeqCst), 0, "{auth_method:?}");
+    }
 }
 
 /// The certificate matches the pin, but the server signs the handshake
@@ -6472,10 +6686,10 @@ async fn pin_applies_to_shared_and_dedicated_legs() {
     let url = format!("https://127.0.0.1:{port}/wsman");
     let t = transport_with(ntlm(port), &wrong).unwrap();
     match ntlm_over_tls(&t, &url).await {
-        Err(WinrmError::AuthFailed(m)) => {
+        Err(WinrmError::Authentication(m)) => {
             assert!(m.contains("pinned certificate check"), "{m}");
         }
-        other => panic!("expected AuthFailed, got {other:?}"),
+        other => panic!("expected Authentication, got {other:?}"),
     }
     assert!(
         seen.lock().unwrap().is_empty(),
@@ -6554,7 +6768,7 @@ async fn pin_refuses_a_host_named_like_the_https_proxy() {
         };
         let err = transport_with(config, &opts).err().expect("must refuse");
         assert!(
-            matches!(&err, WinrmError::AuthFailed(m) if m.starts_with("CredSSP: an https:// proxy is not supported")),
+            matches!(&err, WinrmError::Config(m) if m.starts_with("CredSSP: an https:// proxy is not supported")),
             "{err}"
         );
 
@@ -6579,12 +6793,12 @@ async fn pin_refuses_a_host_named_like_the_https_proxy() {
         )
         .unwrap();
         match send_basic(&t, "localhost").await {
-            Err(WinrmError::AuthFailed(m)) => assert_eq!(
+            Err(WinrmError::Config(m)) => assert_eq!(
                 m,
                 "pin_server_certificate_sha256: host localhost has the name of an https:// \
                  proxy; the pin cannot be applied to it, refusing"
             ),
-            other => panic!("CredSsp (environment proxy): expected AuthFailed, got {other:?}"),
+            other => panic!("CredSsp (environment proxy): expected Config, got {other:?}"),
         }
         assert_eq!(
             read.load(Ordering::SeqCst),
@@ -6609,13 +6823,13 @@ async fn pin_refuses_a_host_named_like_the_https_proxy() {
         };
         let t = transport_with(config, &opts).unwrap();
         match send_basic(&t, "localhost").await {
-            Err(WinrmError::AuthFailed(m)) => assert_eq!(
+            Err(WinrmError::Config(m)) => assert_eq!(
                 m,
                 "pin_server_certificate_sha256: host localhost has the name of an https:// \
                  proxy; the pin cannot be applied to it, refusing",
                 "{label}"
             ),
-            other => panic!("{label}: expected AuthFailed, got {other:?}"),
+            other => panic!("{label}: expected Config, got {other:?}"),
         }
         assert_eq!(read.load(Ordering::SeqCst), 0, "{label}");
     }
@@ -6648,11 +6862,11 @@ async fn pin_accepts_a_host_not_named_like_the_https_proxy() {
     );
 }
 
-/// The build-time refusal of a pin, as `WinrmError::AuthFailed(m)`.
+/// The build-time refusal of a pin, as `WinrmError::Config(m)`.
 fn build_refusal(config: WinrmConfig, opts: &TlsOptions) -> String {
     match transport_with(config, opts) {
-        Err(WinrmError::AuthFailed(m)) => m,
-        other => panic!("expected AuthFailed, got {:?}", other.map(|_| ())),
+        Err(WinrmError::Config(m)) => m,
+        other => panic!("expected Config, got {:?}", other.map(|_| ())),
     }
 }
 
@@ -6724,10 +6938,10 @@ async fn credssp_tls_outer_honours_the_pin() {
     ));
     let t = transport_with(tls_config(AuthMethod::CredSsp, port), &opts).unwrap();
     match send_basic(&t, "127.0.0.1").await {
-        Err(WinrmError::AuthFailed(m)) => {
+        Err(WinrmError::Authentication(m)) => {
             assert!(m.starts_with("CredSSP outer TLS:"), "{m}");
         }
-        other => panic!("expected AuthFailed, got {other:?}"),
+        other => panic!("expected Authentication, got {other:?}"),
     }
     assert_eq!(read.load(Ordering::SeqCst), 0);
 }
@@ -6749,10 +6963,10 @@ async fn kerberos_probe_reports_a_wrong_pin_as_such() {
     )
     .unwrap();
     match send_basic(&t, "127.0.0.1").await {
-        Err(WinrmError::AuthFailed(m)) => {
+        Err(WinrmError::Authentication(m)) => {
             assert!(m.contains("pinned certificate check"), "{m}");
         }
-        other => panic!("expected AuthFailed, got {other:?}"),
+        other => panic!("expected Authentication, got {other:?}"),
     }
     assert_eq!(read.load(Ordering::SeqCst), 0);
 }

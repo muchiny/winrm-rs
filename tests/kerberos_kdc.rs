@@ -32,6 +32,10 @@
     clippy::indexing_slicing,
     clippy::arithmetic_side_effects,
     clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::too_many_lines,
+    clippy::similar_names,
+    clippy::assert_is_empty,
     reason = "test code"
 )]
 
@@ -355,7 +359,7 @@ async fn kdc_establish_refuses_an_ap_rep_from_another_context() {
             .await;
         acceptor.assert_no_problem();
         match result {
-            Err(WinrmError::AuthFailed(m)) => assert!(
+            Err(WinrmError::Authentication(m)) => assert!(
                 m.contains("Kerberos mutual authentication failed"),
                 "{encryption:?}: {m}"
             ),

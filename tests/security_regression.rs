@@ -16,6 +16,10 @@
     clippy::indexing_slicing,
     clippy::arithmetic_side_effects,
     clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::too_many_lines,
+    clippy::similar_names,
+    clippy::assert_is_empty,
     reason = "test code"
 )]
 
@@ -77,7 +81,7 @@ async fn http_307_to_another_origin_is_not_followed() {
         .await
         .expect_err("a 307 must not be followed");
     assert!(
-        matches!(&err, WinrmError::AuthFailed(m) if m.contains("307")),
+        matches!(&err, WinrmError::HttpStatus { status: 307, .. }),
         "{err:?}"
     );
     assert!(
@@ -110,7 +114,7 @@ async fn http_302_to_the_same_origin_is_not_followed() {
         .await
         .expect_err("a 302 must not be followed");
     assert!(
-        matches!(&err, WinrmError::AuthFailed(m) if m.contains("302")),
+        matches!(&err, WinrmError::HttpStatus { status: 302, .. }),
         "{err:?}"
     );
     assert_eq!(

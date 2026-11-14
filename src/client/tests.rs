@@ -119,9 +119,11 @@ async fn send_basic_auth_failure() {
 
     let client = WinrmClient::new(basic_config(port), test_creds()).unwrap();
     let result = client.create_shell("127.0.0.1").await;
-    assert!(result.is_err());
-    let err = format!("{}", result.unwrap_err());
-    assert!(err.contains("auth failed") || err.contains("401"));
+    let err = result.unwrap_err();
+    assert!(
+        matches!(&err, WinrmError::AuthRejected(m) if m.starts_with("HTTP 401")),
+        "{err:?}"
+    );
 }
 
 #[tokio::test]
@@ -295,6 +297,32 @@ async fn signal_terminate_success() {
     assert!(result.is_ok());
 }
 
+/// A Delete and a Signal read nothing from their answer: a success status
+/// is not enough for them to succeed, the body has to be an answer.
+#[tokio::test]
+async fn a_delete_or_a_signal_answered_by_what_is_no_answer_fails() {
+    for body in ["", "OK", "<html><body>Welcome</body>", "x<s:Envelope/>"] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+        let client = WinrmClient::new(basic_config(server.address().port()), test_creds()).unwrap();
+        for result in [
+            client.delete_shell("127.0.0.1", "SHELL-1").await,
+            client.signal_terminate("127.0.0.1", "S1", "C1").await,
+        ] {
+            assert!(
+                matches!(
+                    result,
+                    Err(WinrmError::Soap(crate::error::SoapError::ParseError(_)))
+                ),
+                "{body:?}: {result:?}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn ntlm_handshake_success() {
     let server = MockServer::start().await;
@@ -399,9 +427,11 @@ async fn ntlm_rejected_credentials() {
 
     let client = WinrmClient::new(ntlm_config(port), test_creds()).unwrap();
     let result = client.create_shell("127.0.0.1").await;
-    assert!(result.is_err());
-    let err = format!("{}", result.unwrap_err());
-    assert!(err.contains("auth") || err.contains("rejected"));
+    let err = result.unwrap_err();
+    assert!(
+        matches!(&err, WinrmError::AuthRejected(m) if m.starts_with("NTLM authentication rejected")),
+        "{err:?}"
+    );
 }
 
 #[tokio::test]
@@ -417,9 +447,14 @@ async fn ntlm_unexpected_status_on_negotiate() {
 
     let client = WinrmClient::new(ntlm_config(port), test_creds()).unwrap();
     let result = client.create_shell("127.0.0.1").await;
-    assert!(result.is_err());
-    let err = format!("{}", result.unwrap_err());
-    assert!(err.contains("expected 401"));
+    let err = result.unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            WinrmError::HttpStatus { status: 200, message } if message.contains("expected 401")
+        ),
+        "{err:?}"
+    );
 }
 
 #[tokio::test]
@@ -435,9 +470,77 @@ async fn ntlm_missing_www_authenticate() {
 
     let client = WinrmClient::new(ntlm_config(port), test_creds()).unwrap();
     let result = client.create_shell("127.0.0.1").await;
-    assert!(result.is_err());
-    let err = format!("{}", result.unwrap_err());
-    assert!(err.contains("WWW-Authenticate") || err.contains("auth"));
+    let err = result.unwrap_err();
+    assert!(
+        matches!(&err, WinrmError::AuthRejected(m) if m.contains("carries no Negotiate challenge")),
+        "{err:?}"
+    );
+}
+
+/// A 401 that offers no `Negotiate` token (the server's other methods, or
+/// `Negotiate` alone) is the server's refusal of NTLM. A token that is not
+/// base64 is a malformed message. Either way no Type 3 is sent.
+#[tokio::test]
+async fn ntlm_401_without_a_challenge_is_a_refusal_and_a_bad_token_is_not() {
+    for (challenge, refusal) in [
+        ("Basic realm=\"WSMAN\"", true),
+        ("Negotiate", true),
+        ("Negotiate not*base64", false),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401).insert_header("WWW-Authenticate", challenge))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = WinrmClient::new(ntlm_config(server.address().port()), test_creds()).unwrap();
+        let err = client.create_shell("127.0.0.1").await.unwrap_err();
+        let expected = if refusal {
+            matches!(&err, WinrmError::AuthRejected(m) if m.contains("carries no Negotiate challenge"))
+        } else {
+            matches!(
+                &err,
+                WinrmError::Protocol(m)
+                    if m.starts_with("NTLM: the server's Negotiate token is not base64: ")
+            )
+        };
+        assert!(expected, "{challenge}: {err:?}");
+    }
+}
+
+/// The challenge is looked for in every `WWW-Authenticate` header of the
+/// 401, not only in the first: a server that lists another method before
+/// `Negotiate` still gets its Type 3.
+#[tokio::test]
+async fn ntlm_finds_its_challenge_behind_another_www_authenticate_header() {
+    let challenge = crate::test_ntlm_server::challenge_header();
+    let basic = "Basic realm=\"WSMAN\"";
+    for (first, second) in [(basic, challenge.as_str()), (challenge.as_str(), basic)] {
+        let server = MockServer::start().await;
+        // The handshake goes on to the Type 3, which this server answers
+        // 401: the credentials are refused, with the message of that step.
+        // It is what tells the challenge was read: with the `Basic` header
+        // alone the error is the missing challenge, after one request.
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .append_header("WWW-Authenticate", first)
+                    .append_header("WWW-Authenticate", second),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        let client = WinrmClient::new(ntlm_config(server.address().port()), test_creds()).unwrap();
+        let err = client.create_shell("127.0.0.1").await.unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                WinrmError::AuthRejected(m)
+                    if m == "NTLM authentication rejected (bad credentials or CBT mismatch)"
+            ),
+            "{first}: {err:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -470,9 +573,11 @@ async fn ntlm_non_success_after_auth() {
 
     let client = WinrmClient::new(ntlm_config(port), test_creds()).unwrap();
     let result = client.create_shell("127.0.0.1").await;
-    assert!(result.is_err());
-    let err = format!("{}", result.unwrap_err());
-    assert!(err.contains("500") || err.contains("Internal"));
+    let err = result.unwrap_err();
+    assert!(
+        matches!(&err, WinrmError::HttpStatus { status: 500, .. }),
+        "{err:?}"
+    );
 }
 
 #[tokio::test]
@@ -514,13 +619,16 @@ async fn ntlm_uses_explicit_domain_when_set() {
 
 #[test]
 fn winrm_error_display() {
-    let err = WinrmError::AuthFailed("bad creds".into());
-    assert_eq!(format!("{err}"), "WinRM auth failed: bad creds");
+    let err = WinrmError::AuthRejected("bad creds".into());
+    assert_eq!(format!("{err}"), "WinRM authentication rejected: bad creds");
+
+    let err = WinrmError::Authentication("no ticket".into());
+    assert_eq!(format!("{err}"), "WinRM authentication error: no ticket");
 
     let err = WinrmError::Soap(crate::error::SoapError::MissingElement("ShellId".into()));
     assert!(format!("{err}").contains("SOAP"));
 
-    let err = WinrmError::Ntlm(crate::error::NtlmError::InvalidMessage("bad".into()));
+    let err = WinrmError::Ntlm(crate::error::NtlmError::Handshake("bad".into()));
     assert!(format!("{err}").contains("NTLM"));
 }
 
@@ -1342,7 +1450,7 @@ fn proxy_config_is_preserved() {
 
 #[test]
 fn winrm_error_transfer_display() {
-    let err = WinrmError::Transfer("upload chunk 3 failed".into());
+    let err = WinrmError::Transfer(crate::TransferError::Host("upload chunk 3 failed".into()));
     assert_eq!(
         format!("{err}"),
         "file transfer error: upload chunk 3 failed"
@@ -2374,9 +2482,11 @@ fn refusing_port() -> (tokio::net::TcpSocket, u16) {
 /// refuses connections until a listener appears on it, then the request
 /// goes through.
 #[tokio::test]
-// Windows answers a refused loopback connect only after ~2 s of SYN
-// retries, which makes this slow and timing-sensitive there.
-#[cfg_attr(windows, ignore)]
+#[cfg_attr(
+    windows,
+    ignore = "Windows answers a refused loopback connect only after ~2 s of SYN retries: \
+              slow and timing-sensitive there"
+)]
 async fn retry_backoff_on_http_error() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -2423,7 +2533,8 @@ async fn upload_file_multi_chunk_with_append() {
     let dir = unique_temp_path("winrm-rs-test-upload-multi-chunk");
     std::fs::create_dir_all(&dir).unwrap();
     let local_file = dir.join("multi.bin");
-    // 4001 bytes = 3 chunks with CHUNK_SIZE=2000 (2000 + 2000 + 1)
+    // 4001 bytes = 3 chunks: a chunk holds at most 2000 bytes, and a little
+    // less under the default policy, whose check takes room in the script.
     let data = vec![0xABu8; 4001];
     std::fs::write(&local_file, &data).unwrap();
 
@@ -2628,7 +2739,10 @@ async fn upload_file_with_local_drive_policy_sends_nothing_for_a_unc_path() {
         .await;
 
     assert!(
-        matches!(result, Err(WinrmError::Transfer(_))),
+        matches!(
+            result,
+            Err(WinrmError::Transfer(crate::TransferError::RemotePath(_)))
+        ),
         "got {result:?}"
     );
     assert!(server.received_requests().await.unwrap().is_empty());
@@ -2663,7 +2777,7 @@ async fn every_transfer_entry_point_applies_the_remote_path_policy() {
     ];
     for (name, result) in results {
         match result {
-            Err(WinrmError::Transfer(m)) => {
+            Err(WinrmError::Transfer(crate::TransferError::RemotePath(m))) => {
                 assert!(m.contains("RemotePathPolicy::LocalDrive"), "{name}: {m}");
             }
             other => panic!("{name}: expected Transfer, got {other:?}"),
@@ -2686,7 +2800,7 @@ async fn any_policy_sends_a_unc_path_to_the_host() {
     let result = client
         .download_file("127.0.0.1", r"\\other\share\f", &local)
         .await;
-    if let Err(WinrmError::Transfer(m)) = &result {
+    if let Err(WinrmError::Transfer(crate::TransferError::RemotePath(m))) = &result {
         assert!(!m.contains("RemotePathPolicy"), "{m}");
     }
     assert!(result.is_err(), "the mock server answers nothing useful");
@@ -2715,8 +2829,8 @@ async fn kerberos_auth_dispatch_returns_auth_error() {
         "error should specifically mention kerberos feature, got: {err_msg}"
     );
     assert!(
-        matches!(err, WinrmError::AuthFailed(_)),
-        "error variant should be AuthFailed, got: {err:?}"
+        matches!(err, WinrmError::Config(_)),
+        "error variant should be Config, got: {err:?}"
     );
 }
 
@@ -2996,9 +3110,11 @@ async fn upload_file_launches_powershell_by_full_path() {
 /// Retries of refused connections back off exponentially (100 ms, then
 /// 200 ms) rather than additively.
 #[tokio::test]
-// Windows answers a refused loopback connect only after ~2 s of SYN
-// retries, so three attempts would take seconds there.
-#[cfg_attr(windows, ignore)]
+#[cfg_attr(
+    windows,
+    ignore = "Windows answers a refused loopback connect only after ~2 s of SYN retries: \
+              three attempts would take seconds there"
+)]
 async fn retry_backoff_is_exponential_not_additive() {
     let (_held, port) = refusing_port();
     let config = WinrmConfig {
@@ -3161,28 +3277,35 @@ async fn psrp_shell_with_a_mixed_case_uri_signals_as_psrp() {
     assert!(!signal.contains("windows/shell/signal/ctrl_c"), "{signal}");
 }
 
+/// The cap counts what the Pulls add: a small Enumerate answer passes, the
+/// Pull that takes the items over the cap is refused, and no other follows.
 #[tokio::test]
 async fn run_wql_caps_items_at_max_output_bytes() {
     let server = MockServer::start().await;
     let port = server.address().port();
 
-    // Big enumerate response with EnumerationContext so the Pull loop iterates,
-    // padded so each iteration adds > 1 KiB to the items string.
-    let big = "X".repeat(2048);
-    let chunk = format!(
-        r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
-              xmlns:wsen="http://schemas.xmlsoap.org/ws/2004/09/enumeration">
-              <s:Body>
-                <wsen:EnumerateResponse>
-                  <wsen:EnumerationContext>CTX-1</wsen:EnumerationContext>
-                  <wsen:Items><p:Win32_OS><p:Name>{big}</p:Name></p:Win32_OS></wsen:Items>
-                </wsen:EnumerateResponse>
-              </s:Body>
-            </s:Envelope>"#
-    );
-
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(chunk))
+        .and(body_string_contains("enumeration/Enumerate"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<s:Envelope><s:Body><wsen:EnumerateResponse>\
+             <wsen:EnumerationContext>CTX-1</wsen:EnumerationContext>\
+             <wsen:Items><p:Win32_OS><p:Name>small</p:Name></p:Win32_OS></wsen:Items>\
+             </wsen:EnumerateResponse></s:Body></s:Envelope>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // Each Pull adds more than 1 KiB and keeps the enumeration open.
+    let big = "X".repeat(2048);
+    Mock::given(method("POST"))
+        .and(body_string_contains("enumeration/Pull"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            "<s:Envelope><s:Body><n:PullResponse>\
+             <n:EnumerationContext>CTX-1</n:EnumerationContext>\
+             <n:Items><p:Win32_OS><p:Name>{big}</p:Name></p:Win32_OS></n:Items>\
+             </n:PullResponse></s:Body></s:Envelope>"
+        )))
+        .expect(1)
         .mount(&server)
         .await;
 
@@ -3194,9 +3317,112 @@ async fn run_wql_caps_items_at_max_output_bytes() {
         .await
         .unwrap_err();
     assert!(
-        matches!(err, WinrmError::Transfer(_)),
+        matches!(&err, WinrmError::OutputLimit { limit: 1024, .. }),
         "expected Transfer cap error, got: {err}"
     );
+}
+
+/// An Enumerate answer over the cap is refused before any Pull is sent,
+/// even when it leaves the enumeration open.
+#[tokio::test]
+async fn run_wql_refuses_an_oversized_enumerate_answer_before_any_pull() {
+    let server = MockServer::start().await;
+    let big = "X".repeat(2048);
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            "<s:Envelope><s:Body><wsen:EnumerateResponse>\
+             <wsen:EnumerationContext>CTX-1</wsen:EnumerationContext>\
+             <wsen:Items><p:Win32_OS><p:Name>{big}</p:Name></p:Win32_OS></wsen:Items>\
+             </wsen:EnumerateResponse></s:Body></s:Envelope>"
+        )))
+        .mount(&server)
+        .await;
+
+    let mut config = basic_config(server.address().port());
+    config.max_output_bytes = Some(1024);
+    let client = WinrmClient::new(config, test_creds()).unwrap();
+    let err = client
+        .run_wql("127.0.0.1", "SELECT * FROM Win32_OS", None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, WinrmError::OutputLimit { limit: 1024, .. }),
+        "expected Transfer cap error, got: {err}"
+    );
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1, "a Pull was sent after the refusal");
+}
+
+/// The cap is the largest size accepted: items of exactly that many bytes
+/// pass, one more byte does not, and `None` accepts anything.
+#[test]
+fn check_wql_cap_accepts_items_up_to_the_cap() {
+    assert!(check_wql_cap("", Some(0)).is_ok());
+    assert!(check_wql_cap("12345678", Some(8)).is_ok());
+    assert!(matches!(
+        check_wql_cap("123456789", Some(8)),
+        Err(WinrmError::OutputLimit {
+            kind: crate::OutputKind::WqlEnumeration,
+            limit: 8
+        })
+    ));
+    assert!(matches!(
+        check_wql_cap("x", Some(0)),
+        Err(WinrmError::OutputLimit { limit: 0, .. })
+    ));
+    assert!(check_wql_cap(&"x".repeat(4096), None).is_ok());
+}
+
+/// With `OptimizeEnumeration` the server may put every item in the Enumerate
+/// answer and end the sequence there: no Pull follows, and the cap must still
+/// apply.
+#[tokio::test]
+async fn run_wql_caps_items_of_the_enumerate_answer() {
+    let server = MockServer::start().await;
+    let port = server.address().port();
+
+    let big = "X".repeat(2048);
+    let single_page = format!(
+        r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+              xmlns:wsen="http://schemas.xmlsoap.org/ws/2004/09/enumeration">
+              <s:Body>
+                <wsen:EnumerateResponse>
+                  <wsen:Items><p:Win32_OS><p:Name>{big}</p:Name></p:Win32_OS></wsen:Items>
+                  <wsen:EndOfSequence/>
+                </wsen:EnumerateResponse>
+              </s:Body>
+            </s:Envelope>"#
+    );
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(single_page))
+        .mount(&server)
+        .await;
+
+    let mut config = basic_config(port);
+    config.max_output_bytes = Some(1024);
+    let client = WinrmClient::new(config, test_creds()).unwrap();
+    let err = client
+        .run_wql("127.0.0.1", "SELECT * FROM Win32_OS", None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, WinrmError::OutputLimit { limit: 1024, .. }),
+        "expected Transfer cap error, got: {err}"
+    );
+
+    // Without a cap the same answer is returned whole.
+    let mut config = basic_config(port);
+    config.max_output_bytes = None;
+    let client = WinrmClient::new(config, test_creds()).unwrap();
+    let items = client
+        .run_wql("127.0.0.1", "SELECT * FROM Win32_OS", None)
+        .await
+        .unwrap();
+    assert!(items.contains(&big));
+
+    // One Enumerate per call and no Pull: the cap was not left to a Pull.
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -3247,8 +3473,8 @@ async fn run_in_shell_caps_output_at_max_output_bytes() {
         .await
         .unwrap_err();
     assert!(
-        matches!(err, WinrmError::Transfer(_)),
-        "expected Transfer cap error, got: {err}"
+        matches!(err, WinrmError::OutputLimit { .. }),
+        "expected the output limit error, got: {err}"
     );
 }
 
@@ -3297,7 +3523,7 @@ const DONE_HELLO: &str = r#"<s:Envelope><s:Body><rsp:ReceiveResponse>
         </rsp:CommandState>
     </rsp:ReceiveResponse></s:Body></s:Envelope>"#;
 
-/// Mount `n` HTTP 500 TimedOut faults, as a real host answers them.
+/// Mount `n` HTTP 500 `TimedOut` faults, as a real host answers them.
 async fn mount_timed_out_faults(server: &MockServer, prefix: &str, n: u64) {
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(500).set_body_string(timed_out_fault(prefix)))
@@ -3575,12 +3801,12 @@ async fn upload_file_of_an_empty_file_truncates_the_remote_file() {
     let scripts = powershell_scripts(&bodies);
     assert_eq!(scripts.len(), 1, "{scripts:?}");
     assert!(
-        scripts[0].contains("FromBase64String('')"),
+        scripts[0].contains("$p = 'C:\\dest.txt'; $t = "),
         "{}",
         scripts[0]
     );
     assert!(
-        scripts[0].contains("WriteAllBytes('C:\\dest.txt'"),
+        scripts[0].contains("WriteAllBytes($p, [Convert]::FromBase64String(''))"),
         "{}",
         scripts[0]
     );
@@ -3594,6 +3820,53 @@ async fn upload_file_of_an_empty_file_truncates_the_remote_file() {
         bodies.last().is_some_and(|b| b.contains("transfer/Delete")),
         "{bodies:?}"
     );
+    std::fs::remove_file(&local).ok();
+}
+
+/// The scripts of the three transfer entry points carry the host's check
+/// under `LocalDrive` and not under `Any`.
+#[tokio::test]
+async fn the_remote_path_policy_decides_what_the_transfer_scripts_check() {
+    use std::time::Duration;
+    let local = unique_temp_path("winrm-rs-test-policy-scripts");
+    for (policy, checked) in [
+        (crate::RemotePathPolicy::LocalDrive, true),
+        (crate::RemotePathPolicy::Any, false),
+    ] {
+        let mut scripts = Vec::new();
+        for entry_point in 0..3 {
+            let server = MockServer::start().await;
+            let done = ResponseTemplate::new(200).set_body_string(receive_done(b"", b"", 0));
+            mount_hanging_command(&server, done).await;
+            let client = WinrmClient::builder(basic_config(server.address().port()))
+                .credentials(test_creds())
+                .remote_path_policy(policy)
+                .build()
+                .unwrap();
+            std::fs::write(&local, b"abc").unwrap();
+            let (host, remote) = ("127.0.0.1", "C:\\dest.txt");
+            match entry_point {
+                0 => client.upload_file(host, &local, remote).await,
+                1 => client.download_file(host, remote, &local).await,
+                _ => {
+                    client
+                        .download_file_with_timeout(host, remote, &local, Duration::from_secs(5))
+                        .await
+                }
+            }
+            .unwrap();
+            scripts.extend(powershell_scripts(&received_bodies(&server).await));
+        }
+        assert_eq!(scripts.len(), 3, "{policy:?}: {scripts:?}");
+        for script in &scripts {
+            let names_the_path = script.contains("$p = 'C:\\dest.txt'; ");
+            assert!(names_the_path, "{policy:?}: {script}");
+            let reads_the_drive = script.contains("-ccontains $t");
+            assert_eq!(reads_the_drive, checked, "{policy:?}: {script}");
+            let resolves = script.contains("$p = [IO.Path]::GetFullPath($p)");
+            assert_eq!(resolves, checked, "{policy:?}: {script}");
+        }
+    }
     std::fs::remove_file(&local).ok();
 }
 

@@ -13,8 +13,9 @@
 //!
 //! - **`soap`** (internal) -- builds WS-Management XML envelopes for Create,
 //!   Execute, Receive, Signal, and Delete operations, and parses the
-//!   corresponding responses. Envelope construction uses raw `format!` strings
-//!   rather than a full XML library to keep dependencies minimal.
+//!   corresponding responses. Envelopes are written with `format!` and one
+//!   escaping function; responses are read with `quick-xml`, each element
+//!   taken by its name and its place in the document.
 //!
 //! - **`ntlm`** (internal) -- implements the `NTLMv2` challenge/response handshake
 //!   per MS-NLMP and the NTLM message sealing of HTTP traffic. Only `NTLMv2` is
@@ -30,16 +31,38 @@
 //! | HTTP Basic | [`AuthMethod::Basic`] | Credentials sent base64-encoded per request. Use only over HTTPS with a verified certificate: refused with `accept_invalid_certs` over HTTPS, and over plain HTTP unless `encryption` is [`EncryptionMode::Never`]. |
 //! | `NTLMv2` | [`AuthMethod::Ntlm`] | Three-step handshake (negotiate / challenge / authenticate). Default. Authenticates the client only: over plain HTTP the handshake can be relayed, or recorded to guess the password offline (sealing protects the bodies, not the handshake); on untrusted networks use HTTPS with certificate validation (channel binding) or Kerberos. See [`WinrmConfig`] (Security). |
 //! | Kerberos | [`AuthMethod::Kerberos`] | Raw Kerberos GSS-API tokens (not SPNEGO) under the `Negotiate` HTTP scheme, via the system Kerberos library. Messages sealed with the Kerberos context over HTTP, and over HTTPS with [`WinrmConfig::accept_invalid_certs`] (see [`EncryptionMode`]); over HTTPS, channel binding to the probe's certificate, pinned for the connection's life. Requires `kerberos` feature + `kinit`. Windows clients: SSPI path built by the `kerberos-windows` CI job, not tested live; `EncryptionMode::Never` is the way back. |
-//! | Certificate | [`AuthMethod::Certificate`] | TLS client certificate; requires `use_tls = true` (building the client fails with `AuthFailed` otherwise). Set `client_cert_pem` and `client_key_pem` on config. |
+//! | Certificate | [`AuthMethod::Certificate`] | TLS client certificate; requires `use_tls = true` (building the client fails with [`WinrmError::Config`] otherwise). Set `client_cert_pem` and `client_key_pem` on config. |
 //! | `CredSSP` | [`AuthMethod::CredSsp`] | Delegates the user's credentials to the host (double hop). Requires the `credssp` feature and `use_tls = true` with a verified certificate: it refuses [`WinrmConfig::accept_invalid_certs`], so pin the certificate or add a root. |
 //!
 //! # Error handling
 //!
-//! All fallible operations return `Result<T, WinrmError>`. The top-level
-//! [`WinrmError`] enum wraps transport errors ([`reqwest::Error`]), SOAP faults
-//! ([`SoapError`]), NTLM failures ([`NtlmError`]), and authentication
-//! rejections. Errors are designed for programmatic matching via `match` and
-//! for human-readable display via their [`Display`](std::fmt::Display) impls.
+//! All fallible operations return `Result<T, WinrmError>`. The variant of
+//! [`WinrmError`] says what failed, so that a program decides without
+//! reading a message:
+//!
+//! - [`WinrmError::Config`]: what was asked cannot be done as configured;
+//!   nothing was sent;
+//! - [`WinrmError::Http`] and [`WinrmError::Connection`]: the network path;
+//! - [`WinrmError::AuthRejected`]: the server refused the credentials or
+//!   the method. [`WinrmError::Authentication`]: the authentication failed
+//!   for another reason (a Kerberos ticket, a pinned certificate that does
+//!   not match);
+//! - [`WinrmError::HttpStatus`] and [`WinrmError::Soap`] ([`SoapError`]):
+//!   what the server answered. [`WinrmError::Protocol`],
+//!   [`WinrmError::Ntlm`] ([`NtlmError`]) and [`WinrmError::CredSsp`]
+//!   ([`CredSspError`]): an answer that does not follow the protocol or
+//!   does not verify;
+//! - [`WinrmError::Timeout`] and [`WinrmError::OutputLimit`]: a limit;
+//! - [`WinrmError::Transfer`] ([`TransferError`]): a file transfer;
+//! - [`WinrmError::Cancelled`]: the caller's own decision;
+//! - [`WinrmError::Internal`]: a bug of this crate.
+//!
+//! The enums are `#[non_exhaustive]`: a `match` needs a wildcard arm, and a
+//! pattern on a variant with named fields ends with `..`. The messages
+//! ([`Display`](std::fmt::Display)) are for people, and their wording can
+//! change between releases. No error has a
+//! [`source`](std::error::Error::source): what a variant wraps is part of
+//! its message.
 //!
 //! # Shell reuse
 //!
@@ -83,12 +106,13 @@
 //! - **`credssp`** -- *Experimental.* Enables `CredSSP` authentication for
 //!   double-hop delegation. Links the host's OpenSSL through `openssl-sys`
 //!   (required because Microsoft's `CredSSP` server has proven incompatible
-//!   with `rustls` in-memory TLS — see `src/auth/credssp.rs`).
+//!   with `rustls` in-memory TLS — see `src/auth/credssp/tls.rs`).
 //!   The inner `CredSSP` TLS client parses server-controlled records before
 //!   authentication, so that library must still receive security fixes
 //!   (README, "`credssp` and the host OpenSSL").
-//!   Validated end-to-end against Windows Server 2025; not yet exercised
-//!   on other host generations.
+//!   Validated end-to-end against Windows Server 2016, 2019, 2022 and
+//!   2025; not against Server 2012 R2, whose HTTPS listener shares no
+//!   cipher suite with `rustls`.
 //!   Delegates your cleartext password to the target: use it only toward
 //!   hosts you trust as much as the account.
 //!
@@ -124,6 +148,12 @@
 // these lints (Cargo.toml). `clippy.toml` exempts `#[test]` functions and
 // `#[cfg(test)]` modules from some of them, not from `as` or arithmetic, and
 // not modules gated on `cfg(all(test, ...))`.
+//
+// Of the pedantic group, test code follows everything but four lints:
+// `too_many_lines`; `cast_possible_truncation`, which goes with `as`;
+// `similar_names`, which refuses the names of the protocols side by side
+// (`ap_req` and `ap_rep`, `port` and `pport`); and `assert_is_empty`, whose
+// `assert_eq!(x, [] as [u8; 0])` reads worse than `assert!(x.is_empty())`.
 #![cfg_attr(
     test,
     allow(
@@ -133,6 +163,10 @@
         clippy::indexing_slicing,
         clippy::arithmetic_side_effects,
         clippy::as_conversions,
+        clippy::cast_possible_truncation,
+        clippy::too_many_lines,
+        clippy::similar_names,
+        clippy::assert_is_empty,
         reason = "test code"
     )
 )]
@@ -165,7 +199,7 @@ pub use command::{CommandOutput, encode_powershell_command, quote_powershell_str
 pub use config::{
     AuthMethod, EncryptionMode, ProxySessionAuth, TlsProvider, WinrmConfig, WinrmCredentials,
 };
-pub use error::{CredSspError, NtlmError, SoapError, WinrmError};
+pub use error::{CredSspError, NtlmError, OutputKind, SoapError, TransferError, WinrmError};
 pub use request::{OutgoingRequest, RequestKind};
 pub use secrecy::{ExposeSecret, SecretString};
 pub use shell::Shell;

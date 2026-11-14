@@ -13,6 +13,10 @@
     clippy::indexing_slicing,
     clippy::arithmetic_side_effects,
     clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::too_many_lines,
+    clippy::similar_names,
+    clippy::assert_is_empty,
     reason = "test code"
 )]
 
@@ -37,10 +41,10 @@ fn tls_provider_ring_leaves_the_process_default_alone() {
         "TlsProvider::Ring installed a process default"
     );
     match build(true, TlsProvider::ProcessDefault) {
-        Err(WinrmError::AuthFailed(m)) => {
+        Err(WinrmError::Config(m)) => {
             assert!(m.contains("no process-wide rustls CryptoProvider"), "{m}");
         }
-        other => panic!("expected AuthFailed, got {:?}", other.err()),
+        other => panic!("expected Config, got {:?}", other.err()),
     }
     WinrmClient::new(WinrmConfig::https(), WinrmCredentials::new("u", "p", "")).unwrap();
     assert!(

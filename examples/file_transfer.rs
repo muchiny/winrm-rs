@@ -1,11 +1,11 @@
 //! Uploading a file, checking it on the host, and downloading it back.
 //!
-//! Usage: WINRM_HOST=win-server WINRM_USER=admin WINRM_PASS=password cargo run --example file_transfer -- <local-file> <remote-path>
+//! Usage: `WINRM_HOST=win-server WINRM_USER=admin WINRM_PASS=password cargo run --example file_transfer -- <local-file> <remote-path>`
 //!
 //! For example `-- notes.txt 'C:\Windows\Temp\notes.txt'`. The remote path
 //! must be drive-absolute (`C:\...`): UNC, device and relative paths are
-//! refused before anything is sent (`RemotePathPolicy::LocalDrive`, the
-//! default).
+//! refused before anything is sent, and the host refuses a drive letter that
+//! leads to a share (`RemotePathPolicy::LocalDrive`, the default).
 //!
 //! The example uploads the local file (creating or overwriting the remote
 //! one), asks the host for its size, downloads it to `<local-file>.roundtrip`

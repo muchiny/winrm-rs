@@ -340,7 +340,19 @@ device paths, `\\?\` long paths and relative paths before anything is sent
 (`RemotePathPolicy::LocalDrive`, the default). It also refuses a path whose
 last component, after resolving `.` and `..`, is a DOS device name (`CON`,
 `NUL`, `COM1`, `LPT1`, ...): Windows opens the device instead of a file, and
-a printer port may be redirected to a network printer. With the `Any`
+a printer port may be redirected to a network printer. A path with a
+component made only of dots and blanks, other than `.` and `..`, is refused
+as well (`C:\x\LPT1\. `): Windows does not read such a component the same
+way everywhere. The host checks too, before it resolves or opens the path:
+a drive letter that is a mapped network drive, or a `subst` drive on a
+share, is refused there, and the error quotes the host
+(`RemotePathPolicy::LocalDrive refuses 'T:\f.bin' (drive type 'Network')`).
+That keeps a transfer from reading or writing a file on such a drive. It
+does not keep Windows PowerShell from connecting to the network drives the
+session sees when it starts, as the user of the session (with its
+credentials under CredSSP or Basic): it does so whatever the path and the
+policy.
+With the `Any`
 policy, a path may name a UNC share or a device path, and under CredSSP or
 Basic a UNC path is reached with your credentials: never pass an untrusted
 path. On the host, blocking outbound SMB (445) and WebDAV, the "Network
@@ -363,9 +375,48 @@ let client = WinrmClient::builder(config)
     .build()?;
 ```
 
-Leave the default when remote paths come from anyone but you. The default
-check is lexical: a link, junction or mapped drive on the host can still lead
-to a share. It does not limit which local files a path names.
+Leave the default when remote paths come from anyone but you. Neither the
+client's check nor the host's sees a symbolic link or a junction on the
+host, which can still lead to a share, and the policy does not limit which
+local files a path names.
+
+### Handling errors
+
+`WinrmError` says what failed by its variant, so a program decides without
+reading a message:
+
+```rust
+use winrm_rs::WinrmError;
+
+match client.run_powershell("win-server", "Get-Service").await {
+    Ok(output) => println!("{}", String::from_utf8_lossy(&output.stdout)),
+    // The server refuses the credentials, or the method: ask for them again.
+    Err(WinrmError::AuthRejected(why)) => eprintln!("refused: {why}"),
+    // Nothing was sent: the configuration cannot work as written.
+    Err(WinrmError::Config(why)) => eprintln!("fix the configuration: {why}"),
+    // The network path (connection, TLS) or a deadline. When the failure
+    // came after the request was sent, the command may have run.
+    Err(e @ (WinrmError::Http(_) | WinrmError::Connection(_) | WinrmError::Timeout(_))) => {
+        eprintln!("no answer: {e}");
+    }
+    // An HTTP status that ends the exchange. The request was sent and may
+    // have run: retry on a 503 only what is safe to run twice.
+    Err(WinrmError::HttpStatus { status, message, .. }) => eprintln!("HTTP {status}: {message}"),
+    // A SOAP fault, with its code.
+    Err(WinrmError::Soap(fault)) => eprintln!("WinRM fault: {fault}"),
+    Err(e) => return Err(e.into()),
+}
+```
+
+The enum is `#[non_exhaustive]`, so the last arm stays, and a pattern on a
+variant with named fields ends with `..`. The other variants are
+`Authentication` (the authentication failed for another reason than the
+server's refusal: a Kerberos ticket, a pinned certificate that does not
+match), `Protocol`, `Ntlm` and `CredSsp` (an answer that does not follow the
+protocol or does not verify), `OutputLimit` (`max_output_bytes`), `Transfer`
+(a `TransferError`: the remote path, the local file, the host's refusal),
+`Cancelled` and `Internal`. The messages are for people: their wording can
+change between releases.
 
 ### Runnable examples
 
@@ -517,7 +568,7 @@ cargo test --test integration_real -- --ignored
 |---|---|---|
 | *(default)* | stable | NTLMv2, Basic, Certificate auth; no optional deps |
 | `kerberos` | stable | Pulls `cross-krb5`; requires a working `kinit` |
-| `credssp` | **experimental** | Double-hop delegation. Needs `use_tls = true` with a verified certificate: it refuses `accept_invalid_certs = true`, so pin the listener certificate with `pin_server_certificate_sha256` or trust its CA with `add_root_certificates_pem`. Reaches the host through no proxy, or an `http://` or `socks5://` one set in `WinrmConfig::proxy` or, with `use_env_proxy(true)`, taken from the environment per request (an `https://` or `socks4://` proxy is refused). It does not apply `max_retries` (see `AuthMethod::CredSsp`). Each request holds one of the connection slots shared with the other connection-bound methods for its whole exchange (32 per host, 128 per client). Validated end-to-end against Windows Server 2025; not yet exercised on other host generations. Delegates your cleartext password to the target: use it only toward hosts you trust as much as the account. Transfers refuse UNC paths by default since 2.0, so a double-hop to a share needs `.remote_path_policy(RemotePathPolicy::Any)` on the builder. Links the host OpenSSL; see below. |
+| `credssp` | **experimental** | Double-hop delegation. Needs `use_tls = true` with a verified certificate: it refuses `accept_invalid_certs = true`, so pin the listener certificate with `pin_server_certificate_sha256` or trust its CA with `add_root_certificates_pem`. Reaches the host through no proxy, or an `http://` or `socks5://` one set in `WinrmConfig::proxy` or, with `use_env_proxy(true)`, taken from the environment per request (an `https://` or `socks4://` proxy is refused). It does not apply `max_retries` (see `AuthMethod::CredSsp`). Each request holds one of the connection slots shared with the other connection-bound methods for its whole exchange (32 per host, 128 per client). Validated end-to-end against Windows Server 2016, 2019, 2022 and 2025; not against Server 2012 R2, whose HTTPS listener shares no cipher suite with `rustls`. Delegates your cleartext password to the target: use it only toward hosts you trust as much as the account. Transfers refuse UNC paths by default since 2.0, so a double-hop to a share needs `.remote_path_policy(RemotePathPolicy::Any)` on the builder. Links the host OpenSSL; see below. |
 
 ### `credssp` and the host OpenSSL
 

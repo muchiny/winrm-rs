@@ -40,7 +40,7 @@ use crate::transport::{HttpTransport, TransportOptions};
 /// `[fe80::1]`. The scheme comes from [`WinrmConfig::use_tls`] and the port
 /// from [`WinrmConfig::effective_port`]. A host with a scheme, user info, a path, a
 /// port, or a character that would end the URL authority is refused with
-/// [`WinrmError::AuthFailed`] before anything is sent.
+/// [`WinrmError::Config`] before anything is sent.
 ///
 /// The host must also be written the way the URL parser keeps it, so that
 /// the host on the wire is the one you passed: an IPv4 address in dotted-quad
@@ -50,6 +50,50 @@ use crate::transport::{HttpTransport, TransportOptions};
 /// decomposed accents. An IPv6 literal that stands for an IPv4 address
 /// (`[::ffff:10.0.0.1]`, `[::10.0.0.1]`) is refused: pass the dotted quad.
 /// The error names the form to use.
+///
+/// # Errors of a request
+///
+/// Every method that sends a request can fail with:
+///
+/// - [`WinrmError::Config`]: the `host` is refused (above), or the
+///   configuration does not allow the request (CredSSP without its cargo
+///   feature, a proxy CredSSP cannot go through); nothing was sent;
+/// - [`WinrmError::Http`]: the connection, the TLS handshake or the HTTP
+///   exchange fails or times out. [`WinrmError::Connection`]: the same for
+///   the connection of CredSSP, a proxy that does not keep an authenticated
+///   connection, and an authenticated NTLM or Kerberos connection the
+///   server closed;
+/// - [`WinrmError::AuthRejected`]: the server refuses the credentials or
+///   the method (HTTP 401, or with CredSSP the NTSTATUS of a refused
+///   logon). [`WinrmError::Authentication`]: the authentication fails
+///   otherwise (no Kerberos ticket, a channel binding that cannot be
+///   computed, a server that does not prove who it is, a pinned
+///   certificate that does not match);
+/// - [`WinrmError::HttpStatus`]: the server answers an HTTP status that
+///   ends the exchange and is neither a SOAP fault nor a 401 (a 404, a
+///   503, or any status but 401 where a handshake expects a challenge);
+/// - [`WinrmError::Protocol`]: an answer that does not follow the protocol
+///   or cannot be trusted, such as a successful answer to a sealed request
+///   that the server did not seal. [`WinrmError::Ntlm`]: an NTLM challenge
+///   that is malformed or that this client refuses, a signature that does
+///   not verify
+///   ([`NtlmError::BadSignature`](crate::NtlmError::BadSignature)).
+///   [`WinrmError::CredSsp`]: a message of that protocol is malformed or
+///   fails its checks;
+/// - [`WinrmError::Soap`]: the server answers a fault
+///   ([`SoapError::Fault`](crate::SoapError::Fault)), or a body that is not
+///   an XML document, is larger than the response limit, or is not built
+///   the way the answer to the request must be (an element where a text is
+///   expected, an attribute that does not parse)
+///   ([`SoapError::ParseError`](crate::SoapError::ParseError));
+/// - [`WinrmError::Timeout`]: the cases listed on that variant (a connection
+///   slot, a Kerberos ticket, a CredSSP exchange);
+/// - [`WinrmError::Cancelled`]: the hook set with
+///   [`WinrmClientBuilder::before_send`] or
+///   [`before_send_with`](crate::WinrmClientBuilder::before_send_with)
+///   refuses the request.
+///
+/// The `Errors` section of a method says what it adds to these.
 ///
 /// # Session identifier
 ///
@@ -75,9 +119,9 @@ impl WinrmClient {
     ///
     /// # Errors
     ///
-    /// [`WinrmError::Http`] if the HTTP client cannot be constructed.
-    /// [`WinrmError::AuthFailed`] for a configuration refused before anything
-    /// is sent: Basic over plain HTTP without `EncryptionMode::Never`; Basic
+    /// [`WinrmError::Config`] for a configuration refused before anything
+    /// is sent: an option the HTTP client does not take (a `user_agent`
+    /// with a line break); Basic over plain HTTP without `EncryptionMode::Never`; Basic
     /// over HTTPS with `accept_invalid_certs`; `EncryptionMode::Always` with
     /// a method that does not seal; Certificate or CredSSP without
     /// `use_tls`; CredSSP with `accept_invalid_certs` or with a proxy it
@@ -149,6 +193,12 @@ impl WinrmClient {
     /// The shell uses UTF-8 codepage (65001) and disables the user profile
     /// (`WINRS_NOPROFILE`). The caller must eventually call
     /// [`delete_shell`](Self::delete_shell) to release server resources.
+    ///
+    /// # Errors
+    ///
+    /// The [errors of a request](Self#errors-of-a-request), and
+    /// [`SoapError::MissingElement`](crate::SoapError::MissingElement) for
+    /// an answer without a `ShellId`.
     #[tracing::instrument(
         level = "debug",
         skip(self, host),
@@ -169,6 +219,12 @@ impl WinrmClient {
     ///
     /// Returns a [`Shell`] whose subsequent operations (Execute, Receive,
     /// Send, Signal, Delete) will use the PowerShell resource URI.
+    ///
+    /// # Errors
+    ///
+    /// The [errors of a request](Self#errors-of-a-request), and
+    /// [`SoapError::MissingElement`](crate::SoapError::MissingElement) for
+    /// an answer without a `ShellId`.
     #[tracing::instrument(
         level = "debug",
         skip(self, creation_xml_b64, host),
@@ -209,6 +265,12 @@ impl WinrmClient {
     /// [`receive_output`](Self::receive_output) to poll for results.
     ///
     /// See [`WinrmClient::run_command`] (Arguments) for how `args` reach the host.
+    ///
+    /// # Errors
+    ///
+    /// The [errors of a request](Self#errors-of-a-request), and
+    /// [`SoapError::MissingElement`](crate::SoapError::MissingElement) for
+    /// an answer without a `CommandId`.
     #[tracing::instrument(
         level = "debug",
         skip(self, host, command, args),
@@ -253,6 +315,13 @@ impl WinrmClient {
     /// [`receive_output_raw`](Self::receive_output_raw) and feed its stderr
     /// to one [`StderrDecoder`](crate::StderrDecoder) per command, or use
     /// [`Shell::receive_next`](crate::Shell::receive_next), which does that.
+    ///
+    /// # Errors
+    ///
+    /// The [errors of a request](Self#errors-of-a-request), the `TimedOut`
+    /// fault excepted (above), and
+    /// [`SoapError::ParseError`](crate::SoapError::ParseError) for a stream
+    /// that is not valid base64.
     #[tracing::instrument(
         level = "debug",
         skip(self, host),
@@ -279,6 +348,10 @@ impl WinrmClient {
     /// [`StderrDecoder`](crate::StderrDecoder) per command to decode CLIXML
     /// that spans several responses; its documentation has an example. A
     /// `TimedOut` fault is an empty, not-done poll here too.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`receive_output`](Self::receive_output).
     #[tracing::instrument(
         level = "debug",
         skip(self, host),
@@ -320,6 +393,11 @@ impl WinrmClient {
     ///
     /// This is a best-effort operation -- errors are typically non-fatal
     /// since the shell will be deleted shortly after.
+    ///
+    /// # Errors
+    ///
+    /// The [errors of a request](Self#errors-of-a-request): among them the
+    /// fault of a server that no longer knows the shell or the command.
     #[tracing::instrument(
         level = "debug",
         skip(self, host),
@@ -349,6 +427,11 @@ impl WinrmClient {
     /// an error occurred. The high-level [`run_command`](Self::run_command)
     /// and [`run_powershell`](Self::run_powershell) methods handle this
     /// automatically.
+    ///
+    /// # Errors
+    ///
+    /// The [errors of a request](Self#errors-of-a-request): among them the
+    /// fault of a server that no longer knows the shell.
     #[tracing::instrument(
         level = "debug",
         skip(self, host),
@@ -422,6 +505,16 @@ impl WinrmClient {
     /// # let _ = out;
     /// # Ok(()) }
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// The [errors of a request](Self#errors-of-a-request), from the Create,
+    /// the Execute or a Receive, and [`WinrmError::OutputLimit`] once the output
+    /// exceeds
+    /// [`max_output_bytes`](crate::WinrmConfig::max_output_bytes) (the
+    /// command is then told to terminate). An exit code other than zero is
+    /// not an error: it is in the [`CommandOutput`]. Neither is a failure of
+    /// the clean-up (terminate, delete), which is logged and not returned.
     #[tracing::instrument(
         level = "debug",
         skip(self, host, command, args),
@@ -490,6 +583,11 @@ impl WinrmClient {
     /// }
     /// # Ok(()) }
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Those of [`run_command`](Self::run_command), and
+    /// [`WinrmError::Timeout`] when `timeout` passes first (above).
     #[tracing::instrument(
         level = "debug",
         skip(self, host, command, args),
@@ -655,9 +753,10 @@ impl WinrmClient {
                 && received > cap
             {
                 self.signal_terminate(host, shell_id, command_id).await.ok();
-                return Err(WinrmError::Transfer(format!(
-                    "command output exceeded max_output_bytes ({cap})"
-                )));
+                return Err(WinrmError::OutputLimit {
+                    kind: crate::error::OutputKind::CommandOutput,
+                    limit: cap,
+                });
             }
 
             if output.exit_code.is_some() {
@@ -715,6 +814,12 @@ impl WinrmClient {
     /// [`upload_file`](crate::WinrmClient::upload_file) and
     /// [`download_file`](crate::WinrmClient::download_file) always use the
     /// flags.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`run_command`](Self::run_command). A script that fails is
+    /// not an error of the call: PowerShell reports it on stderr and in the
+    /// exit code of the [`CommandOutput`].
     #[tracing::instrument(
         level = "debug",
         skip(self, script, host),
@@ -762,6 +867,11 @@ impl WinrmClient {
     /// assert!(matches!(err, WinrmError::Timeout(10)));
     /// # Ok(()) }
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Those of [`run_powershell`](Self::run_powershell), and
+    /// [`WinrmError::Timeout`] when `timeout` passes first.
     #[tracing::instrument(
         level = "debug",
         skip(self, script, host),
@@ -802,6 +912,11 @@ impl WinrmClient {
     /// `async` drop); the server reaps it after its idle timeout.
     ///
     /// See [`WinrmClient::run_command`] (Arguments) for how `args` reach the host.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`run_command`](Self::run_command), and
+    /// [`WinrmError::Cancelled`] when `cancel` is cancelled first.
     pub async fn run_command_with_cancel(
         &self,
         host: &str,
@@ -829,6 +944,11 @@ impl WinrmClient {
     /// It starts PowerShell by the same full path as `run_powershell`
     /// (`%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`, never
     /// the 32-bit one).
+    ///
+    /// # Errors
+    ///
+    /// Those of [`run_powershell`](Self::run_powershell), and
+    /// [`WinrmError::Cancelled`] when `cancel` is cancelled first.
     pub async fn run_powershell_with_cancel(
         &self,
         host: &str,
@@ -850,6 +970,11 @@ impl WinrmClient {
     /// Returns the raw XML response items as a string. The response contains
     /// WMI object instances matching the query. Use a `namespace` of `None`
     /// for the default `root/cimv2`.
+    ///
+    /// The items are what the server wrote, and they are not checked: only
+    /// the balance of their tags is. Read them with an XML parser that
+    /// expands no entity and processes no DTD, as for any XML from a host
+    /// you do not control.
     ///
     /// Pages are pulled until a response carries an `EndOfSequence` element
     /// outside its `Items`, or no `EnumerationContext`. Text inside the items,
@@ -875,6 +1000,13 @@ impl WinrmClient {
     /// println!("{xml}");
     /// # Ok(()) }
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// The [errors of a request](Self#errors-of-a-request), from the
+    /// Enumerate or a Pull (a query the server refuses is a fault), and
+    /// [`WinrmError::OutputLimit`] once the items collected exceed
+    /// [`max_output_bytes`](crate::WinrmConfig::max_output_bytes).
     #[tracing::instrument(
         level = "debug",
         skip(self, host, query),
@@ -901,7 +1033,10 @@ impl WinrmClient {
         let (mut items, mut context) =
             soap::parse_enumerate_response(&response).map_err(WinrmError::Soap)?;
 
+        // With `OptimizeEnumeration` the Enumerate answer itself can carry
+        // every item, so the cap applies to it as well as to each Pull.
         let max_output = config.max_output_bytes;
+        check_wql_cap(&items, max_output)?;
 
         // Phase 2: Pull remaining items if enumeration is not complete
         let mut pacer = PollPacer::default();
@@ -923,13 +1058,7 @@ impl WinrmClient {
             items.push_str(&more_items);
             context = next_ctx;
 
-            if let Some(cap) = max_output
-                && items.len() > cap
-            {
-                return Err(WinrmError::Transfer(format!(
-                    "WQL enumeration exceeded max_output_bytes ({cap})"
-                )));
-            }
+            check_wql_cap(&items, max_output)?;
 
             if context.is_some()
                 && let Some(d) = pacer.delay_after(polled_at.elapsed(), progressed)
@@ -976,6 +1105,11 @@ impl WinrmClient {
     /// }
     /// # Ok(()) }
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Those of [`run_wql`](Self::run_wql), and [`WinrmError::Timeout`] when
+    /// `timeout` passes first.
     #[tracing::instrument(
         level = "debug",
         skip(self, host, query),
@@ -1016,6 +1150,11 @@ impl WinrmClient {
     /// println!("{xml}");
     /// # Ok(()) }
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Those of [`run_wql`](Self::run_wql), and [`WinrmError::Cancelled`]
+    /// when `cancel` is cancelled first.
     #[tracing::instrument(
         level = "debug",
         skip(self, host, query, cancel),
@@ -1068,6 +1207,10 @@ impl WinrmClient {
     ///
     /// Close it with [`Shell::close`] when done: dropping it only logs a
     /// warning, and the server keeps the shell until its idle timeout.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`create_shell`](Self::create_shell).
     #[tracing::instrument(
         level = "debug",
         skip(self, host),
@@ -1079,10 +1222,10 @@ impl WinrmClient {
         Ok(Shell::new(self, host.to_string(), shell_id))
     }
 
-    /// Delete a shell that lives under a non-default ResourceURI.
+    /// Delete a shell that lives under a non-default `ResourceURI`.
     ///
     /// Delete is plugin-addressed like every other shell operation. A PSRP
-    /// shell deleted with the `cmd` ResourceURI is reported as not found and
+    /// shell deleted with the `cmd` `ResourceURI` is reported as not found and
     /// stays alive server-side, so `Shell::close` passes the URI the shell
     /// was created with.
     pub(crate) async fn delete_shell_with_resource_uri(
@@ -1108,6 +1251,12 @@ impl WinrmClient {
     /// Sends a WS-Man `Reconnect` SOAP request to validate that the
     /// server-side shell identified by `shell_id` is still alive and
     /// returns a [`Shell`] handle that resumes operations on it.
+    ///
+    /// # Errors
+    ///
+    /// The [errors of a request](Self#errors-of-a-request): among them the
+    /// fault of a server that no longer has the shell, or that has it under
+    /// another `resource_uri`.
     #[tracing::instrument(
         level = "debug",
         skip(self, host),
@@ -1136,6 +1285,18 @@ impl WinrmClient {
             resource_uri.to_string(),
             ShellKind::from_resource_uri(resource_uri),
         ))
+    }
+}
+
+/// Refuse the WQL items collected so far once they exceed
+/// `max_output_bytes` (`cap`); `None` means no cap.
+fn check_wql_cap(items: &str, cap: Option<usize>) -> Result<(), WinrmError> {
+    match cap {
+        Some(cap) if items.len() > cap => Err(WinrmError::OutputLimit {
+            kind: crate::error::OutputKind::WqlEnumeration,
+            limit: cap,
+        }),
+        _ => Ok(()),
     }
 }
 

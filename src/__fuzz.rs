@@ -8,7 +8,11 @@
 //! Wrappers (rather than `pub use`) keep the visibility of the wrapped items
 //! unchanged, so enabling the feature cannot widen the real API surface.
 
-#![allow(missing_docs)]
+#![expect(
+    clippy::must_use_candidate,
+    reason = "wrappers for the fuzz targets and the tests, which read every result: \
+              an attribute on each would say nothing to anybody"
+)]
 
 use crate::error::{NtlmError, SoapError, WinrmError};
 
@@ -54,7 +58,7 @@ pub fn create_authenticate_message(
 /// Build the Type 3 of the HTTP and HTTPS handshakes (MIC, `MsvAvFlags`,
 /// target name, zero LM; the channel binding when given); also returns the
 /// session key.
-#[allow(clippy::too_many_arguments, reason = "mirrors the wrapped builder")]
+#[expect(clippy::too_many_arguments, reason = "mirrors the wrapped builder")]
 pub fn create_authenticate_message_http(
     challenge: &ChallengeMessage,
     username: &str,
@@ -144,12 +148,12 @@ pub fn to_utf16le(s: &str) -> Vec<u8> {
     crate::ntlm::crypto::to_utf16le(s)
 }
 
-/// NTOWFv1: MD4 of the UTF-16-LE password.
+/// `NTOWFv1`: MD4 of the UTF-16-LE password.
 pub fn compute_nt_hash(password: &str) -> [u8; 16] {
     *crate::ntlm::crypto::compute_nt_hash(password)
 }
 
-/// NTOWFv2: HMAC-MD5 over uppercased user + domain.
+/// `NTOWFv2`: HMAC-MD5 over uppercased user + domain.
 pub fn compute_ntlmv2_hash(nt_hash: &[u8; 16], username: &str, domain: &str) -> [u8; 16] {
     *crate::ntlm::crypto::compute_ntlmv2_hash(nt_hash, username, domain)
 }
@@ -160,13 +164,13 @@ pub fn build_ntlmv2_blob(
     client_challenge: &[u8; 8],
     target_info: &[u8],
 ) -> Vec<u8> {
-    crate::ntlm::crypto::build_ntlmv2_blob(timestamp, client_challenge, target_info)
+    crate::ntlm::crypto::build_ntlmv2_blob(*timestamp, *client_challenge, target_info)
 }
 
 /// Compute the `tls-server-end-point` channel binding token from a DER cert
 /// (`None` when its signature algorithm defines no channel binding).
 pub fn compute_channel_bindings(cert_der: &[u8]) -> Option<[u8; 16]> {
-    crate::ntlm::crypto::compute_channel_bindings(cert_der).ok()
+    crate::ntlm::crypto::compute_channel_bindings(cert_der)
 }
 
 /// HMAC-MD5 of `data` under `key`, as the NTLM code computes it (the
@@ -334,6 +338,12 @@ pub fn check_soap_fault(xml: &str) -> Result<(), SoapError> {
     crate::soap::parser::check_soap_fault(xml)
 }
 
+/// What the transport asks of a response that comes with a success status
+/// (`soap::parser::check_answer`): a document that is not a fault.
+pub fn check_answer(xml: &str) -> Result<(), SoapError> {
+    crate::soap::parser::check_answer(xml)
+}
+
 /// Parse a WS-Enumeration `Enumerate`/`Pull` response.
 pub fn parse_enumerate_response(xml: &str) -> Result<(String, Option<String>), SoapError> {
     crate::soap::parser::parse_enumerate_response(xml)
@@ -402,7 +412,7 @@ pub fn signal_terminate_request(
     )
 }
 
-/// Delete carries the shell's own ResourceURI since 1.2.1 — a caller-supplied
+/// Delete carries the shell's own `ResourceURI` since 1.2.1 — a caller-supplied
 /// string spliced into the header, so it is part of the injection surface.
 pub fn delete_shell_request(
     endpoint: &str,
@@ -436,7 +446,7 @@ pub fn create_psrp_shell_request(
     )
 }
 
-#[allow(clippy::too_many_arguments, reason = "mirrors the wrapped builder")]
+#[expect(clippy::too_many_arguments, reason = "mirrors the wrapped builder")]
 pub fn execute_command_with_id_request(
     endpoint: &str,
     shell_id: &str,
@@ -513,7 +523,7 @@ pub fn signal_psrp_ctrl_c_request(
     )
 }
 
-/// Send carries the shell's own ResourceURI, like Delete: a caller-supplied
+/// Send carries the shell's own `ResourceURI`, like Delete: a caller-supplied
 /// string spliced into the header, so it is part of the injection surface.
 #[expect(clippy::too_many_arguments, reason = "mirrors the wrapped builder")]
 pub fn send_input_request(
@@ -579,6 +589,10 @@ pub fn sanitize_host(input: &str) -> String {
 
 /// What the URL parser reads back from an endpoint URL.
 #[derive(Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "a report of what the parser saw, one independent fact per field"
+)]
 pub struct EndpointParts {
     /// The host as the parser normalised it (lowercase, punycode, IPv4).
     pub host: Option<String>,
@@ -711,7 +725,7 @@ pub fn extract_subject_public_key(cert_der: &[u8]) -> Result<Vec<u8>, crate::err
 }
 
 // ---------------------------------------------------------------------------
-// CredSSP HTTP (`src/auth/credssp.rs`)
+// CredSSP HTTP (`src/auth/credssp/response.rs`, `handshake.rs`)
 // ---------------------------------------------------------------------------
 
 /// Feed `chunks` one by one to the CredSSP response reader (head cap of the

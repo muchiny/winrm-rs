@@ -534,14 +534,7 @@ jobs:
           # commit sets the next. The Release workflow runs this check on
           # the tagged commit without this input (`verify`, release.yml):
           # the version chosen for a release is checked there.
-          #
-          # `major` for the 3.0 window, which opens with the typed errors
-          # (#54). The check compares with the last version on crates.io:
-          # until that is 3.0.0, a pull request may break the API, and the
-          # release commit of 3.0.0 is itself compared with 2.1.0. Set this
-          # back to `minor` in the first pull request after 3.0.0 is
-          # published, not before.
-          release-type: major
+          release-type: minor
       - name: Breaking changes under a 1.x version
         if: steps.semver.outcome == 'failure'
         run: >-

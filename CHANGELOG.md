@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [3.0.0] - 2026-11-14
+## [3.0.0] - 2026-11-15
 
 **This release breaks the API of 2.x.** `WinrmError` says what failed by
 its variant: `AuthFailed` and `NtlmError::InvalidMessage` are gone,

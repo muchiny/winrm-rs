@@ -1,0 +1,97 @@
+name: Proofs
+
+# Lean proofs about a few functions of the crate (proofs/README.md). A test
+# tries some inputs; a proof holds for every input, so it says things a test
+# cannot: `decode_length` returns whatever bytes a server sends, and a length
+# it accepts is below 2^24.
+#
+# The proofs are about a Lean translation of the Rust functions, which is
+# committed in `proofs/WinrmRs/Code/`. Two things can then go wrong, and the
+# job checks both:
+#
+#   - the Rust changed and the translation did not follow: the job translates
+#     again and compares (`scripts/lean.sh drift`);
+#   - a theorem no longer holds, or a proof is unfinished: Lean checks every
+#     proof (`scripts/lean.sh check`).
+#
+# It is not one of the jobs `CI passed` waits for: a failure here fails this
+# workflow and nothing else.
+
+# The paths are those Charon reads: it builds the crate, so anything that is
+# compiled can change the translation. The two lists are the same.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "proofs/**"
+      - "scripts/lean.sh"
+      - ".github/workflows/proofs.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "proofs/**"
+      - "scripts/lean.sh"
+      - ".github/workflows/proofs.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to a pull request cancels its older run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  proofs:
+    name: Lean proofs
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # `asn1.rs` is compiled with the `credssp` feature, which needs OpenSSL.
+      - name: Install OpenSSL headers
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+
+      # The release of Aeneas pinned in scripts/lean.sh, checked against its
+      # SHA-256, and the Rust nightly that its Charon is built against. No
+      # `dtolnay/rust-toolchain` step: the script reads the name of that
+      # nightly from the release, so there is one pin and not two.
+      - name: Aeneas, Charon and the Rust toolchain of Charon
+        run: scripts/lean.sh tools
+
+      - name: The Rust sources still give the committed Lean code
+        run: scripts/lean.sh drift
+
+      # elan is to Lean what rustup is to Rust: it installs the version of
+      # Lean that `proofs/lean-toolchain` names. A release, by its SHA-256.
+      - name: Install elan
+        env:
+          ELAN_VERSION: v4.2.4
+          ELAN_SHA256: 42b94d4244e8353142c456ec0e4ca6528fd898a6c604d4059f494e706e431f63
+        working-directory: ${{ runner.temp }}
+        run: |
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+            --output elan.tar.gz \
+            "https://github.com/leanprover/elan/releases/download/${ELAN_VERSION}/elan-x86_64-unknown-linux-gnu.tar.gz"
+          echo "${ELAN_SHA256}  elan.tar.gz" | sha256sum --check --quiet -
+          tar -xzf elan.tar.gz
+          ./elan-init -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      # Downloads the compiled files of Mathlib and of the Lean library of
+      # Aeneas (several gigabytes), then checks the proofs of this repository.
+      - name: Lean checks the proofs
+        run: scripts/lean.sh check

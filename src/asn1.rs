@@ -71,7 +71,11 @@ fn encode_length(len: usize) -> Vec<u8> {
         // emitted a TLV whose declared length was wrong. We never build a
         // message this large, and `decode_length` deliberately still refuses
         // to read one (its 3-byte cap bounds what a hostile server can
-        // declare); this arm exists so the encoder cannot lie about a length.
+        // declare); this arm exists so the encoder cannot lie about a length
+        // below 2^32. From 2^32 up, which a 64-bit `usize` can hold, this
+        // form drops the top bits in its turn: the declared length is right
+        // only below 4 GiB, the hypothesis of `asn1.encode_length.spec` in
+        // `proofs/`.
         vec![0x84, b3, b2, b1, b0]
     }
 }

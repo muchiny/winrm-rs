@@ -50,6 +50,9 @@ notes.md
 /fuzz/artifacts/
 /fuzz/coverage/
 
+# Lean proofs: what Lake downloads and builds (Mathlib, several gigabytes)
+/proofs/.lake/
+
 # SonarQube scanner working directory
 /.scannerwork/
 

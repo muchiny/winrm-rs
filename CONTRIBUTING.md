@@ -76,6 +76,14 @@ scripts/fuzz.sh run fuzz_asn1_ts_request 900
 # they allocate, and would take the machine down before their timeout.
 cargo mutants --features credssp --file src/asn1.rs -- --lib
 
+# Lean proofs about `encode_length` and `decode_length` of src/asn1.rs: see
+# proofs/README.md. Needs elan and about 11 GB of disk (the compiled files of
+# Mathlib are downloaded, nothing is compiled). After a change to one of the
+# two functions, `extract` writes its Lean translation again, to commit with
+# the change; the `Proofs` workflow runs `drift` and `check`.
+scripts/lean.sh tools     # once: the pinned Aeneas and its Rust nightly
+scripts/lean.sh all       # translate, compare with what is committed, check the proofs
+
 # Check what will be published to crates.io (fails on any file outside the allowlist)
 scripts/check-package.sh
 
